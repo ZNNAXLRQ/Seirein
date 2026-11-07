@@ -1,0 +1,20 @@
+node_modules/
+.idea/
+.tmp-*/
+docs/
+logs/
+prototype/
+
+# generated audio fixtures (rebuild with node tools/asr-cutpoint-fixture.mjs)
+test/fixtures/asr-cutpoint/*.wav
+
+# runtime artifacts
+*.log
+*.sqlite
+*.sqlite3
+*.db
+cache/
+models/
+.env*
+Thumbs.db
+.DS_Store

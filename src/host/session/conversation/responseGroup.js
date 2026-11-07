@@ -1,0 +1,1041 @@
+/**
+ * Response groups (batch 2 of the continuous-speech work): the delivery-side bookkeeping that
+ * lets a second spoken segment continue the first answer instead of silently replacing it.
+ *
+ * Batch 1 (`hearing.js`) merged fragments *before* delivery, so one expression normally reaches
+ * the agent once. A group here covers the other case: the first request was already delivered and
+ * the user keeps talking while its answer is still being produced or is already sounding. A group
+ * owns no session history: it only records, next to the real turns,
+ *
+ *   - the user segments (message ids + turns) of one continuous expression,
+ *   - the answer version that is current, its body and its decided spoken plan,
+ *   - the clips that actually reached the player (submitting synthesis or queueing is not playing),
+ *   - the still-unvoiced sentences inherited by the next version,
+ *   - a bounded state (`generating`/`ready`/`playing`/`done`/`cancelled`/`expired`/`abandoned`).
+ *
+ * This module is deliberately pure data + text: it never imports a host module, never reads the
+ * session log and never calls a model. `index.js` feeds it and reads its decisions. The internal
+ * continuation context is built here but delivered by the host's own `agent/pre-step` lane; its
+ * message carries {@link ASSISTANT_RESPONSE_GROUP_SOURCE}, the same isolation marker convention
+ * as the memory block, so it is never recorded as a user utterance or re-memorized.
+ */
+
+import { randomUUID } from 'node:crypto';
+
+/** Custom message source: internal continuation context, never a user utterance. */
+export const ASSISTANT_RESPONSE_GROUP_SOURCE = 'assistant-response-group';
+
+/** Heading/footer of one internal continuation block. */
+export const RESPONSE_GROUP_CONTEXT_HEADING = '【连续表达上下文（内部参考，不是用户本轮的新指令）】';
+export const RESPONSE_GROUP_CONTEXT_FOOTER = '以上是同一段连续表达的参考，不要把它当成本轮用户的原话，也不要逐条复述本说明。';
+
+/** Bounded defaults: group count, group lifetime, segments, and text budgets. */
+export const RESPONSE_GROUP_DEFAULTS = Object.freeze({
+  maxGroups: 8,
+  ttlMs: 10 * 60_000,
+  maxSegments: 8,
+  maxContextChars: 1200,
+  maxPendingSentences: 24,
+  maxPlayedSentences: 64,
+});
+
+/** Terminal states never accept another segment; a later utterance opens a new group. */
+const TERMINAL_STATES = new Set(['done', 'cancelled', 'expired', 'abandoned', 'superseded']);
+/** A group in one of these states still owns unspoken content and may continue. */
+const PENDING_STATES = new Set(['generating', 'ready', 'playing', 'failed']);
+
+/** Explicit "stop talking" openers; anything else keeps the normal delivery path. */
+const EXPLICIT_CANCEL = /^\s*(?:停(?:一下|下来|停)?|别说了|不要说了|不用说了|先别说了|别念了|打住|闭嘴|安静)\s*[，,。.!！~～、；;：:]?\s*/u;
+
+/**
+ * Explicit topic-switch markers. Deliberately conservative: "另外" is additive in this persona's
+ * conversations and is NOT a switch, while an explicit request to change subject is. The host never
+ * runs a model pass to classify this; a false negative simply continues the group (the safe side).
+ */
+const TOPIC_SWITCH = /(?:换个话题|换一个话题|换个题目|说点别的|说个别的|另一个话题|新的话题|换个问题)/u;
+
+/** Parse one user input for an explicit cancel. `remainder` is the content after the opener. */
+export function isExplicitCancelInput(text) {
+  const source = String(text ?? '');
+  let rest = source;
+  let phrase = '';
+  for (let guard = 0; guard < 4; guard += 1) {
+    const match = EXPLICIT_CANCEL.exec(rest);
+    if (match === null || match[0].trim().length === 0) break;
+    phrase = phrase.length === 0 ? match[0].trim() : phrase;
+    rest = rest.slice(match[0].length);
+  }
+  if (phrase.length === 0) return { cancel: false, remainder: '', phrase: '' };
+  return { cancel: true, phrase, remainder: rest.trim() };
+}
+
+/** Is this user input an explicit request to change the subject? */
+export function isTopicSwitchInput(text) {
+  return TOPIC_SWITCH.test(String(text ?? ''));
+}
+
+const SENTENCE_TERMINATORS = new Set(['。', '！', '？', '!', '?', '；', ';', '\n']);
+const SENTENCE_RUN = /[。！？!?；;…\n]/u;
+const SENTENCE_CLOSERS = /[”’"'）)】\]」』》〉]/u;
+
+/**
+ * Sentence split of a spoken plan. One clause with commas stays one sentence: the block splitter
+ * (tts.js) is the only thing that cuts a sentence into comma-sized clips, and a group tracks the
+ * sentence because that is what the player really completed.
+ */
+export function splitSpeechSentences(text) {
+  const source = String(text ?? '');
+  const out = [];
+  let start = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = source[index];
+    // One ellipsis is an inner pause; two or more close the sentence (same rule as the speaker).
+    const terminator = ch === '…' ? source[index + 1] === '…' : SENTENCE_TERMINATORS.has(ch);
+    if (!terminator) continue;
+    let end = index + 1;
+    while (end < source.length && SENTENCE_RUN.test(source[end])) end += 1;
+    while (end < source.length && SENTENCE_CLOSERS.test(source[end])) end += 1;
+    const piece = source.slice(start, end).trim();
+    if (piece.length > 0) out.push(piece);
+    start = end;
+    index = end - 1;
+  }
+  const tail = source.slice(start).trim();
+  if (tail.length > 0) out.push(tail);
+  return out;
+}
+
+/** Comparison key: wording, not whitespace/punctuation, so "第二句。" and "第二句" match. */
+export function sentenceKey(text) {
+  return String(text ?? '').replace(/[\s\p{P}\p{S}]/gu, '').toLowerCase();
+}
+
+/** Normalized view of a text's sentences, for exact (never fuzzy) overlap checks. */
+function sentenceKeys(text) {
+  return splitSpeechSentences(text).map(sentenceKey).filter((key) => key.length > 0);
+}
+
+/** The source a pending answer should be read from: its decided plan, else its body. */
+function answerSource(answer) {
+  if (answer === null || answer === undefined) return '';
+  return String(answer.planText ?? '').trim().length > 0 ? answer.planText : String(answer.body ?? '');
+}
+
+/**
+ * Sentences of one answer that never reached the player. A started sentence counts as covered:
+ * a block cut mid-sentence must not make the next version restart that sentence from the top.
+ */
+export function unspokenSentencesOf(answer, { maxSentences = RESPONSE_GROUP_DEFAULTS.maxPendingSentences } = {}) {
+  if (answer === null || answer === undefined) return [];
+  const played = new Set((answer.playedSentences ?? []).map(sentenceKey));
+  const source = answerSource(answer);
+  const unspoken = splitSpeechSentences(source).filter((sentence) => !played.has(sentenceKey(sentence)));
+  return unspoken.slice(-Math.max(1, Math.trunc(maxSentences)));
+}
+
+/** Was every sentence of this answer's decided plan actually completed? */
+function answerFullyPlayed(answer, maxSentences = RESPONSE_GROUP_DEFAULTS.maxPendingSentences) {
+  const source = answerSource(answer);
+  const sentences = splitSpeechSentences(source);
+  if (sentences.length === 0) return false;
+  const completed = new Set((answer.completedSentenceIds ?? []).filter((id) => Number.isInteger(id)));
+  if (completed.size < sentences.length) return false;
+  // A sentence that was only partly heard still leaves that clip's tail unvoiced; it is covered
+  // for "do not repeat", but it keeps the group from claiming a clean completion.
+  return (answer.partialSentences ?? []).length === 0;
+}
+
+/**
+ * The spoken plan of a continuation: keep the part of the new answer that was not already heard,
+ * and make sure nothing from the previous answer's unvoiced remainder is lost.
+ *
+ * `priorPlanText`/`priorBodyText` are the previous version's decided plan (preferred) or full body.
+ * `playedTexts` are the sentences that really started playing. Leading new sentences that repeat
+ * already-played content are dropped (no restart from the top); prior unvoiced sentences that the
+ * new plan does not itself contain are prepended (coverage). Exact sentence matching only.
+ *
+ * @returns {{text: string, prepended: string[], skippedPlayed: string[], unplayedPrior: string[]}}
+ */
+export function composeContinuationSpeech({
+  priorPlanText = '',
+  priorBodyText = '',
+  playedTexts = [],
+  newPlanText = '',
+} = {}) {
+  const priorSource = String(priorPlanText ?? '').trim().length > 0 ? priorPlanText : priorBodyText;
+  const priorSentences = splitSpeechSentences(priorSource);
+  const playedKeys = new Set((Array.isArray(playedTexts) ? playedTexts : []).map(sentenceKey).filter(Boolean));
+  const unplayedPrior = priorSentences.filter((sentence) => !playedKeys.has(sentenceKey(sentence)));
+  const next = splitSpeechSentences(newPlanText);
+  // A new plan often opens by repeating the previous opening; drop exactly the played prefix.
+  const skippedPlayed = [];
+  while (next.length > 0 && playedKeys.has(sentenceKey(next[0]))) {
+    skippedPlayed.push(next.shift());
+  }
+  const nextKeys = new Set(next.map(sentenceKey).filter(Boolean));
+  const prepended = unplayedPrior.filter((sentence) => {
+    const key = sentenceKey(sentence);
+    if (key.length === 0) return false;
+    if (nextKeys.has(key)) return false;
+    nextKeys.add(key);
+    return true;
+  });
+  const final = [...prepended, ...next];
+  return {
+    text: final.join(''),
+    prepended,
+    skippedPlayed,
+    unplayedPrior,
+  };
+}
+
+/**
+ * The internal context appended to the next turn's first pre-step. It is reference material, not a
+ * user message: the host marks it with {@link ASSISTANT_RESPONSE_GROUP_SOURCE} and every memory /
+ * ack / typed-voice lane already excludes that marker.
+ *
+ * @param {object} options
+ * @param {object} options.group response group record
+ * @param {string} options.newInput the newly delivered segment
+ * @param {number} [options.maxChars]
+ */
+export function composeResponseGroupContext({ group, newInput = '', maxChars = RESPONSE_GROUP_DEFAULTS.maxContextChars } = {}) {
+  if (group === null || group === undefined || typeof group !== 'object') return '';
+  const budget = Math.max(200, Math.trunc(Number(maxChars) || RESPONSE_GROUP_DEFAULTS.maxContextChars));
+  const segments = Array.isArray(group.segments) ? group.segments : [];
+  const prior = group.priorAnswer ?? null;
+  const priorPlayed = (Array.isArray(group.played) ? group.played : []).slice(-6);
+  const pending = Array.isArray(group.pendingSentences) && group.pendingSentences.length > 0
+    ? group.pendingSentences.slice(-8)
+    : unspokenSentencesOf(prior, { maxSentences: 8 });
+  const lines = [RESPONSE_GROUP_CONTEXT_HEADING];
+  lines.push('同一段连续表达被分成了几段，请把它们当成一次请求，连贯地回应。');
+  if (segments.length > 0) {
+    lines.push('已收到的用户输入（按时间顺序）：');
+    for (let index = 0; index < segments.length; index += 1) {
+      const text = String(segments[index]?.text ?? '').trim();
+      if (text.length === 0) continue;
+      lines.push(`${index + 1}. ${text}`);
+    }
+  }
+  if (pending.length > 0) {
+    lines.push('上一轮已经生成、但还没有口头说出的内容（这次要覆盖）：');
+    for (const sentence of pending) lines.push(`- ${sentence}`);
+  }
+  if (priorPlayed.length > 0) {
+    lines.push('已经实际播出、不要从头重复的内容：');
+    for (const sentence of priorPlayed) lines.push(`- ${sentence}`);
+  }
+  lines.push(`本次新增输入：${String(newInput ?? '').trim()}`);
+  lines.push('要求：把前后内容合成一次回应，覆盖上面尚未口头说出的部分；已经播出的内容不要从头重复，也不要只总结前一轮。');
+  lines.push(RESPONSE_GROUP_CONTEXT_FOOTER);
+  let text = lines.join('\n');
+  if (text.length > budget) text = `${text.slice(0, Math.max(0, budget - 1))}…`;
+  return text;
+}
+
+/** The pre-step message carrying the continuation context (never recorded as a user utterance). */
+export function responseGroupContextMessage(text, { groupId = '', version = 0 } = {}) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    source: { kind: ASSISTANT_RESPONSE_GROUP_SOURCE, groupId, version },
+    content: [{ type: 'text', text: String(text ?? '') }],
+  };
+}
+
+/** True for this module's internal context message (the one exclusion marker every lane uses). */
+export function isResponseGroupContextMessage(message) {
+  return message?.source?.kind === ASSISTANT_RESPONSE_GROUP_SOURCE;
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 1 ? Math.floor(number) : fallback;
+}
+
+function createAnswer(version, { at }) {
+  return {
+    version,
+    state: 'generating',
+    createdAt: at,
+    updatedAt: at,
+    turn: null,
+    body: '',
+    bodyChars: 0,
+    planText: '',
+    planChars: 0,
+    feedText: '',
+    source: '',
+    playedSentences: [],
+    completedSentenceIds: [],
+    partialSentences: [],
+    clips: [],
+    progress: { started: 0, completed: 0, partial: 0 },
+    inheritedVersion: null,
+    error: '',
+    completedReason: '',
+  };
+}
+
+function groupView(group, extra = {}) {
+  return {
+    groupId: group.id,
+    sessionId: group.sessionId,
+    generation: group.generation,
+    answerVersion: group.answerVersion,
+    state: group.state,
+    reason: group.reason,
+    segments: Array.isArray(group.segments) ? group.segments.length : 0,
+    turns: Array.isArray(group.turns) ? group.turns.length : 0,
+    played: Array.isArray(group.played) ? group.played.length : 0,
+    pending: Array.isArray(group.pendingSentences) ? group.pendingSentences.length : 0,
+    ...extra,
+  };
+}
+
+/**
+ * The response-group state machine. All methods are synchronous and bounded; the host calls them
+ * from its voice lanes and emits the returned decisions as its own events.
+ *
+ * @param {object} [options]
+ * @param {Function} [options.now] clock seam (tests may advance time)
+ * @param {number} [options.maxGroups] hard cap on retained groups (default 8)
+ * @param {number} [options.ttlMs] group lifetime from creation (default 10 minutes)
+ * @param {number} [options.maxSegments] segments one group may accept (default 8)
+ * @param {number} [options.maxContextChars] internal-context budget (default 1200)
+ * @param {number} [options.maxPendingSentences] unvoiced-sentence bound per answer (default 24)
+ * @param {number} [options.maxPlayedSentences] played-sentence history bound (default 64)
+ * @param {Function} [options.emit] `(type, payload) => void`, the host's observability outlet
+ */
+export function createResponseGroupStore({
+  now = () => Date.now(),
+  maxGroups = RESPONSE_GROUP_DEFAULTS.maxGroups,
+  ttlMs = RESPONSE_GROUP_DEFAULTS.ttlMs,
+  maxSegments = RESPONSE_GROUP_DEFAULTS.maxSegments,
+  maxContextChars = RESPONSE_GROUP_DEFAULTS.maxContextChars,
+  maxPendingSentences = RESPONSE_GROUP_DEFAULTS.maxPendingSentences,
+  maxPlayedSentences = RESPONSE_GROUP_DEFAULTS.maxPlayedSentences,
+  emit = null,
+} = {}) {
+  const groups = new Map();
+  const groupLimit = positiveInteger(maxGroups, RESPONSE_GROUP_DEFAULTS.maxGroups);
+  const lifetime = positiveInteger(ttlMs, RESPONSE_GROUP_DEFAULTS.ttlMs);
+  const segmentLimit = positiveInteger(maxSegments, RESPONSE_GROUP_DEFAULTS.maxSegments);
+  const contextChars = positiveInteger(maxContextChars, RESPONSE_GROUP_DEFAULTS.maxContextChars);
+  const pendingLimit = positiveInteger(maxPendingSentences, RESPONSE_GROUP_DEFAULTS.maxPendingSentences);
+  const playedLimit = positiveInteger(maxPlayedSentences, RESPONSE_GROUP_DEFAULTS.maxPlayedSentences);
+  let sequence = 0;
+  let pendingInternal = null;
+
+  const publish = (type, payload) => {
+    try {
+      emit?.(type, payload);
+    } catch {
+      /* observation only: a broken sink never changes the state machine */
+    }
+  };
+
+  const sessionsActive = () => {
+    const counts = new Map();
+    for (const group of groups.values()) {
+      if (TERMINAL_STATES.has(group.state)) continue;
+      counts.set(group.sessionId, (counts.get(group.sessionId) ?? 0) + 1);
+    }
+    return counts;
+  };
+
+  const expireGroup = (group, at, reason = 'ttl') => {
+    if (TERMINAL_STATES.has(group.state)) return false;
+    group.state = 'expired';
+    group.reason = reason;
+    group.updatedAt = at;
+    if (group.currentAnswer !== null && group.currentAnswer !== undefined
+      && !TERMINAL_STATES.has(group.currentAnswer.state)) {
+      group.currentAnswer.state = 'expired';
+    }
+    publish('voice.response.group.expired', {
+      ...groupView(group),
+      reason,
+      ageMs: Math.max(0, at - group.createdAt),
+      retained: true,
+    });
+    return true;
+  };
+
+  const abandonGroup = (group, at, reason) => {
+    if (TERMINAL_STATES.has(group.state)) return false;
+    group.state = 'abandoned';
+    group.reason = reason;
+    group.updatedAt = at;
+    publish('voice.response.group.abandoned', {
+      ...groupView(group),
+      reason,
+      retained: true,
+    });
+    return true;
+  };
+
+  /** Bounded retention: terminal groups go first; otherwise the oldest active group is abandoned. */
+  const trim = (at) => {
+    while (groups.size > groupLimit) {
+      let victim = null;
+      for (const group of groups.values()) {
+        if (TERMINAL_STATES.has(group.state)) {
+          victim = group;
+          break;
+        }
+      }
+      if (victim === null) {
+        victim = groups.values().next().value ?? null;
+        if (victim === null) return;
+        abandonGroup(victim, at, 'group-limit');
+      }
+      groups.delete(victim.id);
+      publish('voice.response.group.evicted', {
+        groupId: victim.id,
+        sessionId: victim.sessionId,
+        reason: 'limit',
+        priorState: victim.state,
+        groups: groups.size,
+      });
+    }
+  };
+
+  const sweep = (at) => {
+    for (const group of groups.values()) {
+      if (TERMINAL_STATES.has(group.state)) continue;
+      if (at >= group.expiresAt) expireGroup(group, at, 'ttl');
+    }
+  };
+
+  const newestFor = (sessionId) => {
+    let found = null;
+    for (const group of groups.values()) {
+      if (group.sessionId !== sessionId) continue;
+      found = group;
+    }
+    return found;
+  };
+
+  /** Played keys of one group: exact sentence wording, so punctuation never changes coverage. */
+  const playedKeySet = (group) => new Set((group.played ?? []).map(sentenceKey).filter(Boolean));
+
+  /** Remember generated-but-unvoiced sentences (body or plan), bounded and punctuation-insensitive. */
+  const rememberPending = (group, text) => {
+    const played = playedKeySet(group);
+    const known = new Set(group.pendingSentences.map(sentenceKey));
+    for (const sentence of splitSpeechSentences(text)) {
+      const key = sentenceKey(sentence);
+      if (key.length === 0 || played.has(key) || known.has(key)) continue;
+      known.add(key);
+      group.pendingSentences.push(sentence);
+    }
+    while (group.pendingSentences.length > pendingLimit) group.pendingSentences.shift();
+  };
+
+  /** Replace the unvoiced set with the sentences of one adjusted plan (what will really be said). */
+  const replacePendingFromPlan = (group, text) => {
+    const played = playedKeySet(group);
+    const seen = new Set();
+    const next = [];
+    for (const sentence of splitSpeechSentences(text)) {
+      const key = sentenceKey(sentence);
+      if (key.length === 0 || played.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      next.push(sentence);
+    }
+    group.pendingSentences = next.slice(-pendingLimit);
+  };
+
+  /** A sentence actually started: it is no longer pending, whatever version announced it. */
+  const forgetPendingPlayed = (group, text) => {
+    const key = sentenceKey(text);
+    if (key.length === 0) return;
+    group.pendingSentences = group.pendingSentences.filter((sentence) => sentenceKey(sentence) !== key);
+  };
+
+  const hasPending = (group) => {
+    if (Array.isArray(group.pendingSentences) && group.pendingSentences.length > 0) return true;
+    if (group.currentAnswer !== null && group.currentAnswer !== undefined
+      && group.currentAnswer.state === 'generating') return true;
+    return false;
+  };
+
+  const decide = (group, text, at) => {
+    if (TERMINAL_STATES.has(group.state)) return { continuation: false, reason: `prior-${group.state}` };
+    if (at >= group.expiresAt) {
+      expireGroup(group, at, 'ttl');
+      return { continuation: false, reason: 'prior-expired' };
+    }
+    if (isTopicSwitchInput(text)) {
+      if (hasPending(group)) return { continuation: false, reason: 'topic-switch' };
+      return { continuation: false, reason: 'topic-switch-idle' };
+    }
+    if (group.generation >= segmentLimit) return { continuation: false, reason: 'segment-limit' };
+    if (group.state === 'done') return { continuation: false, reason: 'prior-complete' };
+    if (PENDING_STATES.has(group.state) || hasPending(group)) {
+      return { continuation: true, reason: `continue-${group.state}` };
+    }
+    return { continuation: false, reason: `prior-${group.state}` };
+  };
+
+  const createGroup = ({ sessionId, speakerId, text, at, reason }) => {
+    sequence += 1;
+    const answer = createAnswer(1, { at });
+    const group = {
+      id: `rg-${sequence}`,
+      sessionId,
+      speakerId: typeof speakerId === 'string' ? speakerId : '',
+      state: 'generating',
+      reason,
+      generation: 1,
+      answerVersion: 1,
+      segments: [{ text: String(text ?? ''), at, generation: 1, messageId: '', turn: null }],
+      turns: [],
+      messageIds: [],
+      createdAt: at,
+      updatedAt: at,
+      expiresAt: at + lifetime,
+      currentAnswer: answer,
+      priorAnswer: null,
+      played: [],
+      /** Generated-but-unvoiced sentences carried across answer versions (bounded). */
+      pendingSentences: [],
+      cancelReason: '',
+      // Cached copies for the bounded continuation context (the message itself is never stored).
+      lastUserInput: String(text ?? ''),
+    };
+    groups.set(group.id, group);
+    trim(at);
+    publish('voice.response.group.created', {
+      ...groupView(group),
+      reason,
+      groups: groups.size,
+      ttlMs: lifetime,
+    });
+    return group;
+  };
+
+  /**
+   * Register one delivered segment: either continue the session's open group or open a new one.
+   * @returns {{group: object, generation: number, answerVersion: number, continuation: boolean,
+   *            priorVersion: number, reason: string}}
+   */
+  const beginInput = ({ sessionId, text, speakerId = '', at = now() } = {}) => {
+    sweep(at);
+    const current = newestFor(sessionId);
+    let decision = { continuation: false, reason: 'new' };
+    if (current !== null) {
+      decision = decide(current, text, at);
+      if (decision.continuation === true) {
+        const prior = current.currentAnswer;
+        // The superseded version's generated-but-unvoiced sentences become the group's pending
+        // coverage; its playback coverage is already in `played`.
+        rememberPending(current, answerSource(prior));
+        prior.updatedAt = at;
+        const version = current.answerVersion + 1;
+        const answer = createAnswer(version, { at });
+        answer.inheritedVersion = prior.version;
+        current.priorAnswer = prior;
+        current.currentAnswer = answer;
+        current.answerVersion = version;
+        current.generation += 1;
+        current.state = 'generating';
+        current.reason = decision.reason;
+        current.updatedAt = at;
+        current.segments.push({ text: String(text ?? ''), at, generation: current.generation, messageId: '', turn: null });
+        current.lastUserInput = String(text ?? '');
+        const priorUnspoken = unspokenSentencesOf(prior, { maxSentences: pendingLimit });
+        publish('voice.response.group.continued', {
+          ...groupView(current),
+          priorVersion: prior.version,
+          priorState: prior.state,
+          playedSentences: (prior.playedSentences ?? []).length,
+          unplayedSentences: Math.max(priorUnspoken.length, current.pendingSentences.length),
+          newChars: String(text ?? '').length,
+        });
+        return {
+          group: current,
+          generation: current.generation,
+          answerVersion: version,
+          continuation: true,
+          priorVersion: prior.version,
+          reason: decision.reason,
+        };
+      }
+      if (decision.reason === 'topic-switch' || decision.reason === 'segment-limit') {
+        abandonGroup(current, at, decision.reason);
+      }
+    }
+    const group = createGroup({ sessionId, speakerId, text, at, reason: decideReason(current, decision) });
+    return {
+      group,
+      generation: group.generation,
+      answerVersion: 1,
+      continuation: false,
+      priorVersion: 0,
+      reason: group.reason,
+    };
+  };
+
+  const decideReason = (current, decision) => {
+    if (current === null) return 'new';
+    if (decision.reason === 'topic-switch') return 'topic-switch';
+    if (decision.reason === 'segment-limit') return 'segment-limit';
+    return decision.reason;
+  };
+
+  const find = (groupId) => groups.get(String(groupId ?? '')) ?? null;
+
+  /** Associate the injected message id and the accepted turn with this segment/version. */
+  const attachDelivery = ({ group, version, messageId = '', turn = null } = {}) => {
+    if (group === null || group === undefined) return;
+    const segment = group.segments[group.segments.length - 1];
+    if (segment !== undefined && segment !== null) {
+      if (typeof messageId === 'string' && messageId.length > 0) segment.messageId = messageId;
+      if (Number.isInteger(turn)) segment.turn = turn;
+    }
+    if (typeof messageId === 'string' && messageId.length > 0 && !group.messageIds.includes(messageId)) {
+      group.messageIds.push(messageId);
+      if (group.messageIds.length > segmentLimit) group.messageIds.shift();
+    }
+    if (Number.isInteger(turn) && !group.turns.includes(turn)) {
+      group.turns.push(turn);
+      if (group.turns.length > segmentLimit) group.turns.shift();
+    }
+    const answer = findAnswer(group, version);
+    if (answer !== null && Number.isInteger(turn)) answer.turn = turn;
+  };
+
+  const findAnswer = (group, version) => {
+    if (group === null || group === undefined) return null;
+    if (group.currentAnswer?.version === version) return group.currentAnswer;
+    if (group.priorAnswer?.version === version) return group.priorAnswer;
+    return null;
+  };
+
+  const isCurrentAnswer = (group, version) => (
+    group !== null && group !== undefined
+    && group.currentAnswer?.version === version
+    && !TERMINAL_STATES.has(group.state)
+    && group.currentAnswer.state !== 'cancelled'
+    && group.currentAnswer.state !== 'failed'
+  );
+
+  /** Store the committed body once the agent turn succeeded (it still enters memory normally). */
+  const noteAnswerBody = ({ group, version, turn = null, text = '' } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    answer.body = String(text ?? '');
+    answer.bodyChars = answer.body.length;
+    answer.updatedAt = now();
+    if (Number.isInteger(turn)) answer.turn = turn;
+    if (answer.state === 'generating') answer.state = 'ready';
+    // Only a version that is already superseded contributes pending coverage, and only when it has
+    // no decided plan yet: the plan (possibly condensed) is the authoritative spoken share.
+    if (!isCurrentAnswer(group, version) && String(answer.planText ?? '').trim().length === 0) {
+      rememberPending(group, answer.body);
+    }
+    publish('voice.response.group.body', {
+      ...groupView(group),
+      version,
+      turn: Number.isInteger(turn) ? turn : null,
+      chars: answer.bodyChars,
+      playedChars: (answer.playedSentences ?? []).join('').length,
+    });
+  };
+
+  /** Store the decided spoken plan (what the voice would say), even if a newer version took over. */
+  const noteAnswerPlan = ({ group, version, turn = null, text = '', feedText = '', source = '', chars = 0 } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return null;
+    answer.planText = String(text ?? '');
+    answer.feedText = String(feedText ?? answer.planText);
+    answer.planChars = Number(chars) > 0 ? Number(chars) : answer.planText.length;
+    answer.source = String(source ?? '');
+    answer.updatedAt = now();
+    if (Number.isInteger(turn)) answer.turn = turn;
+    if (answer.state === 'generating') answer.state = 'ready';
+    // A superseded version that decides its plan late still contributes its unvoiced sentences;
+    // the current version's plan is handled by adjustSpeech (condensed share, exact coverage).
+    if (!isCurrentAnswer(group, version)) rememberPending(group, answer.planText);
+    if (isCurrentAnswer(group, version)) {
+      group.state = group.state === 'playing' ? 'playing' : 'ready';
+      publish('voice.response.group.ready', {
+        ...groupView(group),
+        version,
+        turn: Number.isInteger(turn) ? turn : null,
+        chars: answer.planChars,
+        source: answer.source,
+      });
+    }
+    return answer;
+  };
+
+  /**
+   * Continue the new version's spoken plan past what was already heard. Returns the text the
+   * speaker should play; exact sentence matching only, no semantic guessing.
+   */
+  const adjustSpeech = ({ group, version, text = '', turn = null } = {}) => {
+    const answer = findAnswer(group, version);
+    const original = String(text ?? '');
+    if (answer === null || !Array.isArray(group.pendingSentences)) {
+      return { text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false };
+    }
+    const priorUnspoken = group.pendingSentences.slice();
+    const composed = composeContinuationSpeech({
+      priorPlanText: priorUnspoken.join(''),
+      playedTexts: group.played ?? [],
+      newPlanText: original,
+    });
+    // Every sentence of the new plan was already heard and there is no unvoiced remainder: staying
+    // silent would drop a legitimately new answer, so speak the decided plan (the user asked
+    // again). This is reported as `repeated`, never as an already-played completion.
+    if (composed.text.length === 0 && original.trim().length > 0) {
+      replacePendingFromPlan(group, original);
+      if (Number.isInteger(turn)) answer.turn = turn;
+      return {
+        text: original,
+        prepended: [],
+        skippedPlayed: composed.skippedPlayed,
+        unplayedPrior: priorUnspoken,
+        changed: false,
+        repeated: true,
+      };
+    }
+    if (composed.text !== original) {
+      answer.planText = composed.text;
+      answer.feedText = composed.text;
+      answer.planChars = composed.text.length;
+      answer.updatedAt = now();
+    }
+    // The adjusted plan is exactly what this version will say: it now owns the pending coverage,
+    // so body sentences the plan intentionally omits (a condensed share) stop being pending.
+    replacePendingFromPlan(group, composed.text);
+    if (Number.isInteger(turn)) answer.turn = turn;
+    return {
+      ...composed,
+      unplayedPrior: priorUnspoken,
+      changed: composed.text !== original,
+      text: composed.text,
+    };
+  };
+
+  /** One clip really started (first audio). Submitting synthesis or queueing never reaches here. */
+  const notePlaybackStart = ({
+    group, version, sentenceId = null, chunkIndex = 0, chunkCount = 1, text = '', chars = 0,
+  } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    const at = now();
+    const sentence = String(text ?? '').trim();
+    answer.state = 'speaking';
+    group.state = 'playing';
+    group.updatedAt = at;
+    answer.updatedAt = at;
+    if (sentence.length > 0 && !answer.playedSentences.some((row) => sentenceKey(row) === sentenceKey(sentence))) {
+      answer.playedSentences.push(sentence);
+      if (answer.playedSentences.length > playedLimit) answer.playedSentences.shift();
+    }
+    if (sentence.length > 0 && !group.played.some((row) => sentenceKey(row) === sentenceKey(sentence))) {
+      group.played.push(sentence);
+      if (group.played.length > playedLimit) group.played.shift();
+    }
+    // A sentence that really started is no longer pending coverage.
+    if (sentence.length > 0) forgetPendingPlayed(group, sentence);
+    const existing = answer.clips.find((clip) => clip.sentenceId === sentenceId && clip.chunkIndex === chunkIndex);
+    if (existing === undefined) {
+      answer.clips.push({
+        sentenceId,
+        chunkIndex,
+        chunkCount,
+        chars: Number(chars) > 0 ? Number(chars) : sentence.length,
+        status: 'started',
+        at,
+      });
+      if (answer.clips.length > playedLimit) answer.clips.shift();
+      answer.progress.started += 1;
+    } else {
+      existing.status = 'started';
+      existing.at = at;
+    }
+    publish('voice.response.playback', {
+      groupId: group.id,
+      sessionId: group.sessionId,
+      groupVersion: group.answerVersion,
+      answerVersion: version,
+      speechId: null,
+      sentenceId,
+      chunkIndex,
+      chunkCount,
+      status: 'started',
+      chars: Number(chars) > 0 ? Number(chars) : sentence.length,
+    });
+  };
+
+  /** One clip ended: completed, or partial when the user interrupted it mid-sentence. */
+  const notePlaybackEnd = ({
+    group, version, sentenceId = null, chunkIndex = 0, chunkCount = 1, status = 'completed', text = '',
+  } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    const at = now();
+    answer.updatedAt = at;
+    group.updatedAt = at;
+    const existing = answer.clips.find((clip) => clip.sentenceId === sentenceId && clip.chunkIndex === chunkIndex);
+    if (existing !== undefined) existing.status = status === 'partial' ? 'partial' : 'completed';
+    if (status === 'partial') {
+      answer.progress.partial += 1;
+      const sentence = String(text ?? answer.planText ?? '').trim();
+      if (sentence.length > 0 && !answer.partialSentences.some((row) => sentenceKey(row) === sentenceKey(sentence))) {
+        answer.partialSentences.push(sentence);
+        if (answer.partialSentences.length > playedLimit) answer.partialSentences.shift();
+      }
+    } else {
+      answer.progress.completed += 1;
+      // Only the sentence's LAST block completes it; an earlier block of the same sentence is not
+      // the end of the sentence and must never close the group.
+      if (chunkIndex >= chunkCount - 1 && Number.isInteger(sentenceId)
+        && !answer.completedSentenceIds.includes(sentenceId)) {
+        answer.completedSentenceIds.push(sentenceId);
+      }
+    }
+    publish('voice.response.playback', {
+      groupId: group.id,
+      sessionId: group.sessionId,
+      groupVersion: group.answerVersion,
+      answerVersion: version,
+      speechId: null,
+      sentenceId,
+      chunkIndex,
+      chunkCount,
+      status: status === 'partial' ? 'partial' : 'completed',
+      chars: Number(answer.clips.find((clip) => clip.sentenceId === sentenceId)?.chars) || 0,
+    });
+    if (status === 'partial') return;
+    // The last block of the plan that really finished closes the group. A partial sentence keeps
+    // it open: its tail was never heard and must stay available.
+    if (isCurrentAnswer(group, version) && answerFullyPlayed(answer, pendingLimit)
+      && group.pendingSentences.length === 0) {
+      completeAnswer({ group, version, reason: 'played' });
+    }
+  };
+
+  /** A stale version's queued block never reached the player: record it, emit, never revive it. */
+  const notePlaybackSkipped = ({ group, version, sentenceId = null, chunkIndex = 0, chunkCount = 1 } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    publish('voice.response.playback', {
+      groupId: group.id,
+      sessionId: group.sessionId,
+      groupVersion: group.answerVersion,
+      answerVersion: version,
+      speechId: null,
+      sentenceId,
+      chunkIndex,
+      chunkCount,
+      status: 'skipped-stale',
+      chars: 0,
+    });
+  };
+
+  const completeAnswer = ({ group, version, reason = 'played' } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    if (answer.state === 'cancelled' || answer.state === 'failed' || answer.state === 'done') return;
+    answer.state = 'done';
+    answer.completedReason = reason;
+    answer.updatedAt = now();
+    // A completed answer has no pending coverage left, whichever path closed it (streamed blocks
+    // or the whole-reply fallback's single clip).
+    group.pendingSentences = [];
+    if (group.currentAnswer?.version === version) {
+      group.state = 'done';
+      group.reason = reason;
+      group.updatedAt = answer.updatedAt;
+    }
+    publish('voice.response.group.done', {
+      ...groupView(group),
+      version,
+      reason,
+      playedSentences: (answer.playedSentences ?? []).length,
+      chars: answer.planChars,
+    });
+  };
+
+  /** A normal answer failure: keep every unvoiced sentence for the next input. */
+  const failAnswer = ({ group, version, status = 'failed', error = '' } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return;
+    const at = now();
+    answer.state = 'failed';
+    answer.error = String(error ?? '');
+    answer.updatedAt = at;
+    // Whatever this version generated but never voiced stays available to the next input.
+    rememberPending(group, answerSource(answer));
+    if (group.currentAnswer?.version === version) {
+      group.state = 'failed';
+      group.reason = String(status ?? 'failed');
+      group.updatedAt = at;
+    }
+    const priorUnspoken = unspokenSentencesOf(answer, { maxSentences: pendingLimit });
+    // A failed answer usually produced no body/plan of its own; the group's pending set already
+    // carries the earlier versions' unvoiced sentences. Report that retained total.
+    publish('voice.response.group.failed', {
+      ...groupView(group),
+      version,
+      status: String(status ?? 'failed'),
+      error: String(error ?? ''),
+      retained: true,
+      pendingSentences: Math.max(priorUnspoken.length, group.pendingSentences.length),
+    });
+  };
+
+  /** An explicit cancel (or a lane teardown): terminal, retained, never automatically resumed. */
+  const cancelAnswer = ({ group, version, reason = 'cancelled', explicit = false } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null) return null;
+    const at = now();
+    answer.state = 'cancelled';
+    answer.updatedAt = at;
+    if (group.currentAnswer?.version === version) {
+      group.state = 'cancelled';
+      group.reason = String(reason ?? 'cancelled');
+      group.cancelReason = String(reason ?? 'cancelled');
+      group.updatedAt = at;
+    }
+    publish('voice.response.group.cancelled', {
+      ...groupView(group),
+      version,
+      reason: String(reason ?? 'cancelled'),
+      explicit: explicit === true,
+    });
+    return group;
+  };
+
+  /** The user said stop: cancel the newest non-terminal group of the session (if any). */
+  const cancelByUserInput = ({ sessionId, text = '' } = {}) => {
+    const at = now();
+    sweep(at);
+    let target = null;
+    for (const group of groups.values()) {
+      if (group.sessionId !== sessionId) continue;
+      if (!TERMINAL_STATES.has(group.state)) target = group;
+    }
+    if (target === null) return null;
+    return cancelAnswer({
+      group: target,
+      version: target.answerVersion,
+      reason: 'user-cancel',
+      explicit: true,
+    });
+  };
+
+  /** Compose the next turn's internal context now; `takePendingInternal` consumes it at pre-step. */
+  const preparePendingInternal = ({ group, version, newInput = '' } = {}) => {
+    if (group === null || group === undefined) return null;
+    const text = composeResponseGroupContext({ group, newInput, maxChars: contextChars });
+    if (text.length === 0) return null;
+    pendingInternal = {
+      sessionId: group.sessionId,
+      groupId: group.id,
+      version,
+      text,
+      at: now(),
+      chars: text.length,
+      priorVersion: group.priorAnswer?.version ?? 0,
+      playedSentences: (group.priorAnswer?.playedSentences ?? []).length,
+      unplayedSentences: group.pendingSentences.length,
+      newChars: String(newInput ?? '').length,
+    };
+    publish('voice.response.internal-context', {
+      groupId: group.id,
+      sessionId: group.sessionId,
+      answerVersion: version,
+      chars: pendingInternal.chars,
+      priorSegments: group.segments.length,
+      priorVersion: pendingInternal.priorVersion,
+      playedSentences: pendingInternal.playedSentences,
+      unplayedSentences: pendingInternal.unplayedSentences,
+      newChars: pendingInternal.newChars,
+      source: ASSISTANT_RESPONSE_GROUP_SOURCE,
+    });
+    return pendingInternal;
+  };
+
+  /** Consume the pending block at the next first pre-step of that session (one turn only). */
+  const takePendingInternal = ({ sessionId } = {}) => {
+    if (pendingInternal === null) return null;
+    if (now() - pendingInternal.at > 30_000) {
+      pendingInternal = null;
+      return null;
+    }
+    if (pendingInternal.sessionId !== sessionId) return null;
+    const taken = pendingInternal;
+    pendingInternal = null;
+    publish('voice.response.internal-context.consumed', {
+      groupId: taken.groupId,
+      sessionId,
+      answerVersion: taken.version,
+      chars: taken.chars,
+    });
+    return taken;
+  };
+
+  return {
+    beginInput,
+    attachDelivery,
+    noteAnswerBody,
+    noteAnswerPlan,
+    adjustSpeech,
+    notePlaybackStart,
+    notePlaybackEnd,
+    notePlaybackSkipped,
+    completeAnswer,
+    failAnswer,
+    cancelAnswer,
+    cancelByUserInput,
+    preparePendingInternal,
+    takePendingInternal,
+    isCurrentAnswer,
+    groupView: (group) => groupView(group),
+    get: find,
+    size: () => groups.size,
+    activeSessions: sessionsActive,
+    /** Test/diagnostic helper: a bounded plain snapshot of one group. */
+    snapshot: (groupId) => {
+      const group = find(groupId);
+      if (group === null) return null;
+      return {
+        ...groupView(group),
+        segments: group.segments.map((segment) => ({ ...segment })),
+        turns: [...group.turns],
+        messageIds: [...group.messageIds],
+        played: [...group.played],
+        currentAnswer: group.currentAnswer === null ? null : {
+          version: group.currentAnswer.version,
+          state: group.currentAnswer.state,
+          turn: group.currentAnswer.turn,
+          bodyChars: group.currentAnswer.bodyChars,
+          planChars: group.currentAnswer.planChars,
+          source: group.currentAnswer.source,
+          playedSentences: [...group.currentAnswer.playedSentences],
+          partialSentences: [...group.currentAnswer.partialSentences],
+          unspoken: unspokenSentencesOf(group.currentAnswer, { maxSentences: pendingLimit }),
+          progress: { ...group.currentAnswer.progress },
+        },
+        priorAnswer: group.priorAnswer === null ? null : {
+          version: group.priorAnswer.version,
+          state: group.priorAnswer.state,
+          bodyChars: group.priorAnswer.bodyChars,
+          planChars: group.priorAnswer.planChars,
+          playedSentences: [...group.priorAnswer.playedSentences],
+          unspoken: unspokenSentencesOf(group.priorAnswer, { maxSentences: pendingLimit }),
+        },
+      };
+    },
+    /** Bounded plain list, newest last; used by diagnostics and tests. */
+    list: () => [...groups.values()].map((group) => groupView(group)),
+  };
+}

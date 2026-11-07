@@ -1,0 +1,7 @@
+{
+  "name": "dsh-spout-layer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal Electron display window for the Seirein Spout layer (phase 0 skeleton).",
+  "main": "main.js"
+}

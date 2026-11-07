@@ -1,0 +1,400 @@
+{
+  "schema": 1,
+  "kind": "asr-cutpoint-fixture",
+  "generatedAt": "2026-11-04T13:29:23.834Z",
+  "generator": "tools/asr-cutpoint-fixture.mjs",
+  "regenerate": "node tools/asr-cutpoint-fixture.mjs",
+  "check": "node tools/asr-cutpoint-check.mjs",
+  "sampleRate": 16000,
+  "channels": 1,
+  "bitsPerSample": 16,
+  "decodeCapSec": 15,
+  "cutPointsMs": [
+    15000,
+    30000
+  ],
+  "voice": "zh-CN-XiaoxiaoNeural",
+  "provider": "edge-tts",
+  "synthetic": true,
+  "disclaimer": "仅覆盖 TTS 清晰发音。真人录音（自然语速、连读、停顿）留作后续：用 node tools/asr-cutpoint-check.mjs --wav <file.wav> --expected \"<整段文本>\" 直接跑。",
+  "script": {
+    "order": [
+      {
+        "text": "第三十七号房间不是四十二号，请确认一万二千五百这个数。"
+      },
+      {
+        "text": "非常非常重要，非常非常重要，这一点非常关键。"
+      },
+      {
+        "marker": "marker1"
+      },
+      {
+        "text": "接下来我们确认后面的内容，请先不要走开。"
+      },
+      {
+        "text": "这段录音会被分成好几个小段，每一段都会单独识别一次。"
+      },
+      {
+        "marker": "marker2"
+      },
+      {
+        "text": "最后重复一遍，第三十七号房间和一万二千五百都没有变。"
+      },
+      {
+        "text": "以上就是这次边界测试的全部内容。"
+      }
+    ],
+    "markers": [
+      {
+        "key": "marker1",
+        "text": "橙子",
+        "cutMs": 15000,
+        "targetOnsetMs": 14750,
+        "windowMs": [
+          14500,
+          15400
+        ]
+      },
+      {
+        "key": "marker2",
+        "text": "雷达",
+        "cutMs": 30000,
+        "targetOnsetMs": 29850,
+        "windowMs": [
+          29600,
+          30500
+        ]
+      }
+    ],
+    "fillers": [
+      "我们先把这个位置记下来。",
+      "继续往下看。",
+      "这里需要一点耐心。",
+      "好的，我们继续。",
+      "请保持安静，很快就好了。"
+    ]
+  },
+  "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+  "checks": {
+    "numbers": [
+      37,
+      42,
+      12500,
+      37,
+      12500
+    ],
+    "negation": "不是",
+    "veryCount": 5,
+    "repetitionPair": "非常非常重要非常非常重要",
+    "markers": [
+      "橙子",
+      "雷达"
+    ],
+    "tail": "全部内容"
+  },
+  "timeline": {
+    "totalMs": 40526,
+    "leadMs": 1200,
+    "gapMs": 120,
+    "markers": [
+      {
+        "key": "marker1",
+        "text": "橙子",
+        "cutMs": 15000,
+        "placedStartMs": 14580,
+        "clipOnsetMs": 170,
+        "clipOffsetMs": 680
+      },
+      {
+        "key": "marker2",
+        "text": "雷达",
+        "cutMs": 30000,
+        "placedStartMs": 29690,
+        "clipOnsetMs": 160,
+        "clipOffsetMs": 670
+      }
+    ]
+  },
+  "versions": [
+    {
+      "name": "offset-0.0",
+      "file": "offset-0.0.wav",
+      "offsetMs": 0,
+      "trimMs": 0,
+      "shiftMs": 0,
+      "note": "基准：两个定位词压在 15 s / 30 s 切点上（跨切点）",
+      "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+      "durationMs": 40526,
+      "bytes": 1296876,
+      "sha256": "46cefa1a57468fc6c6289ef93eefbdac44423855139f65b3085af6eefa43023f",
+      "markers": [
+        {
+          "key": "marker1",
+          "text": "橙子",
+          "cutMs": 15000,
+          "expectedRangeMs": [
+            14750,
+            15260
+          ],
+          "measuredRangeMs": [
+            14760,
+            15260
+          ],
+          "relation": "cross",
+          "crosses": true,
+          "marginBeforeMs": 240,
+          "marginAfterMs": 260,
+          "cutEnergyDb": {
+            "before": -10.3,
+            "after": -10.9
+          }
+        },
+        {
+          "key": "marker2",
+          "text": "雷达",
+          "cutMs": 30000,
+          "expectedRangeMs": [
+            29850,
+            30360
+          ],
+          "measuredRangeMs": [
+            29860,
+            30360
+          ],
+          "relation": "cross",
+          "crosses": true,
+          "marginBeforeMs": 140,
+          "marginAfterMs": 360,
+          "cutEnergyDb": {
+            "before": -10.3,
+            "after": -13.4
+          }
+        }
+      ]
+    },
+    {
+      "name": "offset-0.3",
+      "file": "offset-0.3.wav",
+      "offsetMs": 300,
+      "trimMs": 0,
+      "shiftMs": 300,
+      "note": "整体后移 300 ms：定位词落到切点之后",
+      "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+      "durationMs": 40826,
+      "bytes": 1306476,
+      "sha256": "2a3459b832cbb1c86ccf74cb7c16ca9d995415249a4e02a407703befce8bda9c",
+      "markers": [
+        {
+          "key": "marker1",
+          "text": "橙子",
+          "cutMs": 15000,
+          "expectedRangeMs": [
+            15050,
+            15560
+          ],
+          "measuredRangeMs": [
+            15060,
+            15560
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -60,
+          "marginAfterMs": 560,
+          "cutEnergyDb": {
+            "before": -100.9,
+            "after": -69.8
+          }
+        },
+        {
+          "key": "marker2",
+          "text": "雷达",
+          "cutMs": 30000,
+          "expectedRangeMs": [
+            30150,
+            30660
+          ],
+          "measuredRangeMs": [
+            30160,
+            30660
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -160,
+          "marginAfterMs": 660,
+          "cutEnergyDb": {
+            "before": -140,
+            "after": -140
+          }
+        }
+      ]
+    },
+    {
+      "name": "offset-0.6",
+      "file": "offset-0.6.wav",
+      "offsetMs": 600,
+      "trimMs": 0,
+      "shiftMs": 600,
+      "note": "整体后移 600 ms：定位词落到切点之后",
+      "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+      "durationMs": 41126,
+      "bytes": 1316076,
+      "sha256": "2688b71335f4956c4e60c0f06a5ce0554baa2b7abd7f308a262fe1fb445d57c8",
+      "markers": [
+        {
+          "key": "marker1",
+          "text": "橙子",
+          "cutMs": 15000,
+          "expectedRangeMs": [
+            15350,
+            15860
+          ],
+          "measuredRangeMs": [
+            15360,
+            15860
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -360,
+          "marginAfterMs": 860,
+          "cutEnergyDb": {
+            "before": -140,
+            "after": -140
+          }
+        },
+        {
+          "key": "marker2",
+          "text": "雷达",
+          "cutMs": 30000,
+          "expectedRangeMs": [
+            30450,
+            30960
+          ],
+          "measuredRangeMs": [
+            30460,
+            30960
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -460,
+          "marginAfterMs": 960,
+          "cutEnergyDb": {
+            "before": -140,
+            "after": -140
+          }
+        }
+      ]
+    },
+    {
+      "name": "offset-0.9",
+      "file": "offset-0.9.wav",
+      "offsetMs": 900,
+      "trimMs": 0,
+      "shiftMs": 900,
+      "note": "整体后移 900 ms：定位词落到切点之后",
+      "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+      "durationMs": 41426,
+      "bytes": 1325676,
+      "sha256": "9d42dbafb1b0303c29468b72bb9a566516829eac56b57f64cbd924a8b267adc5",
+      "markers": [
+        {
+          "key": "marker1",
+          "text": "橙子",
+          "cutMs": 15000,
+          "expectedRangeMs": [
+            15650,
+            16160
+          ],
+          "measuredRangeMs": [
+            15660,
+            16160
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -660,
+          "marginAfterMs": 1160,
+          "cutEnergyDb": {
+            "before": -140,
+            "after": -140
+          }
+        },
+        {
+          "key": "marker2",
+          "text": "雷达",
+          "cutMs": 30000,
+          "expectedRangeMs": [
+            30750,
+            31260
+          ],
+          "measuredRangeMs": [
+            30760,
+            31260
+          ],
+          "relation": "after",
+          "crosses": false,
+          "marginBeforeMs": -760,
+          "marginAfterMs": 1260,
+          "cutEnergyDb": {
+            "before": -140,
+            "after": -140
+          }
+        }
+      ]
+    },
+    {
+      "name": "trim-0.45",
+      "file": "trim-0.45.wav",
+      "offsetMs": 0,
+      "trimMs": 450,
+      "shiftMs": -450,
+      "note": "对照组：整体前移 450 ms（削掉前导静音）：定位词落到切点之前",
+      "expectedText": "第三十七号房间不是四十二号，请确认一万二千五百这个数。非常非常重要，非常非常重要，这一点非常关键。橙子接下来我们确认后面的内容，请先不要走开。这段录音会被分成好几个小段，每一段都会单独识别一次。雷达最后重复一遍，第三十七号房间和一万二千五百都没有变。以上就是这次边界测试的全部内容。",
+      "durationMs": 40076,
+      "bytes": 1282476,
+      "sha256": "7185b35101c77bdd3a54f9f4a8d9a7243f3d587c83b72eb5d1817f319d066689",
+      "markers": [
+        {
+          "key": "marker1",
+          "text": "橙子",
+          "cutMs": 15000,
+          "expectedRangeMs": [
+            14300,
+            14810
+          ],
+          "measuredRangeMs": [
+            14310,
+            14810
+          ],
+          "relation": "before",
+          "crosses": false,
+          "marginBeforeMs": 690,
+          "marginAfterMs": -190,
+          "cutEnergyDb": {
+            "before": -90.2,
+            "after": -140
+          }
+        },
+        {
+          "key": "marker2",
+          "text": "雷达",
+          "cutMs": 30000,
+          "expectedRangeMs": [
+            29400,
+            29910
+          ],
+          "measuredRangeMs": [
+            29410,
+            29910
+          ],
+          "relation": "before",
+          "crosses": false,
+          "marginBeforeMs": 590,
+          "marginAfterMs": -90,
+          "cutEnergyDb": {
+            "before": -68.7,
+            "after": -90.4
+          }
+        }
+      ]
+    }
+  ]
+}

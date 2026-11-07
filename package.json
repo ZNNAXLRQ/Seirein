@@ -1,0 +1,44 @@
+{
+  "name": "@local/dsh-assistant",
+  "version": "0.98.9",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/host/index.js",
+  "description": "Seirein Companion: memory, resources, speech, vision, Live2D and subtitles for the Harness.",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "exports": {
+    ".": "./src/host/index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./Seirein.png"
+  },
+  "files": [
+    "client.js",
+    "src/host/**",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "Seirein.ico",
+    "Seirein.png"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "dependencies": {
+    "@napolab/texture-bridge": "0.17.0",
+    "dsh-see-now": "^0.0.5",
+    "koffi": "3.1.1",
+    "msedge-tts": "^2.1.1",
+    "sherpa-onnx-node": "^2.0.1",
+    "ws": "^8.22.1"
+  }
+}

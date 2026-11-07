@@ -1,0 +1,29 @@
+- insert:
+    - id: dsh-assistant
+      name: '@local/dsh-assistant'
+      disabled: false
+      config:
+        root: null
+        enabled: true
+        defaultDomain: chat
+        obsPort: 4455
+        obsPassword: null
+        privacyScene: '隐私'
+        ttsPlayback: true
+        asrMergeWindowMs: 600
+        # 5% sustained-pressure threshold = 250; a database's own value (or the one-time
+        # legacy 100 → 250 migration) stays authoritative, so no pressureThreshold key is set.
+        memoryCapacity: 5000
+        autoMemory:
+          enabled: true
+          minChars: 1
+          maxChars: 400
+          includeReply: true
+        subtitle:
+          enabled: false
+          font: 'Microsoft YaHei UI'
+          sizeMax: 32
+          colorMode: auto
+        hotkeys:
+          mic: 'Ctrl+Alt+M'
+          vision: 'Ctrl+Alt+V'
