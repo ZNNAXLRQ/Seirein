@@ -63,3 +63,25 @@ test('missing context and unknown model capabilities fail closed', () => {
   assert.deepEqual(queryPresets({ state: 'idle', event: 'idle', family: 'unknown', verifiedChannels: CHANNELS }), []);
   assert.equal(getPreset('missing'), null);
 });
+
+test('neutral answer-start works with headX or headY alone, without target or headZ', () => {
+  const context = { state: 'speaking', event: 'answer-start' };
+  const x = queryPresets({ ...context, verifiedChannels: ['headX'] });
+  assert.equal(x.length, 8);
+  assert.deepEqual(new Set(x.map(p => p.recipeId)), new Set(['answer-turn', 'answer-center-lite']));
+  const y = queryPresets({ ...context, verifiedChannels: ['headY'] });
+  assert.equal(y.length, 4);
+  assert.ok(y.every(p => p.recipeId === 'answer-nod' && p.semantic === 'neutral' && p.family === 'speech-beat'));
+  assert.ok([...x, ...y].every(p => !p.requiresTarget && !p.requiresDirection && !p.requires.includes('headZ')));
+  assert.deepEqual(getPreset('answer-center-lite.flow').operations, ['head-center-lite']);
+});
+
+test('answer-start capability alternatives do not relax state/event or disable gates', () => {
+  const context = { event: 'answer-start', verifiedChannels: ['headX', 'headY'] };
+  for (const state of ['waiting', 'listening', 'idle']) assert.deepEqual(queryPresets({ ...context, state }), []);
+  const ids = new Set(['answer-nod', 'answer-turn', 'answer-center-lite']);
+  for (const event of ['idle', 'answer-end', 'sentence-gap']) {
+    assert.ok(queryPresets({ ...context, state: 'speaking', event }).every(p => !ids.has(p.recipeId)));
+  }
+  assert.deepEqual(queryPresets({ ...context, state: 'speaking', disabledFamilies: ['speech-beat', 'posture', 'settle'] }), []);
+});

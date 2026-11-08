@@ -2,7 +2,7 @@
  * 动作预设设置页 v1 + 用户覆盖持久化。
  *
  * 只读 `presets/`，不改 `motion-controller.js` / `avatarRuntime.js`：本测试验证
- *   1) 宿主 motion.presets.list 的 308 条/22 家族与字段；
+ *   1) 宿主 motion.presets.list 的 320 条/22 家族与字段；
  *   2) client.js 真实发货的搜索/家族/风格/可用性过滤；
  *   3) 动作启停 → disabled 写入/移除，且 selector 真的遵守；
  *   4) 家族启停/优先级写入与重新读取；
@@ -154,20 +154,20 @@ const renderSection = (data, over = {}) => {
 };
 
 // ---------------------------------------------------------------------------------------------
-// 1. List: 308 actions, 22 families, grouping and required fields
+// 1. List: 320 actions, 22 families, grouping and required fields
 // ---------------------------------------------------------------------------------------------
-test('1. 列表返回 308 条、22 个家族，按家族分组且字段完整', async (t) => {
+test('1. 列表返回 320 条、22 个家族，按家族分组且字段完整', async (t) => {
   const env = makeEnv();
   t.after(env.cleanup);
   const result = await env.handler({ action: 'motion.presets.list' });
   assert.equal(result.ok, true);
-  assert.equal(result.items.length, 308);
+  assert.equal(result.items.length, 320);
   assert.equal(result.families.length, 22);
   assert.equal(result.items.length, PRESETS.length);
 
   const expected = new Map();
   for (const preset of PRESETS) expected.set(preset.family, (expected.get(preset.family) ?? 0) + 1);
-  assert.equal(result.families.reduce((sum, family) => sum + family.count, 0), 308);
+  assert.equal(result.families.reduce((sum, family) => sum + family.count, 0), 320);
   for (const family of result.families) {
     assert.equal(family.count, expected.get(family.family), family.family);
     assert.equal(family.enabled, true);
@@ -211,7 +211,7 @@ test('2. 搜索与家族/风格/可用性过滤只保留匹配项', async (t) =>
   const rowsOf = tree => collect(tree).filter(node => typeof node.props?.['data-preset-id'] === 'string');
 
   const searched = rowsOf(renderSection(list, { query: '眨眼' }));
-  assert.ok(searched.length > 0 && searched.length < 308, `search hits ${searched.length}`);
+  assert.ok(searched.length > 0 && searched.length < 320, `search hits ${searched.length}`);
   assert.ok(searched.every(row => textOf(row).includes('眨眼')));
 
   const byFamily = rowsOf(renderSection(list, { filters: { family: 'blink', style: '', availability: '' } }));
@@ -223,7 +223,7 @@ test('2. 搜索与家族/风格/可用性过滤只保留匹配项', async (t) =>
   assert.ok(byStyle.every(row => row.props['data-styles'].split(',').includes('dreamy')));
 
   const allAvailable = rowsOf(renderSection(list, { filters: { family: '', style: '', availability: 'available' } }));
-  assert.equal(allAvailable.length, 308);
+  assert.equal(allAvailable.length, 320);
   assert.ok(allAvailable.every(row => row.props['data-available'] === '1'));
 
   const unproved = await env.handler({ action: 'motion.presets.list' });
@@ -525,12 +525,12 @@ test('9. UI 控件：搜索框、三个过滤、启停、优先级、恢复默�
 // ---------------------------------------------------------------------------------------------
 // 10. Regression contract for the read-only library and selector
 // ---------------------------------------------------------------------------------------------
-test('10. 回归：308 条/77 配方/16 风格与 selector 抽样不变', () => {
-  assert.equal(PRESETS.length, 308);
-  assert.equal(RECIPES.length, 77);
+test('10. 回归：320 条/80 配方/16 风格与 selector 抽样不变', () => {
+  assert.equal(PRESETS.length, 320);
+  assert.equal(RECIPES.length, 80);
   assert.equal(STYLES.length, 16);
   assert.equal(new Set(PRESETS.map(preset => preset.family)).size, 22);
-  assert.equal(new Set(PRESETS.map(preset => preset.id)).size, 308);
+  assert.equal(new Set(PRESETS.map(preset => preset.id)).size, 320);
 
   const selector = createPresetSelector();
   const result = selector.select({
@@ -541,7 +541,7 @@ test('10. 回归：308 条/77 配方/16 风格与 selector 抽样不变', () => 
   });
   assert.equal(result.kind, 'preset');
   assert.ok(result.probability > 0 && result.probability < 1);
-  assert.equal(selector.stats().presets, 308);
-  assert.equal(selector.stats().recipes, 77);
+  assert.equal(selector.stats().presets, 320);
+  assert.equal(selector.stats().recipes, 80);
   assert.equal(selector.stats().styles, 16);
 });

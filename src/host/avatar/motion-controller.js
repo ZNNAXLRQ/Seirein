@@ -524,6 +524,9 @@ const PRESET_OPERATION_PROFILE = Object.freeze({
   'head-lower': Object.freeze({ kind: 'move', amount: -0.30, sign: -1, active: 'TURN_ACTIVE_MS' }),
   'head-lift': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, active: 'TURN_ACTIVE_MS' }),
   'head-center': Object.freeze({ kind: 'center', amount: 0, active: 'TURN_ACTIVE_MS' }),
+  // Horizontal-only settle: same duration/amplitude class as `head-center`, but its channel set is
+  // headX alone (see the runtime addition below), so a yaw-only model never falls back to roll.
+  'head-center-lite': Object.freeze({ kind: 'center', amount: 0, active: 'TURN_ACTIVE_MS' }),
   nod: Object.freeze({ kind: 'nod', amount: -0.30, sign: -1, active: 'NOD_ACTIVE_MS' }),
   'double-nod': Object.freeze({ kind: 'double-nod', amount: -0.30, sign: -1, active: 'DOUBLE_NOD_ACTIVE_MS' }),
   shake: Object.freeze({ kind: 'shake', amount: 0.32, sign: 0, active: 'SHAKE_ACTIVE_MS' }),
@@ -541,6 +544,16 @@ const PRESET_OPERATION_PROFILE = Object.freeze({
   'body-settle': Object.freeze({ kind: 'native', amount: 0 }),
   'body-tilt': Object.freeze({ kind: 'native', amount: 0 }),
   'breath-cycle': Object.freeze({ kind: 'native', amount: 0 }),
+});
+
+/**
+ * Runtime channel sets for operations added to the read-only library after the static executor
+ * table in `motion-config.js` was written. `head-center-lite` is headX-only BY DEFINITION: it may
+ * settle the head to its natural horizontal baseline but must never touch headZ (roll). This is a
+ * capability mapping, not a fallback — the selector still hard-filters on the recipe's `requires`.
+ */
+const PRESET_OPERATION_CHANNEL_ADDITIONS = Object.freeze({
+  'head-center-lite': Object.freeze(['headX']),
 });
 
 const PRESET_HEAD_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
@@ -2140,7 +2153,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       ? selection.effectiveRequires
       : (Array.isArray(selection.requires) ? selection.requires : []);
     const verified = new Set(Array.isArray(context?.verifiedChannels) ? context.verifiedChannels : []);
-    return (PRESET_OPERATION_CHANNELS[op] ?? []).filter((channel) => (
+    const operationChannels = PRESET_OPERATION_CHANNEL_ADDITIONS[op]
+      ?? PRESET_OPERATION_CHANNELS[op] ?? [];
+    return operationChannels.filter((channel) => (
       !presetNative.has(channel)
       && required.includes(channel)
       && (verified.size === 0 || verified.has(channel))
