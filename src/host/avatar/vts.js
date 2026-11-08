@@ -227,6 +227,8 @@ export class VtsClient {
     this.connectPromise = null;
     /** True while this connection is waiting for a token grant / AuthenticationRequest answer. */
     this.authPending = false;
+    /** closeEpoch that owns `authPending`, so a cancelled flow settling late cannot clear a newer one. */
+    this.authPendingEpoch = 0;
     this.authRenewed = false;
     /** Authorization state machine (see VTS_AUTH_STATES above). */
     this.authState = 'disconnected';
@@ -387,29 +389,47 @@ export class VtsClient {
     return error;
   }
 
+  /** The one cancellation error shape: a connect whose entry epoch was invalidated by close(). */
+  cancelledError(reason = 'closed') {
+    const error = new Error(`VTube Studio connect was cancelled by close() (${reason})`);
+    error.code = 'VTS_AUTH_CANCELLED';
+    error.reason = reason;
+    return error;
+  }
+
+  /** Emit the debug cancellation event and throw VTS_AUTH_CANCELLED. */
+  rejectCancelled(reason = 'closed') {
+    this.emitAuthEvent('vts.auth.cancelled', { reason });
+    throw this.cancelledError(reason);
+  }
+
+  /**
+   * A connect is bound to the closeEpoch captured when it started. close() bumps that epoch, so
+   * every await re-checks it here: a cancelled flow must not dial, write a token, subscribe or set
+   * ready on a connection the caller already dropped. The first failing check throws, and that
+   * throw is also the single vts.auth.cancelled {reason:'closed'} event for the cancelled flow.
+   */
+  assertCurrentEpoch(epoch, reason = 'closed') {
+    if (epoch !== this.closeEpoch) this.rejectCancelled(reason);
+  }
+
   /**
    * Read the persisted token. Missing is a normal first install; a corrupt/unreadable file is a
    * visible token failure (`vts.auth.token {ok:false}`) and both lead to requesting-grant.
+   * `epoch` binds the read to the connect that started it: a close() during readFile must not let
+   * the late result write a token or emit events into a newer (or already closed) connection.
    */
-  async loadToken() {
+  async loadToken(epoch = this.closeEpoch) {
     if (this.token.length > 0) {
       this.auth.tokenPresent = true;
       return this.token;
     }
     this.auth.tokenPresent = false;
+    let saved;
     try {
-      const saved = JSON.parse(await readFile(this.tokenPath, 'utf8'));
-      const token = typeof saved?.authenticationToken === 'string' ? saved.authenticationToken.trim() : '';
-      this.token = token;
-      this.auth.tokenPresent = token.length > 0;
-      if (token.length === 0) {
-        this.lastTokenError = 'token file has no authenticationToken';
-        this.emitAuthEvent('vts.auth.token', { ok: false, error: this.lastTokenError, action: 'read' });
-      } else {
-        this.lastTokenError = '';
-        this.emitAuthEvent('vts.auth.token', { ok: true, action: 'read' });
-      }
+      saved = JSON.parse(await readFile(this.tokenPath, 'utf8'));
     } catch (error) {
+      if (epoch !== this.closeEpoch) this.rejectCancelled();
       this.token = '';
       this.auth.tokenPresent = false;
       if (error?.code === 'ENOENT') {
@@ -420,6 +440,18 @@ export class VtsClient {
         this.lastTokenError = `token read failed: ${error?.message ?? String(error)}`;
         this.emitAuthEvent('vts.auth.token', { ok: false, error: this.lastTokenError, action: 'read' });
       }
+      return this.token;
+    }
+    this.assertCurrentEpoch(epoch);
+    const token = typeof saved?.authenticationToken === 'string' ? saved.authenticationToken.trim() : '';
+    this.token = token;
+    this.auth.tokenPresent = token.length > 0;
+    if (token.length === 0) {
+      this.lastTokenError = 'token file has no authenticationToken';
+      this.emitAuthEvent('vts.auth.token', { ok: false, error: this.lastTokenError, action: 'read' });
+    } else {
+      this.lastTokenError = '';
+      this.emitAuthEvent('vts.auth.token', { ok: true, action: 'read' });
     }
     return this.token;
   }
@@ -452,17 +484,21 @@ export class VtsClient {
   /**
    * Persist a grant. A failed write is recorded and moves the machine to `error`: reporting ready
    * on a token that only exists in memory would make the next launch ask for authorization again.
+   * `epoch` is the grant's entry epoch: if close() happened while the file was written, the token
+   * may already be on disk, but it must not become the state of a connection that was cancelled.
    */
-  async saveToken(token) {
+  async saveToken(token, epoch = this.closeEpoch) {
     const value = String(token ?? '');
     try {
       await this.writeTokenFile(value);
     } catch (error) {
+      if (epoch !== this.closeEpoch) this.rejectCancelled();
       this.lastTokenError = error.message;
       this.setAuthState('error', 'token-write-failed');
       this.emitAuthEvent('vts.auth.token', { ok: false, error: error.message, action: 'write' });
       throw error;
     }
+    this.assertCurrentEpoch(epoch);
     this.token = value;
     this.auth.tokenPresent = value.length > 0;
     this.lastTokenError = '';
@@ -471,17 +507,19 @@ export class VtsClient {
   }
 
   /** Drop a rejected token from memory and disk so the next run cannot replay it. */
-  async clearToken() {
+  async clearToken(epoch = this.closeEpoch) {
     this.token = '';
     this.auth.tokenPresent = false;
     try {
       await this.writeTokenFile('');
     } catch (error) {
+      if (epoch !== this.closeEpoch) this.rejectCancelled();
       this.lastTokenError = error.message;
       this.setAuthState('error', 'token-clear-failed');
       this.emitAuthEvent('vts.auth.token', { ok: false, error: error.message, action: 'clear' });
       throw error;
     }
+    this.assertCurrentEpoch(epoch);
     this.emitAuthEvent('vts.auth.token', { ok: true, action: 'clear' });
   }
 
@@ -639,7 +677,9 @@ export class VtsClient {
     this.clearReconnect(reason);
     const run = this.authenticate({ reason });
     const shared = run.finally(() => {
-      this.connectPromise = null;
+      // Only the attempt that still owns the slot may clear it: a connect cancelled by close() that
+      // settles late must not detach a newer connect() that replaced it.
+      if (this.connectPromise === shared) this.connectPromise = null;
     });
     this.connectPromise = shared;
     return shared;
@@ -661,16 +701,19 @@ export class VtsClient {
   async authenticate({ reason = 'connect' } = {}) {
     const epoch = this.closeEpoch;
     this.authPending = true;
+    this.authPendingEpoch = epoch;
     this.authRenewed = false;
     this.lastError = '';
     this.setAuthState('connecting', reason);
     let socket = null;
     try {
-      await this.loadToken();
+      await this.loadToken(epoch);
+      this.assertCurrentEpoch(epoch);
       const hadToken = this.token.length > 0;
       // Dial first: a refusal to connect is a transport failure (error), not a grant wait. The
       // requesting-grant state is only entered once there is a socket that can carry the request.
-      if (!this.connected) await this.openSocket();
+      if (!this.connected) await this.openSocket(epoch);
+      this.assertCurrentEpoch(epoch);
       // The socket this connect started on. A reconnect replaces `this.socket`, so readiness stays
       // tied to this exact instance instead of "whatever socket happens to be current".
       socket = this.socket;
@@ -679,11 +722,13 @@ export class VtsClient {
         // No token is the first-install / corrupt-file / revoked-file path: ask once, then wait.
         this.setAuthState('requesting-grant', 'no-token');
         await this.requestGrant('no-token');
+        this.assertCurrentEpoch(epoch);
         // The grant arrived: authentication is now a normal connecting-step, so a socket failure
         // during it is error — only the popup wait itself is allowed to hold requesting-grant.
         this.setAuthState('connecting', 'grant-received');
 
         const first = await this.attemptAuth();
+        this.assertCurrentEpoch(epoch);
         if (first.ok !== true) {
           // A brand-new token refused by VTS is a failed authorization, not a user-revocable token:
           // keeping it out of token-invalid leaves an explicit connect() able to try again.
@@ -696,9 +741,11 @@ export class VtsClient {
         try {
           first = await this.attemptAuth();
         } catch (error) {
+          this.assertCurrentEpoch(epoch);
           // A timeout / socket failure is not evidence the token is invalid.
           throw this.authFailure(error, 'AUTH_FAILED', { authorizationRequested: false });
         }
+        this.assertCurrentEpoch(epoch);
         if (first.ok !== true) {
           // A token granted in this process that VTS already rejected must not trigger another
           // popup on every later connect: the user has to retry explicitly.
@@ -714,10 +761,13 @@ export class VtsClient {
           // token is cleared before the popup so a denial cannot replay a token VTS already killed.
           this.setAuthState('requesting-grant', 'token-rejected');
           this.emitAuth('vts.auth.renew', { reason: first.reason });
-          await this.clearToken();
+          await this.clearToken(epoch);
+          this.assertCurrentEpoch(epoch);
           await this.requestGrant('token-rejected');
+          this.assertCurrentEpoch(epoch);
           this.setAuthState('connecting', 'grant-received');
           const retry = await this.attemptAuth();
+          this.assertCurrentEpoch(epoch);
           if (retry.ok !== true) {
             this.setAuthState('token-invalid', 'token-rejected');
             throw this.authFailure(retry, 'AUTH_RETRY_FAILED', {
@@ -736,10 +786,12 @@ export class VtsClient {
       this.setAuthState('connecting', 'authenticated-pending-ready');
       this.authenticated = true;
       await this.refresh();
+      this.assertCurrentEpoch(epoch);
       // A server-side rejection costs model-change push, not the connection. A subscription request
       // that dies with its socket is different: that is the connection failing, so connect() must
       // fail instead of promoting a dead socket to ready (the bug this guards against).
       const subscription = await this.subscribeEvents(socket);
+      this.assertCurrentEpoch(epoch);
       if (subscription.fatal === true) {
         throw new Error(`VTS connection lost during event subscription: ${subscription.error}`);
       }
@@ -747,15 +799,18 @@ export class VtsClient {
       // the animation timing (non-fatal), but losing the socket here is the same connection failure.
       if (this.animationEvents === true) {
         const animationSubscription = await this.subscribeAnimationEvents(socket);
+        this.assertCurrentEpoch(epoch);
         if (animationSubscription.fatal === true) {
           throw new Error(`VTS connection lost during animation event subscription: ${animationSubscription.error}`);
         }
       }
       // Never report ready unless the socket that authenticated is still the current one, open, and
       // authenticated. This also catches a disconnect that lands after the subscription answered.
+      this.assertCurrentEpoch(epoch);
       if (!this.isUsableSocket(socket)) {
         throw new Error('VTS connection closed before it became ready');
       }
+      this.assertCurrentEpoch(epoch);
       this.ready = true;
       // The active token is accepted: a previous "fresh token rejected" episode is over.
       this.auth.freshTokenRejected = false;
@@ -785,7 +840,9 @@ export class VtsClient {
       }
       throw error;
     } finally {
-      this.authPending = false;
+      // Only the attempt that owns `authPending` may clear it: close() already cleared it for a
+      // cancelled attempt, and a newer connect() may have set it again by the time this settles.
+      if (this.authPendingEpoch === epoch) this.authPending = false;
     }
   }
 
@@ -800,12 +857,8 @@ export class VtsClient {
     try {
       response = await this.request('AuthenticationTokenRequest', { ...this.plugin }, this.grantTimeoutMs);
     } catch (cause) {
-      if (epoch !== this.closeEpoch) {
-        const error = new Error('VTube Studio authorization was cancelled by close()');
-        error.code = 'AUTH_CANCELLED';
-        error.cause = cause;
-        throw error;
-      }
+      // close() while the popup waited: this grant is void, not a timeout or a socket failure.
+      this.assertCurrentEpoch(epoch);
       if (/timed out/iu.test(String(cause?.message ?? ''))) {
         const error = new Error(`VTube Studio authorization timed out after ${this.grantTimeoutMs}ms`);
         error.code = 'AWAITING_GRANT';
@@ -830,25 +883,24 @@ export class VtsClient {
       granted = unwrap(response, 'AuthenticationTokenRequest');
     } catch (cause) {
       // VTS answered APIError, i.e. the user refused (or VTS denied) the grant.
-      if (epoch !== this.closeEpoch) {
-        const error = new Error('VTube Studio authorization was cancelled by close()');
-        error.code = 'AUTH_CANCELLED';
-        error.cause = cause;
-        throw error;
-      }
+      this.assertCurrentEpoch(epoch);
       const error = new Error(cause?.message ?? String(cause));
       error.code = 'TOKEN_INVALID';
       this.setAuthState('token-invalid', 'grant-denied');
       throw error;
     }
+    // A late answer from a connection close() already dropped must not reach persistence at all.
+    this.assertCurrentEpoch(epoch);
     const token = String(granted.authenticationToken ?? '');
     if (token.length === 0) {
       const error = new Error('VTube Studio did not grant a token (the plugin grant was refused)');
       error.code = 'TOKEN_INVALID';
-      if (epoch === this.closeEpoch) this.setAuthState('token-invalid', 'grant-denied');
+      this.setAuthState('token-invalid', 'grant-denied');
       throw error;
     }
-    await this.saveToken(token);
+    await this.saveToken(token, epoch);
+    // saveToken re-checks the epoch internally; this covers a replacement saveToken implementation.
+    this.assertCurrentEpoch(epoch);
     return token;
   }
 
@@ -857,7 +909,8 @@ export class VtsClient {
     try {
       return await this.requestToken(reason);
     } catch (error) {
-      if (error?.code === 'TOKEN_WRITE_FAILED' || error?.code === 'AWAITING_GRANT') throw error;
+      if (error?.code === 'TOKEN_WRITE_FAILED' || error?.code === 'AWAITING_GRANT'
+        || error?.code === 'VTS_AUTH_CANCELLED') throw error;
       throw this.authFailure(error, 'AUTH_TOKEN_FAILED', { authorizationRequested: true });
     }
   }
@@ -923,42 +976,52 @@ export class VtsClient {
    * Open a socket only when no earlier one can still be alive. A socket we no longer hold (one
    * whose close() was called while CLOSING, or a half-open one) still counts in VTS until its close
    * handshake finishes, so it is retired — close, wait, terminate — BEFORE this dial.
+   * `epoch` is the connect's entry epoch: close() invalidates both it and socketEpoch, and a
+   * cancelled dial may never adopt (or retire) a newer connect()'s socket.
    */
-  async openSocket() {
-    const epoch = this.socketEpoch;
+  async openSocket(epoch = this.closeEpoch) {
+    const socketEpoch = this.socketEpoch;
     const retired = await this.retireSockets();
+    if (epoch !== this.closeEpoch || socketEpoch !== this.socketEpoch) this.rejectCancelled();
     if (retired.had === true) {
       // Only a real replacement is recorded; an ordinary reconnect after a clean close is not.
       this.socketReconnects += 1;
       this.emitEvent('vts.socket.replaced', { previous: retired.previous, ms: retired.ms });
       this.emitEvent('vts.socket.stale-closed', { confirmed: retired.confirmed === true });
     }
-    if (epoch !== this.socketEpoch) throw new Error('VTube Studio connect was cancelled by close()');
-    const candidate = await new Promise((resolve, reject) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${this.port}`);
-      this.sockets.add(socket);
-      // Bookkeeping only: this listener may fire long after the socket stopped being current.
-      socket.on('close', () => this.sockets.delete(socket));
-      const settle = (fn, value) => {
-        socket.off('open', onOpen);
-        socket.off('error', onError);
-        socket.off('close', onClose);
-        fn(value);
-      };
-      const onOpen = () => settle(resolve, socket);
-      const onError = (error) => { this.sockets.delete(socket); settle(reject, error); };
-      const onClose = () => {
-        this.sockets.delete(socket);
-        settle(reject, new Error('VTube Studio connection closed before it opened'));
-      };
-      socket.once('open', onOpen);
-      socket.once('error', onError);
-      socket.once('close', onClose);
-    });
-    if (epoch !== this.socketEpoch) {
+    let candidate;
+    try {
+      candidate = await new Promise((resolve, reject) => {
+        const socket = new WebSocket(`ws://127.0.0.1:${this.port}`);
+        this.sockets.add(socket);
+        // Bookkeeping only: this listener may fire long after the socket stopped being current.
+        socket.on('close', () => this.sockets.delete(socket));
+        const settle = (fn, value) => {
+          socket.off('open', onOpen);
+          socket.off('error', onError);
+          socket.off('close', onClose);
+          fn(value);
+        };
+        const onOpen = () => settle(resolve, socket);
+        const onError = (error) => { this.sockets.delete(socket); settle(reject, error); };
+        const onClose = () => {
+          this.sockets.delete(socket);
+          settle(reject, new Error('VTube Studio connection closed before it opened'));
+        };
+        socket.once('open', onOpen);
+        socket.once('error', onError);
+        socket.once('close', onClose);
+      });
+    } catch (error) {
+      // close() retired the candidate while it was opening: report cancellation, not a raw dial error.
+      if (epoch !== this.closeEpoch || socketEpoch !== this.socketEpoch) this.rejectCancelled();
+      throw error;
+    }
+    if (epoch !== this.closeEpoch || socketEpoch !== this.socketEpoch) {
       // close() ran while this candidate was still opening: it must never become the connection.
-      await this.retireSockets();
-      throw new Error('VTube Studio connect was cancelled by close()');
+      // Retire only this candidate — retireSockets() would also tear down a newer connect()'s socket.
+      await this.retireSocket(candidate);
+      this.rejectCancelled();
     }
     this.socket = candidate;
     this.attachSocket(candidate);
@@ -1926,6 +1989,11 @@ export class VtsClient {
     this.closeEpoch += 1;
     this.authenticated = false;
     this.ready = false;
+    // The in-flight connect belongs to the invalidated epoch: detach it so a later explicit
+    // connect() starts a fresh attempt instead of sharing the doomed promise. Its own late
+    // settlement is epoch-checked and cannot clear the newer slot (see startConnect).
+    this.connectPromise = null;
+    this.authPending = false;
     this.eventsSubscribed = false;
     this.subscribedEvents = [];
     this.subscriptionError = '';

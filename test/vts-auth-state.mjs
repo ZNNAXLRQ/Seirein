@@ -547,6 +547,187 @@ test('8. 并发 connect 只发一次认证请求', async () => {
   }
 });
 
+// 9) close() while loadToken() is still reading: the late read must not dial or become ready.
+test('9. 读取令牌期间 close → 不开连接、connect 返回 cancelled、状态非 ready', async () => {
+  const tokenPath = join(await tmp('cancel-load'), 'vts-token.json');
+  const fake = await createFakeVts({ grantToken: 'never-used' });
+  const events = [];
+  const client = newClient(fake, tokenPath, {
+    onAuthEvent: (type, payload) => events.push({ type, ...payload }),
+  });
+  // Delay the real read so close() lands inside the await that used to escape every epoch check.
+  const originalLoad = client.loadToken.bind(client);
+  let reading = false;
+  client.loadToken = async (epoch) => {
+    reading = true;
+    await sleep(120);
+    return originalLoad(epoch);
+  };
+  try {
+    const pending = client.connect();
+    assert(await waitFor(() => reading, 1000, 5), 'loadToken() actually started');
+    client.close();
+    const outcome = await pending.then(() => null, (error) => error);
+    const status = client.status();
+    assert(outcome?.code === 'VTS_AUTH_CANCELLED', `connect() rejects with VTS_AUTH_CANCELLED (got ${outcome?.code})`);
+    assert(status.state !== 'ready' && status.ready === false, `the cancelled connect is not ready (got ${status.state})`);
+    assert(status.socketOpen === false && client.socket === null, 'no socket was adopted');
+    assert(fake.connections === 0, `no socket was ever dialed (connections=${fake.connections})`);
+    assert(countOf(fake.requests, 'AuthenticationTokenRequest') === 0, 'no grant was requested after close');
+    const cancelled = events.filter((entry) => entry.type === 'vts.auth.cancelled');
+    assert(cancelled.length === 1 && cancelled[0].reason === 'closed',
+      `vts.auth.cancelled {reason:'closed'} is emitted once (got ${JSON.stringify(cancelled)})`);
+    console.log(`     code=${outcome.code} state=${status.state} connections=${fake.connections}`
+      + ` cancelled=${cancelled.length} reason=${cancelled[0].reason}`);
+  } finally {
+    client.close();
+    await fake.close();
+  }
+});
+
+// 10) close() while the grant is being persisted: cancel, never promote the write to state.
+test('10. 授权持久化等待期间 close → 取消，写入不影响状态', async () => {
+  const root = await tmp('cancel-write');
+  const tokenPath = join(root, 'vts-token.json');
+  const fake = await createFakeVts({ grantToken: 'late-token' });
+  const events = [];
+  const client = newClient(fake, tokenPath, {
+    onAuthEvent: (type, payload) => events.push({ type, ...payload }),
+  });
+  // Delay the atomic write so close() lands between AuthenticationTokenRequest and saveToken().
+  const originalWrite = client.writeTokenFile.bind(client);
+  let writing = false;
+  client.writeTokenFile = async (value) => {
+    writing = true;
+    await sleep(120);
+    return originalWrite(value);
+  };
+  try {
+    const pending = client.connect();
+    assert(await waitFor(() => writing, 2000, 5), 'the granted token reached the write step');
+    client.close();
+    const outcome = await pending.then(() => null, (error) => error);
+    const status = client.status();
+    assert(outcome?.code === 'VTS_AUTH_CANCELLED', `connect() rejects with VTS_AUTH_CANCELLED (got ${outcome?.code})`);
+    assert(status.state === 'disconnected', `the closed state survives the late write (got ${status.state})`);
+    assert(status.ready === false && status.authenticated === false && status.socketOpen === false,
+      'the cancelled grant is not reported as usable');
+    assert(client.token === '', 'the late-persisted token is not adopted in memory');
+    const writeOk = events.filter((entry) => entry.type === 'vts.auth.token'
+      && entry.action === 'write' && entry.ok === true);
+    assert(writeOk.length === 0, 'no successful token-write event leaks out of the cancelled flow');
+    const cancelled = events.filter((entry) => entry.type === 'vts.auth.cancelled');
+    assert(cancelled.length === 1 && cancelled[0].reason === 'closed',
+      `vts.auth.cancelled {reason:'closed'} is emitted once (got ${JSON.stringify(cancelled)})`);
+    let onDisk = '(absent)';
+    try {
+      onDisk = JSON.parse(await readFile(tokenPath, 'utf8')).authenticationToken;
+    } catch {
+      /* the write may have been abandoned; either outcome is fine as long as state is untouched */
+    }
+    console.log(`     code=${outcome.code} state=${status.state} memoryToken='${client.token}'`
+      + ` diskToken='${onDisk}' writeEvents=${writeOk.length}`);
+  } finally {
+    client.close();
+    await fake.close();
+  }
+});
+
+// 11) After close(), an explicit connect() is a new epoch and must reach ready normally.
+test('11. close 后显式 connect → 正常 ready（新代次）', async () => {
+  const { tokenPath } = await seedToken('new-epoch', 'stable-token');
+  const fake = await createFakeVts({ validTokens: ['stable-token'] });
+  const events = [];
+  const client = newClient(fake, tokenPath, {
+    onAuthEvent: (type, payload) => events.push({ type, ...payload }),
+  });
+  // Only the first attempt is slow; the explicit reconnect reads normally and must not be blocked
+  // by the old connectPromise or cleared by the first attempt settling late.
+  const originalLoad = client.loadToken.bind(client);
+  let loads = 0;
+  client.loadToken = async (epoch) => {
+    loads += 1;
+    if (loads === 1) await sleep(150);
+    return originalLoad(epoch);
+  };
+  try {
+    const first = client.connect();
+    // Attach the outcome handler now: the cancelled promise may reject while the reconnect runs.
+    const firstOutcome = first.then(() => null, (error) => error);
+    assert(await waitFor(() => loads === 1, 1000, 5), 'the first connect started reading the token');
+    client.close();
+    const second = client.connect();
+    assert(second !== first, 'connect() after close() is a fresh attempt, not the cancelled promise');
+    const secondResult = await second;
+    assert(secondResult.ok === true, 'the explicit reconnect succeeds');
+    assert(client.status().state === 'ready', `the new epoch is ready (got ${client.status().state})`);
+    const firstError = await firstOutcome;
+    assert(firstError?.code === 'VTS_AUTH_CANCELLED', `the old attempt is cancelled (got ${firstError?.code})`);
+    assert(client.status().state === 'ready' && client.ready === true,
+      'the old attempt settling does not clear the new ready state');
+    assert(fake.connections === 1, `only the new connection was dialed (connections=${fake.connections})`);
+    assert(countOf(fake.requests, 'AuthenticationRequest') === 1, 'the new connection authenticated once');
+    const cancelled = events.filter((entry) => entry.type === 'vts.auth.cancelled');
+    assert(cancelled.length === 1 && cancelled[0].reason === 'closed',
+      `only the cancelled attempt reports cancellation (got ${JSON.stringify(cancelled)})`);
+    console.log(`     first=${firstError.code} secondState=${client.status().state}`
+      + ` connections=${fake.connections} authRequests=${countOf(fake.requests, 'AuthenticationRequest')}`);
+  } finally {
+    client.close();
+    await fake.close();
+  }
+});
+
+// 12) A late result from the cancelled attempt must not touch the newer socket or its state.
+test('12. 旧调用迟到完成 → 不清理新 socket、不改状态', async () => {
+  const { tokenPath } = await seedToken('late-old', 'stable-token');
+  const fake = await createFakeVts({ validTokens: ['stable-token'] });
+  const client = newClient(fake, tokenPath);
+  // Hold the first attempt after its AuthenticationRequest answered: close() then replaces it, and
+  // the late answer resumes exactly where a missing epoch check would have carried on to ready.
+  const originalAttempt = client.attemptAuth.bind(client);
+  let firstAnswer = null;
+  let attemptCalls = 0;
+  let holding = false;
+  client.attemptAuth = async () => {
+    attemptCalls += 1;
+    const result = await originalAttempt();
+    if (attemptCalls === 1) {
+      holding = true;
+      firstAnswer = result;
+      await sleep(1200);
+    }
+    return result;
+  };
+  try {
+    const first = client.connect();
+    // Attach the outcome handler now: the cancelled promise may reject while the replacement runs.
+    const firstOutcome = first.then(() => null, (error) => error);
+    assert(await waitFor(() => holding, 3000, 5), 'the first attempt is holding its answered AuthenticationRequest');
+    client.close();
+    const secondResult = await client.connect();
+    assert(secondResult.ok === true, 'the replacement connect succeeds');
+    const newSocket = client.socket;
+    assert(newSocket !== null && client.connected === true, 'the replacement socket is open');
+    const stateBefore = client.status().state;
+    // The first attempt's hold is longer than a whole connect: it settles only after the new epoch
+    // is ready, which is exactly the late result that used to be able to disturb it.
+    const firstResult = await firstOutcome;
+    assert(firstResult?.code === 'VTS_AUTH_CANCELLED', `the late answer is cancelled (got ${firstResult?.code})`);
+    assert(client.socket === newSocket, 'the late cancelled attempt did not replace the new socket');
+    assert(client.connected === true && client.status().state === 'ready',
+      `the new connection is still ready (state before=${stateBefore}, after=${client.status().state})`);
+    assert(client.ready === true && client.authenticated === true, 'ready/authenticated stay true');
+    assert(fake.active === 1, `only the new socket is still live (active=${fake.active})`);
+    assert(firstAnswer?.ok === true, 'the first AuthenticationRequest really was answered before close');
+    console.log(`     first=${firstResult.code} newSocketKept=${client.socket === newSocket}`
+      + ` state=${client.status().state} activeSockets=${fake.active}`);
+  } finally {
+    client.close();
+    await fake.close();
+  }
+});
+
 // ---- run ------------------------------------------------------------------
 const failures = [];
 for (const entry of tests) {
