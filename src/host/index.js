@@ -1850,8 +1850,57 @@ export function apply(ctx, config) {
       modelsAppliedAt: appliedAt,
     };
   };
+  // Observation only: the recent synthesis rows, so `voice.pipeline.timeline` can read its FIRST
+  // block's queue wait / provider time / cold start instead of measuring them a second time.
+  const ttsRequestRows = [];
+  const noteTtsRequest = (payload) => {
+    if (payload !== null && typeof payload === 'object') {
+      ttsRequestRows.push({ at: Date.now(), payload });
+      if (ttsRequestRows.length > 64) ttsRequestRows.shift();
+    }
+    return log.emit('voice.tts.request', payload);
+  };
+  /**
+   * The first CHUNK breakdown for `voice.pipeline.timeline`: read back from this round's first
+   * `answer` synthesis row (queue wait, provider time, characters, cold start). A stage that was
+   * never measured stays null. `firstChunkKanaMs` is 0 because the kana rewrite travels in the
+   * same translation request here, so it has no separate stage to measure.
+   */
+  const firstChunkBreakdown = ({ streamed = null, origin = 0 } = {}) => {
+    const from = Number(origin) > 0 ? Number(origin) : 0;
+    let row = null;
+    for (const entry of ttsRequestRows) {
+      if (entry.at < from) continue;
+      const request = entry.payload;
+      if (request?.purpose !== 'answer' || request?.ok !== true) continue;
+      // The first BLOCK of the first SENTENCE only: the streamed say fallback also tags `answer`
+      // but carries no block/sentence number, so it can never be mistaken for the reply's block 0.
+      if (request.chunkIndex !== 0 || request.sentenceId !== 0) continue;
+      if (row === null || entry.at < row.at) row = entry;
+    }
+    const request = row?.payload ?? null;
+    const translateMs = Number(streamed?.firstTranslateMs);
+    const measured = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
+    };
+    return {
+      firstChunkQueueWaitMs: request === null ? null : measured(request.slotWaitMs),
+      // No translation happened (same source/target language) is a measured 0, not an unknown.
+      firstChunkTranslateMs: streamed?.firstTranslated === true
+        ? (Number.isFinite(translateMs) && translateMs >= 0 ? Math.round(translateMs) : null)
+        : (streamed === null ? null : 0),
+      firstChunkKanaMs: request === null ? null : 0,
+      firstChunkTtsMs: request === null ? null : measured(request.requestMs),
+      firstChunkChars: request === null ? null : measured(request.chars),
+      ttsColdStart: request === null
+        ? null
+        : (typeof request.coldStart === 'boolean' ? request.coldStart : null),
+    };
+  };
   configureTts({
     gptSovits: gptSovitsSettings,
+    onTtsRequest: noteTtsRequest,
     onGptSovitsFailed: (payload) => log.emit('tts.gptsovits.failed', payload),
     onGptSovitsSkipped: (payload) => log.emit('tts.gptsovits.skipped', payload),
     onGptSovitsWarning: (payload) => log.emit('tts.gptsovits.warn', payload),
@@ -3600,6 +3649,7 @@ export function apply(ctx, config) {
    */
   const synthesizeChunked = async (prepared, {
     voice, signal, liveSignal = null, chunking: chunkingOverride = undefined,
+    purpose = 'answer', sentenceId = 0,
   }) => {
     // `chunking:false` is the streamed spoken-version path: the semantic unit is already sized
     // from measured synthesis cost, so the comma-level block splitter must not cut it again.
@@ -3610,7 +3660,7 @@ export function apply(ctx, config) {
       ? chunkCuts(prepared.speechText, { minChars })
       : [prepared.speechText];
     const list = blocks.length > 0 ? blocks : [prepared.speechText];
-    const synthesizeBlock = (text, blockSignal, priority = 0) => synthesizeWatched({
+    const synthesizeBlock = (text, blockSignal, priority = 0, chunkIndex = 0) => synthesizeWatched({
       text,
       voice,
       lang: prepared.speechLang,
@@ -3621,6 +3671,10 @@ export function apply(ctx, config) {
       // so the inter-block wait is bounded by the one synthesis that is already running. The key
       // stays absent for every old path, keeping the options shape unchanged.
       ...(priority > 0 ? { priority } : {}),
+      // Observation only: the lane purpose and this block's sentence/block number.
+      purpose,
+      chunkIndex,
+      sentenceId,
     });
     const firstBlockAt = Date.now();
     const audio = await synthesizeBlock(list[0], signal);
@@ -3630,10 +3684,11 @@ export function apply(ctx, config) {
     return {
       audio,
       chunkTexts: list,
-      synthesizeChunk: ({ text, signal: chunkSignal }) => synthesizeBlock(
+      synthesizeChunk: ({ text, signal: chunkSignal, index = 1 }) => synthesizeBlock(
         text,
         liveSignal === null ? chunkSignal : AbortSignal.any([chunkSignal, liveSignal()]),
         1,
+        Number.isInteger(index) ? index : 1,
       ),
     };
   };
@@ -4201,6 +4256,8 @@ export function apply(ctx, config) {
   const playStreaming = async ({
     text, voice, lang, textLang = '', dir, ffplayPath, subtitleText = '', captionStream = null, signal,
     onPlaybackSession = null, onSubtitle = null, owner = null, subtitleFinal = true,
+    // Observation only: the lane purpose reported by the streamed TTS request row.
+    purpose = 'speech',
   }) => {
     signal?.throwIfAborted();
     // FIFO: a queued sentence starts only after the sounding one finished; no mid-sentence cut.
@@ -4242,6 +4299,7 @@ export function apply(ctx, config) {
         dir,
         ffplayPath,
         signal,
+        purpose,
         onStart: (info) => {
           // First chunk handed to the player: the transport is no longer pending. Data arrival is
           // not speaker sound, so this session records firstData* only and keeps PCM/audible null.
@@ -6467,6 +6525,8 @@ export function apply(ctx, config) {
             const synthAt = Date.now();
             const synthesized = await synthesizeWatched({
               text: spokenText, voice, lang: prepared.speechLang, textLang: prepared.speechLang, dir, signal: combined,
+              // Observation only: a line spoken by the say tool.
+              purpose: 'tool',
             });
             synthMs = Date.now() - synthAt;
             chunkMs = synthMs;
@@ -6503,6 +6563,8 @@ export function apply(ctx, config) {
                 signal: combined,
                 onPlaybackSession: adopt,
                 owner: speechOwner,
+                // Observation only: the streamed answer transport.
+                purpose: 'answer',
               });
               result = played.result;
               playedSession = played.session;
@@ -6523,7 +6585,9 @@ export function apply(ctx, config) {
               // playing immediately; block N+1 is synthesized while block N plays. Synthesis
               // stays parallel to earlier lines — only the PLAYBACK turn is FIFO by acceptance.
               const blockStartedAt = Date.now();
-              const chunked = await synthesizeChunked(prepared, { voice, signal: combined, liveSignal: live });
+              const chunked = await synthesizeChunked(prepared, {
+                voice, signal: combined, liveSignal: live, purpose: 'tool',
+              });
               // Register ownership the instant block 0 exists, BEFORE the playback-turn wait: a
               // cancel while queued must still delete this file (the finally below owns it).
               blockZeroAudio = chunked.audio;
@@ -9958,6 +10022,8 @@ export function apply(ctx, config) {
         textLang: prepared.speechLang,
         dir: join(root, 'cache', 'tts'),
         signal,
+        // Observation only: the shared whole-line notice/fallback outlet.
+        purpose: 'say',
       });
       signal.throwIfAborted();
       const synthesizedAt = Date.now();
@@ -10004,6 +10070,8 @@ export function apply(ctx, config) {
       textLang: prepared.speechLang,
       dir: join(root, 'cache', 'tts'),
       signal,
+      // Observation only: the turn's waiting line.
+      purpose: 'ack',
       // A1: the waiting line outranks body prefetch that is still queued in the TTS slot. The
       // priority only reorders waiting jobs; it never interrupts a synthesis already running.
       priority: ACK_SYNTH_PRIORITY,
@@ -10149,6 +10217,8 @@ export function apply(ctx, config) {
       textLang: prepared.speechLang,
       dir: typeof dir === 'string' && dir.length > 0 ? dir : join(root, 'cache', 'ack'),
       signal,
+      // Observation only: an idle-window warm-pool line.
+      purpose: 'ack-warm',
     });
     // The batch was cancelled after this clip finished: delete its audio before the pool decides
     // whether to keep it, so a cancelled warm run never leaves a partial file behind.
@@ -10858,6 +10928,8 @@ export function apply(ctx, config) {
               // language stay sentence-wide, and later blocks reuse the same live signal chain.
               const { audio, chunkTexts, synthesizeChunk } = await synthesizeChunked(prepared, {
                 voice, signal: combined, liveSignal: liveSpeech,
+                // Observation only: this sentence is the answer's body, tagged with its block id.
+                purpose: 'answer', sentenceId,
                 // The streamed spoken-version path already sized this unit from measured synthesis
                 // cost; re-cutting it at a comma would defeat that measurement.
                 ...(semanticUnitMode ? { chunking: false } : {}),
@@ -11843,25 +11915,30 @@ export function apply(ctx, config) {
             const pipelineInputAt = stage.injectedAt > 0
               ? stage.injectedAt
               : (acceptedAt > 0 ? acceptedAt : (stage.ackAt > 0 ? stage.ackAt : replyAt));
-            await log.emit('voice.pipeline.timeline', buildPipelineTimeline({
-              turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
-              origin: pipelineInputAt,
-              bodyReadyAt: replyAt,
-              // When the spoken version started (rewrite request / skip decision), kept apart from
-              // the complete body above.
-              spokenStartedAt: spokenMarks.spokenStartedAt,
-              // The first STABLE semantic unit of the spoken version (or the first queued sentence
-              // on the whole-text path) — never the whole reply.
-              spokenFirstSentenceAt: spokenMarks.firstUnitAt > 0
-                ? spokenMarks.firstUnitAt
-                : Number(streamed.firstQueuedAt),
-              translatedFirstAt: streamed.firstTranslated === true ? spokenMarks.firstTranslateDoneAt : 0,
-              firstChunkSynthAt: spokenMarks.firstChunkAt,
-              firstAudioAt: Number(streamed.firstPlayStartedAt),
-              spokenCompleteAt: Date.now(),
-              skippedSpokenVersion: spokenPlan?.source === 'original',
-              reusedTranslation: spokenMarks.reusedTranslation === true,
-            }));
+            await log.emit('voice.pipeline.timeline', {
+              ...buildPipelineTimeline({
+                turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
+                origin: pipelineInputAt,
+                bodyReadyAt: replyAt,
+                // When the spoken version started (rewrite request / skip decision), kept apart from
+                // the complete body above.
+                spokenStartedAt: spokenMarks.spokenStartedAt,
+                // The first STABLE semantic unit of the spoken version (or the first queued sentence
+                // on the whole-text path) — never the whole reply.
+                spokenFirstSentenceAt: spokenMarks.firstUnitAt > 0
+                  ? spokenMarks.firstUnitAt
+                  : Number(streamed.firstQueuedAt),
+                translatedFirstAt: streamed.firstTranslated === true ? spokenMarks.firstTranslateDoneAt : 0,
+                firstChunkSynthAt: spokenMarks.firstChunkAt,
+                firstAudioAt: Number(streamed.firstPlayStartedAt),
+                spokenCompleteAt: Date.now(),
+                skippedSpokenVersion: spokenPlan?.source === 'original',
+                reusedTranslation: spokenMarks.reusedTranslation === true,
+              }),
+              // First CHUNK breakdown beside the sentence stages (queue wait, translation, kana,
+              // pure synthesis, characters, cold start); a stage never measured stays null.
+              ...firstChunkBreakdown({ streamed, origin: pipelineInputAt }),
+            });
             if (streamed.error.length > 0) {
               await log.emit('voice.first-sentence.failed', {
                 sessionId,
@@ -12345,6 +12422,9 @@ export function apply(ctx, config) {
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
           device,
+          // Observation only: the endpoint-continuation shadow probe and its silence point.
+          endpointProbe: config?.voice?.endpointProbe !== false,
+          endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
           gainDb: Number(config?.asrGainDb ?? 0),
           minRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
           streamThreads: tuning.streamThreads,
@@ -12577,6 +12657,9 @@ export function apply(ctx, config) {
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
           device,
+          // Observation only: the endpoint-continuation shadow probe and its silence point.
+          endpointProbe: config?.voice?.endpointProbe !== false,
+          endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
           gainDb: Number(config?.asrGainDb ?? 0),
           minRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
           streamThreads: tuning.streamThreads,
