@@ -27,11 +27,18 @@ export {
   DIALOGUE_INJECTION_ORDER,
   createDialogueSummaryRunner,
 } from './session/conversation/dialogue-summary.js';
-import { createVoiceCompaction } from './session/compaction/voice-compaction.js';
+import {
+  VOICE_SESSION_RECOVER_ACTION,
+  createVoiceCompaction,
+  createVoiceSessionRecovery,
+} from './session/compaction/voice-compaction.js';
 export {
   VOICE_COMPACTION_PRESET,
   VOICE_COMPACTION_PRESET_ID,
+  VOICE_SESSION_AGENT_OWNED_REASON,
+  VOICE_SESSION_RECOVER_ACTION,
   createVoiceCompaction,
+  createVoiceSessionRecovery,
   isVoiceSessionId,
 } from './session/compaction/voice-compaction.js';
 import {
@@ -14282,6 +14289,17 @@ export function apply(ctx, config) {
     return results;
   };
 
+  // Manual-only recovery of an existing voice session: keeps the session id, resumes it with the
+  // compaction preset mounted, compacts once, and returns. Nothing schedules or emits it; the sole
+  // caller is the explicit `voice.session.recover` action registered below.
+  const recoverVoiceSession = createVoiceSessionRecovery({
+    getService,
+    log,
+    ownerCtx: ctx,
+    compaction: voiceCompaction,
+    defaultSessionId: () => voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId,
+  });
+
   const dispatchUiAction = createSettingsRouter([
 { actions: hearingActions, handle: createHearingSettingsActions({
     get ambientAutostart() { return ambientAutostart; },
@@ -14454,7 +14472,9 @@ export function apply(ctx, config) {
     get readSettings() { return readSettings; },
     get scheduleAvatarStyleRefresh() { return scheduleAvatarStyleRefresh; },
     get writeSettings() { return writeSettings; }
-  }) }
+  }) },
+  // The one manual entry point: never wired to a timer, an event listener or a delivery path.
+  { actions: [VOICE_SESSION_RECOVER_ACTION], handle: recoverVoiceSession }
   ]);
   /**
    * The hearing actions own the switch; the host owns the download subscription. An explicit OFF

@@ -285,3 +285,247 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
 
   return { presetId, setup, ensure, attach, evidenceOf };
 }
+
+/** The ONE action that may re-assemble an existing voice session by hand. */
+export const VOICE_SESSION_RECOVER_ACTION = 'voice.session.recover';
+
+/** Returned when the session still has a live Agent: only a DSH restart releases it. */
+export const VOICE_SESSION_AGENT_OWNED_REASON = '需重启 DSH 释放 agent 后再恢复';
+
+/**
+ * Manual recovery of an EXISTING dated voice session: keep its id, resume it through
+ * `agentLoop.resume(ownerCtx, { resumeSessionId, setup })` with the compaction preset mounted in
+ * the setup callback, then compact once with the preset's own `compactNow()` before returning.
+ *
+ * This module never schedules, subscribes or otherwise triggers recovery: the caller is a single
+ * explicit action (`voice.session.recover`). It opens no turn, writes no user message, creates no
+ * new session and deletes no history; a resume failure is reported verbatim and never retried.
+ *
+ * @param {{
+ *   getService: (name: string) => any,
+ *   log?: { emit?: (type: string, payload: object) => unknown } | null,
+ *   ownerCtx?: any,
+ *   compaction?: { ensure: (agent: any, agentCtx?: any) => Promise<any> } | null,
+ *   defaultSessionId?: (() => string) | null,
+ *   presetId?: string,
+ * }} options
+ */
+export function createVoiceSessionRecovery({
+  getService,
+  log = null,
+  ownerCtx = null,
+  compaction = null,
+  defaultSessionId = null,
+  presetId = VOICE_COMPACTION_PRESET_ID,
+}) {
+  const engine = compaction ?? createVoiceCompaction({ getService, log, presetId });
+  const describe = (error) => (error instanceof Error ? error.message : String(error));
+
+  /** One `voice.session.recover` debug line per attempt; observability never fails the action. */
+  const note = (payload) => {
+    try {
+      const pending = log?.emit?.(VOICE_SESSION_RECOVER_ACTION, {
+        sessionId: payload.sessionId ?? '',
+        ok: payload.ok === true,
+        mounted: payload.mounted === true,
+        before: payload.before ?? null,
+        after: payload.after ?? null,
+        freed: payload.freed ?? null,
+        // The machine code is the stable filter value; success falls back to its own note.
+        reason: typeof payload.code === 'string' && payload.code.length > 0
+          ? payload.code
+          : (payload.reason ?? ''),
+      });
+      if (pending !== undefined && typeof pending?.catch === 'function') pending.catch(() => {});
+    } catch {
+      /* a log that throws must not hide the outcome */
+    }
+  };
+  const done = (payload) => {
+    note(payload);
+    return payload;
+  };
+  /** Every refusal carries the same shape: nothing mounted, nothing compacted. */
+  const fail = (payload) => done({
+    ok: false,
+    mounted: false,
+    before: null,
+    after: null,
+    freed: null,
+    compacted: false,
+    ...payload,
+  });
+
+  /** The compaction engine of the Agent's own preset realm (undefined when unbound). */
+  const serviceOf = (agent) => {
+    const presets = getService('agentPresets');
+    return typeof presets?.serviceFor === 'function' ? presets.serviceFor(agent, 'compaction') : undefined;
+  };
+
+  /** Estimated request tokens (token meter first, backend measure second), or null. */
+  const measureTokens = (agent, service) => {
+    const total = (value) => {
+      const number = Number(value?.totalTokens ?? value);
+      return Number.isFinite(number) ? number : null;
+    };
+    try {
+      const meter = getService('tokenMeter');
+      if (typeof meter?.measure === 'function') {
+        const measured = total(meter.measure(agent.session));
+        if (measured !== null) return measured;
+      }
+    } catch {
+      /* no meter: the honest answer is null, never a guess */
+    }
+    try {
+      if (typeof service?.measure === 'function') return total(service.measure(agent.session));
+    } catch {
+      /* backend measurement is optional too */
+    }
+    return null;
+  };
+
+  /**
+   * Resolve the requested session (argument or today's voice session) and refuse before any
+   * resume when it is not a dated voice session.
+   */
+  const resolveTarget = (body) => {
+    const requested = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+    if (requested.length > 0) return requested;
+    try {
+      const derived = defaultSessionId?.();
+      return typeof derived === 'string' ? derived.trim() : '';
+    } catch {
+      return '';
+    }
+  };
+
+  /** Pre-check the preset declaration before loading (or disturbing) any session. */
+  const presetProblem = async (presets) => {
+    if (typeof presets?.mount !== 'function') {
+      return { code: 'preset-registry-unavailable', reason: '找不到 agent preset 注册表' };
+    }
+    try {
+      const resolved = typeof presets.resolve === 'function' ? await presets.resolve(presetId) : { id: presetId };
+      if (resolved?.broken !== undefined) {
+        return { code: 'preset-invalid', reason: `preset ${presetId}: ${describe(resolved.broken)}` };
+      }
+      if (resolved?.id !== undefined && resolved.id !== presetId) {
+        return { code: 'preset-missing', reason: `profile 未声明 ${presetId}` };
+      }
+      return null;
+    } catch (error) {
+      const code = typeof error?.code === 'string' ? error.code : '';
+      if (code === 'agent-preset/not-found' || /unknown agent preset/iu.test(describe(error))) {
+        return { code: 'preset-missing', reason: `profile 未声明 ${presetId}` };
+      }
+      return { code: 'preset-unavailable', reason: describe(error) };
+    }
+  };
+
+  /**
+   * The action body. `{ sessionId }` is optional; without it today's voice session is used.
+   * @param {{ sessionId?: string }} [body]
+   */
+  const recover = async (body = {}) => {
+    const sessionId = resolveTarget(body);
+    if (sessionId.length === 0) return fail({ sessionId, code: 'session-unresolved', reason: '无法确定语音会话 id' });
+    if (!isVoiceSessionId(sessionId)) {
+      return fail({ sessionId, code: 'not-voice-session', reason: '只恢复 seirein-YYYY-MM-DD 语音会话' });
+    }
+
+    let live;
+    try {
+      live = getService('agents')?.get?.(sessionId);
+    } catch {
+      live = undefined;
+    }
+    if (live !== undefined && live !== null) {
+      // A live Agent owns the write lock and its preset is locked after the first turn; the caller
+      // must restart DSH instead of this action silently reusing/disposing it.
+      return fail({ sessionId, code: 'agent-owned', reason: VOICE_SESSION_AGENT_OWNED_REASON });
+    }
+
+    const presets = getService('agentPresets');
+    const problem = await presetProblem(presets);
+    if (problem !== null) return fail({ sessionId, code: problem.code, reason: problem.reason });
+
+    const agentLoop = getService('agentLoop');
+    if (typeof agentLoop?.resume !== 'function') {
+      return fail({ sessionId, code: 'agent-loop-unavailable', reason: 'agentLoop.resume 不可用' });
+    }
+
+    let handle;
+    let evidence = null;
+    try {
+      // `resume` awaits `initializeAgent`, which awaits this setup and only then announces
+      // `agent/created` and releases queued input: resolving here means announce is complete.
+      handle = await agentLoop.resume(ownerCtx, {
+        resumeSessionId: sessionId,
+        setup: async (agentCtx, agent) => {
+          try {
+            evidence = await engine.ensure(agent, agentCtx);
+          } catch (error) {
+            evidence = { ok: false, reason: 'setup', error: describe(error) };
+          }
+        },
+      });
+    } catch (error) {
+      return fail({
+        sessionId,
+        code: typeof error?.code === 'string' && error.code.length > 0 ? error.code : 'resume-failed',
+        reason: describe(error),
+        error: describe(error),
+      });
+    }
+
+    const agent = handle?.agent;
+    if (agent === undefined || agent === null) {
+      return fail({ sessionId, code: 'resume-failed', reason: 'resume 未返回 agent' });
+    }
+    const mounted = evidence?.ok === true;
+    if (!mounted) {
+      return fail({
+        sessionId,
+        code: typeof evidence?.reason === 'string' ? evidence.reason : 'mount-failed',
+        reason: '恢复成功但压缩 preset 未挂载',
+        error: evidence?.error ?? '',
+      });
+    }
+
+    const service = serviceOf(agent);
+    const before = measureTokens(agent, service);
+    if (typeof service?.compactNow !== 'function') {
+      return fail({ sessionId, mounted: true, before, code: 'compaction-unavailable', reason: '该作用域没有 compactNow()' });
+    }
+    try {
+      // Manual idle compaction: allowed below the pressure threshold, opens no turn.
+      const compacted = await service.compactNow(agent, new AbortController().signal);
+      const after = measureTokens(agent, service);
+      const freed = before !== null && after !== null ? before - after : null;
+      const idle = compacted === null || compacted === undefined;
+      return done({
+        ok: true,
+        sessionId,
+        mounted: true,
+        before,
+        after,
+        freed,
+        compacted: !idle,
+        ...(idle ? { reason: 'no-compactable-range' } : {}),
+      });
+    } catch (error) {
+      // The session is untouched on disk (no deletion, no rewrite) and the attempt is not retried.
+      return fail({
+        sessionId,
+        mounted: true,
+        before,
+        code: 'compaction-failed',
+        reason: describe(error),
+        error: describe(error),
+      });
+    }
+  };
+
+  return recover;
+}
