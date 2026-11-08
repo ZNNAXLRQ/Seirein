@@ -117,6 +117,7 @@ export {
   HOLD_MICRO_DRIFT,
   RELAX_PLAN,
   POSTURE_REACH,
+  PRESET_TAKEOVER,
   buildSpeechLevels,
   createBehaviorRuntime,
 } from './motion-controller.js';
@@ -2895,7 +2896,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     if (current === null) return false;
     actionState.current = null;
     actionState.ended += 1;
-    recordIdleEvent('avatar.action.end', { name: current.name, actionId: current.actionId, interrupted, at });
+    recordIdleEvent('avatar.action.end', { name: current.name, actionId: current.actionId, interrupted, by, at });
     // Exactly one trace per ended action, after the writer has already settled this action's frame.
     finishActionTrace(current, at);
     if (interrupted === true) {
@@ -3106,6 +3107,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           Object.assign(actionState.current, {
             event: 'sentence-gap',
             presetId: drawn.presetId,
+            /** Controller-side identity of the live trajectory (takeover lookup). */
+            presetActionId: drawn.actionId ?? null,
             presetOperations: [...drawn.operations],
           });
           recordIdleEvent('avatar.preset.action', {
@@ -3195,6 +3198,29 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
+   * The takeover request for the answer's opening gesture, or `null` when nothing owns the pose.
+   *
+   * Item 5: a pre-answer action (thinking / listening / idle draw) may still own the pose at the
+   * first body clip's start. Waiting for it would move the gesture past its own moment, so the
+   * request is handed to the executor, which decides IMMEDIATELY — it never waits for that action
+   * to end. The executor refuses an explicit owner, a transition outside the short window or a
+   * channel set it cannot split; the caller then drops the opening gesture with
+   * `takeover-unavailable` and nothing is queued.
+   */
+  function answerStartTakeover() {
+    const current = actionState.current;
+    if (current === null) return null;
+    return {
+      /** Controller-side identity of the live trajectory this action was started from. */
+      actionId: current.presetActionId ?? null,
+      action: current.presetId ?? current.name,
+      /** `null` marks a non-preset action: an explicit gesture the executor must never displace. */
+      preset: current.presetId ?? null,
+      event: String(current.event ?? ''),
+    };
+  }
+
+  /**
    * Release the opening intent of an answer at the first body clip's real start. The generic
    * boundary release may defer a busy action or skip an already-served clip index, which used to
    * leave the intent pending until `speechEnd` — after the host had already moved the status out
@@ -3209,11 +3235,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       dropPendingIntent('expired', { by: 'clip-start', at, intentLabel: 'answer-start' });
       return { ok: false, code: null, released: false, dropped: true, reason: 'expired' };
     }
-    if (actionState.current !== null) {
+    // Without preset execution there is no channel arbitration to run: a busy boundary stays the
+    // legacy miss, byte for byte. With it, the opening gesture may take over instead (item 5).
+    const takeover = presetExecution === true ? answerStartTakeover() : null;
+    if (takeover === null && actionState.current !== null) {
       dropPendingIntent('missed', { by: 'clip-start', at, intentLabel: 'answer-start' });
       return { ok: false, code: null, released: false, dropped: true, reason: 'missed' };
     }
-    const released = releaseIntent(at, 'sentence-start');
+    const released = releaseIntent(at, 'sentence-start', { takeover });
     if (released.released !== true && released.dropped !== true) {
       // It stayed pending (an unexpected gate): never let it wait for speechEnd.
       dropPendingIntent('missed', { by: 'clip-start', at, intentLabel: 'answer-start' });
@@ -3284,14 +3313,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * sentence boundary (clip start / head window / speech end); an action already running defers the
    * intent to the next boundary instead of cutting it.
    */
-  function releaseIntent(at, reason = 'sentence-start') {
+  function releaseIntent(at, reason = 'sentence-start', { takeover = null } = {}) {
     const pending = intentState.pending;
     if (pending === null) return { ok: true, code: null, released: false, dropped: false };
     if (pending.generation !== intentState.generation) {
       dropPendingIntent('stale-generation', { by: reason, at });
       return { ok: false, code: 'STALE_INTENT', released: false, dropped: true, reason: 'stale-generation' };
     }
-    if (actionState.current !== null) {
+    if (actionState.current !== null && takeover === null) {
       // A deferral is a RELEASE PATH that did not release: count it as "other", remember it on the
       // staged intent so the eventual action's trace can name `action-busy`, and keep the ticket.
       intentState.releasedOther += 1;
@@ -3319,8 +3348,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       const targetVerified = attention?.verified === true && attention?.mode === 'user'
         && (controlled.includes('gazeX') || controlled.includes('gazeY'));
       // One preset trajectory at a time: an autonomous idle draw already in flight owns the pose
-      // until it ends, so this boundary holds instead of stacking a second choreography.
-      const presetBusy = (snap.motion?.presets?.active?.length ?? 0) > 0;
+      // until it ends, so this boundary holds instead of stacking a second choreography. A
+      // TAKEOVER is exactly the other case: the executor arbitrates the conflict itself, so this
+      // boundary must not hold — waiting here would delay the gesture past its own moment.
+      const presetBusy = takeover === null && (snap.motion?.presets?.active?.length ?? 0) > 0;
       // Observability only: the host itself decided this boundary holds (another preset owns the
       // pose). It reports the skip through the controller and draws nothing.
       if (presetBusy) inner.notePresetSkip('busy', { event: presetEvent, at });
@@ -3335,7 +3366,29 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           directionVerified: attentionDirectionVerified === true,
           generation: pending.generation,
           seed: `intent:${pending.ticket}:${pending.event}`,
+          takeover,
         });
+      if (takeover !== null && drawn.started !== true && drawn.reason === 'takeover-unavailable') {
+        // Arbitration refused: nothing was displaced and nothing is queued. The opening gesture is
+        // dropped HERE, at its own boundary, and can never be made up later.
+        intentState.dropped += 1;
+        recordIdleEvent('avatar.intent.dropped', {
+          reason: 'takeover-unavailable',
+          event: pending.event,
+          /** The boundary contract names the phase, exactly like `dropPendingIntent`. */
+          intent: pending.event === 'answer-start' ? 'answer-start' : pending.intent,
+          mapped: pending.intent,
+          actionId,
+          generation: pending.generation,
+          by: reason,
+          takeover: drawn.takeover ?? null,
+          at,
+        });
+        return {
+          ok: false, code: null, intent: pending.intent, actionId, released: false, dropped: true,
+          reason: 'takeover-unavailable', takeover: drawn.takeover ?? null,
+        };
+      }
       // Release-path evidence is identical for a preset: a real gesture released at a clip start
       // is a clip-start release, every other path is "other". An unselected hold is neither.
       if (reason === 'sentence-start' && clipState.active === true) intentState.releasedAtClipStart += 1;
@@ -3344,6 +3397,15 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         intentState.lastIntent = drawn.presetId;
         intentState.started += 1;
         intentState.lastIntentProfile = null;
+        // A successful takeover hands the serial slot over: the displaced action's record ends WITH
+        // a reason, while its motion is not cut — the executor keeps its kept channels and
+        // cross-fades the shared ones out over the takeover window.
+        if (takeover !== null && drawn.takeover?.ok === true && actionState.current !== null) {
+          endAction(at, {
+            interrupted: (drawn.takeover.yieldedChannels ?? []).length > 0,
+            by: 'takeover',
+          });
+        }
         startAction({ name: drawn.presetId }, at, {
           deliver: false,
           actionId,
@@ -3364,6 +3426,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           event: pending.event,
           profile: null,
           presetId: drawn.presetId,
+          /** Controller-side identity of the live trajectory (the takeover lookup uses it). */
+          presetActionId: drawn.actionId ?? null,
           presetOperations: [...drawn.operations],
         });
         recordIdleEvent('avatar.preset.action', {
@@ -3378,6 +3442,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           ok: true, code: null, intent: 'preset', presetId: drawn.presetId, actionId,
           released: true, dropped: false, durationMs: drawn.durationMs,
           channels: [...drawn.channels], operations: [...drawn.operations],
+          takeover: drawn.takeover ?? null,
         };
       }
       // The selector held: keep the current posture, write no preset channel, and say why.
@@ -4632,6 +4697,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           profile: actionState.current.profile ?? null,
           /** Preset execution: the stable preset id and the ordered symbolic operations in flight. */
           presetId: actionState.current.presetId ?? null,
+          /** Controller-side live-trajectory id; the answer-start takeover lookup uses it. */
+          presetActionId: actionState.current.presetActionId ?? null,
           presetOperations: [...(actionState.current.presetOperations ?? [])],
           /** Scheduling time (when the scheduler started the action), not the animation's start. */
           startedAt: actionState.current.startedAt,

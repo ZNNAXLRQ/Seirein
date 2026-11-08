@@ -384,6 +384,33 @@ const conclusionEnvelope = (t) => {
 };
 
 
+/**
+ * Item 5 — the answer's opening gesture may TAKE OVER a pre-answer action.
+ *
+ * `answer-start` is bound to the first body clip's REAL start, so it arrives while a thinking /
+ * listening / idle draw may still own the pose. Waiting for that action would move the gesture
+ * past the moment it belongs to, and cutting it would jump the pose. The opening gesture therefore
+ * takes over, but only:
+ *   - from an autonomous, pre-answer action (an explicit gesture is never displaced);
+ *   - on the channels the two really share — every other channel keeps its current owner;
+ *   - through a short cross-fade inside [FADE_MIN_MS, FADE_MAX_MS], so the pose never jumps.
+ * An owner outside that class, a transition outside the window or a channel set that cannot be
+ * split is a REFUSAL (`takeover-unavailable`): the opening gesture is skipped, never queued.
+ */
+export const PRESET_TAKEOVER = Object.freeze({
+  FADE_MS: 200,
+  FADE_MIN_MS: 120,
+  /** Hard ceiling: a longer transition is not the "short hand-over" this feature may take. */
+  FADE_MAX_MS: 240,
+  /** The only action phases that may yield (an autonomous / pre-answer draw). */
+  YIELDABLE_EVENTS: Object.freeze([
+    'thinking', 'listening', 'user-speaking', 'turn-start', 'idle', 'sentence-gap',
+  ]),
+  /** Channels written absolutely (a min blend): two owners can never share one, so no takeover. */
+  ABSOLUTE_CHANNELS: Object.freeze(['eyeOpenL', 'eyeOpenR']),
+});
+
+
 const DEFAULT_CONFIG = Object.freeze({
   computeHz: TIMING.COMPUTE_HZ,
   flushIntervalMs: TIMING.FLUSH_INTERVAL_MS,
@@ -463,6 +490,12 @@ const DEFAULT_CONFIG = Object.freeze({
    * — the `status.live2d.runtime.motion.presets` projection is maintained either way.
    */
   presetDebugEvents: true,
+  /**
+   * Answer-start takeover cross-fade (item 5). Configurable inside [120, 240] ms; a value outside
+   * that window makes the takeover unavailable instead of silently clamping it to a snap or a
+   * long dissolve.
+   */
+  presetTakeoverFadeMs: PRESET_TAKEOVER.FADE_MS,
   random: Math.random,
   now: null,
 });
@@ -940,6 +973,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       selectSeq: 0,
       generation: 0,
       starts: 0,
+      /** Answer-start takeovers that really displaced part (or all) of a pre-answer action. */
+      takeovers: 0,
       holds: 0,
       selected: 0,
       dropped: 0,
@@ -2439,6 +2474,102 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return finishPresetTrace(item, now, { interrupted });
   }
 
+  // ---- answer-start takeover (item 5) ----------------------------------------------------
+  /**
+   * The takeover cross-fade in force, or `null` when the configured value is outside the short
+   * window. A `null` answer is a REFUSAL, never a silent clamp to a snap or a long dissolve.
+   */
+  function resolveTakeoverFadeMs() {
+    const raw = finite(cfg.presetTakeoverFadeMs, PRESET_TAKEOVER.FADE_MS);
+    return raw >= PRESET_TAKEOVER.FADE_MIN_MS && raw <= PRESET_TAKEOVER.FADE_MAX_MS
+      ? Math.round(raw) : null;
+  }
+
+  /**
+   * Arbitrate an opening gesture against the action that owns the pose. This is a PURE decision:
+   * nothing is written, displaced or delayed here, so a refusal leaves the running action intact
+   * and the caller can report `takeover-unavailable` immediately.
+   */
+  function planTakeover(request, channels) {
+    const fadeMs = resolveTakeoverFadeMs();
+    const plan = {
+      fromAction: String(request.action ?? ''),
+      fromActionId: String(request.actionId ?? ''),
+      fromPreset: request.preset ?? null,
+      toChannels: [...channels],
+      yieldedChannels: [],
+      keptChannels: [],
+      fadeMs,
+    };
+    // A transition outside the short window can never be a safe hand-over.
+    if (fadeMs === null) return { ...plan, ok: false, reason: 'transition-out-of-window' };
+    const item = state.presets.active
+      .find((entry) => String(entry.actionId) === String(request.actionId ?? '')) ?? null;
+    // No live trajectory: either the old action already finished its motion (nothing to yield) or
+    // it is not a preset action at all (an explicit gesture is never displaced).
+    if (item === null) {
+      return request.preset === null || request.preset === undefined
+        ? { ...plan, ok: false, reason: 'explicit-action' }
+        : { ...plan, ok: true, item: null };
+    }
+    if (!PRESET_TAKEOVER.YIELDABLE_EVENTS.includes(String(item.event ?? request.event ?? ''))) {
+      return { ...plan, ok: false, reason: 'explicit-action' };
+    }
+    const yielded = item.channels.filter((channel) => channels.includes(channel));
+    const kept = item.channels.filter((channel) => !channels.includes(channel));
+    // An absolute channel (eye-open) has no blend: two owners cannot share it even for 200 ms.
+    if (yielded.some((channel) => PRESET_TAKEOVER.ABSOLUTE_CHANNELS.includes(channel))) {
+      return { ...plan, ok: false, reason: 'channel-not-separable', yieldedChannels: yielded, keptChannels: kept };
+    }
+    return { ...plan, ok: true, item, yieldedChannels: yielded, keptChannels: kept };
+  }
+
+  /** Start the cross-fade on the CONFLICT channels only; every kept channel keeps its owner. */
+  function applyTakeover(plan, toItem, at) {
+    const from = plan.item;
+    if (plan.yieldedChannels.length > 0) {
+      from.yieldAt = at;
+      from.yieldFadeMs = plan.fadeMs;
+      for (const channel of plan.yieldedChannels) from.yieldChannels.add(channel);
+      from.trace.interrupt = {
+        reason: 'takeover', at, fadeMs: plan.fadeMs, by: plan.fromAction, toPreset: toItem.presetId,
+      };
+    }
+    state.presets.takeovers += 1;
+    // `fromAction` is the displaced action (its preset id), `toPreset` the opening gesture; the
+    // channel lists say exactly what moved and what stayed with the old owner.
+    recordEvent('avatar.preset.takeover', {
+      fromAction: plan.fromAction,
+      fromActionId: plan.fromActionId,
+      fromPreset: from.presetId,
+      toPreset: toItem.presetId,
+      toActionId: toItem.actionId,
+      yieldedChannels: [...plan.yieldedChannels],
+      keptChannels: [...plan.keptChannels],
+      fadeMs: plan.fadeMs,
+      at,
+    });
+    return plan;
+  }
+
+  /**
+   * The fade is over: the yielded channels leave the old owner entirely, so exactly ONE action
+   * owns each of them from here on. An action with nothing left simply ends (its kept channels —
+   * if any — keep running to their own natural end).
+   */
+  function completeTakeoverYield(item, now) {
+    const yielded = [...item.yieldChannels];
+    item.yieldAt = null;
+    item.yieldFadeMs = 0;
+    item.yieldChannels.clear();
+    item.channels = item.channels.filter((channel) => !yielded.includes(channel));
+    item.yieldedReleased.push(...yielded);
+    recordEvent('avatar.preset.takeover.done', {
+      actionId: item.actionId, presetId: item.presetId, channels: yielded, at: now,
+    });
+    if (item.channels.length === 0) removePresetItem(item, now, { interrupted: true });
+  }
+
   /**
    * Execute one already-selected preset through the ONE controller. The operations keep their
    * order and channels; a failed capability check is a hold, never a silent partial gesture.
@@ -2484,6 +2615,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         selectionId: selection?.selectionId ?? null, actionId: null,
       }, at);
       return { ok: true, started: false, kind: 'hold', reason, selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
+    }
+    // Answer-start takeover (item 5): decided BEFORE anything is written or displaced. A refusal
+    // returns here, so the running action is untouched and the caller can drop the opening gesture
+    // at once instead of waiting for that action to end.
+    const toChannels = [...new Set(built.stages.flatMap((stage) => stage.channels))];
+    const takeover = options.takeover ? planTakeover(options.takeover, toChannels) : null;
+    if (takeover !== null && takeover.ok !== true) {
+      return {
+        ok: true, started: false, kind: 'hold', reason: 'takeover-unavailable', takeover,
+        trace: clonePresetTrace(state.presets.lastTrace),
+      };
     }
     const trace = presetTraceBase({
       ...selection,
@@ -2538,6 +2680,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       firstCommitted: null,
       /** Acknowledgements merged by this action id; never a per-frame counter. */
       commitCount: 0,
+      /** Takeover state: the channels fading OUT to a newer owner, and when that fade began. */
+      yieldChannels: new Set(),
+      yieldAt: null,
+      yieldFadeMs: 0,
+      /** Channels already handed over after the fade completed (evidence only). */
+      yieldedReleased: [],
       trace,
     };
     state.presets.active.push(item);
@@ -2548,6 +2696,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       finishPresetTrace(evicted, at, { interrupted: true });
     }
     handOffReleases(item.channels);
+    if (takeover !== null && takeover.ok === true && takeover.item !== null) {
+      applyTakeover(takeover, item, at);
+    }
     state.presets.starts += 1;
     state.presets.lastSign = state.presets.lastSign ?? Object.create(null);
     state.presets.history.push({ id: selection.presetId, at });
@@ -2580,6 +2731,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       started: true,
       kind: 'preset',
       actionId,
+      /** Item 5: the arbitration that let this action replace a pre-answer one (null = none). */
+      takeover: takeover !== null && takeover.ok === true
+        ? {
+            ok: true,
+            fromAction: takeover.fromAction,
+            fromActionId: takeover.fromActionId,
+            fromPreset: takeover.fromPreset,
+            toChannels: [...takeover.toChannels],
+            yieldedChannels: [...takeover.yieldedChannels],
+            keptChannels: [...takeover.keptChannels],
+            fadeMs: takeover.fadeMs,
+          }
+        : null,
       event: item.event,
       selectionId: item.selectionId,
       presetId: selection.presetId,
@@ -2606,6 +2770,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       at: Number.isFinite(context.at) ? context.at : clockNow(),
       generation: context.generation,
       context,
+      /** Item 5: the opening gesture arbitrated against the action that owns the pose. */
+      takeover: context.takeover ?? null,
     });
   }
 
@@ -2622,6 +2788,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const item = state.presets.active[index];
       const elapsed = now - item.startedAt;
       if (elapsed < 0) continue;
+      // A finished takeover fade releases the yielded channels to the new owner (and ends an
+      // action that has nothing left to drive) before this frame contributes anything.
+      if (item.yieldAt !== null && now - item.yieldAt >= Math.max(1, item.yieldFadeMs)) {
+        completeTakeoverYield(item, now);
+        if (item.done === true) continue;
+      }
       let fade = 1;
       if (item.cancelledAt !== null) {
         const cancelElapsed = now - item.cancelledAt;
@@ -2631,6 +2803,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         }
         fade = 1 - smootherstep(cancelElapsed / Math.max(1, item.cancelFadeMs));
       }
+      // A takeover scales ONLY the channels the newer action needs; every kept channel keeps its
+      // full contribution until the old action's own end.
+      const yieldFade = item.yieldAt === null
+        ? 1 : 1 - smootherstep((now - item.yieldAt) / Math.max(1, item.yieldFadeMs));
       if (elapsed >= item.durationMs) {
         removePresetItem(item, now, { interrupted: item.cancelledAt !== null });
         continue;
@@ -2642,7 +2818,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         const values = presetStageValues(stage, envelope.wave);
         let any = false;
         for (const [channel, value] of Object.entries(values)) {
-          const scaled = finite(value, 0) * fade;
+          // Ownership: a channel this action already handed over is no longer its to write.
+          if (!item.channels.includes(channel)) continue;
+          let scaled = finite(value, 0) * fade;
+          if (item.yieldChannels.has(channel)) scaled *= yieldFade;
           if (!Number.isFinite(scaled)) continue;
           if (PRESET_HEAD_CHANNELS.includes(channel) || channel === 'bodyX' || channel === 'bodyY' || channel === 'bodyZ') {
             adds[channel] += scaled;
@@ -2983,6 +3162,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return {
       enabled: state.presets.enabled,
       starts: state.presets.starts,
+      takeovers: state.presets.takeovers,
       holds: state.presets.holds,
       selected: state.presets.selected,
       dropped: state.presets.dropped,
@@ -3002,8 +3182,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         family: item.family,
         recipe: item.recipe,
         variant: item.variant,
+        /** The phase this action was started for (`thinking` / `idle` / `answer-start` / …). */
+        event: item.event,
         operations: [...item.operations],
         channels: [...item.channels],
+        /** Answer-start takeover: what this action is fading out, and what it still owns. */
+        yieldedChannels: [...item.yieldChannels],
+        keptChannels: item.channels.filter((channel) => !item.yieldChannels.has(channel)),
+        yieldFadeMs: item.yieldFadeMs,
+        releasedChannels: [...item.yieldedReleased],
         startedAt: item.startedAt,
         durationMs: item.durationMs,
         remainingMs: Math.max(0, item.durationMs - ((state.lastAt ?? 0) - item.startedAt)),
