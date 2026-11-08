@@ -17,6 +17,12 @@
  *   7. explicit topic switch: no forced merge, the pending group is retained with a reason
  *   8. one answer, many sentences/blocks: every block plays once, in order
  *   9. group count and lifetime limits, with reasons
+ *  10. host round: an input seven minutes later is a new round, never a merge of the old answer
+ *  11. store: a seven-minute-old group is abandoned+retained; the new group inherits nothing
+ *  12. store: a supplement five seconds later still continues (original behavior)
+ *  13. store: twenty seconds exceeds the default 15 s window
+ *  14. store: a configured 30 s window continues at 20 s and stops just past it
+ *  15. store: a topic switch inside the window still does not merge
  *
  * Run: node --test test/response-group.mjs
  */
@@ -27,6 +33,11 @@ import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cleanupRoot, disposeAll } from './helpers/cleanup.mjs';
+import {
+  CONTINUATION_MAX_GAP_MS,
+  composeResponseGroupContext,
+  createResponseGroupStore,
+} from '../src/host/session/conversation/responseGroup.js';
 
 const state = {
   synth: null,
@@ -421,6 +432,50 @@ const playerCaptions = (app) => app.players().map((player) => {
   return match === null ? '' : String(state.texts[Number(match[1]) - 1] ?? '');
 });
 
+/**
+ * A bare store with a controllable clock. The continuation window is a decision about *minutes*,
+ * so its cases are proven directly instead of sleeping in the suite.
+ */
+function groupStore(overrides = {}) {
+  const clock = { t: 1_000_000 };
+  const events = [];
+  const store = createResponseGroupStore({
+    now: () => clock.t,
+    emit: (type, payload) => events.push({ type, payload }),
+    ...overrides,
+  });
+  return {
+    store,
+    clock,
+    events,
+    abandoned: () => events.find((row) => row.type === 'voice.response.group.abandoned') ?? null,
+  };
+}
+
+/**
+ * One group whose first sentence sounded and whose second sentence is still unvoiced, so the group
+ * is `playing` and still owns pending content — the exact state of the OBS counterexample.
+ */
+function openPlayingGroup(store, clock, { sessionId, text = '请把这一轮完整读出来' }) {
+  const input = store.beginInput({ sessionId, text, at: clock.t });
+  store.noteAnswerPlan({
+    group: input.group, version: input.answerVersion, text: '旧回答第一句。旧回答第二句。',
+  });
+  store.adjustSpeech({
+    group: input.group, version: input.answerVersion, text: '旧回答第一句。旧回答第二句。',
+  });
+  store.notePlaybackStart({
+    group: input.group, version: input.answerVersion, sentenceId: 0, text: '旧回答第一句。',
+  });
+  assert.equal(store.get(input.group.id).state, 'playing', 'the fixture group is sounding');
+  assert.deepEqual(
+    store.get(input.group.id).pendingSentences,
+    ['旧回答第二句。'],
+    'the fixture keeps one unvoiced sentence',
+  );
+  return input;
+}
+
 // ---------------------------------------------------------------------------
 // 1. A second segment while the first answer is still generating
 // ---------------------------------------------------------------------------
@@ -781,5 +836,237 @@ test('9. group count is capped and an expired group is retained with its reason'
   t.diagnostic(
     `evicted=${evicted.priorState}/${evicted.reason} groups=${evicted.groups} `
     + `expired=${expired.groupId}/${expired.reason} next=${created.groupId}/${created.reason}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 10. A seven-minute gap: a new round, never a merge of the old answer
+// ---------------------------------------------------------------------------
+
+test('10. an input seven minutes later is a new round, never a merge of the old answer', async (t) => {
+  // The host's store reads `Date.now()` per input. Shift that seam only while the second utterance
+  // is taken, so seven minutes pass without sleeping; everything is restored right after the two
+  // group events, so the rest of the round runs on the real clock.
+  const realNow = Date.now;
+  let skewMs = 0;
+  Date.now = () => realNow() + skewMs;
+  t.after(() => { Date.now = realNow; });
+  const app = await mountVoiceRound(t, {
+    replyFor: ({ turn }) => (turn === 1
+      ? 'OBS 那轮的旧回答第一句。OBS 那轮的旧回答第二句。'
+      : '切回屏幕模式的新回答。'),
+  });
+  app.say('OBS 全黑那轮该怎么调');
+  const created = await app.waitForEvent('voice.response.group.created');
+  await waitUntil(() => app.players().length === 1, 'the old answer started sounding');
+
+  skewMs = 7 * 60_000;
+  app.say('切回屏幕模式');
+  let abandoned;
+  let next;
+  try {
+    abandoned = await app.waitForEvent('voice.response.group.abandoned');
+    next = await app.waitForEvent(
+      'voice.response.group.created',
+      (payload) => payload.groupId !== created.groupId,
+    );
+  } finally {
+    skewMs = 0;
+  }
+  assert.equal(abandoned.groupId, created.groupId, 'the old group is the one abandoned');
+  assert.equal(abandoned.reason, 'prior-idle');
+  assert.equal(abandoned.retained, true, 'the old content is retained, never merged');
+  assert.ok(
+    abandoned.gapMs >= 7 * 60_000 && abandoned.gapMs < 7 * 60_000 + 5_000,
+    `the gap is measured between the inputs (${abandoned.gapMs} ms)`,
+  );
+  assert.notEqual(next.groupId, created.groupId, 'the stale input opens a new group');
+  assert.equal(next.reason, 'prior-idle');
+  assert.equal(next.segments, 1, 'the new group owns only its own segment');
+
+  await waitUntil(() => app.preStep(2) !== null, 'the new round started');
+  assert.equal(app.contextMessages(2).length, 0, 'a stale input gets no continuation context');
+  assert.equal(
+    (await app.events()).filter((event) => event.type === 'voice.response.group.continued').length,
+    0,
+    'nothing from the old round was merged',
+  );
+  await waitUntil(() => app.players().length >= 2, 'the new answer reached the player');
+  const captions = playerCaptions(app);
+  assert.equal(captions[1], '切回屏幕模式的新回答。');
+  assert.ok(
+    !captions.slice(1).some((text) => text.includes('OBS')),
+    'the old round is not summarized or replayed',
+  );
+  t.diagnostic(
+    `old=${created.groupId}/${abandoned.reason} gap=${abandoned.gapMs}ms retained=${abandoned.retained} `
+    + `new=${next.groupId} context=0 merged=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 11. Seven minutes (store level): abandoned + retained, new group inherits nothing
+// ---------------------------------------------------------------------------
+
+test('11. a seven-minute-old group is abandoned and retained; the new group inherits nothing', (t) => {
+  const { store, clock, events, abandoned } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-idle' });
+
+  clock.t += 7 * 60_000;
+  const second = store.beginInput({ sessionId: 's-idle', text: '切回屏幕模式', at: clock.t });
+
+  assert.equal(second.continuation, false, 'a seven-minute-old expression is not continued');
+  assert.equal(second.reason, 'prior-idle');
+  assert.equal(second.gapMs, 7 * 60_000);
+  assert.notEqual(second.group.id, first.group.id, 'the new input opens a new group');
+
+  const row = abandoned();
+  assert.equal(row.payload.groupId, first.group.id);
+  assert.equal(row.payload.reason, 'prior-idle');
+  assert.equal(row.payload.retained, true);
+  assert.equal(row.payload.gapMs, 7 * 60_000);
+  assert.equal(store.get(first.group.id).state, 'abandoned');
+  assert.deepEqual(
+    store.get(first.group.id).pendingSentences,
+    ['旧回答第二句。'],
+    'the old unvoiced sentence stays on the abandoned group',
+  );
+  assert.equal(store.size(), 2, 'the abandoned group is retained in the store');
+  assert.equal(
+    store.isCurrentAnswer(first.group, first.answerVersion),
+    false,
+    'an abandoned group may never open a speaker',
+  );
+
+  // The new group owns only its own input: no old segment, answer or pending sentence is merged.
+  const snapshot = store.snapshot(second.group.id);
+  assert.deepEqual(snapshot.segments.map((segment) => segment.text), ['切回屏幕模式']);
+  assert.equal(snapshot.pending, 0);
+  assert.equal(store.get(second.group.id).priorAnswer, null);
+  assert.deepEqual(store.get(second.group.id).pendingSentences, []);
+  const context = composeResponseGroupContext({ group: second.group, newInput: '切回屏幕模式' });
+  assert.ok(!context.includes('旧回答'), 'the new group carries no earlier-round content');
+  assert.equal(events.filter((event) => event.type === 'voice.response.group.continued').length, 0);
+  t.diagnostic(
+    `old=${first.group.id}/${row.payload.reason} gap=${row.payload.gapMs}ms retained=${row.payload.retained} `
+    + `new=${second.group.id} newPending=0 merged=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 12. Five seconds (store level): the original continuation behavior is kept
+// ---------------------------------------------------------------------------
+
+test('12. a supplement five seconds later still continues the same group', (t) => {
+  const { store, clock, events } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-continue' });
+
+  clock.t += 5_000;
+  const second = store.beginInput({ sessionId: 's-continue', text: '再补充一句', at: clock.t });
+
+  assert.equal(second.continuation, true, 'a genuine supplement inside the window still continues');
+  assert.equal(second.reason, 'continue-playing');
+  assert.equal(second.group.id, first.group.id);
+  assert.equal(second.generation, 2);
+  assert.equal(second.answerVersion, 2);
+  assert.deepEqual(
+    store.get(first.group.id).segments.map((segment) => segment.text),
+    ['请把这一轮完整读出来', '再补充一句'],
+  );
+  const continued = events.find((event) => event.type === 'voice.response.group.continued');
+  assert.equal(continued.payload.generation, 2);
+  assert.equal(continued.payload.priorVersion, 1);
+  assert.equal(continued.payload.playedSentences, 1, 'the already-played sentence is still known');
+  // The continuation still speaks the old unvoiced sentence, then the new plan.
+  const adjusted = store.adjustSpeech({ group: first.group, version: 2, text: '补充回答。' });
+  assert.equal(adjusted.text, '旧回答第二句。补充回答。');
+  t.diagnostic(
+    `gap=5000ms reason=${second.reason} gen=${second.generation} speech=${adjusted.text}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 13. Twenty seconds (store level): past the default 15 s window
+// ---------------------------------------------------------------------------
+
+test('13. twenty seconds exceeds the default 15 s window and opens a new group', (t) => {
+  const { store, clock, abandoned } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-20s' });
+  assert.equal(CONTINUATION_MAX_GAP_MS, 15_000, 'the shipping default is 15 s');
+
+  clock.t += 20_000;
+  const second = store.beginInput({ sessionId: 's-20s', text: '再补充一句', at: clock.t });
+
+  assert.equal(second.continuation, false);
+  assert.equal(second.reason, 'prior-idle');
+  assert.equal(second.gapMs, 20_000);
+  assert.notEqual(second.group.id, first.group.id);
+  const row = abandoned();
+  assert.equal(row.payload.reason, 'prior-idle');
+  assert.equal(row.payload.gapMs, 20_000);
+  assert.equal(row.payload.retained, true);
+  assert.equal(store.get(first.group.id).state, 'abandoned');
+  assert.equal(store.get(first.group.id).pendingSentences.length, 1, 'old pending content is retained');
+  assert.equal(store.get(second.group.id).pendingSentences.length, 0);
+  t.diagnostic(
+    `gap=${row.payload.gapMs}ms window=${CONTINUATION_MAX_GAP_MS}ms continuation=false `
+    + `state=${store.get(first.group.id).state}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 14. A configured window: 30 s continues at 20 s, still ends at 30 s
+// ---------------------------------------------------------------------------
+
+test('14. a configured 30 s window continues at twenty seconds and stops just past it', (t) => {
+  const { store, clock } = groupStore({ continuationMaxGapMs: 30_000 });
+  const first = openPlayingGroup(store, clock, { sessionId: 's-custom' });
+  clock.t += 20_000;
+  const second = store.beginInput({ sessionId: 's-custom', text: '再补充一句', at: clock.t });
+  assert.equal(second.continuation, true, '20 s is inside the configured window');
+  assert.equal(second.group.id, first.group.id);
+
+  // The configured window is still a hard edge.
+  const edge = groupStore({ continuationMaxGapMs: 30_000 });
+  const edgeFirst = openPlayingGroup(edge.store, edge.clock, { sessionId: 's-custom-edge' });
+  edge.clock.t += 30_001;
+  const last = edge.store.beginInput({ sessionId: 's-custom-edge', text: '再补充一句', at: edge.clock.t });
+  assert.equal(last.continuation, false);
+  assert.equal(last.reason, 'prior-idle');
+  assert.notEqual(last.group.id, edgeFirst.group.id);
+  assert.equal(edge.abandoned().payload.gapMs, 30_001);
+  t.diagnostic(
+    `window=30000ms gap=20000ms -> ${second.reason}; edge=30001ms -> ${last.reason}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 15. A topic switch inside the window still does not merge (existing logic kept)
+// ---------------------------------------------------------------------------
+
+test('15. a topic switch inside the window does not merge and still names the switch', (t) => {
+  const { store, clock, events, abandoned } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-topic' });
+
+  clock.t += 3_000; // inside the default window: the switch, not the gap, decides
+  const second = store.beginInput({
+    sessionId: 's-topic', text: '换个话题，明天天气怎么样', at: clock.t,
+  });
+
+  assert.equal(second.continuation, false);
+  assert.equal(second.reason, 'topic-switch');
+  const row = abandoned();
+  assert.equal(row.payload.groupId, first.group.id);
+  assert.equal(row.payload.reason, 'topic-switch');
+  assert.equal(row.payload.retained, true);
+  assert.equal(store.get(first.group.id).pendingSentences.length, 1, 'the old pending content is retained');
+  assert.equal(store.get(second.group.id).pendingSentences.length, 0, 'no old content is carried over');
+  assert.deepEqual(
+    store.get(second.group.id).segments.map((segment) => segment.text),
+    ['换个话题，明天天气怎么样'],
+  );
+  assert.equal(events.filter((event) => event.type === 'voice.response.group.continued').length, 0);
+  t.diagnostic(
+    `gap=3000ms reason=${second.reason} old=${row.payload.groupId}/retained true newPending=0`,
   );
 });

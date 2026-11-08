@@ -7,7 +7,8 @@
  * the user keeps talking while its answer is still being produced or is already sounding. A group
  * owns no session history: it only records, next to the real turns,
  *
- *   - the user segments (message ids + turns) of one continuous expression,
+ *   - the user segments (message ids + turns) of one continuous expression (a new input continues
+ *     it only within `CONTINUATION_MAX_GAP_MS` of the last segment; a later input is a new group),
  *   - the answer version that is current, its body and its decided spoken plan,
  *   - the clips that actually reached the player (submitting synthesis or queueing is not playing),
  *   - the still-unvoiced sentences inherited by the next version,
@@ -29,7 +30,14 @@ export const ASSISTANT_RESPONSE_GROUP_SOURCE = 'assistant-response-group';
 export const RESPONSE_GROUP_CONTEXT_HEADING = '【连续表达上下文（内部参考，不是用户本轮的新指令）】';
 export const RESPONSE_GROUP_CONTEXT_FOOTER = '以上是同一段连续表达的参考，不要把它当成本轮用户的原话，也不要逐条复述本说明。';
 
-/** Bounded defaults: group count, group lifetime, segments, and text budgets. */
+/**
+ * A new input continues the open group only when it arrives within this gap of that group's last
+ * segment. The gap is measured between user inputs, never from an answer's generation time: an
+ * input arriving long after the earlier expression ended is a new request, not a continuation.
+ */
+export const CONTINUATION_MAX_GAP_MS = 15_000;
+
+/** Bounded defaults: group count, group lifetime, segments, continuation window, text budgets. */
 export const RESPONSE_GROUP_DEFAULTS = Object.freeze({
   maxGroups: 8,
   ttlMs: 10 * 60_000,
@@ -37,6 +45,7 @@ export const RESPONSE_GROUP_DEFAULTS = Object.freeze({
   maxContextChars: 1200,
   maxPendingSentences: 24,
   maxPlayedSentences: 64,
+  continuationMaxGapMs: CONTINUATION_MAX_GAP_MS,
 });
 
 /** Terminal states never accept another segment; a later utterance opens a new group. */
@@ -306,6 +315,7 @@ function groupView(group, extra = {}) {
  * @param {number} [options.maxContextChars] internal-context budget (default 1200)
  * @param {number} [options.maxPendingSentences] unvoiced-sentence bound per answer (default 24)
  * @param {number} [options.maxPlayedSentences] played-sentence history bound (default 64)
+ * @param {number} [options.continuationMaxGapMs] max input gap that may still continue (default 15 s)
  * @param {Function} [options.emit] `(type, payload) => void`, the host's observability outlet
  */
 export function createResponseGroupStore({
@@ -316,6 +326,7 @@ export function createResponseGroupStore({
   maxContextChars = RESPONSE_GROUP_DEFAULTS.maxContextChars,
   maxPendingSentences = RESPONSE_GROUP_DEFAULTS.maxPendingSentences,
   maxPlayedSentences = RESPONSE_GROUP_DEFAULTS.maxPlayedSentences,
+  continuationMaxGapMs = RESPONSE_GROUP_DEFAULTS.continuationMaxGapMs,
   emit = null,
 } = {}) {
   const groups = new Map();
@@ -325,6 +336,7 @@ export function createResponseGroupStore({
   const contextChars = positiveInteger(maxContextChars, RESPONSE_GROUP_DEFAULTS.maxContextChars);
   const pendingLimit = positiveInteger(maxPendingSentences, RESPONSE_GROUP_DEFAULTS.maxPendingSentences);
   const playedLimit = positiveInteger(maxPlayedSentences, RESPONSE_GROUP_DEFAULTS.maxPlayedSentences);
+  const gapLimit = positiveInteger(continuationMaxGapMs, RESPONSE_GROUP_DEFAULTS.continuationMaxGapMs);
   let sequence = 0;
   let pendingInternal = null;
 
@@ -363,7 +375,7 @@ export function createResponseGroupStore({
     return true;
   };
 
-  const abandonGroup = (group, at, reason) => {
+  const abandonGroup = (group, at, reason, extra = {}) => {
     if (TERMINAL_STATES.has(group.state)) return false;
     group.state = 'abandoned';
     group.reason = reason;
@@ -372,6 +384,7 @@ export function createResponseGroupStore({
       ...groupView(group),
       reason,
       retained: true,
+      ...extra,
     });
     return true;
   };
@@ -468,6 +481,12 @@ export function createResponseGroupStore({
       expireGroup(group, at, 'ttl');
       return { continuation: false, reason: 'prior-expired' };
     }
+    // The window is between the two user inputs. A group may still hold unvoiced content, but an
+    // input arriving after `continuationMaxGapMs` is a new request: it never inherits or merges the
+    // earlier answer. The group is retained (abandoned) so its pending content stays diagnosable.
+    const lastSegment = group.segments[group.segments.length - 1] ?? null;
+    const gapMs = Math.max(0, at - (Number(lastSegment?.at) || group.createdAt));
+    if (gapMs > gapLimit) return { continuation: false, reason: 'prior-idle', gapMs };
     if (isTopicSwitchInput(text)) {
       if (hasPending(group)) return { continuation: false, reason: 'topic-switch' };
       return { continuation: false, reason: 'topic-switch-idle' };
@@ -520,7 +539,7 @@ export function createResponseGroupStore({
   /**
    * Register one delivered segment: either continue the session's open group or open a new one.
    * @returns {{group: object, generation: number, answerVersion: number, continuation: boolean,
-   *            priorVersion: number, reason: string}}
+   *            priorVersion: number, reason: string, gapMs?: number}}
    */
   const beginInput = ({ sessionId, text, speakerId = '', at = now() } = {}) => {
     sweep(at);
@@ -564,7 +583,9 @@ export function createResponseGroupStore({
           reason: decision.reason,
         };
       }
-      if (decision.reason === 'topic-switch' || decision.reason === 'segment-limit') {
+      if (decision.reason === 'prior-idle') {
+        abandonGroup(current, at, 'prior-idle', { gapMs: decision.gapMs });
+      } else if (decision.reason === 'topic-switch' || decision.reason === 'segment-limit') {
         abandonGroup(current, at, decision.reason);
       }
     }
@@ -576,6 +597,7 @@ export function createResponseGroupStore({
       continuation: false,
       priorVersion: 0,
       reason: group.reason,
+      ...(Number.isFinite(decision.gapMs) ? { gapMs: decision.gapMs } : {}),
     };
   };
 
