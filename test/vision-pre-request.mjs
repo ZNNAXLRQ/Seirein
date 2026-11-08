@@ -11,6 +11,13 @@
  *   ④ a non-reuse delivery keeps the exact same result shape and image block;
  *   ⑤ a failed preparation leaves the turn running (fail-open) and the read still delivers.
  *
+ * P2-1 owner binding, driven on a bare channel (no sight.js/OBS at all), ⑥-⑩:
+ *   ⑥ a late capture from the old turn is discarded and never overwrites the new turn;
+ *   ⑦ a late failure clears only its own entry and keeps the new turn's frame;
+ *   ⑧ two sessions preparing concurrently keep one frame each;
+ *   ⑨ take() with a mismatched session/turn/source/scene is a miss and returns null;
+ *   ⑩ same-turn reuse still holds (attributed and unattributed callers).
+ *
  * Run: node --test test/vision-pre-request.mjs
  */
 import assert from 'node:assert/strict';
@@ -26,8 +33,9 @@ import { cleanupRoot } from './helpers/cleanup.mjs';
 
 const deferred = () => {
   let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -105,6 +113,9 @@ const hooks = registerHooks({
 });
 const { apply } = await import('../src/host/index.js');
 hooks.deregister();
+// Already loaded by index.js inside the hook window, so this is the same module instance (the
+// sight.js double above, not the real capture stack).
+const { createPreRequestVision } = await import('../src/host/vision/pre-request.js');
 
 const server = createServer((socket) => socket.end());
 before(async () => { await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve)); });
@@ -424,3 +435,167 @@ test('⑤ 准备失败 fail-open：本轮照常运行，视觉读取自行采集
   t.diagnostic(`fail-open: decision=${decision?.kind} misses=prepare-failed implCalls=${state.implCalls} `
     + `delivered=${look.value.ok}`);
 });
+
+/* -------------------------------------------------------------------------------------------- *
+ * P2-1: owner binding. These drive `createPreRequestVision` directly, so a "capture" is a
+ * deferred the test settles at the exact moment it wants: no screen, ffmpeg, OBS or attachment
+ * store is involved, and the clock is frozen.
+ * -------------------------------------------------------------------------------------------- */
+
+/** A bare channel: one controllable capture per call, a frozen clock and a recorded event log. */
+function unitChannel({ ttlMs = 30_000, start = 1_000_000 } = {}) {
+  const events = [];
+  let stamp = start;
+  const shotOf = (name, at = stamp) => ({
+    file: `/fake/${name}.png`,
+    bytes: 8,
+    width: 32,
+    height: 20,
+    engine: 'fake',
+    at,
+    capturedAt: at,
+  });
+  const channel = createPreRequestVision({
+    now: () => stamp,
+    ttlMs,
+    emit: (type, payload) => events.push({ type, payload }),
+  });
+  return {
+    channel,
+    events,
+    shotOf,
+    advance: (ms) => { stamp += ms; },
+    misses: () => events
+      .filter((event) => event.type === 'vision.pre-request.miss')
+      .map((event) => event.payload.reason),
+    stales: () => events
+      .filter((event) => event.type === 'vision.pre-request.stale')
+      .map((event) => event.payload.reason),
+    reused: () => events.filter((event) => event.type === 'vision.pre-request.reused'),
+  };
+}
+
+test('⑥ P2-1 迟到成功：旧轮结果被丢弃，不覆盖新轮缓存', async (t) => {
+  const app = unitChannel();
+  const slow = deferred();
+  // Turn 1 starts a capture that will not settle yet.
+  const oldTurn = app.channel.prepare({ sessionId: 's', turn: 1, capture: () => slow.promise });
+  // Turn 2 arrives, prepares and publishes its own frame.
+  const shotB = app.shotOf('b');
+  const newTurn = app.channel.prepare({ sessionId: 's', turn: 2, capture: async () => shotB });
+  assert.equal(await newTurn, shotB);
+  assert.equal(app.channel.take({ sessionId: 's', turn: 2 })?.file, shotB.file);
+
+  // Turn 1's capture finally lands AFTER turn 2 published: it must be dropped, not published.
+  const shotA = app.shotOf('a');
+  slow.resolve(shotA);
+  assert.equal(await oldTurn, null, 'the late capture result is discarded, not returned');
+  assert.deepEqual(app.stales(), ['turn-changed'], 'the discard is recorded with its reason');
+  assert.equal(app.misses().includes('prepare-failed'), false, 'a discard is not a failure');
+
+  const after = app.channel.take({ sessionId: 's', turn: 2 });
+  assert.equal(after?.file, shotB.file, 'turn 2 still reads turn 2 frame');
+  assert.equal(app.channel.state().snapshot.turn, 2);
+  assert.equal(app.channel.take({ sessionId: 's', turn: 1 }) === null, true, 'turn 1 has no frame');
+  t.diagnostic(`late-success: discarded=stale:${app.stales().join(',')} `
+    + `turn2=${after.file} state.turn=${app.channel.state().snapshot.turn} misses=${app.misses().join(',')}`);
+});
+
+test('⑦ P2-1 迟到失败：只清理入口自身状态，不清空新轮缓存', async (t) => {
+  const app = unitChannel();
+  const slow = deferred();
+  const oldTurn = app.channel.prepare({ sessionId: 's', turn: 1, capture: () => slow.promise });
+  const shotB = app.shotOf('b');
+  const newTurn = app.channel.prepare({ sessionId: 's', turn: 2, capture: async () => shotB });
+  assert.equal(await newTurn, shotB);
+
+  slow.reject(new Error('late capture failed'));
+  assert.equal(await oldTurn, null, 'the late failure resolves as a fail-open null');
+  assert.deepEqual(app.stales(), ['turn-changed']);
+  assert.equal(app.misses().includes('prepare-failed'), false,
+    'the old turn failure is not reported against the new turn');
+  assert.equal(app.channel.take({ sessionId: 's', turn: 2 })?.file, shotB.file,
+    'turn 2 frame survived the late failure');
+  assert.equal(app.misses().length, 0);
+  t.diagnostic(`late-failure: stales=${app.stales().join(',')} turn2=${shotB.file} `
+    + `misses=${app.misses().join(',')} delivered=${app.reused().length}`);
+});
+
+test('⑧ P2-1 不同会话并发：各自缓存、互不驱逐', async (t) => {
+  const app = unitChannel();
+  const slowA = deferred();
+  const fastB = deferred();
+  const shotA = app.shotOf('a');
+  const shotB = app.shotOf('b');
+  const sessionA = app.channel.prepare({ sessionId: 'A', turn: 1, capture: () => slowA.promise });
+  const sessionB = app.channel.prepare({ sessionId: 'B', turn: 1, capture: () => fastB.promise });
+
+  fastB.resolve(shotB);
+  assert.equal(await sessionB, shotB);
+  // B published first: A has no frame of its own yet and never borrows B's.
+  assert.equal(app.channel.take({ sessionId: 'A', turn: 1 }), null);
+  assert.deepEqual(app.misses(), ['no-snapshot'], 'A misses without touching B');
+  assert.equal(app.channel.take({ sessionId: 'B', turn: 1 })?.file, shotB.file);
+
+  slowA.resolve(shotA);
+  assert.equal(await sessionA, shotA);
+  // A publishing after B must not evict B, and B's earlier read must not have evicted A.
+  assert.equal(app.channel.take({ sessionId: 'A', turn: 1 })?.file, shotA.file);
+  assert.equal(app.channel.take({ sessionId: 'B', turn: 1 })?.file, shotB.file);
+  assert.equal(app.channel.take({ sessionId: 'C', turn: 1 }) === null, true, 'a third session borrows nothing');
+  assert.deepEqual(app.stales(), [], 'no capture was discarded');
+  t.diagnostic(`sessions: A=${shotA.file} B=${shotB.file} C=miss:${app.misses().at(-1)} `
+    + `stales=${app.stales().length}`);
+});
+
+test('⑨ P2-1 take 归属不匹配：session/turn/source/scene 均 miss 且返回 null', async (t) => {
+  const cases = [
+    { name: 'session', query: { sessionId: 'other', turn: 1 }, reason: 'session-changed' },
+    { name: 'turn', query: { sessionId: 's', turn: 9 }, reason: 'turn-changed' },
+    { name: 'source', query: { sessionId: 's', turn: 1, source: 'obs' }, reason: 'source-changed' },
+    { name: 'scene', query: { sessionId: 's', turn: 1, source: 'desktop', scene: 'Other' }, reason: 'scene-changed' },
+  ];
+  const seen = [];
+  for (const entry of cases) {
+    const app = unitChannel();
+    const shot = app.shotOf('shot');
+    assert.equal(await app.channel.prepare({ sessionId: 's', turn: 1, capture: async () => shot }), shot);
+    const value = app.channel.take(entry.query);
+    assert.equal(value, null, `${entry.name} mismatch returns null`);
+    assert.deepEqual(app.misses(), [entry.reason], `${entry.name} mismatch reason`);
+    assert.equal(app.reused().length, 0, `${entry.name} mismatch never reports a reuse`);
+    seen.push(`${entry.name}->${app.misses()[0]}`);
+  }
+  // The exact owner still hits after each independent case (the frame is never served to a
+  // mismatched caller, but it is also never handed out under a wrong identity).
+  const app = unitChannel();
+  const shot = app.shotOf('owner');
+  await app.channel.prepare({ sessionId: 's', turn: 1, capture: async () => shot });
+  assert.equal(app.channel.take({ sessionId: 's', turn: 1, source: 'desktop', scene: '' })?.file, shot.file);
+  t.diagnostic(`attribution-miss: ${seen.join(' ')}`);
+});
+
+test('⑩ P2-1 同轮复用回归：同一 owner 的读取命中同一帧', async (t) => {
+  const app = unitChannel();
+  const shot = app.shotOf('keep');
+  assert.equal(await app.channel.prepare({ sessionId: 's', turn: 3, capture: async () => shot }), shot);
+  assert.equal(app.channel.take({ sessionId: 's', turn: 3, source: 'desktop', scene: '' }), shot);
+  assert.equal(app.channel.take({ sessionId: 's', turn: 3, source: 'desktop', scene: '' }), shot);
+  // Unattributed callers (today's index wiring) still read the last begun scope.
+  assert.equal(app.channel.take({ source: 'desktop', scene: '' }), shot);
+  assert.equal(app.reused().length, 3);
+  assert.equal(app.reused()[0].payload.turn, 3);
+  assert.equal(app.reused()[0].payload.sessionId, 's');
+  assert.equal(app.channel.peek({ sessionId: 's', turn: 3 })?.shot, shot);
+  // Preparing the same turn again reuses the frame instead of capturing a second one.
+  const again = await app.channel.prepare({
+    sessionId: 's',
+    turn: 3,
+    capture: async () => { throw new Error('must not capture twice in one turn'); },
+  });
+  assert.equal(again, shot);
+  assert.equal(app.misses().length, 0);
+  t.diagnostic(`same-turn: reused=${app.reused().length} turn=${app.reused()[0].payload.turn} `
+    + `ageMs=${app.reused().map((event) => event.payload.ageMs).join('/')} misses=${app.misses().length}`);
+});
+

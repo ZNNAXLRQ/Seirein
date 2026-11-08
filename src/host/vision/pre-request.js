@@ -10,6 +10,16 @@
  *   - its source/scene equals the caller's current source/scene;
  *   - it is younger than `ttlMs` (wall-clock, the same freshness rule as an observation).
  *
+ * Ownership (P2-1). A scope is `(sessionId, turn)` plus an epoch bumped by every `beginTurn`, and
+ * both a published frame and a failed preparation are keyed by the scope that produced them. A
+ * capture that lands after the turn moved on is DISCARDED (`vision.pre-request.stale`), so a slow
+ * turn can never overwrite a newer turn's frame; a late failure clears only its own entry. Scopes
+ * are per session, so two sessions preparing concurrently never share or evict each other's frame.
+ * `take()`/`peek()` accept the caller's `{sessionId, turn}`; a mismatch is a miss
+ * (`session-changed` / `turn-changed`) and returns null. A caller that passes no ownership still
+ * reads the scope opened by the last `beginTurn` — the index side does that today, and its two call
+ * sites are the pending wiring, not this module's business.
+ *
  * Privacy (or a mode change) clears the channel; a cleared channel is a miss and is never read
  * as a fallback. Reuse only returns the existing shot object: the file, size, source label and
  * delivery path stay exactly the ones the capture produced. Nothing here starts a timer; the
@@ -59,133 +69,249 @@ export function createPreRequestVision({
   };
   const miss = (reason) => event('vision.pre-request.miss', { reason });
 
-  /** Current turn scope. `key` is the identity used for "same turn". */
+  /**
+   * Open turn scopes, one per session: `sessionId -> {key, turn, sessionId, source, scene, epoch}`.
+   * The epoch is bumped by every `beginTurn`, so a capture can prove it still owns the very scope
+   * it started for even when that same turn is prepared twice.
+   */
+  const scopes = new Map();
+  /** Published frames keyed by owner scope key; a write keeps at most one per session. */
+  const snapshots = new Map();
+  /** Turns whose preparation failed; a read there falls through to its own capture. */
+  const failed = new Set();
+  let epochSeq = 0;
+  /** Scope opened by the last `beginTurn`: the fallback for callers that pass no ownership. */
   let active = null;
-  /** The one snapshot this channel currently offers. */
-  let snapshot = null;
-  /** Turn whose preparation failed; a read then falls through to its own capture. */
-  let failedKey = null;
+
+  /** Caller attribution: an absent pair means "the last scope opened by `beginTurn`". */
+  const attributionOf = (sessionId, turn) => ({
+    hasSession: typeof sessionId === 'string' && sessionId.length > 0,
+    hasTurn: Number.isSafeInteger(turn) && turn >= 0,
+  });
 
   /**
-   * Mark the turn that is about to build its first request.
-   * Repeating the same (session, turn) is a no-op; a new turn keeps the old snapshot only long
-   * enough for `take()` to report `turn-changed` and then discard it.
+   * Mark the turn that is about to build its first request. Every call opens a NEW epoch for that
+   * session: repeating the same (session, turn) supersedes a preparation of it that is still in
+   * flight, while a new turn keeps the old snapshot only long enough for `take()` to report
+   * `turn-changed` and then discard it.
    */
   function beginTurn({ turn, sessionId = '', source = 'desktop', scene = '' } = {}) {
     const turnValue = Number.isSafeInteger(turn) ? turn : -1;
     const key = `${sessionId}\u0000${turnValue}`;
-    if (active !== null && active.key === key) {
-      active.source = source;
-      active.scene = scene;
-      return active;
-    }
-    active = { key, turn: turnValue, sessionId, source, scene };
-    failedKey = null;
-    return active;
+    const previous = scopes.get(sessionId);
+    if (previous !== undefined && previous.key !== key) failed.delete(previous.key);
+    const scope = { key, turn: turnValue, sessionId, source, scene, epoch: ++epochSeq };
+    scopes.set(sessionId, scope);
+    active = scope;
+    return scope;
   }
 
-  /** Fresh snapshot for this exact scope, or null. Does not emit or mutate. */
-  function peek({ source = 'desktop', scene = '' } = {}) {
-    if (snapshot === null || active === null) return null;
-    if (snapshot.turnKey !== active.key) return null;
-    if (snapshot.source !== source) return null;
-    if ((snapshot.scene ?? '') !== (scene ?? '')) return null;
-    const capturedAt = Number(snapshot.capturedAt);
+  /**
+   * The scope the caller means: its own `(sessionId, turn)` when given, otherwise the last scope
+   * opened by `beginTurn`. `null` when that scope is unknown or its turn already moved on.
+   */
+  function resolveScope({ sessionId = '', turn } = {}) {
+    const { hasSession, hasTurn } = attributionOf(sessionId, turn);
+    if (!hasSession && !hasTurn) return active;
+    if (hasSession) {
+      const scope = scopes.get(sessionId);
+      if (scope === undefined) return null;
+      if (hasTurn && scope.turn !== turn) return null;
+      return scope;
+    }
+    return active !== null && active.turn === turn ? active : null;
+  }
+
+  /** Publish only while the entrance epoch still owns its scope (see `prepare`). */
+  function isCurrent(scope) {
+    const live = scopes.get(scope.sessionId);
+    return live !== undefined && live.key === scope.key && live.epoch === scope.epoch;
+  }
+
+  /** A result that arrived after its turn moved on: report why, never publish it. */
+  function stale(scope) {
+    const live = scopes.get(scope.sessionId);
+    const reason = live === undefined
+      ? 'cleared'
+      : live.key !== scope.key ? 'turn-changed' : 'superseded';
+    event('vision.pre-request.stale', {
+      reason,
+      turn: scope.turn,
+      sessionId: scope.sessionId,
+    });
+  }
+
+  /** Drop any frame this session published for another turn; reports whether one existed. */
+  function dropOtherTurns(sessionId, keepKey) {
+    let dropped = false;
+    for (const [key, entry] of snapshots) {
+      if (key !== keepKey && entry.sessionId === sessionId) {
+        snapshots.delete(key);
+        dropped = true;
+      }
+    }
+    return dropped;
+  }
+
+  /** Whether the channel still offers a frame that belongs to a DIFFERENT session. */
+  function hasOtherSession(sessionId) {
+    for (const entry of snapshots.values()) {
+      if (entry.sessionId !== sessionId) return true;
+    }
+    return false;
+  }
+
+  /** Fresh frame for this exact scope, or null. Does not emit or mutate. */
+  function peek({ sessionId = '', turn, source = 'desktop', scene = '' } = {}) {
+    const scope = resolveScope({ sessionId, turn });
+    if (scope === null) return null;
+    const entry = snapshots.get(scope.key);
+    if (entry === undefined) return null;
+    if (entry.source !== source) return null;
+    if ((entry.scene ?? '') !== (scene ?? '')) return null;
+    const capturedAt = Number(entry.capturedAt);
     if (!Number.isFinite(capturedAt) || capturedAt <= 0) return null;
     const ageMs = clock() - capturedAt;
     if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs >= windowMs()) return null;
-    return { shot: snapshot.shot, ageMs };
+    return { shot: entry.shot, ageMs };
   }
 
   /**
    * Reuse the prepared frame when every condition holds. A miss is reported with its reason and
    * leaves the caller to capture normally; a miss never deletes a file that is still in flight.
+   *
+   * `sessionId`/`turn` are the CALLER's ownership. When given, a frame published for another
+   * session or another turn is never served: the read is a miss (`session-changed` /
+   * `turn-changed`). Without them the last scope opened by `beginTurn` is used, which is the
+   * pre-wiring behavior.
    */
-  function take({ source = 'desktop', scene = '' } = {}) {
+  function take({ sessionId = '', turn, source = 'desktop', scene = '' } = {}) {
     if (blocked()) {
-      snapshot = null;
+      snapshots.clear();
       miss('privacy');
       return null;
     }
-    if (active === null) {
+    const { hasSession, hasTurn } = attributionOf(sessionId, turn);
+    let scope = active;
+    if (hasSession || hasTurn) {
+      if (hasSession) {
+        const own = scopes.get(sessionId);
+        if (own === undefined) {
+          // This session never opened a turn: another session's frame is not its answer.
+          miss(hasOtherSession(sessionId) ? 'session-changed' : 'no-turn');
+          return null;
+        }
+        if (hasTurn && own.turn !== turn) {
+          miss('turn-changed');
+          return null;
+        }
+        scope = own;
+      } else {
+        if (active === null) {
+          miss('no-turn');
+          return null;
+        }
+        if (active.turn !== turn) {
+          miss('turn-changed');
+          return null;
+        }
+        scope = active;
+      }
+    }
+    if (scope === null) {
       miss('no-turn');
       return null;
     }
-    if (failedKey === active.key && snapshot === null) {
-      miss('prepare-failed');
-      return null;
-    }
-    if (snapshot === null) {
+    const entry = snapshots.get(scope.key);
+    if (entry === undefined) {
+      if (failed.has(scope.key)) {
+        miss('prepare-failed');
+        return null;
+      }
+      if (dropOtherTurns(scope.sessionId, scope.key)) {
+        miss('turn-changed');
+        return null;
+      }
       miss('no-snapshot');
       return null;
     }
-    if (snapshot.turnKey !== active.key) {
-      snapshot = null;
-      miss('turn-changed');
-      return null;
-    }
-    if (snapshot.source !== source) {
-      snapshot = null;
+    if (entry.source !== source) {
+      snapshots.delete(scope.key);
       miss('source-changed');
       return null;
     }
-    if ((snapshot.scene ?? '') !== (scene ?? '')) {
-      snapshot = null;
+    if ((entry.scene ?? '') !== (scene ?? '')) {
+      snapshots.delete(scope.key);
       miss('scene-changed');
       return null;
     }
-    const capturedAt = Number(snapshot.capturedAt);
+    const capturedAt = Number(entry.capturedAt);
     const freshness = readObservation(
       { at: capturedAt, capturedAt },
       { now: clock(), ttlMs: windowMs() },
     );
     const ageMs = Number.isFinite(capturedAt) && capturedAt > 0 ? clock() - capturedAt : null;
     if (freshness.stale === true || ageMs === null || ageMs < 0) {
-      snapshot = null;
+      snapshots.delete(scope.key);
       miss('expired');
       return null;
     }
     event('vision.pre-request.reused', {
-      turn: active.turn,
+      turn: scope.turn,
+      sessionId: scope.sessionId,
       ageMs: Math.round(ageMs),
       source,
       scene: scene ?? '',
     });
-    return snapshot.shot;
+    return entry.shot;
   }
 
   /**
    * Capture the turn's preparation once. Any failure is swallowed (fail-open): the turn keeps
    * running and the first visual read falls back to its normal capture path.
+   *
+   * The capture, its publication and its failure cleanup all belong to the entrance scope captured
+   * here (session + turn + epoch). If the turn moved on while the capture ran, the result is
+   * dropped (`vision.pre-request.stale`) and the newer turn's frame is left untouched.
    */
   async function prepare({
     turn, sessionId = '', source = 'desktop', scene = '', signal = null, capture: runCapture = capture,
   } = {}) {
-    beginTurn({ turn, sessionId, source, scene });
+    const scope = beginTurn({ turn, sessionId, source, scene });
     if (blocked()) {
-      snapshot = null;
+      snapshots.delete(scope.key);
       miss('privacy');
       return null;
     }
-    const cached = peek({ source, scene });
+    const cached = peek({ sessionId, turn: scope.turn, source, scene });
     if (cached !== null) return cached.shot;
     if (typeof runCapture !== 'function') {
-      failedKey = active.key;
+      failed.add(scope.key);
       miss('prepare-failed');
       return null;
     }
     try {
-      const shot = await runCapture({ turn: active.turn, sessionId, source, scene, signal });
+      const shot = await runCapture({ turn: scope.turn, sessionId, source, scene, signal });
+      if (!isCurrent(scope)) {
+        // A slow turn must never publish over the turn that replaced it.
+        stale(scope);
+        return null;
+      }
       if (shot === null || shot === undefined) {
-        failedKey = active.key;
+        failed.add(scope.key);
         miss('prepare-failed');
         return null;
       }
-      remember(shot, { source, scene, kind: 'shot' });
+      remember(shot, { source, scene, kind: 'shot', owner: scope });
       return shot;
     } catch {
-      snapshot = null;
-      failedKey = active?.key ?? null;
+      // A late failure clears ONLY its own entry; the newer turn's frame survives.
+      snapshots.delete(scope.key);
+      if (!isCurrent(scope)) {
+        stale(scope);
+        return null;
+      }
+      failed.add(scope.key);
       miss('prepare-failed');
       return null;
     }
@@ -195,45 +321,66 @@ export function createPreRequestVision({
    * Publish one real capture as this turn's snapshot. Only a scope established by `beginTurn`
    * (or `prepare`) may hold a snapshot: a tool-only flow without a pre-step stays uncached, which
    * keeps every existing "each look is a new capture" contract intact.
+   *
+   * `owner` binds the write to the scope the frame was captured for; when that scope is no longer
+   * the current one the write is refused, so nothing can resurrect an old turn. Without `owner`
+   * the write belongs to the last scope opened by `beginTurn` (the index call sites today).
    */
-  function remember(shot, { source = 'desktop', scene = '', kind = 'shot' } = {}) {
-    if (active === null || shot === null || shot === undefined) return null;
+  function remember(shot, { source = 'desktop', scene = '', kind = 'shot', owner = null } = {}) {
+    const scope = owner ?? active;
+    if (scope === null || shot === null || shot === undefined) return null;
+    if (owner !== null && !isCurrent(owner)) return null;
     const capturedAt = Number(shot.capturedAt ?? shot.at);
-    snapshot = {
+    const entry = {
       shot,
-      turnKey: active.key,
-      turn: active.turn,
+      key: scope.key,
+      // The scope's identity is snapshotted too: a frame can never be read by another session
+      // even while it waits in the store.
+      sessionId: scope.sessionId,
+      turn: scope.turn,
       source,
       scene: scene ?? '',
       capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : clock(),
       kind,
     };
-    failedKey = null;
-    return snapshot;
+    snapshots.set(scope.key, entry);
+    failed.delete(scope.key);
+    dropOtherTurns(scope.sessionId, scope.key);
+    return entry;
   }
 
   /** Drop the snapshot when its file is deleted (failed delivery, cleanup, cancellation). */
   function forget(file) {
-    if (snapshot !== null && snapshot.shot?.file === file) snapshot = null;
+    for (const [key, entry] of snapshots) {
+      if (entry.shot?.file === file) snapshots.delete(key);
+    }
   }
 
   /** Privacy, a source/scene switch or teardown: no snapshot may survive across the boundary. */
   function clear() {
-    snapshot = null;
+    scopes.clear();
+    snapshots.clear();
+    failed.clear();
     active = null;
-    failedKey = null;
   }
 
   /** Diagnostic view (tests and future status projection); never exposes pixel bytes. */
   function state() {
+    const entry = active === null ? null : (snapshots.get(active.key) ?? null);
     return {
-      active: active === null ? null : { turn: active.turn, sessionId: active.sessionId, source: active.source, scene: active.scene },
-      snapshot: snapshot === null ? null : {
-        turn: snapshot.turn,
-        source: snapshot.source,
-        scene: snapshot.scene,
-        capturedAt: snapshot.capturedAt,
-        kind: snapshot.kind,
+      active: active === null ? null : {
+        turn: active.turn,
+        sessionId: active.sessionId,
+        source: active.source,
+        scene: active.scene,
+        epoch: active.epoch,
+      },
+      snapshot: entry === null ? null : {
+        turn: entry.turn,
+        source: entry.source,
+        scene: entry.scene,
+        capturedAt: entry.capturedAt,
+        kind: entry.kind,
       },
     };
   }
