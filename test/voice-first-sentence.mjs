@@ -669,14 +669,20 @@ test('prefetch: depth 2 never runs more than two synthesizers at once for five s
   assert.deepEqual(plays.map((entry) => entry.text), ['一。', '二。', '三。', '四。', '五。'],
     'serial playback order is preserved');
   assert.equal(stats.played, 5);
-  assert.ok(events.length > 0, 'voice.prefetch was emitted');
-  for (const event of events) {
-    assert.equal(event.type, 'voice.prefetch');
+  // `onEvent` is the speaker's diagnostic stream and now also carries lifecycle rows
+  // (`voice.speech.lifecycle`). This test owns the prefetch contract, so select those rows; every
+  // other row must still be the known lifecycle diagnostic, never a malformed prefetch event.
+  const prefetchEvents = events.filter((event) => event.type === 'voice.prefetch');
+  assert.ok(prefetchEvents.length > 0, 'voice.prefetch was emitted');
+  for (const event of prefetchEvents) {
     assert.equal(event.depth, 2);
     assert.ok(event.prepared <= 2, `prepared stays within the window (${event.prepared})`);
     assert.ok(event.maxAhead <= 2, `maxAhead stays within the window (${event.maxAhead})`);
   }
-  assert.equal(Math.max(...events.map((event) => event.maxAhead)), 2);
+  const otherEvents = events.filter((event) => event.type !== 'voice.prefetch');
+  assert.ok(otherEvents.every((event) => event.type === 'voice.speech.lifecycle'),
+    'the only non-prefetch rows on this stream are lifecycle diagnostics');
+  assert.equal(Math.max(...prefetchEvents.map((event) => event.maxAhead)), 2);
 });
 
 test('prefetch: the first sentence still starts synthesizing at the queue instant', async (t) => {
