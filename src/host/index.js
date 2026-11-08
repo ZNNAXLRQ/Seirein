@@ -334,6 +334,9 @@ import { openAudioRetention } from './hearing/audio-retention.js';
 // Voiceprint enrollment (`<root>/data/speaker-enrollment.json`): the Host owns the one store the
 // settings card reads and writes through its four explicit actions.
 import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
+// Stage 3: attribute a NEW record/candidate to the user's CONFIRMED self only. Pure decision
+// layer — no I/O, no event, no gate — so wiring it can never change delivery, muting or barge-in.
+import { createRecordAttribution, resolveIdentityForNewRecord } from './hearing/speaker-identity.js';
 import { ensureSpeakerModel, isSharedModelTarget, speakerModelTarget } from './platform/modelDownload.js';
 import { createDialogueContext } from './session/conversation/dialogueContext.js';
 import { FeatureStore } from './runtime/features.js';
@@ -6007,6 +6010,10 @@ export function apply(ctx, config) {
     normalize: memoryNormalize,
     timeZone: memoryTimeZone,
     contextOf: memoryContextOf,
+    // Stage 3: identity evidence for a NEW voice record only. The resolver reads the bounded
+    // `speaker.shadow` cache; a non-voice message has no join key and therefore no attribution.
+    // `null` means "no claim", and the voice path never gates a write on the verdict.
+    attributionOf: (messageId, at) => speakerAttributionForMessage(messageId, at),
   });
   if (typeof ctx.on === 'function') {
     ctx.effect(() => ctx.on('session/event', (session, event) => {
@@ -10960,6 +10967,20 @@ export function apply(ctx, config) {
       ? meta.speakerId.trim()
       : null
   );
+  /**
+   * Stage 3: for a candidate, a `speaker.shadow` row for THIS exact utterance is the authority —
+   * only a resolved `assigned === true` (a confirmed self) supplies a speakerId. With no row for
+   * that utterance, the legacy capture-supplied confirmed speaker is kept (unchanged behaviour).
+   * A candidate is never retro-assigned: `noteLexiconTranscript` runs once per delivery.
+   */
+  const lexiconSpeakerFor = (meta) => {
+    const utteranceId = typeof meta?.utteranceId === 'string' ? meta.utteranceId : '';
+    if (utteranceId.length > 0 && speakerShadowByUtterance.has(utteranceId)) {
+      const attribution = speakerAttributionForUtterance(utteranceId);
+      return attribution !== null && attribution.assigned === true ? attribution.speakerId : null;
+    }
+    return confirmedLexiconSpeaker(meta);
+  };
   const noteLexiconTranscript = (text, meta = {}) => {
     try {
       const at = new Date().toISOString();
@@ -10969,7 +10990,7 @@ export function apply(ctx, config) {
         // A correction is its own lane: the sentence is not ordinary evidence, so the wrong form it
         // names cannot become a proper-noun candidate just by being repeated.
         if (parsed.ignored !== true) {
-          lexiconCorrections.push({ ...parsed, id, at, speakerId: confirmedLexiconSpeaker(meta) });
+          lexiconCorrections.push({ ...parsed, id, at, speakerId: lexiconSpeakerFor(meta) });
           if (lexiconCorrections.length > LEXICON_WINDOW) lexiconCorrections.shift();
         }
       } else {
@@ -11234,6 +11255,9 @@ export function apply(ctx, config) {
           endpointAt: Number(meta.endpointAt) || 0,
           asrMs: Number(meta.asrMs) || 0,
           transcriptAt,
+          // Stage 3: the delivery keeps its utterance identity, so a NEW memory record can be
+          // attributed to this exact utterance's shadow row (never to "the last one heard").
+          utteranceId: typeof meta.utteranceId === 'string' ? meta.utteranceId : '',
         });
       }
       // Candidate extraction is observation only: it sees the ASR text BEFORE the personal-lexicon
@@ -12068,6 +12092,9 @@ export function apply(ctx, config) {
     const roundOpenedAt = Date.now();
     const endpointAt = Number(timing.endpointAt) || 0;
     const transcriptAt = Number(timing.transcriptAt) || 0;
+    // Stage 3 join key: the utterance this delivery carries. It is registered against the injected
+    // message id (below) so the auto-recorder can attribute the NEW record; it gates nothing.
+    const utteranceId = typeof timing.utteranceId === 'string' ? timing.utteranceId : '';
     // The waiter acquired by `prepareVoiceTurn`; kept outside `try` so a failed delivery can
     // release it instead of leaving the session owned until timeout.
     let pendingResult = null;
@@ -13240,6 +13267,11 @@ export function apply(ctx, config) {
       // Stable join keys for this delivery: the injected message id never changes; the accepted
       // turn is filled by the ack (possibly already known here).
       deliveryMessageId = request.id;
+      // Stage 3: the exact message this utterance injects, so the later `user/message` record can
+      // be attributed to the same utterance. Registered BEFORE the injection; bounded, no timer.
+      if (utteranceId.length > 0) {
+        rememberRecent(speakerUtteranceByMessage, request.id, utteranceId, SPEAKER_MESSAGE_CACHE);
+      }
       if (acceptTurn === null) acceptTurn = Number.isSafeInteger(stage.acceptTurn) ? stage.acceptTurn : null;
       // Gap 2: the turn wins delivery here, so this is where its cancellation identity is taken:
       // the speech signal that is live right now. Mute/barge-in aborts exactly this signal, so a
@@ -13778,6 +13810,69 @@ export function apply(ctx, config) {
     if (controller.signal.aborted !== true) controller.abort(reason);
     return true;
   };
+  // ---- stage 3: attribution of NEW records only --------------------------------------------
+  // Final rules (2026-11-09): identity is used ONLY to attribute a new personal-lexicon candidate
+  // and a new memory record; an uncertain row never claims the user; nothing here rejects, mutes,
+  // interrupts, reorders or rewrites an already-stored row. These are bounded debug caches read by
+  // the writer path only — no delivery, barge-in or gate ever consults them.
+  const SPEAKER_ATTRIBUTION_CACHE = 32;
+  const SPEAKER_MESSAGE_CACHE = 64;
+  /** `utteranceId -> recent speaker.shadow row`: the only evidence a new record may use. */
+  const speakerShadowByUtterance = new Map();
+  /** `injected messageId -> utteranceId` for voice deliveries; typed/assistant ids stay absent. */
+  const speakerUtteranceByMessage = new Map();
+  /** `utteranceId -> assigned` once the writer asked: a later shadow can never rewrite that row. */
+  const speakerAttributionWritten = new Map();
+  /** `utteranceId` already reported as a late shadow (one debug row each). */
+  const speakerLateNoted = new Map();
+  /** Bounded insertion-order cache: newest `limit` keys survive, no clock and no timer. */
+  const rememberRecent = (map, key, value, limit = SPEAKER_ATTRIBUTION_CACHE) => {
+    if (typeof key !== 'string' || key.length === 0) return;
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > limit) {
+      const oldest = map.keys().next().value;
+      if (oldest === key) break;
+      map.delete(oldest);
+    }
+  };
+  /**
+   * Resolve one utterance's attribution from its exact shadow row, or null when no row arrived
+   * yet. The decision (`match` + `self` + confirmed selfId) lives in `speaker-identity.js`; this
+   * function only supplies the state and the fixed record field.
+   */
+  const speakerAttributionForUtterance = (utteranceId) => {
+    const id = typeof utteranceId === 'string' ? utteranceId : '';
+    if (id.length === 0) return null;
+    const shadow = speakerShadowByUtterance.get(id);
+    if (shadow === undefined) return null;
+    return createRecordAttribution({
+      resolution: resolveIdentityForNewRecord({ shadow, enrollment: speakerEnrollmentStore }),
+    });
+  };
+  /**
+   * `attributionOf` seam for the auto-recorder: a message without a voice join key (typed input,
+   * assistant reply) returns null and stores no attribution. A voice message always returns the
+   * fixed field — `assigned:false` when its utterance is unassigned/unknown — so a record states
+   * "not attributed" instead of guessing. The one debug event names no transcript text.
+   */
+  const speakerAttributionForMessage = (messageId, at = null) => {
+    const key = typeof messageId === 'string' ? messageId : '';
+    if (key.length === 0) return null;
+    const utteranceId = speakerUtteranceByMessage.get(key);
+    if (typeof utteranceId !== 'string' || utteranceId.length === 0) return null;
+    const shadow = speakerShadowByUtterance.get(utteranceId);
+    const resolution = resolveIdentityForNewRecord({ shadow: shadow ?? null, enrollment: speakerEnrollmentStore });
+    const attribution = createRecordAttribution({ resolution, at });
+    rememberRecent(speakerAttributionWritten, utteranceId, attribution.assigned === true);
+    void log.emit(
+      attribution.assigned === true ? 'speaker.attribution.assigned' : 'speaker.attribution.unassigned',
+      attribution.assigned === true
+        ? { utteranceId, speakerId: attribution.speakerId, confidence: attribution.confidence }
+        : { utteranceId, reason: shadow === undefined ? 'shadow-not-received' : (resolution.reason || 'unassigned') },
+    ).catch(() => {});
+    return attribution;
+  };
   /** Aggregate what hearing already emitted; this never scores and never touches delivery. */
   const noteSpeakerEvent = (type, payload) => {
     if (type === 'speaker.shadow') {
@@ -13788,14 +13883,31 @@ export function apply(ctx, config) {
       if (decision === 'match' || decision === 'mismatch' || decision === 'unsure') {
         speakerShadowCounts[decision] += 1;
       }
+      const rawUtterance = payload?.utteranceId;
+      const utteranceId = typeof rawUtterance === 'string'
+        ? rawUtterance
+        : (typeof rawUtterance === 'number' && Number.isFinite(rawUtterance) ? String(rawUtterance) : '');
       speakerLastShadow = {
         decision,
         score: Number.isFinite(Number(payload?.score)) ? Number(payload.score) : 0,
         speakerId: typeof payload?.speakerId === 'string' ? payload.speakerId : null,
         class: typeof payload?.class === 'string' ? payload.class : '',
         quality: typeof payload?.quality === 'string' ? payload.quality : '',
+        source: typeof payload?.source === 'string' ? payload.source : '',
+        utteranceId,
         at: Date.now(),
       };
+      if (utteranceId.length > 0) {
+        rememberRecent(speakerShadowByUtterance, utteranceId, speakerLastShadow);
+        // The record already landed without this row: it stays unassigned (never rewritten); the
+        // late arrival is recorded as evidence only, so the card can explain the missing claim.
+        if (speakerAttributionWritten.get(utteranceId) === false && !speakerLateNoted.has(utteranceId)) {
+          rememberRecent(speakerLateNoted, utteranceId, true);
+          void log.emit('speaker.attribution.unassigned', {
+            utteranceId, reason: 'attribution-late',
+          }).catch(() => {});
+        }
+      }
       emitSpeakerStatus(false);
       return;
     }

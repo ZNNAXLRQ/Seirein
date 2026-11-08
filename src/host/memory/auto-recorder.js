@@ -34,7 +34,8 @@ export const SKIP_SUMMARY_WINDOW_MS = 5 * 60_000;
  *          featureEnabled?: () => boolean, scopeOf?: (session: object) => string,
  *          normalize?: (text: string, options: object) => object,
  *          timeZone?: string|(() => string),
- *          contextOf?: (sessionId: string) => object}} options
+ *          contextOf?: (sessionId: string) => object,
+ *          attributionOf?: (messageId: string, at: string) => object|null}} options
  */
 export function createAutoMemoryRecorder({
   memory,
@@ -46,6 +47,7 @@ export function createAutoMemoryRecorder({
   normalize = normalizeForMemory,
   timeZone = DEFAULT_MEMORY_TIME_ZONE,
   contextOf = null,
+  attributionOf = null,
 } = {}) {
   const readSettings = () => {
     const raw = typeof settings === 'function' ? settings() : settings;
@@ -111,6 +113,20 @@ export function createAutoMemoryRecorder({
       return { text, rawText: text, changes: [], unresolved: 0, tz: zoneOf() };
     }
   };
+  /**
+   * Stage 3: identity evidence for ONE new record. Only a real user message can be a voice
+   * delivery; the host decides by its message→utterance join and returns the fixed field (or null
+   * for typed input). Observation only: a throwing/failed resolver never blocks the write.
+   */
+  const attributionFor = (role, messageId, ts) => {
+    if (role !== 'user' || typeof attributionOf !== 'function') return null;
+    try {
+      const value = attributionOf(messageId, ts);
+      return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    } catch {
+      return null;
+    }
+  };
 
   const write = async (role, sessionId, turnId, messageId, text, ts) => {
     if (featureEnabled() !== true) return null;
@@ -123,6 +139,7 @@ export function createAutoMemoryRecorder({
       // resolved pronoun was based on (`referent` link, stage 3).
       const context = contextFor(sessionId);
       const normalized = normalizedBody(text, ts, context);
+      const speakerAttribution = attributionFor(role, messageId, ts);
       const result = memory.addMessage({
         role,
         sessionId,
@@ -140,6 +157,7 @@ export function createAutoMemoryRecorder({
         rawText: normalized.text === normalized.rawText ? null : normalized.rawText,
         unresolved: normalized.unresolved,
         tzUsed: normalized.tz,
+        speakerAttribution,
       });
       if (result.record !== null && typeof memory.addLink === 'function') {
         const referentId = memoryReferentRecord(normalized);

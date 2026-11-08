@@ -78,6 +78,31 @@ export {
   scoreImportance,
 } from './query.js';
 
+/**
+ * Serialize the optional stage-3 speaker attribution of a NEW message record.
+ *
+ * Shape: `{speakerId, assigned, confidence, source:'shadow', at}`. It is written by the auto
+ * recorder from the host's `speaker.shadow` decision; an unknown/malformed value becomes `null`
+ * (an old row has no value either). `assigned:true` is only ever stored together with a real id
+ * and `confidence:'confirmed'`, so a stored row can never claim the user without a confirmed self.
+ * Nothing in recall reads this field: it is evidence on the record, not a retrieval key.
+ *
+ * @param {unknown} value
+ * @returns {string|null} JSON text, or null when there is nothing valid to store
+ */
+function serializeSpeakerAttribution(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+  const speakerId = typeof value.speakerId === 'string' && value.speakerId.trim().length > 0
+    ? value.speakerId.trim()
+    : null;
+  const assigned = value.assigned === true && speakerId !== null;
+  const confidence = assigned
+    ? 'confirmed'
+    : (value.confidence === 'mismatch' ? 'mismatch' : 'unsure');
+  const at = typeof value.at === 'string' && value.at.length > 0 ? value.at : null;
+  return JSON.stringify({ speakerId, assigned, confidence, source: 'shadow', at });
+}
+
 
 /**
  * Memory store: one SQLite file, domains as a column.
@@ -188,6 +213,9 @@ export class MemoryStore {
       // still refundable (0 means already consumed). Legacy rows default to "already consumed".
       ['pressure_epoch', 'INTEGER NOT NULL DEFAULT 0'],
       ['pressure_contribution', 'INTEGER NOT NULL DEFAULT 0'],
+      // Stage 3 (purely additive): the speaker attribution of a NEW voice record, as JSON text.
+      // Old rows stay NULL; no query, index or recall path reads it, so compatibility is unchanged.
+      ['speaker_attribution', 'TEXT'],
     ]) {
       if (!columns.has(name)) db.exec(`ALTER TABLE memory_event ADD COLUMN ${name} ${type}`);
     }
@@ -301,6 +329,9 @@ export class MemoryStore {
       // tell whether that credit belongs to the current cycle.
       ['pressure_epoch', 'INTEGER NOT NULL DEFAULT 0'],
       ['pressure_contribution', 'INTEGER NOT NULL DEFAULT 0'],
+      // The stage-3 speaker attribution survives fading: a forgotten record still says whose voice
+      // it was (when one was confirmed at write time). Legacy archive rows stay NULL.
+      ['speaker_attribution', 'TEXT'],
     ]) {
       if (!archiveColumns.has(name)) db.exec(`ALTER TABLE memory_archive ADD COLUMN ${name} ${type}`);
     }
@@ -453,8 +484,8 @@ export class MemoryStore {
           .prepare(`INSERT OR IGNORE INTO memory_event
             (id, ts, domain, kind, text, importance, clarity, last_seen, recall_count, source,
              session_id, turn_id, message_id, role, truncated, raw_text, unresolved, tz_used,
-             pressure_epoch, pressure_contribution)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+             pressure_epoch, pressure_contribution, speaker_attribution)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(
             id,
             row.ts ?? nowIso(),
@@ -476,6 +507,11 @@ export class MemoryStore {
             row.tz_used ?? null,
             this.pressureEpoch,
             1,
+            // A restored archive row already carries the serialized text; a direct object from the
+            // public API is normalized here, so every write path stores the same validated shape.
+            typeof row.speaker_attribution === 'string'
+              ? row.speaker_attribution
+              : serializeSpeakerAttribution(row.speaker_attribution),
           );
         // Only the row that actually landed costs pressure: duplicates are ignored by SQLite.
         if (Number(result.changes) > 0) this.noteNewMemory(id);
@@ -754,7 +790,7 @@ export class MemoryStore {
    *          messageId: string, ts?: string, text: string, domain?: string,
    *          importance?: number, clarity?: string, source?: string,
    *          minChars?: number, rawText?: string|null, unresolved?: number,
-   *          tzUsed?: string|null}} [message]
+   *          tzUsed?: string|null, speakerAttribution?: object|null}} [message]
    * @returns {{record: object|null, deduped: boolean, skipped: string, chars: number,
    *            truncated: boolean, archived?: boolean}}
    */
@@ -773,6 +809,7 @@ export class MemoryStore {
     rawText = null,
     unresolved = 0,
     tzUsed = null,
+    speakerAttribution = null,
   } = {}) {
     this.open();
     const body = typeof text === 'string' ? text.trim() : '';
@@ -836,6 +873,9 @@ export class MemoryStore {
       raw_text: typeof rawText === 'string' && rawText.length > 0 && rawText !== clipped.text ? rawText : null,
       unresolved: unresolved ? 1 : 0,
       tz_used: typeof tzUsed === 'string' && tzUsed.length > 0 ? tzUsed : null,
+      // Stage 3 (additive): only a NEW voice record carries one; a typed/assistant record stores
+      // NULL and every legacy row stays NULL. Validated once, here at the public boundary.
+      speaker_attribution: serializeSpeakerAttribution(speakerAttribution),
     };
     const inserted = this.insert({ ...record, last_seen: record.ts });
     // Stage 3: the turn's other side (if it is already stored) becomes an explicit `turn` link in
@@ -864,6 +904,10 @@ export class MemoryStore {
         messageId: key,
         truncated: 0,
         chars: record.text.length,
+        // The validated field exactly as stored (already sanitized), not the caller's object.
+        speakerAttribution: record.speaker_attribution === null
+          ? null
+          : JSON.parse(record.speaker_attribution),
       },
       deduped: false,
       skipped: '',
