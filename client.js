@@ -2631,6 +2631,422 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ---- P-111 客户端诊断 ---------------------------------------------------------------
+    // 只读 /assistant/status：设置页打开时读一次，之后只由「刷新」再读。这里没有任何定时器，
+    // 不新增轮询；所有字段都按可选处理，宿主暂时没有的字段在面板里显示「不可用」。
+    const DIAGNOSTICS_READ_TIMEOUT_MS = 4000;
+
+    const DIAGNOSTICS_ACK_SOURCE = { draft: '本轮草稿', warm: '预热池', fallback: '兜底句' };
+    const DIAGNOSTICS_ACK_PHASE = {
+      preparing: '准备中', ready: '就绪', playing: '播放中', played: '已播放', dropped: '未播放',
+    };
+
+    /** status 是宿主给的 JSON：每个分支都必须容错，不能因为一个坏字段抛异常。 */
+    const diagnosticsObject = (value) => (
+      value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null
+    );
+
+    const diagnosticsText = (...values) => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+      }
+      return '';
+    };
+
+    const diagnosticsNumber = (...values) => {
+      for (const value of values) {
+        if (value === null || value === undefined || value === '') continue;
+        const number = Number(value);
+        if (Number.isFinite(number)) return number;
+      }
+      return null;
+    };
+
+    /** count/total 优先，其次数组长度；没有可数结构就是 null（界面显示不可用）。 */
+    const diagnosticsCount = (value) => {
+      const object = diagnosticsObject(value);
+      if (object === null) return null;
+      for (const key of ['count', 'total']) {
+        const number = diagnosticsNumber(object[key]);
+        if (number !== null && number >= 0) return Math.round(number);
+      }
+      for (const key of ['items', 'entries', 'rows', 'list']) {
+        if (Array.isArray(object[key])) return object[key].length;
+      }
+      return null;
+    };
+
+    const diagnosticsRestart = (value) => {
+      const object = diagnosticsObject(value);
+      if (object === null) return null;
+      const restarted = object.restarted === true;
+      return {
+        ok: object.ok === true || restarted || object.success === true,
+        restarted,
+        instanceId: diagnosticsText(object.instanceId, object.instance),
+        at: diagnosticsNumber(object.at, object.time, object.ts),
+        message: diagnosticsText(object.message, object.error, object.reason),
+      };
+    };
+
+    /**
+     * 把一次 /assistant/status 投影成面板与报告共用的安全结构。只读取下面列出的白名单字段，
+     * 因此 voiceAck.captionText/speechText、ambient.recent、voicePending 等文本永远不会进入报告。
+     */
+    function diagnosticsView(status, localRestart = null) {
+      const root = diagnosticsObject(status) ?? {};
+      const hearing = diagnosticsObject(root.hearing);
+      const voice = diagnosticsObject(root.voice);
+      const vision = diagnosticsObject(root.vision);
+      const privacy = diagnosticsObject(root.privacy);
+      const runtime = diagnosticsObject(diagnosticsObject(root.live2d)?.runtime);
+      const presets = diagnosticsObject(diagnosticsObject(runtime?.motion)?.presets)
+        ?? diagnosticsObject(diagnosticsObject(root.motion)?.presets)
+        ?? diagnosticsObject(root.presets);
+      const debug = diagnosticsObject(presets?.debug) ?? presets;
+      const byAction = diagnosticsObject(presets?.byAction) ?? diagnosticsObject(debug?.byAction);
+
+      const restart = diagnosticsRestart(
+        hearing?.lastRestart ?? hearing?.restart ?? root.lastRestart ?? localRestart,
+      );
+      const instanceId = diagnosticsText(
+        hearing?.instanceId,
+        hearing?.sessionInstanceId,
+        hearing?.diagnostics?.instanceId,
+        root.instanceId,
+        voice?.instanceId,
+      );
+      const thresholdDb = diagnosticsNumber(
+        hearing?.thresholdDb,
+        hearing?.minRmsDb,
+        hearing?.effectiveMinRmsDb,
+        voice?.thresholdDb,
+      );
+
+      const ackRows = Array.isArray(root.voiceAck) ? root.voiceAck : [];
+      const latestAck = ackRows.length === 0 ? null : diagnosticsObject(ackRows[ackRows.length - 1]);
+      const ackSourceKey = diagnosticsText(latestAck?.source);
+      const ackSource = ackSourceKey === ''
+        ? '' : (DIAGNOSTICS_ACK_SOURCE[ackSourceKey] ?? ackSourceKey);
+      const ackPhaseKey = diagnosticsText(latestAck?.phase);
+      const ackPhase = ackPhaseKey === ''
+        ? '' : (DIAGNOSTICS_ACK_PHASE[ackPhaseKey] ?? ackPhaseKey);
+      const ackPlayed = ackPhaseKey === 'played' || ackPhaseKey === 'playing';
+      const ackHit = latestAck === null
+        ? ''
+        : ackPlayed
+          ? (ackSourceKey === 'warm' ? '预热池命中' : ackSourceKey === 'draft' ? '本轮草稿命中'
+            : ackSourceKey === 'fallback' ? '兜底句命中' : '命中')
+          : `未命中${ackPhase === '' ? '' : `（${ackPhase}）`}`;
+
+      const latency = diagnosticsObject(root.voiceLatency);
+      const recent = Array.isArray(latency?.recent) ? latency.recent : [];
+      const latestRound = recent.length === 0 ? null : diagnosticsObject(recent[recent.length - 1]);
+      const lastError = diagnosticsText(
+        hearing?.lastError,
+        hearing?.error,
+        hearing?.diagnostics?.lastError,
+        hearing?.deferred?.reason,
+        voice?.lastError,
+        root.voiceError,
+      );
+
+      const virtualCamErrorObject = diagnosticsObject(vision?.virtualCamError);
+      const virtualCamError = vision === null || vision.virtualCamError === null
+        || vision.virtualCamError === undefined
+        ? ''
+        : virtualCamErrorObject !== null
+          ? diagnosticsText(virtualCamErrorObject.code, virtualCamErrorObject.reason,
+            virtualCamErrorObject.message, virtualCamErrorObject.error) || '已记录（无详情）'
+          : diagnosticsText(vision.virtualCamError);
+      const visionSourceKey = diagnosticsText(vision?.source);
+      const visionSource = visionSourceKey === ''
+        ? '' : visionSourceKey === 'obs' ? 'OBS 场景' : visionSourceKey === 'desktop' ? '桌面' : visionSourceKey;
+      const privacyOn = privacy !== null
+        ? privacy.active === true
+        : vision !== null ? (vision.locked === true || vision.mode === 'privacy') : null;
+
+      const presetEnabled = presets === null
+        ? null
+        : (presets.enabled === true || debug?.enabled === true) ? true
+          : (presets.enabled === false || debug?.enabled === false) ? false : null;
+      const selection = diagnosticsObject(presets?.lastSelection);
+      const selectionReasons = Array.isArray(selection?.reasons) ? selection.reasons : [];
+      const lastSkipReason = diagnosticsText(
+        debug?.lastSkipReason,
+        presets?.lastSkipReason,
+        diagnosticsObject(presets?.lastSkip)?.reason,
+        diagnosticsObject(root.motion)?.lastSkipReason,
+        selectionReasons.find((reason) => typeof reason === 'string' && reason.length > 0),
+        diagnosticsObject(presets?.lastTrace)?.output?.reason,
+      );
+
+      const lexicon = diagnosticsObject(root.lexicon) ?? diagnosticsObject(hearing?.lexicon);
+      const retention = diagnosticsObject(root.retention)
+        ?? diagnosticsObject(root.audioRetention)
+        ?? diagnosticsObject(hearing?.retention)
+        ?? diagnosticsObject(diagnosticsObject(root.audio)?.retention);
+      const library = (value) => (value === null
+        ? { available: false, enabled: null, count: null }
+        : {
+            available: true,
+            enabled: value.enabled === true ? true : value.enabled === false ? false : null,
+            count: diagnosticsCount(value),
+          });
+
+      return {
+        about: {
+          serverVersion: diagnosticsText(root.version),
+          uptimeMs: diagnosticsNumber(root.uptimeMs),
+          instanceId,
+          thresholdDb,
+          restart,
+        },
+        voice: {
+          lastError,
+          ackSource,
+          ackHit,
+          firstAudibleMs: diagnosticsNumber(latestRound?.firstAudibleMs),
+          firstAudibleLane: diagnosticsText(latestRound?.firstAudibleLane),
+          firstAudibleUnknown: diagnosticsText(latestRound?.firstAudibleUnknown),
+        },
+        vision: {
+          available: vision !== null,
+          source: visionSource,
+          scene: diagnosticsText(vision?.scene),
+          privacy: privacyOn,
+          virtualCam: vision === null ? null : vision.virtualCam === true,
+          virtualCamError,
+        },
+        motion: {
+          available: presets !== null,
+          enabled: presetEnabled,
+          select: diagnosticsNumber(debug?.decisions, debug?.select, debug?.selected, debug?.selects),
+          skip: diagnosticsNumber(debug?.skips, debug?.skip),
+          commit: diagnosticsNumber(byAction?.lastCommitCount, debug?.lastCommitCount, debug?.commits),
+          lastSkipReason,
+          lastEvent: diagnosticsText(debug?.lastEvent, presets?.lastEvent),
+        },
+        libraries: { lexicon: library(lexicon), retention: library(retention) },
+      };
+    }
+
+    const diagnosticsRestartText = (restart) => {
+      if (restart === null) return '不可用';
+      if (restart.ok === true && restart.restarted === true) {
+        return restart.instanceId === '' ? '成功（新实例）' : `成功（新实例 ${restart.instanceId}）`;
+      }
+      if (restart.ok === true) return '已保存（采集未运行）';
+      return restart.message === '' ? '失败' : `失败：${restart.message}`;
+    };
+
+    const diagnosticsFirstAudibleText = (voice) => {
+      if (voice.firstAudibleMs !== null) {
+        return voice.firstAudibleLane === ''
+          ? `${voice.firstAudibleMs}ms` : `${voice.firstAudibleMs}ms · ${voice.firstAudibleLane}`;
+      }
+      if (voice.firstAudibleUnknown !== '') return `不可用（${voice.firstAudibleUnknown}）`;
+      return '不可用';
+    };
+
+    const diagnosticsLibraryText = (library) => {
+      if (library.available !== true) return '不可用';
+      const enabled = library.enabled === true ? '已开启' : library.enabled === false ? '已关闭' : '开关不可用';
+      const count = library.count === null ? '条目数不可用' : `${library.count} 条`;
+      return `${enabled} · ${count}`;
+    };
+
+    /**
+     * 纯文本 JSON 摘要。字段是上面投影的白名单子集：不包含转写、字幕、候音台词、环境声文本
+     * 或任何音频/文件路径；复制按钮只把这段文本写进剪贴板。
+     */
+    function diagnosticsReportOf(
+      status,
+      { clientVersion = '', localRestart = null, at = Date.now(), readError = '' } = {},
+    ) {
+      const view = diagnosticsView(status, localRestart);
+      const report = {
+        schema: 1,
+        generatedAt: new Date(at).toISOString(),
+        clientVersion: String(clientVersion ?? ''),
+        readError: diagnosticsText(readError) || null,
+        serverVersion: view.about.serverVersion || null,
+        uptimeMs: view.about.uptimeMs,
+        instanceId: view.about.instanceId || null,
+        thresholdDb: view.about.thresholdDb,
+        restart: view.about.restart === null ? null : {
+          ok: view.about.restart.ok,
+          restarted: view.about.restart.restarted,
+          instanceId: view.about.restart.instanceId || null,
+          at: view.about.restart.at,
+          message: view.about.restart.message || null,
+        },
+        voice: {
+          lastError: view.voice.lastError || null,
+          ackSource: view.voice.ackSource || null,
+          ackHit: view.voice.ackHit || null,
+          firstAudibleMs: view.voice.firstAudibleMs,
+          firstAudibleLane: view.voice.firstAudibleLane || null,
+        },
+        vision: {
+          available: view.vision.available,
+          source: view.vision.source || null,
+          scene: view.vision.scene || null,
+          privacy: view.vision.privacy,
+          virtualCam: view.vision.virtualCam,
+          virtualCamError: view.vision.virtualCamError || null,
+        },
+        motion: {
+          available: view.motion.available,
+          enabled: view.motion.enabled,
+          select: view.motion.select,
+          skip: view.motion.skip,
+          commit: view.motion.commit,
+          lastSkipReason: view.motion.lastSkipReason || null,
+        },
+        libraries: {
+          lexicon: { ...view.libraries.lexicon },
+          retention: { ...view.libraries.retention },
+        },
+      };
+      return JSON.stringify(report, null, 2);
+    }
+
+    async function copyDiagnosticsReport(text, clipboard) {
+      const target = clipboard !== undefined
+        ? clipboard : (typeof navigator === 'undefined' ? null : navigator.clipboard);
+      if (target === null || target === undefined || typeof target.writeText !== 'function') {
+        return { ok: false, error: '剪贴板不可用' };
+      }
+      try {
+        await target.writeText(String(text ?? ''));
+        return { ok: true, error: '' };
+      } catch (cause) {
+        return { ok: false, error: cause && cause.message ? String(cause.message) : String(cause) };
+      }
+    }
+
+    /**
+     * One `GET /assistant/status` for the diagnostics card. A new AbortController gives the read a
+     * hard timeout; the caller never gets an exception, only `{status, error, at}`.
+     */
+    async function loadDiagnosticsStatus(
+      fetchImpl = typeof fetch === 'function' ? fetch : null,
+      timeoutMs = DIAGNOSTICS_READ_TIMEOUT_MS,
+    ) {
+      if (typeof fetchImpl !== 'function') {
+        return { status: null, error: '无法读取状态', at: Date.now() };
+      }
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      const timer = controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchImpl('/assistant/status', {
+          cache: 'no-store',
+          signal: controller?.signal,
+        });
+        if (response === null || response === undefined || response.ok !== true) {
+          throw new Error(`HTTP ${response?.status ?? 'UNKNOWN'}`);
+        }
+        const status = await response.json();
+        return { status: diagnosticsObject(status), error: '', at: Date.now() };
+      } catch (cause) {
+        const aborted = cause && cause.name === 'AbortError';
+        return {
+          status: null,
+          error: aborted ? '请求超时' : (cause && cause.message ? String(cause.message) : String(cause)),
+          at: Date.now(),
+        };
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    }
+
+    /** 设置页「关于 / 诊断」卡片：纯展示，所有写入都经 handlers。 */
+    function diagnosticsSection(h, { data, clientVersion, restart, busy, onRefresh, onCopy }) {
+      const status = diagnosticsObject(data?.status);
+      const view = diagnosticsView(status, restart);
+      const loading = data === null || data === undefined || data.loading === true;
+      const error = diagnosticsText(data?.error);
+      const updated = diagnosticsNumber(data?.at);
+      const missing = status === null;
+      const value = (text, fallback = '不可用') => (
+        text === '' || text === null || text === undefined ? fallback : text
+      );
+      const row = (label, text) => h('div', { style: styles.row },
+        h('span', { style: styles.label }, label),
+        h('span', { style: styles.value }, value(text)));
+      const group = (title, rows) => h('div', { style: { marginTop: 10 } },
+        h('div', { style: { ...styles.label, fontWeight: 600 } }, title),
+        ...rows);
+      const sourceText = (text) => (missing ? '不可用' : value(text, '无'));
+      const motionCounts = view.motion.available
+        ? `select ${view.motion.select ?? '—'} · skip ${view.motion.skip ?? '—'} · commit ${view.motion.commit ?? '—'}`
+        : '不可用';
+
+      return h('div', { style: styles.card, 'data-seirein-diagnostics': 'client' },
+        h('div', { style: styles.title }, '诊断（客户端）'),
+        h('div', { style: styles.hint },
+          '打开时读取一次 /assistant/status，不新增轮询；只显示状态摘要，不含对话文本或音频。'),
+        h('div', { style: styles.row },
+          h('button', {
+            style: { ...styles.btn, ...(busy || loading ? styles.off : {}) },
+            disabled: busy || loading,
+            onClick: () => onRefresh?.(),
+          }, loading ? '读取中…' : '刷新'),
+          h('button', {
+            style: { ...styles.btn, ...(busy || loading ? styles.off : {}) },
+            disabled: busy || loading,
+            onClick: () => onCopy?.(),
+          }, '复制诊断报告')),
+        error === ''
+          ? null
+          : h('div', { style: { ...styles.hint, color: DANGER } }, `诊断读取失败：${error}`),
+        loading ? h('div', { style: styles.hint }, '正在读取诊断状态…') : null,
+        updated === null
+          ? null
+          : h('div', { style: styles.mono },
+            `上次读取：${new Date(updated).toLocaleTimeString('zh-CN', { hour12: false })}`),
+        group('概况', [
+          row('客户端 / 服务端版本', missing
+            ? '不可用' : `v${clientVersion} / v${view.about.serverVersion || '不可用'}`),
+          row('运行实例 id', view.about.instanceId),
+          row('阈值生效值', view.about.thresholdDb === null
+            ? '不可用' : `${view.about.thresholdDb} dB`),
+          row('最近重启结果', diagnosticsRestartText(view.about.restart)),
+        ]),
+        group('语音', [
+          row('最后错误', sourceText(view.voice.lastError)),
+          row('候音来源', sourceText(view.voice.ackSource)),
+          row('候音命中', sourceText(view.voice.ackHit)),
+          row('首音时间（最近一轮）', missing ? '不可用' : diagnosticsFirstAudibleText(view.voice)),
+        ]),
+        group('视觉', [
+          row('来源', missing ? '不可用' : view.vision.source),
+          row('场景', missing ? '不可用' : view.vision.scene),
+          row('隐私模式', view.vision.privacy === null
+            ? '不可用' : view.vision.privacy ? '开启' : '关闭'),
+          row('虚拟摄像头', view.vision.virtualCam === null
+            ? '不可用' : view.vision.virtualCam ? '运行中' : '未运行'),
+          row('虚拟摄像头错误', missing ? '不可用' : value(view.vision.virtualCamError, '无')),
+        ]),
+        group('动作', [
+          row('预设开关（presets.enabled）', view.motion.enabled === null
+            ? '不可用' : view.motion.enabled ? '已开启' : '已关闭'),
+          row('最近计数', missing ? '不可用' : motionCounts),
+          row('最近跳过原因', missing
+            ? '不可用'
+            : view.motion.lastSkipReason !== ''
+              ? view.motion.lastSkipReason
+              : (view.motion.skip !== null && view.motion.skip > 0 ? '不可用（状态未提供）' : '无')),
+          row('最近事件', sourceText(view.motion.lastEvent)),
+        ]),
+        group('语言库 / 音频保留', [
+          row('语言库', missing ? '不可用' : diagnosticsLibraryText(view.libraries.lexicon)),
+          row('音频保留', missing ? '不可用' : diagnosticsLibraryText(view.libraries.retention)),
+        ]),
+      );
+    }
+
     function Panel() {
       const [status, setStatus] = useState(null);
       const [error, setError] = useState('');
@@ -2694,6 +3110,10 @@ window.__ModuleLoader__.load({
       const [lexiconData, setLexiconData] = useState(null);
       const [lexiconDialog, setLexiconDialog] = useState(null);
       const [lexiconPending, setLexiconPending] = useState(null);
+      // 客户端诊断：打开设置页时读一次 /assistant/status；之后只由「刷新」再读，不新增轮询。
+      const [diagnostics, setDiagnostics] = useState(null);
+      // 阈值保存触发的采集重启结果：状态接口未提供时，用本次设置页最后一次动作结果补齐。
+      const [lastRestart, setLastRestart] = useState(null);
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
       const [expandedAmbient, setExpandedAmbient] = useState(false);
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
@@ -2737,6 +3157,15 @@ window.__ModuleLoader__.load({
               body: JSON.stringify(body),
             });
             const result = await response.json();
+            if (body.action === 'hearing.threshold' && result !== null && typeof result === 'object') {
+              setLastRestart({
+                ok: result.ok === true,
+                restarted: result.restarted === true,
+                instanceId: String(result.instanceId ?? ''),
+                message: String(result.message ?? result.error ?? ''),
+                at: Date.now(),
+              });
+            }
             if (!result.ok) show(result.error ? `失败：${result.error}` : '操作失败');
             await load();
             return result;
@@ -2749,6 +3178,39 @@ window.__ModuleLoader__.load({
         },
         [load, show],
       );
+
+      /**
+       * 客户端诊断：一次面板打开只读一次 /assistant/status，之后只由「刷新」再读。
+       * 失败时保留上一次成功的数据并显示错误；首次失败则各分区显示「不可用」。
+       */
+      const loadDiagnostics = useCallback(async () => {
+        setDiagnostics((current) => ({
+          status: current?.status ?? null,
+          error: '',
+          loading: true,
+          at: current?.at ?? 0,
+        }));
+        const result = await loadDiagnosticsStatus();
+        setDiagnostics((current) => ({
+          status: result.status ?? current?.status ?? null,
+          error: result.error,
+          loading: false,
+          at: result.at,
+        }));
+      }, []);
+
+      const copyDiagnostics = useCallback(async () => {
+        const text = diagnosticsReportOf(diagnostics?.status ?? null, {
+          clientVersion: CLIENT_VERSION,
+          localRestart: lastRestart,
+          readError: diagnostics?.error ?? '',
+        });
+        const result = await copyDiagnosticsReport(
+          text,
+          typeof navigator === 'undefined' ? null : navigator.clipboard,
+        );
+        show(result.ok ? '诊断报告已复制' : `复制失败：${result.error}`);
+      }, [diagnostics, lastRestart, show]);
 
       // 动作预设列表：只在打开设置页时读一次，覆盖/恢复后再读一次（保持按钮与覆盖值一致）。
       const loadMotionPresets = useCallback(async () => {
@@ -3138,6 +3600,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         void loadLexicon();
       }, [loadLexicon]);
+
+      // 诊断面板只在挂载时读一次（打开设置页 = 一次）；没有 setInterval，也没有第二个轮询源。
+      useEffect(() => {
+        void loadDiagnostics();
+      }, [loadDiagnostics]);
 
       // A queued round is finished by the host later: the 3 s status poll is what releases the
       // silent button, so the card can never stay on 「已排队…」 after the queue drained.
@@ -3609,6 +4076,15 @@ window.__ModuleLoader__.load({
           line('人设与画像', `${status.personaChars} 字符`),
           line('固定记忆', `${resources.length} 条`),
         ),
+
+        diagnosticsSection(h, {
+          data: diagnostics,
+          clientVersion: CLIENT_VERSION,
+          restart: lastRestart,
+          busy: busy !== '',
+          onRefresh: () => void loadDiagnostics(),
+          onCopy: () => void copyDiagnostics(),
+        }),
 
         card(
           '作用域',
