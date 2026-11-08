@@ -1403,7 +1403,7 @@ test('23. a fully played round contributes no carry to the next round', (t) => {
 // ---------------------------------------------------------------------------
 
 test('24. a 1158-char carry plus a 106-char conclusion with a failed organizer keeps the conclusion', (t) => {
-  const { store, clock } = groupStore();
+  const { store, clock, events } = groupStore();
   const head1 = '旧要点一：先确认采集源类型。';
   const head2 = '旧要点二：窗口采集要选中目标窗口。';
   const head3 = '旧要点三：如果还黑屏就点开采集属性确认一次';
@@ -1428,6 +1428,10 @@ test('24. a 1158-char carry plus a 106-char conclusion with a failed organizer k
   assert.equal(fallback.text, newText, 'the 106-char conclusion is the whole fallback plan');
   assert.equal(fallback.pending.join(''), oldText, 'all old points stay pending, uncut');
   store.deferCarry({ group: first.group, version: 2, sentences: fallback.pending });
+  const deferRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1);
+  assert.equal(deferRow.payload.deferred, 3, 'the report counts the deferred points');
+  assert.equal(deferRow.payload.superseded, 0, 'nothing was corrected, so nothing is superseded');
+  assert.equal(deferRow.payload.reason, 'budget-deferred');
   const adjusted = store.adjustSpeech({ group: first.group, version: 2, text: fallback.text });
   assert.equal(adjusted.text, newText, 'the old points are never prepended');
   assert.equal(adjusted.deferred, true, 'the carry is explicitly deferred, not fulfilled');
@@ -1467,16 +1471,23 @@ test('24. a 1158-char carry plus a 106-char conclusion with a failed organizer k
 // 25. P2-2: a correction in the new answer wins over the old conclusion
 // ---------------------------------------------------------------------------
 
-test('25. a correcting new conclusion is spoken instead of the old conclusion', (t) => {
+test('25. a correcting new conclusion is spoken and the old conclusion is superseded', (t) => {
   const oldText = '旧结论：先重启软件。条件：不要先删除场景。';
   const newText = '更正：不是先重启软件，而是先换一个采集源。';
   const fallback = composeCarryConveyFallback(oldText, newText, { maxChars: 1200 });
   assert.equal(fallback.merged, false);
   assert.equal(fallback.text, newText, 'the correction is the spoken version');
   assert.ok(!fallback.text.includes('旧结论'), 'the old conclusion is not repeated');
-  assert.deepEqual(fallback.pending, ['旧结论：先重启软件。', '条件：不要先删除场景。']);
+  assert.deepEqual(fallback.pending, [], 'a corrected point is NOT deferred: it must never carry again');
+  assert.deepEqual(
+    fallback.superseded,
+    ['旧结论：先重启软件。', '条件：不要先删除场景。'],
+    'the whole old carry is retired',
+  );
+  assert.equal(fallback.reason, 'superseded');
   t.diagnostic(
-    `old="${oldText}" new="${fallback.text}" oldConclusionSpoken=no pending=${fallback.pending.length}句`,
+    `old="${oldText}" new="${fallback.text}" oldConclusionSpoken=no `
+    + `superseded=${fallback.superseded.length}句 deferred=${fallback.pending.length}句`,
   );
 });
 
@@ -1494,5 +1505,95 @@ test('26. when the budget is sufficient the old points still merge (original beh
   assert.equal(fallback.text, composeCarryConveyText(oldText, newText), 'the original merge is unchanged');
   t.diagnostic(
     `old=${oldText.length}字 new=${newText.length}字 budget=1200 merged=yes pending=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 27. P2: a corrected point is superseded (not deferred) and never comes back
+// ---------------------------------------------------------------------------
+
+test('27. A -> correcting B -> C fallback never revives the corrected A point', (t) => {
+  const { store, clock, events } = groupStore();
+  const A = '先重启软件。';
+  const B = '更正：不要重启软件，先换一个采集源。';
+  const C = '确认采集源的目标窗口即可。';
+  const first = store.beginInput({ sessionId: 's-superseded', text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: A });
+  store.adjustSpeech({ group: first.group, version: 1, text: A });
+  assert.equal(store.get(first.group.id).speechStarted, false, 'A never sounded');
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-superseded', text: '补充一下，那采集源呢', at: clock.t });
+  assert.equal(second.continuation, true);
+  assert.deepEqual(store.carryForSpeech(second.group, 2).sentences, [A], 'A is the carry material for B');
+
+  store.noteAnswerBody({ group: second.group, version: 2, text: B });
+  const fallback = composeCarryConveyFallback(A, B, { maxChars: 1200 });
+  assert.equal(fallback.merged, false);
+  assert.deepEqual(fallback.superseded, [A], 'the corrected A point is superseded, not deferred');
+  assert.deepEqual(fallback.pending, [], 'nothing is deferred: a superseded point never carries again');
+
+  // index.js order: supersede BEFORE adjustSpeech, so no old point can be prepended.
+  store.supersedeCarry({
+    group: second.group, version: 2, sentences: fallback.superseded, reason: fallback.reason,
+  });
+  const row = events.filter((event) => event.type === 'voice.carry.convey').at(-1);
+  assert.equal(row.payload.superseded, 1, 'the event reports the retired count');
+  assert.equal(row.payload.deferred, 0);
+  assert.equal(store.carryForSpeech(second.group, 2), null, 'the carry pool is empty');
+  assert.deepEqual(store.snapshot(second.group.id).supersededCarry, [A], 'kept as internal history only');
+
+  const adjusted = store.adjustSpeech({ group: second.group, version: 2, text: fallback.text });
+  assert.equal(adjusted.text, B, 'the correction is the whole plan: the old point is not prepended');
+  store.notePlaybackStart({ group: second.group, version: 2, sentenceId: 0, text: B });
+  store.notePlaybackEnd({
+    group: second.group, version: 2, sentenceId: 0, chunkIndex: 0, chunkCount: 1, status: 'completed', text: B,
+  });
+  assert.deepEqual(store.get(second.group.id).played, [B], 'exactly the correction played');
+  assert.equal(store.get(second.group.id).state, 'done');
+
+  // C: same topic, organizer failed, no carry left anywhere.
+  clock.t += 2_000;
+  const third = store.beginInput({ sessionId: 's-superseded', text: '再补充一句，那窗口呢', at: clock.t });
+  assert.equal(store.carryForSpeech(third.group, third.answerVersion), null, 'C inherits nothing');
+  assert.deepEqual(store.get(third.group.id).pendingSentences, []);
+  const cFallback = composeCarryConveyFallback('', C, { maxChars: 1200 });
+  assert.equal(cFallback.text, C, 'C only speaks its own body');
+  assert.ok(!cFallback.text.includes('先重启软件'), 'the corrected A point never returns');
+  t.diagnostic(
+    `A="${A}" B="${B}" superseded=${row.payload.superseded} deferred=${row.payload.deferred} `
+    + `Bplayed="${B}" Ccarry=0 Cplayed="${cFallback.text}" staleReplay=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 28. P2: an ambiguous contradiction (no correction word) carries nothing
+// ---------------------------------------------------------------------------
+
+test('28. an ambiguous contradiction without a correction word is never carried', (t) => {
+  const oldText = '先重启软件。';
+  const newText = '其实不用重启软件，先换一个采集源。';
+  assert.ok(!/(?:更正|纠正|改为|以[^。！？；;]{0,12}为准)/u.test(newText), 'fixture: no explicit correction word');
+  const fallback = composeCarryConveyFallback(oldText, newText, { maxChars: 1200 });
+  assert.equal(fallback.merged, false, 'validity is unconfirmed: no merge');
+  assert.equal(fallback.text, newText, 'only the current answer is played');
+  assert.deepEqual(fallback.pending, [], 'the old point is not deferred either');
+  assert.deepEqual(fallback.superseded, [oldText]);
+  assert.equal(fallback.reason, 'unconfirmed');
+
+  const { store, clock } = groupStore();
+  const first = openNeverPlayedGroup(store, clock, { sessionId: 's-ambiguous', plan: oldText });
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-ambiguous', text: '补充一下，那采集源呢', at: clock.t });
+  store.supersedeCarry({ group: second.group, version: 2, sentences: fallback.superseded, reason: fallback.reason });
+  store.adjustSpeech({ group: second.group, version: 2, text: fallback.text });
+  assert.ok(
+    !store.get(first.group.id).pendingSentences.some((sentence) => sentence.includes('先重启软件')),
+    'pending excludes the unconfirmed old point',
+  );
+  assert.equal(store.carryForSpeech(second.group, 2), null);
+  t.diagnostic(
+    `old="${oldText}" new="${newText}" correctionWord=no merged=${fallback.merged} `
+    + `played="${fallback.text}" pending=0 carry=null`,
   );
 });

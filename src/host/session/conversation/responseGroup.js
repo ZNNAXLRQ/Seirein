@@ -304,6 +304,24 @@ export function composeCarryConveyUser(carryText, source) {
 
 /** Explicit correction in the NEW answer: old points must not be replayed over it. */
 const CARRY_CORRECTION = /(?:更正|纠正|改为|(?:不是|并非)[^。！？；;]{0,24}?(?:而是|是)|以[^。！？；;]{0,12}为准)/u;
+/** A negation that, on a shared subject, means the old point and the new answer disagree. */
+const CARRY_NEGATION = /(?:不要|不用|不必|不能|别|并非|不是|没有|无需|不再)/u;
+
+/**
+ * Validity of the carried points cannot be confirmed: the new answer negates a shared subject
+ * without using one of the explicit correction words. The conservative answer is "do not carry".
+ */
+export function carryConflictsWithAnswer(carryText, newText) {
+  const carried = splitSpeechSentences(carryText);
+  // A sentence that is itself a carried point is not evidence of a contradiction: the plan may
+  // legitimately repeat it verbatim.
+  const carriedKeys = new Set(carried.map(sentenceKey).filter(Boolean));
+  const fresh = splitSpeechSentences(newText).filter((line) => !carriedKeys.has(sentenceKey(line)));
+  return carried.some((sentence) => fresh.some((line) => (
+    isSameTopicInput(line, sentence)
+    && CARRY_NEGATION.test(sentence) !== CARRY_NEGATION.test(line)
+  )));
+}
 
 /**
  * Deterministic merge used when the organizer is unavailable: the carried points, then the new
@@ -327,7 +345,11 @@ export function composeCarryConveyText(carryText, newText) {
  * does not correct them. Otherwise they stay pending for a later round, never forced into this
  * playback (the old "old + new" hard merge could spend the whole budget on the old points).
  *
- * @returns {{text: string, pending: string[], merged: boolean}}
+ * A point the new answer corrects is `superseded`, not `pending`: it leaves the carry pool for
+ * good. An answer that disagrees without an explicit correction word leaves validity unconfirmed,
+ * so the same conservative rule applies.
+ *
+ * @returns {{text: string, pending: string[], superseded: string[], merged: boolean, reason: string}}
  */
 export function composeCarryConveyFallback(carryText, newText, { maxChars = 0 } = {}) {
   const fresh = splitSpeechSentences(newText);
@@ -336,15 +358,26 @@ export function composeCarryConveyFallback(carryText, newText, { maxChars = 0 } 
     const key = sentenceKey(sentence);
     return key.length > 0 && !freshKeys.has(key);
   });
-  // A correction in the new answer wins: replaying the old point would contradict it.
+  // A correction in the new answer wins: replaying the old point would contradict it, and it must
+  // never come back in a later round.
   const corrected = CARRY_CORRECTION.test(String(newText ?? ''));
-  const merged = corrected ? [] : [...carried, ...fresh];
+  const conflicted = !corrected && carryConflictsWithAnswer(carried.join(''), newText);
+  if (corrected || conflicted) {
+    return {
+      text: fresh.join(''),
+      pending: [],
+      superseded: carried,
+      merged: false,
+      reason: corrected ? 'superseded' : 'unconfirmed',
+    };
+  }
+  const merged = [...carried, ...fresh];
   const budget = Number(maxChars) > 0 ? Math.trunc(Number(maxChars)) : 0;
   const fits = budget === 0 || [...merged.join('')].length <= budget;
   if (!fits || merged.length === 0) {
-    return { text: fresh.join(''), pending: carried, merged: false };
+    return { text: fresh.join(''), pending: carried, superseded: [], merged: false, reason: 'budget' };
   }
-  return { text: merged.join(''), pending: [], merged: true };
+  return { text: merged.join(''), pending: [], superseded: [], merged: true, reason: 'same-topic' };
 }
 
 /**
@@ -458,6 +491,8 @@ function groupView(group, extra = {}) {
     carry: group.carryConvey === null || group.carryConvey === undefined
       ? 0
       : group.carryConvey.sentences.length,
+    /** Points a correcting answer retired: internal history only, never carried again. */
+    superseded: Array.isArray(group.supersededCarry) ? group.supersededCarry.length : 0,
     ...extra,
   };
 }
@@ -599,13 +634,17 @@ export function createResponseGroupStore({
   /** Played keys of one group: exact sentence wording, so punctuation never changes coverage. */
   const playedKeySet = (group) => new Set((group.played ?? []).map(sentenceKey).filter(Boolean));
 
+  /** Points retired by a correcting answer: internal history only, never pending again. */
+  const supersededKeySet = (group) => new Set((group.supersededCarry ?? []).map(sentenceKey).filter(Boolean));
+
   /** Remember generated-but-unvoiced sentences (body or plan), bounded and punctuation-insensitive. */
   const rememberPending = (group, text) => {
     const played = playedKeySet(group);
+    const retired = supersededKeySet(group);
     const known = new Set(group.pendingSentences.map(sentenceKey));
     for (const sentence of splitSpeechSentences(text)) {
       const key = sentenceKey(sentence);
-      if (key.length === 0 || played.has(key) || known.has(key)) continue;
+      if (key.length === 0 || played.has(key) || known.has(key) || retired.has(key)) continue;
       known.add(key);
       group.pendingSentences.push(sentence);
     }
@@ -651,9 +690,10 @@ export function createResponseGroupStore({
     const rows = [];
     const seen = new Set();
     const played = playedKeySet(group);
+    const retired = supersededKeySet(group);
     const push = (sentence) => {
       const key = sentenceKey(sentence);
-      if (key.length === 0 || seen.has(key) || played.has(key)) return;
+      if (key.length === 0 || seen.has(key) || played.has(key) || retired.has(key)) return;
       seen.add(key);
       rows.push(String(sentence));
     };
@@ -764,12 +804,13 @@ export function createResponseGroupStore({
     // ride the next round even after that round started speaking. Every other point is replayed
     // only while the round was still silent.
     const played = playedKeySet(group);
+    const retired = supersededKeySet(group);
     const seen = new Set();
     const deferredSentences = (group.carryConvey?.deferred === true ? group.carryConvey.sentences ?? [] : [])
       .map((sentence) => String(sentence ?? ''))
       .filter((sentence) => {
         const key = sentenceKey(sentence);
-        if (key.length === 0 || played.has(key) || seen.has(key)) return false;
+        if (key.length === 0 || played.has(key) || seen.has(key) || retired.has(key)) return false;
         seen.add(key);
         return true;
       });
@@ -820,7 +861,52 @@ export function createResponseGroupStore({
       reason: carry.reason,
       gapMs: carry.gapMs,
       answerVersion: version,
+      superseded: 0,
+      deferred: carry.merged === true && carry.deferred === true ? carry.sentences.length : 0,
     });
+  };
+
+  /**
+   * A correcting answer retires the carried points: they stay in `supersededCarry` as internal
+   * history but never enter `pendingSentences` or the carry pool again. This is NOT `deferCarry`:
+   * a deferred point is still valid, a superseded one is dead.
+   */
+  const supersedeCarry = ({ group, version = null, sentences = [], reason = 'superseded' } = {}) => {
+    if (group === null || group === undefined) return null;
+    const rows = (Array.isArray(sentences) ? sentences : [])
+      .map((sentence) => String(sentence ?? '').trim())
+      .filter((sentence) => sentenceKey(sentence).length > 0);
+    if (rows.length === 0) return group.carryConvey ?? null;
+    const known = supersededKeySet(group);
+    for (const sentence of rows) {
+      const key = sentenceKey(sentence);
+      if (known.has(key)) continue;
+      known.add(key);
+      group.supersededCarry.push(sentence);
+    }
+    while (group.supersededCarry.length > pendingLimit) group.supersededCarry.shift();
+    const retired = supersededKeySet(group);
+    group.pendingSentences = group.pendingSentences.filter((sentence) => !retired.has(sentenceKey(sentence)));
+    const carry = group.carryConvey ?? null;
+    if (carry !== null) {
+      const kept = carry.sentences.filter((sentence) => !retired.has(sentenceKey(sentence)));
+      group.carryConvey = kept.length === 0
+        ? null
+        : { ...carry, sentences: kept, chars: kept.join('').length };
+    }
+    publish('voice.carry.convey', {
+      groupId: group.id,
+      priorGroupId: carry?.priorGroupId ?? group.id,
+      sentences: group.carryConvey?.sentences.length ?? 0,
+      chars: group.carryConvey?.chars ?? 0,
+      merged: false,
+      reason: String(reason ?? 'superseded'),
+      gapMs: 0,
+      answerVersion: version ?? group.answerVersion,
+      superseded: rows.length,
+      deferred: group.carryConvey?.deferred === true ? group.carryConvey.sentences.length : 0,
+    });
+    return group.carryConvey;
   };
 
   /**
@@ -829,9 +915,10 @@ export function createResponseGroupStore({
    */
   const deferCarry = ({ group, version, sentences = [] } = {}) => {
     if (group === null || group === undefined) return null;
+    const retired = supersededKeySet(group);
     const rows = (Array.isArray(sentences) ? sentences : [])
       .map((sentence) => String(sentence ?? '').trim())
-      .filter((sentence) => sentenceKey(sentence).length > 0);
+      .filter((sentence) => sentenceKey(sentence).length > 0 && !retired.has(sentenceKey(sentence)));
     if (rows.length === 0) return null;
     const prior = group.carryConvey ?? null;
     group.carryConvey = {
@@ -843,6 +930,18 @@ export function createResponseGroupStore({
       deferred: true,
       at: now(),
     };
+    publish('voice.carry.convey', {
+      groupId: group.id,
+      priorGroupId: group.carryConvey.priorGroupId,
+      sentences: group.carryConvey.sentences.length,
+      chars: group.carryConvey.chars,
+      merged: false,
+      reason: 'budget-deferred',
+      gapMs: 0,
+      answerVersion: version,
+      superseded: 0,
+      deferred: group.carryConvey.sentences.length,
+    });
     return group.carryConvey;
   };
 
@@ -891,6 +990,8 @@ export function createResponseGroupStore({
        * only. It is not a user message, not a body, and not written into memory.
        */
       carryConvey: null,
+      /** Internal history of points a correcting answer retired: never pending, never carried. */
+      supersededCarry: [],
       cancelReason: '',
       // Cached copies for the bounded continuation context (the message itself is never stored).
       lastUserInput: String(text ?? ''),
@@ -1139,6 +1240,20 @@ export function createResponseGroupStore({
     // B: the carried points were already woven into THIS plan by the spoken organizer; prepending
     // the old sentences again would say them twice. The plan owns the pending coverage instead.
     if (carryForSpeech(group, version) !== null) {
+      const carry = group.carryConvey;
+      // A plan that corrects the carried points retires them for this round AND every later round.
+      const corrected = CARRY_CORRECTION.test(original);
+      const conflicted = !corrected && carryConflictsWithAnswer(carry.sentences.join(''), original);
+      if (corrected || conflicted) {
+        supersedeCarry({
+          group, version, sentences: carry.sentences, reason: corrected ? 'superseded' : 'unconfirmed',
+        });
+        if (Number.isInteger(turn)) answer.turn = turn;
+        return {
+          text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false,
+          carried: false, superseded: true,
+        };
+      }
       replacePendingFromPlan(group, original);
       if (Number.isInteger(turn)) answer.turn = turn;
       // A budget-deferred fallback did NOT convey them: keep the points pending for a later round.
@@ -1467,6 +1582,7 @@ export function createResponseGroupStore({
     adjustSpeech,
     carryForSpeech,
     deferCarry,
+    supersedeCarry,
     notePlaybackStart,
     notePlaybackEnd,
     notePlaybackSkipped,
@@ -1505,6 +1621,7 @@ export function createResponseGroupStore({
           reason: group.carryConvey.reason,
           deferred: group.carryConvey.deferred === true,
         },
+        supersededCarry: [...(group.supersededCarry ?? [])],
         currentAnswer: group.currentAnswer === null ? null : {
           version: group.currentAnswer.version,
           state: group.currentAnswer.state,

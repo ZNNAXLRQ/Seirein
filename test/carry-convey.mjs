@@ -860,3 +860,67 @@ test('8. a failed organizer plays the new conclusion and never spends the budget
     + `fallback=${fallback.reason} playedNew=${captions.join('').length} oldPlayed=0`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// 9. P2: a corrected point is superseded, never deferred, never revived
+// ---------------------------------------------------------------------------
+
+test('9. a corrected never-spoken point is superseded and a later fallback cannot revive it', async (t) => {
+  const A_PLAN = '先重启软件。';
+  const B_BODY = '更正：不要重启软件，先换一个采集源。';
+  const C_BODY = '确认采集源的目标窗口即可，如果还是黑屏，就把窗口采集的属性重新点开确认一次，顺便看一眼采集源的类型有没有选错，最后再看看场景里有没有多余的滤镜。';
+  const app = await mountRound(t, {
+    // A never really starts sounding: its first clip is held before any audio.
+    holdSynth: (text) => text.includes('先重启软件'),
+    replyFor: ({ turn }) => (turn === 1 ? A_PLAN : turn === 2 ? B_BODY : C_BODY),
+    // The organizer fails on the carry round AND on C: both fall back deterministically.
+    spoken: () => '',
+  });
+
+  app.say('OBS 全黑怎么调');
+  await waitUntil(() => state.held === 1, 'A\'s clip is held before any sound');
+  const firstGroup = (await app.waitForEvent('voice.response.group.ready', (payload) => payload.version === 1)).groupId;
+  assert.equal(app.players().length, 0, 'A never reached the player');
+
+  app.say('补充一下，那采集源呢');
+  const carry = await carryEventOf(app, (payload) => payload.merged === true);
+  assert.equal(carry.priorGroupId, firstGroup, 'A\'s never-spoken point is the carry material');
+  assert.equal(carry.sentences, 1);
+  const retired = await carryEventOf(app, (payload) => payload.superseded >= 1);
+  assert.equal(retired.superseded, 1, 'the corrected A point is superseded');
+  assert.equal(retired.deferred, 0, 'nothing is deferred: a correction is not a budget defer');
+  assert.equal(retired.reason, 'superseded');
+
+  state.holdGate.resolve();
+  await waitUntil(() => app.players().length >= 1, 'B\'s correction reached the player');
+  assert.equal(app.playerCaptions()[0], B_BODY, 'the correction itself plays normally');
+  await playAll(app, 1);
+  await app.waitForEvent('voice.response.group.done', (payload) => payload.reason === 'played');
+  assert.equal(joined(app.playerCaptions()), B_BODY, 'B says exactly the correction, never the old point');
+
+  app.say('再补充一句，那窗口呢');
+  const cClips = sentenceClips(C_BODY);
+  await waitUntil(() => app.players().length >= 2, 'C\'s fallback answer reached the player');
+  const request = app.spokenRequests().at(-1);
+  assert.ok(!request.system.includes(CARRY_CONVEY_SYSTEM_NOTE), 'C gets no carry instruction');
+  assert.ok(!request.user.includes('<上一轮待传达>'), 'nothing is carried into C');
+  await playAll(app, 1 + cClips.length);
+  const captions = app.playerCaptions();
+  assert.deepEqual(captions.slice(1), cClips, 'C plays only its own current body');
+  const spoken = captions.join('');
+  assert.ok(!spoken.includes('先重启软件'), 'the corrected A point never comes back');
+  assert.equal(spoken.split('采集源的目标窗口').length - 1, 1, 'the current body is said exactly once');
+  const rows = await app.events();
+  assert.equal(
+    rows.filter((event) => event.type === 'voice.carry.convey' && event.payload.merged === true).length,
+    1,
+    'only B carries; the corrected point is never re-carried',
+  );
+  await tick(20);
+  assert.ok(!app.playerCaptions().join('').includes('先重启软件'), 'no late clip revives the old point');
+  t.diagnostic(
+    `A="${A_PLAN}" B="${B_BODY}" superseded=${retired.superseded} deferred=${retired.deferred} `
+    + `Bplayed="${captions[0]}" Cclips=${cClips.length} Cplayed="${captions.slice(1).join('|')}" `
+    + `staleReplay=0 merges=1`,
+  );
+});

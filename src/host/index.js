@@ -11812,6 +11812,10 @@ export function apply(ctx, config) {
           });
           const fallbackText = fallback === null ? full : fallback.text;
           const carryPending = fallback === null ? [] : fallback.pending;
+          // P2: a point the new answer corrects is superseded, not deferred. It leaves the carry
+          // pool for good, so no later round can revive the stale conclusion.
+          const carrySuperseded = fallback === null ? [] : fallback.superseded;
+          const carrySupersededReason = fallback === null ? 'superseded' : fallback.reason;
           const plan = {
             text: full,
             feedText: raw,
@@ -11840,6 +11844,8 @@ export function apply(ctx, config) {
             plan.feedText = fallbackText;
             plan.chars = speechCharCount(fallbackText);
             plan.carryPending = carryPending;
+            plan.carrySuperseded = carrySuperseded;
+            plan.carrySupersededReason = carrySupersededReason;
             await emitSpokenVersion(plan, 'original', plan.chars, 0);
             return plan;
           }
@@ -11850,6 +11856,8 @@ export function apply(ctx, config) {
             plan.feedText = carryText.length > 0 ? fallbackText : raw;
             plan.chars = speechCharCount(fallbackText);
             plan.carryPending = carryPending;
+            plan.carrySuperseded = carrySuperseded;
+            plan.carrySupersededReason = carrySupersededReason;
             plan.source = 'full-fallback';
             plan.fallback = 'duplicate-task';
             await emitSpokenVersion(plan, 'full-fallback', plan.chars, 0, 'duplicate-task');
@@ -11886,6 +11894,8 @@ export function apply(ctx, config) {
           plan.source = 'full-fallback';
           plan.feedText = carryText.length > 0 ? fallbackText : raw;
           plan.carryPending = carryPending;
+          plan.carrySuperseded = carrySuperseded;
+          plan.carrySupersededReason = carrySupersededReason;
           plan.ms = ms;
           plan.fallback = failure;
           await log.emit('voice.spoken.fallback', {
@@ -11913,6 +11923,16 @@ export function apply(ctx, config) {
           source: plan.source,
           chars: plan.chars,
         });
+        // P2: a correcting fallback retires the old points BEFORE any plan is adjusted: superseded
+        // points are never deferred, never prepended and never inherited by a later round.
+        if (Array.isArray(plan.carrySuperseded) && plan.carrySuperseded.length > 0) {
+          responseGroups.supersedeCarry({
+            group: voiceGroup,
+            version: voiceGroupVersion,
+            sentences: plan.carrySuperseded,
+            reason: plan.carrySupersededReason ?? 'superseded',
+          });
+        }
         if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
         if (plan.text.length === 0) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
