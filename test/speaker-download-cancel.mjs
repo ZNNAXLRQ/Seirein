@@ -40,13 +40,38 @@ const PROJECT_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const SPEAKER_FILE = '3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx';
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const childEnv = { ...process.env };
+/**
+ * A suite must run as a plain `node <file>`: inheriting the parent runner's `NODE_TEST_CONTEXT`
+ * makes node:test switch the child to its serialized IPC reporter instead of human output.
+ *
+ * The child also carries every nested-run guard: test 7 below aggregates `speaker-*`, and those
+ * suites aggregate `speaker-*` back. Without the guards the fan-out is recursive/duplicated
+ * (`speaker-download-cancel` -> `speaker-loopback-shadow` -> `speaker-download-cancel` ...), which
+ * is what pushed this file past the 300 s single-file budget. A guard only suppresses the
+ * receiving suite's own `回归` test; its functional tests always run.
+ */
+const childEnv = {
+  ...process.env,
+  DSH_SPEAKER_CANCEL_NESTED: '1',
+  DSH_SPEAKER_REGRESSION_NESTED: '1',
+  DSH_LOOPBACK_SHADOW_NESTED: '1',
+  DSH_SPEAKER_ATTRIBUTION_NESTED: '1',
+};
 delete childEnv.NODE_TEST_CONTEXT;
 const runSuite = (file, args = []) => run(process.execPath, [...args, file], {
   cwd: PROJECT_ROOT,
   env: childEnv,
   maxBuffer: 64 * 1024 * 1024,
 });
+/**
+ * Run a suite's functional tests only: `--test-skip-pattern` drops every `回归` / `regression` test
+ * in the child, so no second-level aggregator starts its own copy of this same fan-out. The
+ * functional assertions themselves are untouched.
+ */
+const runFunctionalSuite = (file) => runSuite(file, [
+  '--test-skip-pattern',
+  '回归|regression',
+]);
 
 /** Poll until `predicate()` is true; a missed deadline fails the test instead of hanging it. */
 async function until(predicate, label, timeoutMs = 8000) {
@@ -548,7 +573,23 @@ test('6) 无取消的成功路径不变：宿主订阅正常完成、status read
 // 7. regression
 // ---------------------------------------------------------------------------
 
+/** Nested-run guards: any one means a top-level aggregator already runs this same fan-out. */
+const NESTED_GUARDS = [
+  'DSH_SPEAKER_CANCEL_NESTED',
+  'DSH_SPEAKER_REGRESSION_NESTED',
+  'DSH_LOOPBACK_SHADOW_NESTED',
+  'DSH_SPEAKER_ATTRIBUTION_NESTED',
+];
+const nestedGuard = NESTED_GUARDS.find((name) => process.env[name] === '1');
+
 test('7) 回归：node --check、speaker-* / model-download / voice-lanes / shutdown、smoke', async (t) => {
+  // A nested run (speaker-loopback-shadow / speaker-attribution / speaker-host-wiring / this file)
+  // already aggregates `speaker-*`; repeating it here is the recursion that timed out the batch.
+  if (nestedGuard) {
+    console.log(`[speaker-cancel 7] skip: nested run (${nestedGuard}=1), the top-level regression already covers these suites`);
+    t.skip(`nested run (${nestedGuard}=1): the top-level regression already covers these suites`);
+    return;
+  }
   for (const file of ['src/host/index.js', 'src/host/platform/modelDownload.js', 'test/speaker-download-cancel.mjs']) {
     await runSuite(file, ['--check']);
   }
@@ -562,7 +603,8 @@ test('7) 回归：node --check、speaker-* / model-download / voice-lanes / shut
   assert.ok(suites.includes('speaker-download-cancel.mjs'), 'this suite is part of the regression set');
   assert.ok(suites.length >= 6, `found the speaker/download/shutdown suites: ${suites.length}`);
   for (const name of suites.filter((entry) => entry !== 'speaker-download-cancel.mjs')) {
-    await runSuite(join(testDir, name));
+    // Functional tests only: a child's own `回归` test is another aggregator over this same set.
+    await runFunctionalSuite(join(testDir, name));
   }
   await runSuite('test/smoke.mjs');
   console.log(`[speaker-cancel 7] node --check=ok suites=${suites.length - 1} smoke=ok`);

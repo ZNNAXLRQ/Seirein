@@ -44,13 +44,24 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * A suite must run as a plain `node <file>`: inheriting the parent runner's `NODE_TEST_CONTEXT`
  * makes node:test switch the child to its serialized IPC reporter instead of human output.
  */
-const childEnv = { ...process.env };
+const childEnv = {
+  ...process.env,
+  DSH_SPEAKER_REGRESSION_NESTED: '1',
+  DSH_SPEAKER_CANCEL_NESTED: '1',
+  DSH_LOOPBACK_SHADOW_NESTED: '1',
+  DSH_SPEAKER_ATTRIBUTION_NESTED: '1',
+};
 delete childEnv.NODE_TEST_CONTEXT;
 const runSuite = (file, args = []) => run(process.execPath, [...args, file], {
   cwd: PROJECT_ROOT,
   env: childEnv,
   maxBuffer: 64 * 1024 * 1024,
 });
+/** Functional tests only (for suites that keep their own `回归` aggregator over this same set). */
+const runFunctionalSuite = (file) => runSuite(file, [
+  '--test-skip-pattern',
+  '回归|regression',
+]);
 
 /** Poll until `predicate()` is true; a missed deadline fails the test instead of hanging it. */
 async function until(predicate, label, timeoutMs = 4000) {
@@ -633,6 +644,19 @@ async function runRealClip(t, { speakerShadow, speakerLibrary, speakerEmbedderFa
 // ---------------------------------------------------------------------------
 
 test('7) 回归：node --check、speaker-voice/speaker-shadow/voice-lanes/hearing-*、smoke', async (t) => {
+  // Nested runs (speaker-download-cancel / speaker-loopback-shadow / speaker-attribution) already
+  // aggregate these suites; running this fan-out there is a duplicate (and recursive) aggregation.
+  const nestedGuard = [
+    'DSH_SPEAKER_CANCEL_NESTED',
+    'DSH_SPEAKER_REGRESSION_NESTED',
+    'DSH_LOOPBACK_SHADOW_NESTED',
+    'DSH_SPEAKER_ATTRIBUTION_NESTED',
+  ].find((name) => process.env[name] === '1');
+  if (nestedGuard) {
+    console.log(`[speaker-host 7] skip: nested run (${nestedGuard}=1), the top-level regression already covers these suites`);
+    t.skip(`nested run (${nestedGuard}=1): the top-level regression already covers these suites`);
+    return;
+  }
   t.timeout = 900_000;
   for (const file of ['src/host/index.js', 'src/host/hearing/speakerVoice.js', 'client.js', 'test/speaker-host-wiring.mjs']) {
     await assert.doesNotReject(runSuite(join(PROJECT_ROOT, file), ['--check']), `${file} parses`);
@@ -649,7 +673,11 @@ test('7) 回归：node --check、speaker-voice/speaker-shadow/voice-lanes/hearin
 
   const results = [];
   for (const suite of suites) {
-    const result = await runSuite(suite);
+    // Only `speaker-voice` / `speaker-shadow` carry a `回归` aggregator over this same set; every
+    // other suite here (including `hearing-*`, which names an ordinary assertion "回归") runs in full.
+    const result = /speaker-(?:voice|shadow)\.mjs$/u.test(suite)
+      ? await runFunctionalSuite(suite)
+      : await runSuite(suite);
     results.push({ suite, output: `${result.stdout}\n${result.stderr}` });
   }
   for (const { suite, output } of results) {

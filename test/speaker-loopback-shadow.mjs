@@ -51,6 +51,8 @@ const childEnv = {
   ...process.env,
   DSH_LOOPBACK_SHADOW_NESTED: '1',
   DSH_SPEAKER_ATTRIBUTION_NESTED: '1',
+  DSH_SPEAKER_REGRESSION_NESTED: '1',
+  DSH_SPEAKER_CANCEL_NESTED: '1',
 };
 delete childEnv.NODE_TEST_CONTEXT;
 const runSuite = (file, args = []) => run(process.execPath, [...args, file], {
@@ -674,11 +676,17 @@ async function runRealClip(t, { speakerShadow, speakerLibrary, speakerEmbedderFa
 // ---------------------------------------------------------------------------
 
 test('7) 回归：node --check、speaker-*、voice-lanes、ambient-*、smoke', async (t) => {
-  // A nested run (speaker-attribution's / another speaker suite's own regression) already covers
-  // these; skipping here keeps the fan-out bounded.
-  if (process.env.DSH_LOOPBACK_SHADOW_NESTED === '1'
-    || process.env.DSH_SPEAKER_ATTRIBUTION_NESTED === '1') {
-    t.skip('nested run: the top-level regression already covers these suites');
+  // A nested run (speaker-attribution's / speaker-download-cancel's / speaker-host-wiring's own
+  // regression) already covers these; skipping here keeps the fan-out bounded and non-recursive.
+  const nestedGuard = [
+    'DSH_LOOPBACK_SHADOW_NESTED',
+    'DSH_SPEAKER_ATTRIBUTION_NESTED',
+    'DSH_SPEAKER_REGRESSION_NESTED',
+    'DSH_SPEAKER_CANCEL_NESTED',
+  ].find((name) => process.env[name] === '1');
+  if (nestedGuard) {
+    console.log(`[loopback-shadow 7] skip: nested run (${nestedGuard}=1), the top-level regression already covers these suites`);
+    t.skip(`nested run (${nestedGuard}=1): the top-level regression already covers these suites`);
     return;
   }
   t.timeout = 900_000;
