@@ -294,6 +294,7 @@ import * as sightRuntime from './vision/sight.js';
 import { assessFrame } from './vision/black-frame.js';
 import { ambientSourceEvent, ambientSourceOf } from './hearing/ambient.js';
 import { VISION_MODES, VisionMode } from './vision/vision.js';
+import { createPreRequestVision } from './vision/pre-request.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -6150,6 +6151,13 @@ export function apply(ctx, config) {
       // Keep the memory lane's exact call shape (tests assert it) and append after the whole
       // waterfall, so the notice is the last internal block and the base decision is untouched.
       const decision = await memoryPreStep.handle(payload, next);
+      // P-48: establish this turn's vision preparation before the first request is built. It
+      // returns the decision untouched and can never fail the turn (fail-open inside).
+      try {
+        await prepareVisionForTurn(payload, decision);
+      } catch {
+        /* vision preparation is an optimization; the turn must run without it */
+      }
       return injectFaultNotice(payload, decision);
     }));
     // Batch 2: the continuation context rides the same waterfall as the memory block. It touches
@@ -8194,6 +8202,19 @@ export function apply(ctx, config) {
   let visionDisposed = false;
   let visionModeQueue = Promise.resolve();
   let visionModeRequest = 0;
+  /**
+   * P-48: one turn-scoped visual preparation. `beginTurn` runs at the turn's first pre-step, the
+   * optional eager capture runs only when the user actually asked to look, and every visual read
+   * in the turn asks this channel before touching the screen/OBS.
+   */
+  const preRequestVision = createPreRequestVision({
+    isBlocked: () => visionDisposed || visionChanging || vision.mode === 'privacy' || visionController.signal.aborted,
+    ttlMs: () => {
+      const configured = Number(config?.vision?.preRequestTtlMs ?? config?.visionPreRequestTtlMs);
+      return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 30_000;
+    },
+    emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+  });
   let watcherStarting = null;
   let watcherStopping = Promise.resolve();
   const capturedTokens = new WeakMap();
@@ -8243,6 +8264,8 @@ export function apply(ctx, config) {
   };
   const discardVisionFile = async (file) => {
     if (!file) return;
+    // The pre-request channel must never point at a file that no longer exists.
+    preRequestVision.forget(file);
     visionFiles.delete(file);
     await rm(file, { force: true, maxRetries: 3, retryDelay: 30 });
   };
@@ -8274,6 +8297,8 @@ export function apply(ctx, config) {
     try { await remove.call(service, attachment); } catch { /* immutable backend */ }
   };
   const invalidateVision = () => {
+    // A snapshot from the previous source/scene/privacy era is never a reusable frame.
+    preRequestVision.clear();
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
     visionController = new AbortController();
@@ -8787,8 +8812,30 @@ export function apply(ctx, config) {
       throw captureCancelledError(callSignal.reason);
     }
     assertVisionToken(token);
+    // P-48: a preparation already taken this turn is the frame this read must use. The check
+    // comes before the coalescing lane so a second look reuses the snapshot instead of waiting
+    // for (or starting) another capture.
+    if (reason !== 'pre-request') {
+      const reuseSource = token.mode === 'scene' ? 'obs' : 'desktop';
+      const reuseScene = token.mode === 'scene' ? token.scene : '';
+      // Verify the live source before the reuse event is published: an OBS scene switched
+      // while the preparation waited must invalidate the snapshot, not reuse it.
+      await assertProgramScene(token);
+      assertVisionToken(token);
+      const prepared = preRequestVision.take({ source: reuseSource, scene: reuseScene });
+      if (prepared !== null) {
+        const reused = { ...prepared, source: token.mode };
+        capturedTokens.set(reused, token);
+        if (token.generation === visionGeneration) visionFiles.set(reused.file, token.generation);
+        return reused;
+      }
+    }
     const laneKey = `${token.generation}|${token.mode}|${token.mode === 'scene' ? token.scene : ''}`;
-    const existing = visionCaptureLanes.get(laneKey);
+    const existing = reason === 'pre-request'
+      // A preparation is the turn's NEW frame: it must not join a capture started by an older
+      // turn that merely happened to be inside the 500 ms merge window.
+      ? undefined
+      : visionCaptureLanes.get(laneKey);
     if (existing !== undefined) {
       // A stale frame is never reused as the answer to a new "look now", even inside the window.
       const reusable = existing.stale !== true
@@ -8883,6 +8930,13 @@ export function apply(ctx, config) {
           observedAt: capturedAt,
           generation: baseToken.generation,
         };
+        // This real frame is now the turn's prepared view: a later read in the same turn reuses
+        // it (only when a turn scope exists; a tool-only flow stays uncached).
+        preRequestVision.remember(shot, {
+          source: captureToken.mode === 'scene' ? 'obs' : 'desktop',
+          scene: captureToken.mode === 'scene' ? captureToken.scene : '',
+          kind: 'shot',
+        });
         // A fresh observation may prove where the user is: republish attention only when BOTH the
         // verified gaze channel and this real position exist; otherwise it stays untouched.
         refreshAvatarAttention();
@@ -8916,6 +8970,61 @@ export function apply(ctx, config) {
     capturedTokens.set(result, token);
     if (token.generation === visionGeneration) visionFiles.set(result.file, token.generation);
     return result;
+  };
+
+  /**
+   * Does this turn's own words ask for a look at the current picture? Only then does the
+   * preparation spend a capture before the first request; ordinary chat never auto-captures.
+   * Deliberately narrow: a false negative only costs the normal tool-path capture.
+   */
+  const VISION_LOOK_REQUEST = /(看看|看一下|看一眼|瞧瞧|瞅瞅|看下|看屏幕|看画面|看我的屏幕|看一下屏幕|当前画面|目前画面|屏幕上|截图|截个图|截屏|look at (?:the )?(?:screen|desktop|this)|look at my screen|screenshot|what(?:'s| is) on my screen|show me (?:the )?screen)/iu;
+  const visionLookRequested = (messages) => {
+    let text = '';
+    try {
+      text = memoryQueryText(messages);
+    } catch {
+      text = '';
+    }
+    return typeof text === 'string' && text.length > 0 && VISION_LOOK_REQUEST.test(text);
+  };
+
+  /**
+   * P-48 pre-step lane: open the turn scope and, when the user asked to look, take the one
+   * preparation capture before the first model request. Returns nothing and never throws: a
+   * failed preparation leaves the turn running and the first visual read captures normally.
+   */
+  const prepareVisionForTurn = async (payload, decision) => {
+    if (Number(payload?.step) !== 1) return;
+    if (decision === null || typeof decision !== 'object' || decision.kind === 'reject') return;
+    const agent = payload?.agent;
+    if (isSubagentAgent(agent)) return;
+    if (!inWorkspaceScope({ agent })) return;
+    const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : '';
+    const turn = Number.isSafeInteger(payload?.turn) ? payload.turn : -1;
+    if (sessionId.length === 0 || turn < 0) return;
+    const source = vision.mode === 'scene' ? 'obs' : 'desktop';
+    const scene = vision.mode === 'scene' ? vision.scene : '';
+    // Always open the turn scope: a snapshot from the previous turn must not be reused even
+    // when this turn does not ask to look.
+    preRequestVision.beginTurn({ sessionId, turn, source, scene });
+    if (vision.mode === 'privacy' || visionChanging || visionDisposed) return;
+    let enabled = false;
+    try {
+      enabled = features.enabled('vision') === true;
+    } catch {
+      enabled = false;
+    }
+    if (!enabled) return;
+    if (!visionLookRequested(payload?.messages)) return;
+    // `prepare` reports its own miss and swallows the failure (fail-open).
+    await preRequestVision.prepare({
+      turn,
+      sessionId,
+      source,
+      scene,
+      signal: payload?.signal ?? null,
+      capture: () => captureForAgent('pre-request', payload?.signal),
+    });
   };
 
   /** Attachment cap: native resolution by default; a larger frame is scaled only to fit. */
@@ -9376,17 +9485,29 @@ export function apply(ctx, config) {
       const session = watcher;
       const token = visionToken();
       let sheet;
+      let reusedSheet = false;
       try {
         assertVisionToken(token);
         await assertProgramScene(token);
-        // The storyboard is judged from its own pixels too: an all-black sheet is not the screen.
-        sheet = await captureVerified({
-          take: () => session.take(),
-          source: `sheet:${token.mode}`,
-          virtualCam: token.mode === 'scene',
-          token,
-          assertCurrent: () => assertProgramScene(token),
+        // P-48: the turn's prepared frame is preferred over taking a fresh storyboard. It was
+        // already verified when captured, and it keeps its original file/size/source metadata.
+        const prepared = preRequestVision.take({
+          source: token.mode === 'scene' ? 'obs' : 'desktop',
+          scene: token.mode === 'scene' ? token.scene : '',
         });
+        if (prepared !== null) {
+          sheet = prepared;
+          reusedSheet = true;
+        } else {
+          // The storyboard is judged from its own pixels too: an all-black sheet is not the screen.
+          sheet = await captureVerified({
+            take: () => session.take(),
+            source: `sheet:${token.mode}`,
+            virtualCam: token.mode === 'scene',
+            token,
+            assertCurrent: () => assertProgramScene(token),
+          });
+        }
         assertVisionToken(token);
         await assertProgramScene(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
@@ -9402,14 +9523,22 @@ export function apply(ctx, config) {
           };
         }
         await log.emit('vision.sheet', {
-          frames: sheet.frames,
+          frames: Number(sheet.frames) || 0,
           bytes: sheet.bytes,
-          from: sheet.from,
-          to: sheet.to,
+          from: sheet.from ?? 0,
+          to: sheet.to ?? 0,
         });
         assertVisionToken(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
         visionFiles.set(sheet.file, token.generation);
+        if (!reusedSheet) {
+          // The freshly taken sheet becomes this turn's reusable view.
+          preRequestVision.remember(sheet, {
+            source: token.mode === 'scene' ? 'obs' : 'desktop',
+            scene: token.mode === 'scene' ? token.scene : '',
+            kind: 'sheet',
+          });
+        }
         // The sheet is the newest observation too: status.lastCaptureAt and the preview card
         // follow the same stored record as a one-shot look.
         const capturedAt = Number(sheet.capturedAt ?? sheet.at) || Date.now();
@@ -9439,7 +9568,7 @@ export function apply(ctx, config) {
           frames: stats.frames,
           sheets: stats.sheets,
           ready: true,
-          framesInSheet: sheet.frames,
+          framesInSheet: Number(sheet.frames) || 0,
           source: token.mode === 'scene' ? 'obs' : 'desktop',
           scene: token.mode === 'scene' ? token.scene : '',
         };
