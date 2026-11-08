@@ -9965,8 +9965,10 @@ export function apply(ctx, config) {
   // The DeepSeek route sets `systemPromptUpdate: 'in-history'`: a changed section text appends a
   // COMPLETE system-prompt copy to the history (for prefix caching) and the old copy stays billed
   // until compaction. Continuous observation therefore cannot be a section — it changes every
-  // utterance. It is registered as runtime context instead, which the loop stores as a replaced,
-  // sourced user-role snapshot. Stable sections stay sections. This tracker fingerprints this
+  // utterance. Runtime context is NOT replaced in history: the loop appends a sourced user-role
+  // snapshot each step (the newest semantically supersedes older ones; older copies stay until
+  // compaction, bounded at ~3.5 KB/round by the dialogue window). Stable sections stay sections.
+  // This tracker fingerprints this
   // plugin's section text once per assembly so `assistant.prompt.stable {changed:false}` is
   // observable (`assistant.context.refreshed` reports the dynamic half). Debug events are throttled.
   const promptStabilityThrottleMs = Math.max(0, Number(config?.promptStabilityThrottleMs ?? 30_000));
@@ -10032,8 +10034,9 @@ export function apply(ctx, config) {
       ...declaration,
       text: promptStability.section(declaration.name, declaration.text, final),
     });
-    // Runtime context, not a section: the snapshot is replaced each step, so a changing
-    // observation never appends a system-prompt copy. An empty text yields no snapshot. The
+    // Runtime context, not a section: a changing observation never appends a system-prompt copy.
+    // The loop appends one sourced user-role snapshot per step (newest wins semantically; older
+    // copies are compacted away). An empty text yields no snapshot. The
     // section fallback only keeps legacy/Host-double mounts (no `context()`) from throwing.
     const registerContext = (declaration) => {
       const text = promptStability.context(declaration.name, declaration.text);

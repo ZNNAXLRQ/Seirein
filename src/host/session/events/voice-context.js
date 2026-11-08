@@ -9,6 +9,7 @@ export function createVoiceContextObserver(services) {
       // A user message in the dated voice session (spoken or typed) keeps the noise gate's
       // conversation window open, so the next lone filler is delivered instead of swallowed.
       if (event?.type === 'user/message'
+        && event?.data?.source?.kind === 'user'
         && sessionId === (0, services.voiceSessionTarget)({ root: services.root, rolloverHour: services.ROLLOVER_HOUR }).sessionId) {
         services.voiceContextAt = Date.now();
       }

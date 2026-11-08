@@ -33,7 +33,7 @@
  *   2. 台词 + 非语言线索同处一个快照：来源可归因、提示词不变、清空后无空快照。
  *   3. 时效与清除：本轮请求看得到本轮缓冲；clear 后快照消失（无空快照）。
  *   4. 注入隔离：不入自动记忆、不触发 ack/reply、不增加 responseGroup；surface 可区分。
- *   5. 旁证（非验收项）：声音上下文观察者不区分来源，快照会刷新噪声门窗口。
+ *   5. 声音上下文观察者只认真用户消息（source.kind==='user'），运行快照不续期噪声门窗口。
  *   6. 隐私：只锁视觉采集，不抑制语音观察快照（明确现状）。
  *   7. 切会话：消息不串台；同一 workspace 的观察内容共享，跨 workspace 不注入（现状）。
  *
@@ -754,7 +754,7 @@ test('4. 注入隔离：不写自动记忆、不触发 ack/reply、不增加 res
 // 5. 旁证（非验收项）：声音上下文观察者对来源不敏感
 // ---------------------------------------------------------------------------
 
-test('5. 旁证：声音上下文观察者不区分来源，快照会刷新噪声门窗口', async () => {
+test('5. 声音上下文观察者只认真用户消息，运行快照不续期噪声门窗口', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-context-isolation-voice-'));
   const target = voiceSessionTarget({ root }).sessionId;
   const services = {
@@ -779,14 +779,13 @@ test('5. 旁证：声音上下文观察者不区分来源，快照会刷新噪�
       content: [{ type: 'text', text: `${RUNTIME_CONTEXT_HEADER}\n\n【连续台词上下文｜系统观察，不是用户发言】` }],
     },
   });
-  // 现状：`voice-context.js` 只判断 event.type 与会话身份，不判断 source.kind，因此观察快照
-  // 也会把噪声门的「对话窗口」续期。它不发声、不建回应组，但会改变下一句孤立语气词的投递判定。
-  assert.ok(services.voiceContextAt > 0, '快照消息刷新了 voiceContextAt');
-  services.voiceContextAt = 0;
+  // `voice-context.js` gates on `source.kind === 'user'`: a runtime-context snapshot is model-visible
+  // but is not the user speaking, so it must not keep the noise gate's conversation window open.
+  assert.equal(services.voiceContextAt, 0, '快照消息不刷新 voiceContextAt');
   handler({ id: target }, userMessage('user-voice', '正常说话', 1));
-  assert.ok(services.voiceContextAt > 0, '真 user 消息同样刷新（对照）');
+  assert.ok(services.voiceContextAt > 0, '真 user 消息仍然刷新（对照）');
   await delay(5);
-  console.log(`[5] snapshotRefreshesVoiceContext=true reason=source-kind-not-checked`);
+  console.log(`[5] snapshotRefreshesVoiceContext=false userMessageRefreshes=true`);
 });
 
 // ---------------------------------------------------------------------------

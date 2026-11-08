@@ -5,11 +5,12 @@
  * the loop APPENDS a complete copy to the history (so the prefix stays cacheable) and the old copy
  * stays billed until compaction. Continuous dialogue and the nonverbal cue change almost every
  * utterance, so as sections they appended ~11–13 KB per round. They are now runtime CONTEXT: the
- * loop stores a sourced user-role snapshot and REPLACES it each step, while the system prompt stays
+ * loop APPENDS a sourced user-role snapshot each step (the newest wins semantically; older copies
+ * stay in history until compaction, bounded by the dialogue window) while the system prompt stays
  * byte-identical.
  *
  * This suite mounts the real `apply()` with a fake `systemPrompt` service that mirrors the shipped
- * assembly contract (`section` text → prompt; `context` text → separate replaced snapshot; empty
+ * assembly contract (`section` text → prompt; `context` text → separate appended snapshot; empty
  * text contributes nothing). It proves:
  *  1. two consecutive rounds with a changing dialogue buffer render the SAME system prompt, while
  *     the runtime context text updates; `assistant.prompt.stable {changed:false}` and
@@ -89,8 +90,9 @@ async function untilEvents(root, predicate, label, timeoutMs = 3000) {
 
 /**
  * Mount the real plugin. The fake prompt service mirrors the shipped contract: section text is
- * joined into the system prompt, context text forms a separate snapshot that is replaced each step,
- * and an empty contribution disappears. `promptStabilityThrottleMs: 0` is the debug-event seam.
+ * joined into the system prompt, context text forms a separate snapshot appended each step (it
+ * supersedes semantically but older copies remain until compaction), and an empty contribution
+ * disappears. `promptStabilityThrottleMs: 0` is the debug-event seam.
  */
 function mount(root, { dialogueContext } = {}) {
   const sections = new Map();
