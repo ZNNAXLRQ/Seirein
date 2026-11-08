@@ -8,6 +8,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 
 import {
   createBehaviorRuntime,
@@ -22,13 +23,14 @@ const ALL_CHANNELS = Object.freeze([
 ]);
 const ALL_FAMILIES = [...new Set(PRESETS.map((preset) => preset.family))];
 
-function makeRuntime({ style = null, enabled = false, overrides = null } = {}) {
+function makeRuntime({ style = null, enabled = false, overrides = null, debugEvents = true } = {}) {
   return createBehaviorRuntime({
     config: {
       seed: 11,
       presetExecution: enabled,
       presetTargetVerified: true,
       presetChannels: [...ALL_CHANNELS],
+      presetDebugEvents: debugEvents,
       ...(overrides === null ? {} : { presetOverrides: overrides }),
       ...(style === null ? {} : { style }),
     },
@@ -373,4 +375,197 @@ test('10. 控制器接线：意图事件边界走 select/preset，动作不再�
   assert.ok(liveTrace.output.channels.length > 0, 'the preset trajectory produced channel output');
   assert.ok(liveTrace.output.channels.every((channel) => written.has(channel)),
     'every preset channel reached the one transport writer');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Preset decision observability (read-only): the events + projection answer "did the idle preset
+// really run, and what filtered it out". These tests only READ; they never assert a new writer.
+// ---------------------------------------------------------------------------------------------
+const DECISION_EVENT_TYPES = Object.freeze([
+  'avatar.preset.select', 'avatar.preset.skip', 'avatar.preset.commit',
+]);
+const SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
+
+/** Tick an idle runtime, draining the diagnostic buffer so nothing is lost to the ring cap. */
+function idleEvents(runtime, toMs, fromMs = 0, stepMs = 33) {
+  const events = [];
+  for (let at = fromMs; at <= toMs; at += stepMs) {
+    runtime.tick(at);
+    events.push(...runtime.takeEvents());
+  }
+  return events;
+}
+
+const decisionEvents = (events) => events.filter((event) => DECISION_EVENT_TYPES.includes(event.type));
+
+test('11. 待机决策事件：select/skip 字段齐全，同类事件 1 秒内至多 1 条', () => {
+  // A boosted action keeps the draw on a preset (hold still competes, so both remain visible).
+  const runtime = makeRuntime({ enabled: true, overrides: { actionPriority: { 'idle-tilt': 100 } } });
+  const decisions = decisionEvents(idleEvents(runtime, 20_000));
+  assert.ok(decisions.length >= 2, `the idle rhythm published decisions: ${decisions.length}`);
+
+  const selects = decisions.filter((event) => event.type === 'avatar.preset.select');
+  assert.ok(selects.length >= 1, 'an idle draw selected a preset');
+  for (const row of selects) {
+    assert.equal(typeof row.presetId, 'string');
+    assert.equal(typeof row.family, 'string');
+    assert.equal(typeof row.recipe, 'string');
+    assert.equal(typeof row.variant, 'string');
+    assert.equal(row.event, 'idle');
+    assert.equal(typeof row.score, 'number');
+    assert.ok(Array.isArray(row.channels) && row.channels.length > 0, 'selected channels are named');
+  }
+
+  const skips = decisions.filter((event) => event.type === 'avatar.preset.skip');
+  assert.ok(skips.length >= 1, 'a wait/skip is observable (the throttled idle gate)');
+  for (const row of skips) {
+    assert.ok(SKIP_REASONS.includes(row.reason), `skip reason is the closed vocabulary: ${row.reason}`);
+    assert.equal(row.event, 'idle');
+    assert.ok(Array.isArray(row.droppedChannels));
+  }
+
+  // Throttle proof: the same class never appears twice inside one second.
+  for (const type of DECISION_EVENT_TYPES) {
+    const at = decisions.filter((event) => event.type === type).map((event) => event.at);
+    for (let index = 1; index < at.length; index += 1) {
+      assert.ok(at[index] - at[index - 1] >= 1000, `${type} throttled: ${at[index - 1]} -> ${at[index]}`);
+    }
+  }
+});
+
+test('12. 被过滤的决策带原因：no-candidate / channel-unverified / hold', () => {
+  // Every family disabled → the selector has no legal candidate at all.
+  const disabled = makeRuntime({ enabled: true, overrides: { disabledFamilies: ALL_FAMILIES } });
+  const none = decisionEvents(idleEvents(disabled, 12_000))
+    .find((event) => event.type === 'avatar.preset.skip' && event.reason === 'no-candidate');
+  assert.ok(none, 'all families disabled must report no-candidate');
+  assert.equal(none.event, 'idle');
+  assert.deepEqual(none.droppedChannels, []);
+
+  // No verified channel set → the hard channel filter refuses every candidate.
+  const blind = makeRuntime({ enabled: true });
+  blind.tick(0);
+  blind.selectPreset({ state: 'idle', event: 'idle', verifiedChannels: [], seed: 0, now: 10 });
+  const channelSkip = blind.takeEvents().find((event) => event.type === 'avatar.preset.skip');
+  assert.ok(channelSkip, 'an unverified channel set is reported');
+  assert.equal(channelSkip.reason, 'channel-unverified');
+  assert.equal(channelSkip.event, 'idle');
+
+  // A legal hold draw (privacy refuses the draw) is not an error: it is `hold`.
+  const privacy = makeRuntime({ enabled: true });
+  privacy.tick(0);
+  privacy.selectPreset({ state: 'idle', event: 'idle', privacy: true, seed: 0, now: 10 });
+  const hold = privacy.takeEvents().find((event) => event.type === 'avatar.preset.skip');
+  assert.ok(hold, 'a hold is still an explicit decision');
+  assert.equal(hold.reason, 'hold');
+  assert.equal(hold.event, 'idle');
+});
+
+test('13. 状态投影随决策更新：motion.presets.debug 八个字段（index 映射）', () => {
+  const runtime = makeRuntime({ enabled: true, overrides: { actionPriority: { 'idle-tilt': 100 } } });
+  const decisions = decisionEvents(idleEvents(runtime, 20_000));
+  const snapshot = presetSnapshot(runtime);
+  const projection = snapshot.debug;
+  assert.deepEqual(
+    Object.keys(projection).sort(),
+    ['decisions', 'enabled', 'holds', 'lastAt', 'lastEvent', 'lastPresetId', 'selectorKey', 'skips'],
+  );
+  assert.equal(projection.enabled, true, 'the projection says preset execution is on');
+  assert.ok(projection.decisions > 0, `decisions ${projection.decisions}`);
+  assert.equal(projection.decisions, snapshot.selected + snapshot.holds, 'every draw counted once');
+  assert.ok(projection.skips >= 1, `skips ${projection.skips}`);
+  assert.equal(projection.lastEvent, 'idle');
+  assert.equal(typeof projection.lastAt, 'number');
+  assert.ok(projection.selectorKey.includes('idle-tilt'), 'selectorKey names the overrides in force');
+  const lastSelect = decisions.filter((event) => event.type === 'avatar.preset.select').at(-1);
+  assert.ok(lastSelect, 'a select event exists');
+  assert.equal(projection.lastPresetId, lastSelect.presetId);
+  assert.equal(projection.lastAt >= lastSelect.at, true, 'the projection is never older than its event');
+
+  // index.js exposes that exact object at status.live2d.runtime.motion.presets (source wiring proof,
+  // the same pattern test/observability-wiring.mjs uses for index.js projections).
+  const source = readFileSync(new URL('../src/host/index.js', import.meta.url), 'utf8');
+  assert.match(source, /presets: inner\.motion\?\.presets\?\.debug \?\? \{/u);
+  assert.match(source, /lastPresetId: null, lastEvent: '', lastAt: null, selectorKey: ''/u);
+});
+
+test('14. 关闭 presetDebugEvents：零事件，投影照常更新', () => {
+  const runtime = makeRuntime({
+    enabled: true,
+    debugEvents: false,
+    overrides: { actionPriority: { 'idle-tilt': 100 } },
+  });
+  const events = idleEvents(runtime, 20_000);
+  assert.equal(decisionEvents(events).length, 0, 'the switch silences every new debug event');
+  const projection = presetSnapshot(runtime).debug;
+  assert.ok(projection.decisions > 0, `decisions ${projection.decisions}`);
+  assert.ok(projection.skips >= 1, `skips ${projection.skips}`);
+  assert.equal(projection.lastEvent, 'idle');
+  assert.equal(typeof projection.lastAt, 'number');
+});
+
+test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 debug 日志', async () => {
+  let clock = 0;
+  const logs = [];
+  const transport = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: async () => ({ ok: true }),
+    writeMotion: async () => ({ ok: true }),
+  };
+  const runtime = createAvatarRuntime({
+    transport,
+    now: () => clock,
+    log: (message, data = {}) => logs.push({ message, ...data }),
+    config: {
+      autoTickMs: 0,
+      flushIntervalMs: 1,
+      idleActions: [],
+      idleSwayScale: 0,
+      motionWrites: true,
+      motionOutputHz: 30,
+      presetExecution: true,
+    },
+  });
+  assert.equal((await runtime.connect()).ok, true);
+  const rows = ['headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'eyeOpenL', 'eyeOpenR', 'browL', 'browR']
+    .map((channel) => ({ channel, inputName: `P_${channel}`, injectable: true, verified: true }));
+  await runtime.setChannelMappings(rows, { channelMap: {} });
+
+  let started = null;
+  for (let seed = 0; seed < 96 && started === null; seed += 1) {
+    const drawn = runtime.preset({ state: 'idle', event: 'idle', recipe: 'idle-tilt', seed, at: 0 });
+    if (drawn.started === true) started = drawn;
+  }
+  assert.ok(started !== null, 'a preset trajectory started');
+  for (const at of [0, 200, 400, 800, 1200, 1600]) {
+    clock = at;
+    runtime.tick(at);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.ok(commits.length >= 1, 'the acknowledged send produced a commit event');
+  const commit = commits[0];
+  assert.deepEqual(
+    Object.keys(commit).sort(),
+    ['at', 'channels', 'committed', 'presetId', 'skippedByTransport', 'type'],
+  );
+  assert.equal(commit.presetId, started.presetId);
+  assert.deepEqual(commit.channels, started.channels);
+  assert.ok(commit.committed.length > 0);
+  assert.ok(commit.committed.every((channel) => commit.channels.includes(channel)));
+  assert.equal(typeof commit.skippedByTransport, 'object');
+
+  // The same decisions reach the host debug log (`avatarRuntimeLog` → events.jsonl).
+  const logged = logs.filter((row) => DECISION_EVENT_TYPES.includes(row.message));
+  assert.ok(logged.some((row) => row.message === 'avatar.preset.select'), 'select is logged');
+  assert.ok(logged.some((row) => row.message === 'avatar.preset.skip' && row.reason === 'busy'),
+    'the busy boundary is logged');
+  assert.ok(logged.some((row) => row.message === 'avatar.preset.commit' && row.presetId === started.presetId),
+    'the commit is logged');
+  const select = logged.find((row) => row.message === 'avatar.preset.select');
+  assert.equal(select.event, 'idle', 'the payload keeps the preset event vocabulary');
+  assert.equal(typeof select.score, 'number');
+  assert.ok(Array.isArray(select.channels));
 });

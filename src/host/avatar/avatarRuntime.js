@@ -914,6 +914,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       inputs: innerInputs,
       now: clockNow,
       writer: writeThroughTransport,
+      /**
+       * Preset decisions are also written to the host's debug event log (the controller throttles
+       * them to one per class per second and only when `config.presetDebugEvents` is on). This is
+       * a log sink only: the controller never reads it back, so no motion decision can change.
+       */
+      debugEvent: (type, data) => appendLog('debug', type, data),
     },
   });
 
@@ -3240,6 +3246,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       // One preset trajectory at a time: an autonomous idle draw already in flight owns the pose
       // until it ends, so this boundary holds instead of stacking a second choreography.
       const presetBusy = (snap.motion?.presets?.active?.length ?? 0) > 0;
+      // Observability only: the host itself decided this boundary holds (another preset owns the
+      // pose). It reports the skip through the controller and draws nothing.
+      if (presetBusy) inner.notePresetSkip('busy', { event: presetEvent, at });
       const drawn = presetBusy
         ? { started: false, trace: { output: { reason: 'preset-busy' }, selection: { reasons: ['preset-busy'] } } }
         : inner.preset({

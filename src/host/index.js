@@ -9,7 +9,7 @@
 
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { cpSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect } from 'node:net';
@@ -294,6 +294,13 @@ import {
   truncationNotice,
   watchHearingExit,
 } from './hearing/hearing.js';
+// Pure evidence helpers, imported from their own module: tests replace hearing.js with a stub,
+// and these three signals must stay available regardless of which delivery build is mounted.
+import {
+  DROP_SHORT_TEXT_MAX_CHARS,
+  isProtectedShortAnswer,
+  shadowTextKey,
+} from './hearing/audio-evidence.js';
 // Namespace access for the loopback guard: the named import above is the stable contract, and a test
 // build that replaces hearing.js with a stub (test/asr-events.mjs) still links.
 import * as hearingRuntime from './hearing/hearing.js';
@@ -2637,6 +2644,15 @@ export function apply(ctx, config) {
       void log.emit('avatar.action.trace', payload).catch(() => {});
       return;
     }
+    // Preset decision observability: the controller already throttles select/skip/commit to one
+    // per class per second and silences them with `presetDebugEvents:false`. Log sink only.
+    if (message === 'avatar.preset.select' || message === 'avatar.preset.skip'
+      || message === 'avatar.preset.commit') {
+      const payload = { ...data };
+      delete payload.level;
+      void log.emit(message, payload).catch(() => {});
+      return;
+    }
     const level = typeof data?.level === 'string' ? data.level : 'debug';
     if (level !== 'warn' && level !== 'error') return;
     void log.emit('avatar.runtime.log', { level, message: String(message ?? '') }).catch(() => {});
@@ -2763,6 +2779,8 @@ export function apply(ctx, config) {
         // Stage 1 is the default writer: the single-slot 30 Hz controller. Only an explicit
         // `avatarMotionWrites:false` opts back into the legacy 4 Hz idle contract.
         motionWrites: config?.avatarMotionWrites !== false,
+        // 预设决策的只读诊断事件（默认开，仅本地诊断）；false 时零事件，status 投影照常更新。
+        presetDebugEvents: config?.presetDebugEvents !== false,
         // Explicit hotkey probe: without it the runtime has to infer from the narrowed pool and may
         // either wait for a hotkey that does not exist or skip a preset that does.
         hasHotkey: (name) => {
@@ -2951,6 +2969,14 @@ export function apply(ctx, config) {
         attentionCalls: avatarAttentionCalls,
         /** Read-only evidence: the last 5 ended-action traces, chained by actionId. */
         actionTrace: Array.isArray(snap.motion?.actionTrace) ? snap.motion.actionTrace : [],
+        /**
+         * 预设决策投影（只读）：待机/思考时的选择与过滤结果。即使 `presetDebugEvents:false`
+         * 也照常更新，用来回答“待机时预设到底有没有执行、被什么过滤掉”。
+         */
+        presets: inner.motion?.presets?.debug ?? {
+          enabled: false, decisions: 0, holds: 0, skips: 0,
+          lastPresetId: null, lastEvent: '', lastAt: null, selectorKey: '',
+        },
       },
       motionEpoch: snap.motion?.epoch ?? 0,
       /** Verified takeover set; unmapped channels are skipped, failed explicit probes unverified. */
@@ -5698,8 +5724,110 @@ export function apply(ctx, config) {
       }
     },
   });
+
+  // ---- recognition-fault notice throttle ---------------------------------
+  // 连续多轮解释“只收到半个字”会变成唠叨：同一会话首次可疑输入可以带一条内部提示，之后
+  // N 分钟（默认 10）内不再重复。提示只追加到本轮请求的上下文里，不进入用户消息、不写记忆。
+  const FAULT_NOTICE_DEFAULT_THROTTLE_MS = 10 * 60_000;
+  const FAULT_NOTICE_MAX_SESSIONS = 64;
+  const FAULT_NOTICE_SOURCE = 'assistant-fault-notice';
+  const FAULT_NOTICE_TEXT = '如果本轮输入是识别残片：不要重复解释识别问题；若无新信息就简短回应或继续当前话题。';
+  /** 每会话最近一次实际注入的时刻；可选地从 memory-state 恢复，重启后不会立刻重复。 */
+  const faultNoticeAtBySession = (() => {
+    const map = new Map();
+    const state = readMemoryState();
+    const stored = state !== null && typeof state === 'object' ? state.faultNoticeAt : undefined;
+    if (stored !== null && typeof stored === 'object' && !Array.isArray(stored)) {
+      for (const [sessionId, at] of Object.entries(stored)) {
+        if (sessionId.length > 0 && Number.isFinite(at)) map.set(sessionId, at);
+      }
+    }
+    return map;
+  })();
+  /** `voice.faultNoticeThrottleMs`：0 = 每次都可注入，缺失/非法值回到 10 分钟默认。 */
+  const faultNoticeThrottleMs = () => {
+    const value = config?.voice?.faultNoticeThrottleMs;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value
+      : FAULT_NOTICE_DEFAULT_THROTTLE_MS;
+  };
+  /** 复用听觉现有的短文本口径：去标签/标点后 <=2 字符，且不是受保护的短回答。 */
+  const faultNoticeReason = (text) => {
+    const key = shadowTextKey(text);
+    if (key.length === 0 || isProtectedShortAnswer(key)) return '';
+    return [...key].length <= DROP_SHORT_TEXT_MAX_CHARS ? 'short-text' : '';
+  };
+  /** 本轮请求里最后一条真正的用户消息（跳过记忆/日摘要/连续表达等内部块）。 */
+  const faultNoticeUserMessage = (messages) => {
+    if (!Array.isArray(messages)) return null;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role !== 'user') continue;
+      const kind = message?.source?.kind;
+      if (typeof kind === 'string' && kind !== 'user') continue;
+      return message;
+    }
+    return null;
+  };
+  const rememberFaultNotice = (sessionId, at) => {
+    faultNoticeAtBySession.delete(sessionId);
+    faultNoticeAtBySession.set(sessionId, at);
+    while (faultNoticeAtBySession.size > FAULT_NOTICE_MAX_SESSIONS) {
+      faultNoticeAtBySession.delete(faultNoticeAtBySession.keys().next().value);
+    }
+    setImmediate(() => {
+      try {
+        writeMemoryState({ faultNoticeAt: Object.fromEntries(faultNoticeAtBySession) });
+      } catch {
+        /* bookkeeping only, never block the request */
+      }
+    });
+  };
+  /** 只追加一条内部上下文；base decision（包括 reject）原样返回，输入文本从不改写。 */
+  const injectFaultNotice = (payload, decision) => {
+    if (decision === null || typeof decision !== 'object' || decision.kind === 'reject') return decision;
+    if (Number(payload?.step) !== 1 || !Array.isArray(decision.messages)) return decision;
+    if (isSubagentAgent(payload?.agent)) return decision;
+    const sessionId = typeof payload?.agent?.session?.id === 'string'
+      ? payload.agent.session.id
+      : (typeof payload?.session?.id === 'string' ? payload.session.id : '');
+    if (sessionId.length === 0) return decision;
+    const sourceMessages = Array.isArray(payload?.messages) && payload.messages.length > 0
+      ? payload.messages
+      : decision.messages;
+    const message = faultNoticeUserMessage(sourceMessages);
+    if (message === null) return decision;
+    const text = typeof message?.content === 'string' ? message.content : messageTextBlocks(message);
+    const reason = faultNoticeReason(text);
+    if (reason.length === 0) return decision;
+    const at = Date.now();
+    const last = faultNoticeAtBySession.get(sessionId);
+    const sinceLastMs = Number.isFinite(last) ? Math.max(0, at - last) : null;
+    const throttleMs = faultNoticeThrottleMs();
+    if (throttleMs > 0 && sinceLastMs !== null && sinceLastMs < throttleMs) {
+      void log.emit('voice.fault-notice.skipped', { level: 'debug', reason: 'throttled' }).catch(() => {});
+      return decision;
+    }
+    rememberFaultNotice(sessionId, at);
+    void log.emit('voice.fault-notice.injected', { sessionId, reason, sinceLastMs }).catch(() => {});
+    return {
+      ...decision,
+      messages: [...decision.messages, {
+        id: randomUUID(),
+        role: 'user',
+        source: { kind: FAULT_NOTICE_SOURCE },
+        content: [{ type: 'text', text: FAULT_NOTICE_TEXT }],
+      }],
+    };
+  };
+
   if (typeof ctx.on === 'function') {
-    ctx.effect(() => ctx.on('agent/pre-step', (payload, next) => memoryPreStep.handle(payload, next)));
+    ctx.effect(() => ctx.on('agent/pre-step', async (payload, next) => {
+      // Keep the memory lane's exact call shape (tests assert it) and append after the whole
+      // waterfall, so the notice is the last internal block and the base decision is untouched.
+      const decision = await memoryPreStep.handle(payload, next);
+      return injectFaultNotice(payload, decision);
+    }));
     // Batch 2: the continuation context rides the same waterfall as the memory block. It touches
     // only the first step of the turn that follows a continuation delivery, and its source kind is
     // the isolation marker every memory/ack/typed lane already excludes, so it is never recorded

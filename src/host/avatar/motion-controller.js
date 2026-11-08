@@ -457,6 +457,12 @@ const DEFAULT_CONFIG = Object.freeze({
   relaxDurationMs: RELAXATION.DURATION_MS,
   relaxAmplitudeDrop: RELAXATION.AMPLITUDE_DROP,
   relaxTempoDrop: RELAXATION.TEMPO_DROP,
+  /**
+   * Local diagnosis only: whether preset DECISIONS are also reported as throttled debug events
+   * (`avatar.preset.select/skip/commit`). It never gates selection/execution/transport — the
+   * `status.live2d.runtime.motion.presets` projection is maintained either way.
+   */
+  presetDebugEvents: true,
   random: Math.random,
   now: null,
 });
@@ -539,6 +545,15 @@ const PRESET_OPERATION_PROFILE = Object.freeze({
 
 const PRESET_HEAD_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
 const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
+
+/**
+ * Preset decision observability (read-only). `config.presetDebugEvents` only gates the EVENTS —
+ * the projection counters below are always maintained — and one class is emitted at most once per
+ * second so a 30 Hz tick can never flood the event log.
+ */
+const PRESET_DEBUG_THROTTLE_MS = 1000;
+/** Closed vocabulary of "why no preset ran" (`status.live2d.runtime.motion.presets.skips`). */
+const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
 
 const presetClamp = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
 
@@ -886,6 +901,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       nextDecisionAt: null,
       lastSelection: null,
       lastTrace: null,
+      /**
+       * Read-only observability for "did the idle preset really run, and what filtered it out".
+       * Decisions/skips/last* are ALWAYS maintained; `enabled` only silences the debug EVENTS.
+       * `gate` remembers the last blocking episode so a 30 Hz tick reports it once, not 30×/s.
+       */
+      debug: {
+        enabled: cfg.presetDebugEvents !== false,
+        decisions: 0,
+        skips: 0,
+        lastPresetId: null,
+        lastEvent: '',
+        lastAt: null,
+        gate: '',
+        lastEmitAt: Object.create(null),
+      },
       recent: [],
       history: [],
       recentFamilies: [],
@@ -1772,6 +1802,79 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
   }
 
+  // ---- preset decision observability (read-only; it never selects, executes or writes) -----
+  /**
+   * Record ONE preset decision for diagnosis. The projection counters and `last*` values are
+   * updated for every decision, so they stay truthful even with `config.presetDebugEvents:false`;
+   * the debug EVENT itself (`state.events` + the host log sink) is throttled to one per class per
+   * second. Nothing here is read back by selection, the pose or the transport.
+   */
+  function notePresetDebugEvent(type, payload = {}, at = null) {
+    const debug = state.presets.debug;
+    const now = Number.isFinite(at) ? at : clockNow();
+    debug.lastAt = now;
+    if (type === 'avatar.preset.select') {
+      debug.lastPresetId = payload.presetId ?? null;
+      debug.lastEvent = payload.event ?? '';
+    } else if (type === 'avatar.preset.skip') {
+      debug.skips += 1;
+      if (typeof payload.event === 'string' && payload.event.length > 0) debug.lastEvent = payload.event;
+    } else if (type === 'avatar.preset.commit') {
+      debug.lastPresetId = payload.presetId ?? debug.lastPresetId;
+    }
+    if (debug.enabled !== true) return false;
+    const last = debug.lastEmitAt[type];
+    if (Number.isFinite(last) && now - last < PRESET_DEBUG_THROTTLE_MS) return false;
+    debug.lastEmitAt[type] = now;
+    recordEvent(type, payload);
+    if (typeof cfg.debugEvent === 'function') {
+      try {
+        cfg.debugEvent(type, payload);
+      } catch {
+        // Diagnostics must never break a tick.
+      }
+    }
+    return true;
+  }
+
+  /** Most specific `skip.reason` for a selection/executor hold (closed vocabulary, spec order). */
+  function presetSkipReason(selection, context) {
+    const reasons = Array.isArray(selection?.reasons) ? selection.reasons : [];
+    const has = (name) => reasons.some((reason) => (
+      reason === name || String(reason).startsWith(`${name}:`)
+    ));
+    const verified = Array.isArray(context?.verifiedChannels) ? context.verifiedChannels : null;
+    if (verified !== null && verified.length === 0) return 'channel-unverified';
+    if (has('invalid-channels') || has('channel-unverified') || has('no-executable-operations')
+      || reasons.includes('native-owned')) {
+      return 'channel-unverified';
+    }
+    if (has('no-candidates') || has('candidate-shortage')) return 'no-candidate';
+    return 'hold';
+  }
+
+  /** One debug skip per blocking episode (the same gate is not repeated on every 30 Hz tick). */
+  function notePresetGateSkip(reason, key, event, at) {
+    const debug = state.presets.debug;
+    if (debug.gate === key) return;
+    debug.gate = key;
+    notePresetDebugEvent('avatar.preset.skip', { reason, event, droppedChannels: [] }, at);
+  }
+
+  /**
+   * Report a decision that never reached the selector (the host refused the boundary itself, e.g.
+   * `busy`: one preset already owns the pose). Read-only; it selects, executes and writes nothing.
+   */
+  function notePresetSkip(reason, { event = '', droppedChannels = [], at = null } = {}) {
+    const why = PRESET_SKIP_REASONS.includes(reason) ? reason : 'hold';
+    notePresetDebugEvent('avatar.preset.skip', {
+      reason: why,
+      event: typeof event === 'string' ? event : '',
+      droppedChannels: [...(Array.isArray(droppedChannels) ? droppedChannels : [])],
+    }, at);
+    return { ok: true, reason: why };
+  }
+
   /**
    * Selection boundary. A missing target never degrades into a guessed gaze; the candidate is
    * excluded (the selector already hard-filters) and the trace records why the draw held.
@@ -1841,6 +1944,26 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
     if (normalized.kind === 'preset') state.presets.selected += 1;
     else state.presets.holds += 1;
+    // Observability only: the decision already happened above; this cannot feed back into it.
+    state.presets.debug.decisions += 1;
+    state.presets.debug.gate = '';
+    if (normalized.kind === 'preset') {
+      notePresetDebugEvent('avatar.preset.select', {
+        presetId: normalized.presetId,
+        family: normalized.family ?? null,
+        recipe: normalized.recipe ?? null,
+        variant: normalized.variant ?? null,
+        event: context.event,
+        score: finite(normalized.score, 0),
+        channels: [...(normalized.effectiveRequires ?? normalized.requires ?? [])],
+      }, context.now);
+    } else {
+      notePresetDebugEvent('avatar.preset.skip', {
+        reason: presetSkipReason(normalized, context),
+        event: context.event,
+        droppedChannels: [...(normalized.droppedChannels ?? [])],
+      }, context.now);
+    }
     return normalized;
   }
 
@@ -2249,6 +2372,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (selection === null || selection === undefined || selection.kind !== 'preset') {
       const hold = selection ?? holdSelection(['no-selection']);
       recordPresetHoldTrace({ ...hold, verifiedChannels: context.verifiedChannels }, at, 'hold');
+      notePresetDebugEvent('avatar.preset.skip', {
+        reason: presetSkipReason(hold, context),
+        event: context.event,
+        droppedChannels: [...(hold.droppedChannels ?? [])],
+      }, at);
       return { ok: true, started: false, kind: 'hold', selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
     }
     const built = buildPresetTrajectory(selection, context, at);
@@ -2256,6 +2384,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const reason = built.nativeOps.length > 0 ? 'native-owned' : 'no-executable-operations';
       const hold = holdSelection([...selection.reasons, reason]);
       recordPresetHoldTrace({ ...hold, verifiedChannels: context.verifiedChannels }, at, reason);
+      notePresetDebugEvent('avatar.preset.skip', {
+        reason: presetSkipReason(hold, context),
+        event: context.event,
+        droppedChannels: [...(hold.droppedChannels ?? [])],
+      }, at);
       return { ok: true, started: false, kind: 'hold', reason, selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
     }
     const trace = presetTraceBase({
@@ -2516,6 +2649,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       }
       stats.committed += 1;
       stats.lastAt = now;
+      // Observability only: report the acknowledged channels of the trajectory that really
+      // committed. The values are the trace's own commit evidence; nothing is re-sent here.
+      const committedItem = state.presets.active.find((item) => (
+        (allow === null || allow.has(presetOwnerKey(item)) === true)
+        && Object.keys(item.trace.output.committed).length > 0
+      ));
+      if (committedItem !== undefined) {
+        notePresetDebugEvent('avatar.preset.commit', {
+          presetId: committedItem.presetId,
+          channels: [...committedItem.channels],
+          committed: Object.keys(committedItem.trace.output.committed),
+          skippedByTransport: { ...committedItem.trace.output.skippedByTransport },
+        }, now);
+      }
       return { committed: committed > 0, stale: false, reason: '' };
     }
     if (phase === 'failed') {
@@ -2602,18 +2749,33 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /** Low-frequency autonomous idle boundary. Never samples a sentence gap without playback. */
   function maybeAutoPreset(now) {
     if (state.presets.enabled !== true) return null;
-    if (state.presets.active.length > 0) return null;
-    if (state.status === 'speaking') return null;
-    if (state.intents.some((item) => item.done !== true)) return null;
+    // Observability only: the gates below are the real filtering points of the idle draw. Each
+    // blocking episode is reported ONCE (see `notePresetGateSkip`), never per 30 Hz tick.
+    const event = PRESET_EVENT_BY_STATE[state.status] ?? 'idle';
+    if (state.presets.active.length > 0) {
+      notePresetGateSkip('busy', `busy:preset:${state.presets.seq}`, event, now);
+      return null;
+    }
+    if (state.status === 'speaking') {
+      notePresetGateSkip('busy', 'busy:speaking', event, now);
+      return null;
+    }
+    if (state.intents.some((item) => item.done !== true)) {
+      notePresetGateSkip('busy', `busy:intent:${state.intentSeq}`, event, now);
+      return null;
+    }
     if (state.presets.nextDecisionAt === null) {
       state.presets.nextDecisionAt = now + PRESET_EXECUTION.DECISION_MIN_MS
         + (PRESET_EXECUTION.DECISION_MAX_MS - PRESET_EXECUTION.DECISION_MIN_MS) * state.presets.random();
       return null;
     }
-    if (now < state.presets.nextDecisionAt) return null;
+    if (now < state.presets.nextDecisionAt) {
+      notePresetGateSkip('throttled', `throttled:${state.presets.nextDecisionAt}`, event, now);
+      return null;
+    }
     const result = preset({
       state: state.status,
-      event: PRESET_EVENT_BY_STATE[state.status] ?? 'idle',
+      event,
       at: now,
       generation: state.presets.generation,
       seed: Math.floor(state.presets.random() * 0x1_0000_0000),
@@ -2731,6 +2893,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         .map(([channel, entry]) => ({
           channel, kind: entry.kind, atMs: entry.atMs, frames: entry.frames,
         })),
+      /**
+       * Decision projection (status.live2d.runtime.motion.presets): the last select/skip/commit
+       * and the counters that answer "did the idle preset really run, and what filtered it out".
+       * `config.presetDebugEvents:false` silences the EVENTS only; this object is always maintained.
+       */
+      debug: {
+        enabled: state.presets.enabled,
+        decisions: state.presets.debug.decisions,
+        holds: state.presets.holds,
+        skips: state.presets.debug.skips,
+        lastPresetId: state.presets.debug.lastPresetId,
+        lastEvent: state.presets.debug.lastEvent,
+        lastAt: state.presets.debug.lastAt,
+        selectorKey: state.presets.selectorKey,
+      },
       recent: state.presets.recent.map((trace) => clonePresetTrace(trace)),
     };
   }
@@ -4297,6 +4474,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     setPresetCapabilities,
     setPresetOverrides,
     presetsSnapshot,
+    /** Read-only: report a boundary the host skipped itself (e.g. `busy`); nothing is drawn. */
+    notePresetSkip,
     /**
      * Autonomous expression layer entry points (thinking / listening / occasional). The facade
      * calls these on a communication phase edge; they start one bounded envelope on the same tick.
