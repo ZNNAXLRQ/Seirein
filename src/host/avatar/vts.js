@@ -18,7 +18,7 @@
  * The 33 ms frame gap is an experience-based ceiling (≈30 Hz), NOT a documented VTS limit; it is a
  * constant precisely so it can be tuned without touching the loop.
  */
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import WebSocket from 'ws';
@@ -54,8 +54,40 @@ const API_VERSION = '1.0';
 const FRAME_PREFIX = 'dsh-frame-';
 const REQUEST_PREFIX = 'dsh-';
 
+/**
+ * Authorization state machine. The states are deliberately few: "connected but not authorized"
+ * is not a state, because a socket that cannot authenticate is not a usable connection.
+ *
+ *   disconnected → connecting → ready
+ *                        ↘ requesting-grant → ready
+ *                        ↘ token-invalid    (waits for an explicit retry())
+ *                        ↘ error            (transport failure, never disguised as a grant wait)
+ *
+ * requesting-grant is a *quiet* state: the plugin has asked VTS once and is waiting for the user.
+ * No timer, reconnect or concurrent connect() may send a second AuthenticationTokenRequest from it.
+ */
+export const VTS_AUTH_STATES = Object.freeze([
+  'disconnected',
+  'connecting',
+  'requesting-grant',
+  'ready',
+  'token-invalid',
+  'error',
+]);
+/** States in which an automatic reconnect is forbidden: a popup is already waiting for the user. */
+const AUTH_QUIET_STATES = new Set(['requesting-grant', 'token-invalid']);
+/** How long the user is given to answer the VTS authorization popup before it is recorded as slow. */
+const AUTH_GRANT_TIMEOUT_MS = 60_000;
+/** Backoff defaults used only when autoReconnect is explicitly enabled by the caller. */
+const RECONNECT_BASE_MS = 2_000;
+const RECONNECT_MAX_MS = 60_000;
+/** Bounded history so status() can explain the last transitions without growing forever. */
+const AUTH_TRANSITION_LIMIT = 32;
+const AUTH_EVENT_LIMIT = 64;
+
 const normalizeName = (name) => String(name ?? '').trim().toLowerCase();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let tokenTempSeq = 0;
 
 /** VTS answers an unsupported message with messageType=APIError (HTTP 200), so surface it. */
 function unwrap(response, messageType) {
@@ -128,11 +160,35 @@ export class VtsClient {
     animationEvents = false,
     /** true, or a function read on every frame: the `avatar.faceFound` setting. Default false. */
     faceFound = null,
-    /** (type, payload) => void — observation events: vts.auth.*, avatar.animation.*, avatar.inject.*. */
+    /**
+     * (type, payload) => void — legacy observation events: vts.auth.renew/ok/failed,
+     * avatar.animation.*, avatar.inject.*. The new state-machine events are on onAuthEvent.
+     */
     onEvent = null,
+    /**
+     * (type, payload) => void — the authorization state machine's own channel. It is separate from
+     * `onEvent` because the legacy auth event contract (renew/ok/failed) is asserted exactly by the
+     * existing vts-* suites; mixing the new state/token/requested events into it would silently
+     * change that contract. The Host projection subscribes here.
+     */
+    onAuthEvent = null,
+    /** Mirror the state-machine events into `onEvent` too (opt-in; default keeps legacy exact). */
+    mirrorAuthEvents = false,
+    /** How long the user has to answer VTS's authorization popup before the wait is recorded. */
+    grantTimeoutMs = AUTH_GRANT_TIMEOUT_MS,
+    /**
+     * Automatic reconnect is OFF by default. The Host already retries every minute; a client-side
+     * timer would be a second, uncoordinated dialer. When enabled, every attempt is backed off
+     * exponentially and is refused entirely while requesting-grant / token-invalid.
+     */
+    autoReconnect = false,
+    reconnectBaseMs = RECONNECT_BASE_MS,
+    reconnectMaxMs = RECONNECT_MAX_MS,
   }) {
     this.port = port;
-    this.plugin = { pluginName, pluginDeveloper };
+    // Captured once and only changed through setPluginIdentity(): VTS binds a token to this pair,
+    // so deriving it per request would silently authorize a different plugin.
+    this.plugin = { pluginName: String(pluginName), pluginDeveloper: String(pluginDeveloper) };
     this.tokenPath = tokenPath;
     this.token = '';
     this.socket = null;
@@ -148,6 +204,8 @@ export class VtsClient {
     this.socketRetiring = new Map();
     /** Bumped by close(): an openSocket() that resolves afterwards must not adopt its candidate. */
     this.socketEpoch = 0;
+    /** Bumped by close(): an in-flight authenticate() must not overwrite the closed state. */
+    this.closeEpoch = 0;
     /** Actual replacements (a leftover socket retired before a new dial), exposed for status. */
     this.socketReconnects = 0;
     this.seq = 0;
@@ -156,6 +214,7 @@ export class VtsClient {
     this.lastSentAt = 0;
     this.lastError = '';
     this.lastFrameError = '';
+    this.lastTokenError = '';
     this.model = null;
     this.modelId = '';
     this.hotkeys = [];
@@ -169,6 +228,41 @@ export class VtsClient {
     /** True while this connection is waiting for a token grant / AuthenticationRequest answer. */
     this.authPending = false;
     this.authRenewed = false;
+    /** Authorization state machine (see VTS_AUTH_STATES above). */
+    this.authState = 'disconnected';
+    this.auth = {
+      previous: '',
+      reason: '',
+      changedAt: 0,
+      /** AuthenticationTokenRequest sends; the `attempt` carried by vts.auth.requested. */
+      attempts: 0,
+      /** AuthenticationRequest sends (a grant retry adds one). */
+      authentications: 0,
+      retries: 0,
+      tokenPresent: false,
+      /** A token VTS granted in this process was rejected; do not re-ask for another popup. */
+      freshTokenRejected: false,
+      transitions: [],
+      events: [],
+      pluginChanged: false,
+      pluginChangedAt: 0,
+      pluginPrevious: null,
+      pluginHistory: [],
+    };
+    this.grantTimeoutMs = Math.max(1, Number(grantTimeoutMs) || AUTH_GRANT_TIMEOUT_MS);
+    this.autoReconnect = autoReconnect === true;
+    this.reconnectBaseMs = Math.max(1, Number(reconnectBaseMs) || RECONNECT_BASE_MS);
+    this.reconnectMaxMs = Math.max(this.reconnectBaseMs, Number(reconnectMaxMs) || RECONNECT_MAX_MS);
+    this.reconnect = {
+      attempts: 0,
+      timer: null,
+      nextAt: 0,
+      lastDelayMs: 0,
+      scheduled: 0,
+      fired: 0,
+      lastReason: '',
+      delays: [],
+    };
 
     // Real-time frame transport (single slot + single-flight loop).
     this.pendingFrame = null;
@@ -227,6 +321,8 @@ export class VtsClient {
     this.onModelChanged = onModelChanged;
     this.onFrameError = onFrameError;
     this.onEvent = typeof onEvent === 'function' ? onEvent : null;
+    this.onAuthEvent = typeof onAuthEvent === 'function' ? onAuthEvent : null;
+    this.mirrorAuthEvents = mirrorAuthEvents === true;
   }
 
   /** WebSocket state only. Use `ready` to mean "connected and authenticated". */
@@ -247,142 +343,523 @@ export class VtsClient {
       && this.authenticated === true;
   }
 
+  /** (type, payload) => void for the authorization state machine only. Never throws. */
+  emitAuthEvent(type, payload = {}) {
+    const event = { type, at: Date.now(), ...payload };
+    this.auth.events.push(event);
+    while (this.auth.events.length > AUTH_EVENT_LIMIT) this.auth.events.shift();
+    try {
+      this.onAuthEvent?.(type, payload);
+    } catch {
+      /* an observer must not be able to break authorization */
+    }
+    // Opt-in so the legacy vts.auth.renew/ok/failed sequence on `onEvent` stays byte-identical.
+    if (this.mirrorAuthEvents === true) this.emitEvent(type, payload);
+  }
+
+  /**
+   * The only place `authState` changes. Re-entering the same state is not a transition (no event),
+   * but the reason is still updated so status() explains why that state is held.
+   */
+  setAuthState(to, reason = '') {
+    if (!VTS_AUTH_STATES.includes(to)) throw new Error(`unknown VTS auth state: ${to}`);
+    const from = this.authState;
+    const text = String(reason ?? '');
+    if (from === to) {
+      this.auth.reason = text;
+      return from;
+    }
+    this.authState = to;
+    this.auth.previous = from;
+    this.auth.reason = text;
+    this.auth.changedAt = Date.now();
+    this.auth.transitions.push({ from, to, reason: text, at: this.auth.changedAt });
+    while (this.auth.transitions.length > AUTH_TRANSITION_LIMIT) this.auth.transitions.shift();
+    this.emitAuthEvent('vts.auth.state', { from, to, reason: text });
+    return from;
+  }
+
+  /** A coded error for the "already waiting for the user" gates (no request is sent). */
+  authGateError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    error.authState = this.authState;
+    return error;
+  }
+
+  /**
+   * Read the persisted token. Missing is a normal first install; a corrupt/unreadable file is a
+   * visible token failure (`vts.auth.token {ok:false}`) and both lead to requesting-grant.
+   */
   async loadToken() {
-    if (this.token.length > 0) return this.token;
+    if (this.token.length > 0) {
+      this.auth.tokenPresent = true;
+      return this.token;
+    }
+    this.auth.tokenPresent = false;
     try {
       const saved = JSON.parse(await readFile(this.tokenPath, 'utf8'));
-      this.token = saved.authenticationToken ?? '';
-    } catch {
+      const token = typeof saved?.authenticationToken === 'string' ? saved.authenticationToken.trim() : '';
+      this.token = token;
+      this.auth.tokenPresent = token.length > 0;
+      if (token.length === 0) {
+        this.lastTokenError = 'token file has no authenticationToken';
+        this.emitAuthEvent('vts.auth.token', { ok: false, error: this.lastTokenError, action: 'read' });
+      } else {
+        this.lastTokenError = '';
+        this.emitAuthEvent('vts.auth.token', { ok: true, action: 'read' });
+      }
+    } catch (error) {
       this.token = '';
+      this.auth.tokenPresent = false;
+      if (error?.code === 'ENOENT') {
+        // First install: no file is not a failure, only a missing token.
+        this.lastTokenError = '';
+        this.emitAuthEvent('vts.auth.token', { ok: false, error: 'no token file', action: 'read', missing: true });
+      } else {
+        this.lastTokenError = `token read failed: ${error?.message ?? String(error)}`;
+        this.emitAuthEvent('vts.auth.token', { ok: false, error: this.lastTokenError, action: 'read' });
+      }
     }
     return this.token;
   }
 
-  async saveToken(token) {
-    this.token = token;
-    await mkdir(dirname(this.tokenPath), { recursive: true });
-    await writeFile(this.tokenPath, JSON.stringify({ authenticationToken: token }, null, 2), 'utf8');
+  /**
+   * Atomic token write: temp file in the same directory, then rename over the target. A partial
+   * file can therefore never be read as a token (the failure mode that forced a manual delete).
+   */
+  async writeTokenFile(value) {
+    if (typeof this.tokenPath !== 'string' || this.tokenPath.length === 0) {
+      const error = new Error('token write failed: tokenPath is not configured');
+      error.code = 'TOKEN_WRITE_FAILED';
+      throw error;
+    }
+    const tempPath = `${this.tokenPath}.tmp-${process.pid}-${++tokenTempSeq}`;
+    try {
+      await mkdir(dirname(this.tokenPath), { recursive: true });
+      await writeFile(tempPath, `${JSON.stringify({ authenticationToken: value }, null, 2)}\n`, 'utf8');
+      // Same-directory rename is the atomic replace on NTFS as well as POSIX filesystems.
+      await rename(tempPath, this.tokenPath);
+    } catch (cause) {
+      await unlink(tempPath).catch(() => {});
+      const error = new Error(`token write failed: ${cause?.message ?? String(cause)}`);
+      error.code = 'TOKEN_WRITE_FAILED';
+      error.cause = cause;
+      throw error;
+    }
   }
 
   /**
-   * Connect + authenticate + refresh. Concurrent callers share one promise, and an already open
-   * socket is never mistaken for an authenticated one: auth runs again unless `ready` is true.
+   * Persist a grant. A failed write is recorded and moves the machine to `error`: reporting ready
+   * on a token that only exists in memory would make the next launch ask for authorization again.
    */
-  connect() {
-    if (this.connectPromise !== null) return this.connectPromise;
-    this.connectPromise = this.authenticate().finally(() => {
-      this.connectPromise = null;
-    });
-    return this.connectPromise;
+  async saveToken(token) {
+    const value = String(token ?? '');
+    try {
+      await this.writeTokenFile(value);
+    } catch (error) {
+      this.lastTokenError = error.message;
+      this.setAuthState('error', 'token-write-failed');
+      this.emitAuthEvent('vts.auth.token', { ok: false, error: error.message, action: 'write' });
+      throw error;
+    }
+    this.token = value;
+    this.auth.tokenPresent = value.length > 0;
+    this.lastTokenError = '';
+    this.emitAuthEvent('vts.auth.token', { ok: true, action: 'write' });
+    return value;
   }
 
-  async authenticate() {
-    if (this.ready) return { ok: true, model: this.model, modelId: this.modelId, hotkeys: this.hotkeys.length };
-    await this.loadToken();
-    if (!this.connected) await this.openSocket();
-    // The socket this connect started on. A reconnect replaces this.socket, so readiness stays
-    // tied to this exact instance instead of "whatever socket happens to be current".
-    const socket = this.socket;
+  /** Drop a rejected token from memory and disk so the next run cannot replay it. */
+  async clearToken() {
+    this.token = '';
+    this.auth.tokenPresent = false;
+    try {
+      await this.writeTokenFile('');
+    } catch (error) {
+      this.lastTokenError = error.message;
+      this.setAuthState('error', 'token-clear-failed');
+      this.emitAuthEvent('vts.auth.token', { ok: false, error: error.message, action: 'clear' });
+      throw error;
+    }
+    this.emitAuthEvent('vts.auth.token', { ok: true, action: 'clear' });
+  }
 
-    // A token that was rejected is renewed at most once. The retry limit lives here, not in a loop,
-    // so a VTS build that keeps rejecting fresh tokens can never make connect() spin.
-    const hadToken = this.token.length > 0;
+  /** Read-only auth projection for the Host: state/tokenPresent/pluginName/attempts/lastError. */
+  status() {
+    return {
+      state: this.authState,
+      tokenPresent: this.auth.tokenPresent === true,
+      pluginName: this.plugin.pluginName,
+      pluginDeveloper: this.plugin.pluginDeveloper,
+      attempts: this.auth.attempts,
+      lastError: this.lastError,
+      reason: this.auth.reason,
+      previous: this.auth.previous,
+      changedAt: this.auth.changedAt,
+      socketOpen: this.connected,
+      authenticated: this.authenticated === true,
+      ready: this.ready === true,
+      grantInFlight: this.authPending === true,
+      authAttempts: this.auth.authentications,
+      retries: this.auth.retries,
+      tokenError: this.lastTokenError,
+      pluginChanged: this.auth.pluginChanged === true,
+      pluginChangedAt: this.auth.pluginChangedAt,
+      pluginPrevious: this.auth.pluginPrevious === null ? null : { ...this.auth.pluginPrevious },
+      autoReconnectAllowed: this.autoReconnectAllowed(),
+      reconnect: {
+        attempts: this.reconnect.attempts,
+        nextAt: this.reconnect.nextAt,
+        lastDelayMs: this.reconnect.lastDelayMs,
+        scheduled: this.reconnect.scheduled,
+        fired: this.reconnect.fired,
+        lastReason: this.reconnect.lastReason,
+        delays: [...this.reconnect.delays],
+      },
+      transitions: this.auth.transitions.map((entry) => ({ ...entry })),
+    };
+  }
+
+  /** Copy of the bounded auth event log (the same events `onAuthEvent` receives). */
+  getAuthEvents() {
+    return this.auth.events.map((entry) => ({ ...entry }));
+  }
+
+  /** requesting-grant / token-invalid must never be dialed automatically. */
+  autoReconnectAllowed() {
+    return !AUTH_QUIET_STATES.has(this.authState);
+  }
+
+  /**
+   * Change the plugin identity. It is deliberately NOT a reason to clear the token or request a
+   * new one: VTS decides whether the stored token still matches, and a name change is visible in
+   * status() (`pluginChanged` / `pluginPrevious`) instead of silently triggering a popup.
+   */
+  setPluginIdentity({ pluginName = this.plugin.pluginName, pluginDeveloper = this.plugin.pluginDeveloper } = {}) {
+    const next = { pluginName: String(pluginName), pluginDeveloper: String(pluginDeveloper) };
+    const from = { ...this.plugin };
+    if (next.pluginName === from.pluginName && next.pluginDeveloper === from.pluginDeveloper) {
+      return { ok: true, changed: false, plugin: { ...this.plugin } };
+    }
+    this.plugin = next;
+    this.auth.pluginChanged = true;
+    this.auth.pluginChangedAt = Date.now();
+    this.auth.pluginPrevious = from;
+    this.auth.pluginHistory.push({ from, to: { ...next }, at: this.auth.pluginChangedAt });
+    while (this.auth.pluginHistory.length > 8) this.auth.pluginHistory.shift();
+    this.emitAuthEvent('vts.auth.identity', { ...next, previous: from });
+    return { ok: true, changed: true, plugin: { ...next }, previous: from };
+  }
+
+  /** Exponential backoff, capped: attempt 1 = base, attempt 2 = 2×base, … */
+  reconnectDelayMs(attempt) {
+    const exponent = Math.max(0, Number(attempt) - 1);
+    return Math.min(this.reconnectMaxMs, this.reconnectBaseMs * (2 ** exponent));
+  }
+
+  /** Schedule one backed-off reconnect. Never schedules while requesting-grant / token-invalid. */
+  scheduleReconnect(reason = 'auth-failed') {
+    if (this.autoReconnect !== true) return null;
+    if (!this.autoReconnectAllowed()) return null;
+    if (this.reconnect.timer !== null) return this.reconnect.timer;
+    const attempt = this.reconnect.attempts + 1;
+    const delay = this.reconnectDelayMs(attempt);
+    this.reconnect.attempts = attempt;
+    this.reconnect.lastDelayMs = delay;
+    this.reconnect.nextAt = Date.now() + delay;
+    this.reconnect.lastReason = String(reason);
+    this.reconnect.scheduled += 1;
+    this.reconnect.delays.push(delay);
+    while (this.reconnect.delays.length > 8) this.reconnect.delays.shift();
+    this.emitAuthEvent('vts.auth.reconnect', { reason: this.reconnect.lastReason, attempt, delayMs: delay });
+    const timer = setTimeout(() => {
+      this.reconnect.timer = null;
+      this.reconnect.fired += 1;
+      this.reconnect.nextAt = 0;
+      void this.startConnect({ reason: 'auto-reconnect', auto: true }).catch(() => {});
+    }, delay);
+    timer.unref?.();
+    this.reconnect.timer = timer;
+    return timer;
+  }
+
+  clearReconnect(reason = '') {
+    if (this.reconnect.timer !== null) {
+      clearTimeout(this.reconnect.timer);
+      this.reconnect.timer = null;
+    }
+    this.reconnect.nextAt = 0;
+    if (reason.length > 0) this.reconnect.lastReason = String(reason);
+  }
+
+  resetReconnect() {
+    this.clearReconnect();
+    this.reconnect.attempts = 0;
+    this.reconnect.lastDelayMs = 0;
+    this.reconnect.delays = [];
+  }
+
+  readyResult() {
+    return { ok: true, model: this.model, modelId: this.modelId, hotkeys: this.hotkeys.length, state: this.authState };
+  }
+
+  /**
+   * Connect + authenticate + refresh. Concurrent callers share one promise. A stale gate state is
+   * respected: normal connect() cannot leave requesting-grant / token-invalid (only retry() can),
+   * which is what stops a repeated popup while the user has not answered or has denied.
+   */
+  connect() {
+    return this.startConnect({ reason: 'connect' });
+  }
+
+  startConnect({ reason = 'connect', force = false, auto = false } = {}) {
+    if (this.connectPromise !== null) return this.connectPromise;
+    if (this.ready) return Promise.resolve(this.readyResult());
+    if (!force) {
+      if (this.authState === 'token-invalid') {
+        return Promise.reject(this.authGateError(
+          'TOKEN_INVALID',
+          'VTS authorization is token-invalid; call retry() to ask VTS for a new grant',
+        ));
+      }
+      if (this.authState === 'requesting-grant') {
+        return Promise.reject(this.authGateError(
+          'AWAITING_GRANT',
+          'VTS authorization is waiting for the user; no new grant is requested while it waits',
+        ));
+      }
+    }
+    if (auto === true && !this.autoReconnectAllowed()) {
+      return Promise.reject(this.authGateError(
+        'AUTO_RECONNECT_BLOCKED',
+        'automatic reconnect is disabled while authorization is waiting for the user',
+      ));
+    }
+    this.clearReconnect(reason);
+    const run = this.authenticate({ reason });
+    const shared = run.finally(() => {
+      this.connectPromise = null;
+    });
+    this.connectPromise = shared;
+    return shared;
+  }
+
+  /**
+   * Explicit user retry. The only path allowed to leave token-invalid, and the only path that emits
+   * vts.auth.retry. It never races an in-flight connect (that promise is shared instead).
+   */
+  retry({ reason = 'user' } = {}) {
+    const why = typeof reason === 'string' && reason.length > 0 ? reason : 'user';
+    this.auth.retries += 1;
+    this.emitAuthEvent('vts.auth.retry', { reason: why, from: this.authState, attempt: this.auth.attempts + 1 });
+    if (this.connectPromise !== null) return this.connectPromise;
+    if (this.ready) return Promise.resolve(this.readyResult());
+    return this.startConnect({ reason: 'retry', force: true });
+  }
+
+  async authenticate({ reason = 'connect' } = {}) {
+    const epoch = this.closeEpoch;
     this.authPending = true;
     this.authRenewed = false;
     this.lastError = '';
+    this.setAuthState('connecting', reason);
+    let socket = null;
     try {
-      await this.negotiateAuth(hadToken);
+      await this.loadToken();
+      const hadToken = this.token.length > 0;
+      // Dial first: a refusal to connect is a transport failure (error), not a grant wait. The
+      // requesting-grant state is only entered once there is a socket that can carry the request.
+      if (!this.connected) await this.openSocket();
+      // The socket this connect started on. A reconnect replaces `this.socket`, so readiness stays
+      // tied to this exact instance instead of "whatever socket happens to be current".
+      socket = this.socket;
+
+      if (!hadToken) {
+        // No token is the first-install / corrupt-file / revoked-file path: ask once, then wait.
+        this.setAuthState('requesting-grant', 'no-token');
+        await this.requestGrant('no-token');
+        // The grant arrived: authentication is now a normal connecting-step, so a socket failure
+        // during it is error — only the popup wait itself is allowed to hold requesting-grant.
+        this.setAuthState('connecting', 'grant-received');
+
+        const first = await this.attemptAuth();
+        if (first.ok !== true) {
+          // A brand-new token refused by VTS is a failed authorization, not a user-revocable token:
+          // keeping it out of token-invalid leaves an explicit connect() able to try again.
+          this.auth.freshTokenRejected = true;
+          this.setAuthState('error', 'token-rejected-fresh');
+          throw this.authFailure(first, 'AUTH_FAILED', { authorizationRequested: true });
+        }
+      } else {
+        let first;
+        try {
+          first = await this.attemptAuth();
+        } catch (error) {
+          // A timeout / socket failure is not evidence the token is invalid.
+          throw this.authFailure(error, 'AUTH_FAILED', { authorizationRequested: false });
+        }
+        if (first.ok !== true) {
+          // A token granted in this process that VTS already rejected must not trigger another
+          // popup on every later connect: the user has to retry explicitly.
+          if (this.auth.freshTokenRejected === true) {
+            this.setAuthState('token-invalid', 'fresh-token-rejected');
+            throw this.authFailure(first, 'AUTH_RETRY_FAILED', {
+              previousReason: first.reason,
+              authorizationRequested: false,
+              renewal: false,
+            });
+          }
+          // The one legitimate re-request: a stored token VTS says is invalid/revoked. The old
+          // token is cleared before the popup so a denial cannot replay a token VTS already killed.
+          this.setAuthState('requesting-grant', 'token-rejected');
+          this.emitAuth('vts.auth.renew', { reason: first.reason });
+          await this.clearToken();
+          await this.requestGrant('token-rejected');
+          this.setAuthState('connecting', 'grant-received');
+          const retry = await this.attemptAuth();
+          if (retry.ok !== true) {
+            this.setAuthState('token-invalid', 'token-rejected');
+            throw this.authFailure(retry, 'AUTH_RETRY_FAILED', {
+              previousReason: first.reason,
+              authorizationRequested: true,
+              renewal: true,
+            });
+          }
+          this.authRenewed = true;
+          this.emitAuth('vts.auth.ok', { renewed: true });
+        }
+      }
+
+      // Authentication succeeded: leave requesting-grant before refresh/subscription, so a socket
+      // that dies during those steps is reported as a connection failure, not as a grant wait.
+      this.setAuthState('connecting', 'authenticated-pending-ready');
+      this.authenticated = true;
+      await this.refresh();
+      // A server-side rejection costs model-change push, not the connection. A subscription request
+      // that dies with its socket is different: that is the connection failing, so connect() must
+      // fail instead of promoting a dead socket to ready (the bug this guards against).
+      const subscription = await this.subscribeEvents(socket);
+      if (subscription.fatal === true) {
+        throw new Error(`VTS connection lost during event subscription: ${subscription.error}`);
+      }
+      // Animation events are a second, optional subscription: a server-side rejection costs only
+      // the animation timing (non-fatal), but losing the socket here is the same connection failure.
+      if (this.animationEvents === true) {
+        const animationSubscription = await this.subscribeAnimationEvents(socket);
+        if (animationSubscription.fatal === true) {
+          throw new Error(`VTS connection lost during animation event subscription: ${animationSubscription.error}`);
+        }
+      }
+      // Never report ready unless the socket that authenticated is still the current one, open, and
+      // authenticated. This also catches a disconnect that lands after the subscription answered.
+      if (!this.isUsableSocket(socket)) {
+        throw new Error('VTS connection closed before it became ready');
+      }
+      this.ready = true;
+      // The active token is accepted: a previous "fresh token rejected" episode is over.
+      this.auth.freshTokenRejected = false;
+      this.setAuthState('ready', 'authenticated');
+      this.resetReconnect();
+      return this.readyResult();
     } catch (error) {
-      this.lastError = error?.message ?? String(error);
-      this.emitAuth('vts.auth.failed', { code: error?.code ?? 'AUTH_FAILED' });
-      // A rejected auth must not leave a socket that still looks connected.
-      this.close();
+      // A close() during this connect owns the final state; a late failure must not overwrite it.
+      if (epoch === this.closeEpoch) {
+        this.lastError = error?.message ?? String(error);
+        if (this.authState === 'requesting-grant') {
+          // A slow popup is not a failure: keep the state quiet and the socket for an explicit retry.
+        } else if (this.authState === 'token-invalid') {
+          this.close({ keepAuthState: true });
+        } else {
+          if (this.authState !== 'error') this.setAuthState('error', 'auth-failed');
+          this.close({ keepAuthState: true });
+        }
+        // A slow grant is recorded by vts.auth.timeout; it is not an auth failure event.
+        if (error?.code !== 'AWAITING_GRANT') {
+          this.emitAuth('vts.auth.failed', { code: error?.code ?? 'AUTH_FAILED' });
+        }
+        if (this.autoReconnect === true && this.autoReconnectAllowed() && this.authState === 'error'
+          && error?.code !== 'AWAITING_GRANT' && error?.code !== 'TOKEN_WRITE_FAILED') {
+          this.scheduleReconnect('auth-failed');
+        }
+      }
       throw error;
     } finally {
       this.authPending = false;
     }
-
-    this.authenticated = true;
-    await this.refresh();
-    // A server-side rejection costs model-change push, not the connection. A subscription request
-    // that dies with its socket is different: that is the connection failing, so connect() must
-    // fail instead of promoting a dead socket to ready (the bug this guards against).
-    const subscription = await this.subscribeEvents(socket);
-    if (subscription.fatal === true) {
-      this.close();
-      throw new Error(`VTS connection lost during event subscription: ${subscription.error}`);
-    }
-    // Animation events are a second, optional subscription: a server-side rejection costs only the
-    // animation timing (non-fatal), but losing the socket here is the same connection failure.
-    if (this.animationEvents === true) {
-      const animationSubscription = await this.subscribeAnimationEvents(socket);
-      if (animationSubscription.fatal === true) {
-        this.close();
-        throw new Error(`VTS connection lost during animation event subscription: ${animationSubscription.error}`);
-      }
-    }
-    // Never report ready unless the socket that authenticated is still the current one, open, and
-    // authenticated. This also catches a disconnect that lands after the subscription answered.
-    if (!this.isUsableSocket(socket)) {
-      this.close();
-      throw new Error('VTS connection closed before it became ready');
-    }
-    this.ready = true;
-    return { ok: true, model: this.model, modelId: this.modelId, hotkeys: this.hotkeys.length };
   }
 
-  /**
-   * Establish a valid token. A persisted token rejected with invalid/revoked is replaced exactly
-   * once: clear it from memory + disk, ask VTS for a new one (this is the popup the user approves),
-   * persist it and retry AuthenticationRequest. Any second rejection is surfaced, never retried.
-   */
-  async negotiateAuth(hadToken) {
-    if (!hadToken) {
-      try {
-        await this.requestToken();
-      } catch (error) {
-        throw this.authFailure(error, 'AUTH_TOKEN_FAILED', { authorizationRequested: true });
+  /** One authorization request + persistence, with every outcome mapped to an honest state. */
+  async requestToken(reason = 'grant') {
+    const epoch = this.closeEpoch;
+    this.setAuthState('requesting-grant', reason);
+    const attempt = this.auth.attempts + 1;
+    this.auth.attempts = attempt;
+    this.emitAuthEvent('vts.auth.requested', { attempt });
+    let response;
+    try {
+      response = await this.request('AuthenticationTokenRequest', { ...this.plugin }, this.grantTimeoutMs);
+    } catch (cause) {
+      if (epoch !== this.closeEpoch) {
+        const error = new Error('VTube Studio authorization was cancelled by close()');
+        error.code = 'AUTH_CANCELLED';
+        error.cause = cause;
+        throw error;
       }
+      if (/timed out/iu.test(String(cause?.message ?? ''))) {
+        const error = new Error(`VTube Studio authorization timed out after ${this.grantTimeoutMs}ms`);
+        error.code = 'AWAITING_GRANT';
+        error.cause = cause;
+        this.lastError = error.message;
+        // Timeout is an observation, not a reason to re-request: the state stays requesting-grant.
+        this.emitAuthEvent('vts.auth.timeout', {
+          attempt,
+          state: this.authState,
+          timeoutMs: this.grantTimeoutMs,
+        });
+        throw error;
+      }
+      const error = new Error(`VTube Studio authorization request failed: ${cause?.message ?? String(cause)}`);
+      error.code = 'GRANT_SOCKET_LOST';
+      error.cause = cause;
+      this.setAuthState('error', 'grant-socket-lost');
+      throw error;
     }
-
-    let first;
+    let granted;
     try {
-      first = await this.attemptAuth();
-    } catch (error) {
-      // A timeout / socket failure is not evidence that the token is invalid, so it is not renewed.
-      throw this.authFailure(error, 'AUTH_FAILED', { authorizationRequested: !hadToken });
+      granted = unwrap(response, 'AuthenticationTokenRequest');
+    } catch (cause) {
+      // VTS answered APIError, i.e. the user refused (or VTS denied) the grant.
+      if (epoch !== this.closeEpoch) {
+        const error = new Error('VTube Studio authorization was cancelled by close()');
+        error.code = 'AUTH_CANCELLED';
+        error.cause = cause;
+        throw error;
+      }
+      const error = new Error(cause?.message ?? String(cause));
+      error.code = 'TOKEN_INVALID';
+      this.setAuthState('token-invalid', 'grant-denied');
+      throw error;
     }
-    if (first.ok === true) return { renewed: false };
-    if (!hadToken) {
-      // A brand-new token was refused: repeating AuthenticationTokenRequest cannot help.
-      throw this.authFailure(first, 'AUTH_FAILED', { authorizationRequested: true });
+    const token = String(granted.authenticationToken ?? '');
+    if (token.length === 0) {
+      const error = new Error('VTube Studio did not grant a token (the plugin grant was refused)');
+      error.code = 'TOKEN_INVALID';
+      if (epoch === this.closeEpoch) this.setAuthState('token-invalid', 'grant-denied');
+      throw error;
     }
+    await this.saveToken(token);
+    return token;
+  }
 
-    this.emitAuth('vts.auth.renew', { reason: first.reason });
-    let authorizationRequested = false;
-    let retry;
+  /** Wrap grant failures for connect() while keeping the state transitions intact. */
+  async requestGrant(reason) {
     try {
-      await this.clearToken();
-      authorizationRequested = true;
-      await this.requestToken();
-      retry = await this.attemptAuth();
+      return await this.requestToken(reason);
     } catch (error) {
-      throw this.authFailure(error, 'AUTH_RETRY_FAILED', {
-        previousReason: first.reason,
-        authorizationRequested,
-        renewal: true,
-      });
+      if (error?.code === 'TOKEN_WRITE_FAILED' || error?.code === 'AWAITING_GRANT') throw error;
+      throw this.authFailure(error, 'AUTH_TOKEN_FAILED', { authorizationRequested: true });
     }
-    if (retry.ok !== true) {
-      throw this.authFailure(retry, 'AUTH_RETRY_FAILED', {
-        previousReason: first.reason,
-        authorizationRequested: true,
-        renewal: true,
-      });
-    }
-    this.authRenewed = true;
-    this.emitAuth('vts.auth.ok', { renewed: true });
-    return { renewed: true };
   }
 
   /**
@@ -390,6 +867,7 @@ export class VtsClient {
    * can tell an unusable token (APIError or authenticated:false) from a transport failure.
    */
   async attemptAuth() {
+    this.auth.authentications += 1;
     const response = await this.request('AuthenticationRequest', {
       ...this.plugin,
       authenticationToken: this.token,
@@ -409,25 +887,6 @@ export class VtsClient {
       reason: String(data.reason ?? data.message ?? data.errorMessage ?? 'authenticated is not true'),
       code: data.errorID ?? null,
     };
-  }
-
-  /** Ask VTS for a token. With an empty tokenPath VTS shows its authorization popup here. */
-  async requestToken() {
-    const granted = unwrap(
-      await this.request('AuthenticationTokenRequest', this.plugin, 60_000),
-      'AuthenticationTokenRequest',
-    );
-    const token = String(granted.authenticationToken ?? '');
-    if (token.length === 0) throw new Error('VTube Studio did not grant a token (click Allow)');
-    await this.saveToken(token);
-    return token;
-  }
-
-  /** Drop a rejected token from memory and disk so the next run cannot replay it. */
-  async clearToken() {
-    this.token = '';
-    await mkdir(dirname(this.tokenPath), { recursive: true });
-    await writeFile(this.tokenPath, JSON.stringify({ authenticationToken: '' }, null, 2), 'utf8');
   }
 
   /** One clear, coded error that also records whether the authorization popup was triggered. */
@@ -551,6 +1010,21 @@ export class VtsClient {
     // A reconnect gets a new socket: any frame still waiting belongs to the old one.
     this.frameEpoch += 1;
     this.failPending(new Error('VTube Studio connection closed'));
+
+    // A socket lost while the user is deciding is NOT a reason to reconnect (that would reopen the
+    // popup path). The quiet gate stays in place; only retry() may leave it.
+    if (this.authState === 'requesting-grant' || this.authState === 'token-invalid') {
+      this.setAuthState(this.authState, this.authState === 'requesting-grant'
+        ? 'socket-lost-while-waiting'
+        : 'socket-lost-after-invalid');
+      return;
+    }
+    // `error` is already the honest state of a failed connection; a late close must not hide it.
+    if (this.authState === 'disconnected' || this.authState === 'error') return;
+    this.setAuthState('disconnected', 'socket-closed');
+    if (this.autoReconnect === true && this.autoReconnectAllowed()) {
+      this.scheduleReconnect('socket-closed');
+    }
   }
 
   /**
@@ -1440,9 +1914,16 @@ export class VtsClient {
     await this.request('MoveModelRequest', data);
   }
 
-  close() {
+  /**
+   * Drop the socket and every per-connection cache. A deliberate close returns the machine to
+   * disconnected so the next explicit connect() starts clean; `keepAuthState` is used by the auth
+   * failure paths, where the failure state (error / token-invalid / requesting-grant) must survive
+   * the socket teardown.
+   */
+  close({ keepAuthState = false } = {}) {
     // Bumped first: a connect() whose socket is still opening must not adopt it after this close.
     this.socketEpoch += 1;
+    this.closeEpoch += 1;
     this.authenticated = false;
     this.ready = false;
     this.eventsSubscribed = false;
@@ -1459,6 +1940,8 @@ export class VtsClient {
     // Frames queued before the close must never wake up and reach a later connection.
     this.frameEpoch += 1;
     this.failPending(new Error('VTube Studio connection closed'));
+    this.clearReconnect('closed');
+    if (keepAuthState !== true) this.setAuthState('disconnected', 'closed');
     const socket = this.socket;
     this.socket = null;
     if (socket !== null) {
