@@ -1,12 +1,24 @@
 node_modules/
 .idea/
 .tmp-*/
+.tmp-*
 docs/
 logs/
 prototype/
 
 # generated audio fixtures (rebuild with node tools/asr-cutpoint-fixture.mjs)
 test/fixtures/asr-cutpoint/*.wav
+
+# local runtime data / build output
+data/
+workspace/
+dist/
+coverage/
+
+# packages and archives
+*.tgz
+*.zip
+*.tar.gz
 
 # runtime artifacts
 *.log

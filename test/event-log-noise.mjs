@@ -59,7 +59,7 @@ function observerContext() {
   };
 }
 
-const SCOPE = resolve('G:\\Seirein\\workspace');
+const SCOPE = resolve('C:\\data\\Seirein\\workspace');
 const FOREIGN = resolve('C:\\Users\\dev\\default-workspace');
 
 test('1a. 5000 foreign cwd-mismatch events → 0 per-event lines, 1 summary with the exact count', async () => {
