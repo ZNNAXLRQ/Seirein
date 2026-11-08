@@ -42,6 +42,9 @@ const state = {
   obsScene: 'Main',
   obsScenes: ['Main', 'Other', 'Privacy'],
   obsRequests: [],
+  saveGate: null,
+  saves: 0,
+  deletedAttachments: [],
 };
 globalThis.__perceptionHostTest = state;
 
@@ -195,6 +198,9 @@ async function fixture(t, { attachments = true, llm = true } = {}) {
   state.obsScene = 'Main';
   state.obsScenes = ['Main', 'Other', 'Privacy'];
   state.obsRequests = [];
+  state.saveGate = null;
+  state.saves = 0;
+  state.deletedAttachments = [];
 
   const root = await mkdtemp(join(tmpdir(), 'dsh-perception-host-'));
   const tools = new Map();
@@ -208,8 +214,13 @@ async function fixture(t, { attachments = true, llm = true } = {}) {
   let saved = 0;
   const attachmentsService = {
     async saveImage({ data, mediaType, name }) {
+      state.saves += 1;
+      if (state.saveGate !== null) await state.saveGate;
       saved += 1;
       return { id: `att-${saved}`, mediaType, name, bytes: data.length };
+    },
+    async deleteImage(attachment) {
+      state.deletedAttachments.push(attachment);
     },
   };
   const llmService = {
@@ -454,6 +465,74 @@ test('② 切 OBS 场景：旧截图不再交付，在途场景采集被作废�
   assert.equal(external.ok, false);
   assert.match(external.reason, /场景已切换/u);
   assert.equal((await app.status()).perception.lastVision, null);
+});
+
+test('P2-1 缓存命中后切场景：复用前核验来源，旧图作废且不再标 current', async (t) => {
+  const app = await fixture(t);
+  const scene = await app.action({ action: 'vision.mode', mode: 'scene', scene: 'Main' });
+  assert.equal(scene.ok, true, scene.error);
+  state.capture = ({ dir }) => app.makeShot(dir, { name: 'cached.png' });
+
+  const first = await app.call('assistant_see', {});
+  assert.equal(first.ok, true, first.reason);
+  assert.equal(first.current, true);
+  assert.equal(state.saves, 1);
+  assert.equal(state.calls.filter((name) => name === 'device').length, 1);
+
+  // The cached frame is still inside the 500 ms merge window, but OBS now shows another scene.
+  state.obsScene = 'Other';
+  const second = await app.call('assistant_see', {});
+  t.diagnostic(`cache-then-switch: ok=${second.ok} current=${second.current} reason=${second.reason}`);
+  assert.equal(second.ok, false, 'the cached old-scene frame is refused');
+  assert.equal(second.current, false);
+  assert.match(second.reason, /场景已切换/u);
+  assert.equal(second.attachment, null, 'no image is delivered for the stale cache hit');
+  assert.equal(state.saves, 1, 'the cache hit is not saved as a second attachment');
+  assert.equal(state.calls.filter((name) => name === 'device').length, 1,
+    'the old cache is verified and refused, not silently recaptured');
+  assert.deepEqual(await app.listScreens(), [], 'the cached screenshot is deleted');
+  assert.equal((await app.shot(first.file)).status, 403, 'the old preview is no longer served');
+  assert.equal((await app.status()).perception.lastVision, null);
+});
+
+test('P2-1 附件保存期间切场景：最终交付前核验来源，刚保存的附件被丢弃', async (t) => {
+  const app = await fixture(t);
+  const scene = await app.action({ action: 'vision.mode', mode: 'scene', scene: 'Main' });
+  assert.equal(scene.ok, true, scene.error);
+  state.capture = ({ dir }) => app.makeShot(dir, { name: 'save-race.png' });
+
+  const gate = deferred();
+  state.saveGate = gate.promise;
+  t.after(() => gate.resolve());
+  const pending = app.call('assistant_see', {});
+  let early = null;
+  void pending.then((value) => { early = value; }, (error) => { early = { ok: false, reason: String(error) }; });
+  for (let i = 0; i < 200 && state.saves === 0 && early === null; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(early === null, `the call finished before saveImage: ${JSON.stringify(early)}`);
+  assert.equal(state.saves, 1, 'the delivery is inside saveImage');
+  // OBS switches while the attachment bytes are being written.
+  state.obsScene = 'Other';
+  gate.resolve();
+
+  const result = await pending;
+  t.diagnostic(`switch-during-save: ok=${result.ok} stale=${result.stale} current=${result.current} `
+    + `attachments=${state.saves} deleted=${state.deletedAttachments.length}`);
+  assert.equal(result.ok, false, 'the late frame is refused');
+  assert.equal(result.stale, true, 'the refusal says the observation is stale');
+  assert.equal(result.current, false);
+  assert.equal(result.attachment, null);
+  assert.equal(state.saves, 1);
+  assert.equal(state.deletedAttachments.length, 1, 'the just-saved attachment is dropped');
+  assert.equal(state.deletedAttachments[0].id, 'att-1');
+  assert.deepEqual(await app.listScreens(), [], 'the screenshot file is deleted too');
+  assert.equal((await app.status()).perception.lastVision, null);
+  const events = await app.events();
+  assert.equal(events.some((event) => event.type === 'vision.delivered'), false,
+    'a stale frame never records delivery');
+  assert.equal(events.some((event) => event.type === 'vision.delivery.refused'
+    && event.payload.stage === 'source'), true, 'the refusal names the source stage');
 });
 
 test('③ 同源连点 5 次只产生 1 次采集，合并事件记录 count=5', async (t) => {

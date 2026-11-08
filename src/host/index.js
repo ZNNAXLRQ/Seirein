@@ -7548,6 +7548,17 @@ export function apply(ctx, config) {
     }
     if (lastVision?.file === file) lastVision = null;
   };
+  /**
+   * Best-effort removal of an attachment saved for a frame that turned stale afterwards.
+   * The Harness attachment store is content-addressed and exposes no delete operation, so the
+   * reference is at least never delivered; a provider that does expose removal drops it too.
+   */
+  const discardSavedAttachment = async (service, attachment) => {
+    if (service === null || service === undefined || attachment === null || attachment === undefined) return;
+    const remove = service.deleteImage ?? service.deleteAttachment ?? service.delete;
+    if (typeof remove !== 'function') return;
+    try { await remove.call(service, attachment); } catch { /* immutable backend */ }
+  };
   const invalidateVision = () => {
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
@@ -7936,6 +7947,54 @@ export function apply(ctx, config) {
   };
 
   /**
+   * One cancellation error for a caller whose own wait ended early. Kept Chinese so the
+   * model-facing refusal and the event log say why the frame was not delivered.
+   */
+  const captureCancelledError = (rootCause) => Object.assign(
+    new Error(rootCause?.message ? `工具调用已取消：${rootCause.message}` : '工具调用已取消：视觉采集已取消'),
+    { name: 'AbortError', cause: rootCause ?? null },
+  );
+
+  /**
+   * Wait for one shared capture lane.
+   *
+   * Each caller owns only its own wait: cancelling one caller withdraws that caller and never
+   * touches the shared capture while another waiter remains. The capture is owned by a private
+   * controller and is aborted only when the last waiter leaves; a frame produced after that is
+   * discarded, so a cancelled request leaves no deliverable orphan.
+   */
+  const awaitCaptureLane = (lane, laneKey, callSignal) => new Promise((resolve, reject) => {
+    lane.waiters += 1;
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      callSignal?.removeEventListener?.('abort', onAbort);
+      lane.waiters -= 1;
+      const reason = captureCancelledError(callSignal?.reason);
+      if (lane.waiters > 0) {
+        perceptionEvent('perception.capture.detached', { waiters: lane.waiters });
+      } else {
+        lane.aborted = true;
+        if (visionCaptureLanes.get(laneKey) === lane) visionCaptureLanes.delete(laneKey);
+        if (lane.pending === true) lane.controller.abort(reason);
+        perceptionEvent('perception.capture.cancelled', { waiters: 0 });
+      }
+      reject(reason);
+    };
+    const onSettled = (ok, value) => {
+      if (settled) return;
+      settled = true;
+      callSignal?.removeEventListener?.('abort', onAbort);
+      lane.waiters -= 1;
+      if (ok) resolve(value); else reject(value);
+    };
+    if (callSignal?.aborted === true) { onAbort(); return; }
+    callSignal?.addEventListener?.('abort', onAbort, { once: true });
+    lane.promise.then((value) => onSettled(true, value), (error) => onSettled(false, error));
+  });
+
+  /**
    * Capture for the agent, honouring the current mode. Privacy is refused outright; scene
    * mode reads OBS's program output through the virtual camera; watch mode reads the desktop.
    *
@@ -7944,11 +8003,14 @@ export function apply(ctx, config) {
    * re-validates mode/generation per call and a refused call cannot borrow the other's state.
    */
   const captureForAgent = async (reason, callSignal) => {
-    const token = visionToken();
-    // One cancellation lane for the whole call: privacy/dispose invalidates via the module
-    // controller, while DSH's tool AbortSignal covers a cancelled model step or turn.
-    if (callSignal !== undefined && callSignal !== null) {
-      token.signal = AbortSignal.any([token.signal, callSignal]);
+    const baseToken = visionToken();
+    // The caller's own signal covers this call's delivery, never the shared capture: a cancelled
+    // waiter must be able to leave without aborting the frame another waiter is still waiting for.
+    const token = callSignal === undefined || callSignal === null
+      ? baseToken
+      : { ...baseToken, signal: AbortSignal.any([baseToken.signal, callSignal]) };
+    if (callSignal?.aborted === true) {
+      throw captureCancelledError(callSignal.reason);
     }
     assertVisionToken(token);
     const laneKey = `${token.generation}|${token.mode}|${token.mode === 'scene' ? token.scene : ''}`;
@@ -7958,74 +8020,89 @@ export function apply(ctx, config) {
       const reusable = existing.stale !== true
         && (existing.pending === true || Date.now() - existing.at < VISION_COALESCE_MS);
       if (reusable) {
-        existing.joins += 1;
-        perceptionStat('coalesced');
-        perceptionEvent('perception.coalesced', { count: existing.joins + 1, source: token.mode });
-        const shared = await existing.promise;
+        // Re-verify the live source BEFORE reusing a cached frame. OBS may have switched the
+        // program scene while the frame waited in the merge window; the old lane key cannot see
+        // that, and a mismatch invalidates the generation and deletes the cached file.
+        await assertProgramScene(token);
         assertVisionToken(token);
-        const joined = { ...shared, source: token.mode };
-        capturedTokens.set(joined, token);
-        visionFiles.set(joined.file, token.generation);
-        return joined;
+        if (visionCaptureLanes.get(laneKey) === existing) {
+          existing.joins += 1;
+          perceptionStat('coalesced');
+          perceptionEvent('perception.coalesced', { count: existing.joins + 1, source: token.mode });
+          const shared = await awaitCaptureLane(existing, laneKey, callSignal);
+          assertVisionToken(token);
+          const joined = { ...shared, source: token.mode };
+          capturedTokens.set(joined, token);
+          if (token.generation === visionGeneration) visionFiles.set(joined.file, token.generation);
+          return joined;
+        }
       }
-      visionCaptureLanes.delete(laneKey);
+      if (visionCaptureLanes.get(laneKey) === existing) visionCaptureLanes.delete(laneKey);
       if (existing.stale === true) noteStaleVision('reuse-expired');
     }
-    const lane = { promise: null, at: Date.now(), pending: true, joins: 0, stale: false };
+    const lane = {
+      promise: null, at: Date.now(), pending: true, joins: 0, stale: false,
+      waiters: 0, controller: new AbortController(), aborted: false,
+    };
+    // The shared capture owns a private controller; caller signals are only waiter subscriptions.
+    const captureToken = {
+      ...baseToken,
+      signal: AbortSignal.any([baseToken.signal, lane.controller.signal]),
+    };
     const runCapture = async () => {
-      assertVisionToken(token);
+      assertVisionToken(captureToken);
       let shot;
       // Watch mode is ffmpeg ddagrab, never OBS (performance, and it must not depend on OBS).
       try {
         const dir = join(root, 'cache', 'screens');
         const ffmpegPath = resolveFfmpeg(root, config);
-        if (token.mode === 'scene') {
-          await assertProgramScene(token);
-          await ensureSceneCamera(token);
-          assertVisionToken(token);
-          await assertProgramScene(token);
+        if (captureToken.mode === 'scene') {
+          await assertProgramScene(captureToken);
+          await ensureSceneCamera(captureToken);
+          assertVisionToken(captureToken);
+          await assertProgramScene(captureToken);
           if (ffmpegPath === null) throw new Error('场景模式需要 ffmpeg（用来读取 OBS 虚拟摄像头）');
-          shot = await captureDevice({ dir, ffmpegPath, device: virtualCamDevice(), signal: token.signal });
+          shot = await captureDevice({ dir, ffmpegPath, device: virtualCamDevice(), signal: captureToken.signal });
         } else if (ffmpegPath !== null) {
           // Desktop capture never depends on OBS. Do not fall back after cancellation.
           try {
-            shot = await captureDesktop({ dir, ffmpegPath, signal: token.signal });
+            shot = await captureDesktop({ dir, ffmpegPath, signal: captureToken.signal });
           } catch (error) {
-            assertVisionToken(token);
-            shot = { ...(await capture({ dir, signal: token.signal })), engine: 'powershell' };
+            assertVisionToken(captureToken);
+            shot = { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
           }
         } else {
-          shot = { ...(await capture({ dir, signal: token.signal })), engine: 'powershell' };
+          shot = { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
         }
-        assertVisionToken(token);
+        assertVisionToken(captureToken);
         // A scene may have been switched in OBS while ffmpeg was decoding this frame.
-        await assertProgramScene(token);
+        await assertProgramScene(captureToken);
         await log.emit('vision.captured', {
-          source: token.mode, scene: token.mode === 'scene' ? token.scene : undefined,
+          source: captureToken.mode, scene: captureToken.mode === 'scene' ? captureToken.scene : undefined,
           engine: shot.engine, reason: reason ?? null,
           bytes: shot.bytes, width: shot.width, height: shot.height,
         });
         // Event persistence is asynchronous too: recheck before publishing a path or preview.
-        assertVisionToken(token);
+        assertVisionToken(captureToken);
         const capturedAt = Number(shot.capturedAt ?? shot.at) || Date.now();
         lane.stale = readObservation({ at: capturedAt, capturedAt }, { now: Date.now() }).stale === true;
         lastVisionStaleRecorded = false;
         lastVision = {
-          file: shot.file, source: token.mode,
-          ...(token.mode === 'scene' ? { scene: token.scene } : { engine: shot.engine }),
+          file: shot.file, source: captureToken.mode,
+          ...(captureToken.mode === 'scene' ? { scene: captureToken.scene } : { engine: shot.engine }),
           ts: Date.now(), width: shot.width, height: shot.height,
           // `capturedAt` is when the pixels left the capture device; `at`/`observedAt` are the
           // aliases the freshness reader and the model-facing evidence use.
           capturedAt,
           at: capturedAt,
           observedAt: capturedAt,
-          generation: token.generation,
+          generation: baseToken.generation,
         };
         // A fresh observation may prove where the user is: republish attention only when BOTH the
         // verified gaze channel and this real position exist; otherwise it stays untouched.
         refreshAvatarAttention();
-        visionFiles.set(shot.file, token.generation);
-        return { ...shot, source: token.mode };
+        visionFiles.set(shot.file, baseToken.generation);
+        return { ...shot, source: captureToken.mode };
       } catch (error) {
         await discardUndelivered(shot?.file, 'capture');
         throw error;
@@ -8033,21 +8110,27 @@ export function apply(ctx, config) {
     };
     perceptionStat('captures');
     lane.promise = runCapture();
+    lane.promise.then(
+      (shot) => {
+        lane.pending = false;
+        lane.at = Date.now();
+        // The last waiter already withdrew: the late frame has no owner and must not stay.
+        if (lane.aborted === true) void discardUndelivered(shot?.file, 'cancelled');
+      },
+      () => {
+        lane.pending = false;
+        lane.at = Date.now();
+        if (lane.aborted !== true && visionCaptureLanes.get(laneKey) === lane) {
+          visionCaptureLanes.delete(laneKey);
+        }
+      },
+    );
     visionCaptureLanes.set(laneKey, lane);
-    try {
-      const shot = await lane.promise;
-      lane.pending = false;
-      lane.at = Date.now();
-      const result = { ...shot };
-      capturedTokens.set(result, token);
-      visionFiles.set(result.file, token.generation);
-      return result;
-    } catch (error) {
-      if (visionCaptureLanes.get(laneKey) === lane) visionCaptureLanes.delete(laneKey);
-      throw error;
-    } finally {
-      lane.pending = false;
-    }
+    const shot = await awaitCaptureLane(lane, laneKey, callSignal);
+    const result = { ...shot };
+    capturedTokens.set(result, token);
+    if (token.generation === visionGeneration) visionFiles.set(result.file, token.generation);
+    return result;
   };
 
   /** Attachment cap: native resolution by default; a larger frame is scaled only to fit. */
@@ -8145,11 +8228,13 @@ export function apply(ctx, config) {
      */
     const refusal = async (reason, {
       stage = 'delivery', unknown = false, capability: refusedCapability = null, extra = [],
+      stale = false, attachment: saved = null, attachments: service = null,
     } = {}) => {
       perceptionStat('rejected');
       perceptionEvent('perception.rejected', { reason, stage });
       const files = [...new Set([shot.file, ...extra].filter(Boolean))];
       for (const file of files) await discardUndelivered(file, stage);
+      if (saved !== null) await discardSavedAttachment(service, saved);
       await log.emit('vision.delivery.refused', {
         reason,
         stage,
@@ -8165,7 +8250,8 @@ export function apply(ctx, config) {
           model: refusedCapability?.model ?? '',
         });
       }
-      return sightFailure(reason);
+      const failure = sightFailure(reason);
+      return stale === true ? { ...failure, stale: true } : failure;
     };
     const gate = () => {
       try {
@@ -8243,9 +8329,22 @@ export function apply(ctx, config) {
     } catch (error) {
       return refusal(`附件保存失败：${error?.message ?? String(error)}`, { stage: 'save' });
     }
-    // Delivery boundary: saveImage is async, so privacy may have landed while it ran.
-    blocked = gate();
-    if (blocked !== null) return refusal(blocked, { stage: 'save' });
+    // Delivery boundary: saveImage is async, so privacy/mode/generation or the OBS program
+    // scene may have changed while the bytes were written. Re-verify both; any mismatch makes
+    // this observation stale, and the attachment that was just saved must be dropped.
+    let sourceIssue = gate();
+    if (sourceIssue === null) {
+      try {
+        await assertProgramScene(token);
+      } catch (error) {
+        sourceIssue = error?.message ?? String(error);
+      }
+    }
+    if (sourceIssue !== null) {
+      return refusal(sourceIssue, {
+        stage: 'source', stale: true, attachment: attachment ?? null, attachments,
+      });
+    }
     if (attachment === undefined || attachment === null) {
       return refusal('附件服务没有返回可用的图像附件', { stage: 'save' });
     }
