@@ -81,6 +81,15 @@ const INFO_FAILURE_PATTERN = /(?:fail(?:ed|ure)?|error|timed?\s*out|timeout|unav
  * throttled. The sampling itself and `snapshot().alphaSample` stay at the renderer's 1 Hz.
  */
 export const ALPHA_SAMPLE_LOG_INTERVAL_MS = 30_000;
+/**
+ * `spout.stage2` is renderer health evidence, not a 1 Hz heartbeat: a healthy steady sample
+ * (`fps >= STAGE2_MIN_FPS`, unchanged dropped/resized/framebuffer counters and alphaMode) writes
+ * one line per window. A counter change, an alphaMode change or a low fps is written at once —
+ * the anomalies are never throttled. `snapshot().stage2` keeps the newest sample regardless.
+ */
+export const STAGE2_LOG_INTERVAL_MS = 60_000;
+/** Below this fps a stage-2 sample is a real degradation and is always written immediately. */
+export const STAGE2_MIN_FPS = 30;
 
 const VERSION_TIMEOUT_MS = 3000;
 const CREATED_TOLERANCE_MS = 1000;
@@ -201,6 +210,8 @@ export class SpoutLayer {
    *   a short window to observe the coalesced count without waiting a minute.
    * @param {number} [options.alphaSampleIntervalMs] - steady transparent alpha sample window
    *   (default 30 s); a verdict change or a non-transparent sample is always recorded at once.
+   * @param {number} [options.stage2LogIntervalMs] - steady stage-2 heartbeat window (default 60 s);
+   *   a counter/alphaMode change or `fps < 30` is always recorded at once.
    * @param {'spout'|'wpf'} [options.backend] - the backend this instance belongs to, as reported by
    *   `snapshot().backend`. Defaults to `spout`; a WPF instance is only ever constructed with an
    *   explicit `backend`, so status can never claim one backend while the other is running.
@@ -218,6 +229,7 @@ export class SpoutLayer {
     vtsWindow = null,
     infoThrottleMs = INFO_THROTTLE_MS,
     alphaSampleIntervalMs = ALPHA_SAMPLE_LOG_INTERVAL_MS,
+    stage2LogIntervalMs = STAGE2_LOG_INTERVAL_MS,
     backend = 'spout',
     vtsHideRetryDelays = VTS_HIDE_RETRY_DELAYS_MS,
     timers = null,
@@ -381,6 +393,18 @@ export class SpoutLayer {
       : ALPHA_SAMPLE_LOG_INTERVAL_MS;
     this.alphaSampleLastVerdict = null;
     this.alphaSampleLastEmitAt = 0;
+    /**
+     * `spout.stage2` write gate: the renderer still reports at 1 Hz, but only a change (dropped /
+     * resized / framebufferErrors / alphaMode), a low fps or the heartbeat reaches the event log.
+     * `stage2LastWrite` is the last *written* sample; `stage2Suppressed` counts the folded ones.
+     */
+    const stage2Interval = Number(stage2LogIntervalMs);
+    this.stage2LogIntervalMs = Number.isFinite(stage2Interval) && stage2Interval >= 0
+      ? stage2Interval
+      : STAGE2_LOG_INTERVAL_MS;
+    this.stage2LastWrite = null;
+    this.stage2LastEmitAt = 0;
+    this.stage2Suppressed = 0;
   }
 
   /**
@@ -2739,7 +2763,28 @@ export class SpoutLayer {
         alphaMode: String(payload?.alphaMode ?? ''),
         at: Date.now(),
       };
-      void this.emitEvent('spout.stage2', { ...this.stage2 });
+      // The snapshot above always carries the newest sample; the event log only needs a change, a
+      // degradation or the heartbeat. The folded samples are counted on the next written row.
+      const previous = this.stage2LastWrite;
+      const changed = previous === null
+        || previous.dropped !== this.stage2.dropped
+        || previous.resized !== this.stage2.resized
+        || previous.framebufferErrors !== this.stage2.framebufferErrors
+        || previous.alphaMode !== this.stage2.alphaMode;
+      const degraded = this.stage2.fps < STAGE2_MIN_FPS;
+      if (changed || degraded || this.stage2.at - this.stage2LastEmitAt >= this.stage2LogIntervalMs) {
+        const { dropped, resized, framebufferErrors, alphaMode } = this.stage2;
+        this.stage2LastWrite = { dropped, resized, framebufferErrors, alphaMode };
+        this.stage2LastEmitAt = this.stage2.at;
+        void this.emitEvent('spout.stage2', {
+          ...this.stage2,
+          suppressed: this.stage2Suppressed,
+          windowMs: this.stage2LogIntervalMs,
+        });
+        this.stage2Suppressed = 0;
+      } else {
+        this.stage2Suppressed += 1;
+      }
       return;
     }
 

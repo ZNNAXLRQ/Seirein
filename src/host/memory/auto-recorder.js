@@ -10,6 +10,14 @@ import { resolveMemoryTimeZone } from './memory-normalize.js';
 import { stripMemoryInjection } from '../shared/text.js';
 
 /**
+ * Out-of-scope / cwd-less sessions are reported once per session, then counted: one
+ * `memory.auto.skipped.summary {count, windowMs}` per window (or at the session's turn/end)
+ * instead of one `memory.auto.skipped` row per skipped message. A log gate only — the scope
+ * decision itself never changes.
+ */
+export const SKIP_SUMMARY_WINDOW_MS = 5 * 60_000;
+
+/**
  * Message-level auto recorder: one `user/message` → one record; `assistant/message` records are
  * buffered per turn and only flushed when that turn actually completed (an aborted/cancelled
  * turn's drafts never enter memory). Every write is idempotent on the Harness message id.
@@ -17,7 +25,9 @@ import { stripMemoryInjection } from '../shared/text.js';
  * Recording obeys two gates before anything is buffered or written: the memory component must
  * be on (`featureEnabled`), and the session must be in the workspace scope (`scopeOf` returns
  * `in-scope` | `out-of-scope` | `no-cwd`). Out-of-scope and cwd-less sessions record nothing and
- * emit `memory.auto.skipped`, so another project's conversation can never leak into memory.
+ * emit `memory.auto.skipped` (first per session) plus `memory.auto.skipped.summary` (the counted
+ * rest per `SKIP_SUMMARY_WINDOW_MS` or at turn/end), so another project's conversation can never
+ * leak into memory.
  *
  * @param {{memory: object, log?: object,
  *          settings?: (() => object)|object, now?: () => number,
@@ -53,6 +63,32 @@ export function createAutoMemoryRecorder({
   const turnBySession = new Map();
   const buffers = new Map();
   const keyFor = (sessionId, turnId) => `${sessionId}\u0000${turnId ?? 'none'}`;
+  /**
+   * Skip rows already reported per session: `{ reason, count, at }`. The first skip of a session is
+   * written, the following ones are only counted until the window (or the session's turn/end)
+   * flushes one summary — the exact skip is still fully accounted for. The entry is kept (reset)
+   * after a flush, so a later skip continues the same session without a second "first" row.
+   */
+  const skipWindows = new Map();
+  /** Flush one session's counted skips as `memory.auto.skipped.summary`; never throws. */
+  const flushSkipSummary = async (sessionId) => {
+    const window = skipWindows.get(sessionId);
+    if (window === undefined) return;
+    window.at = now();
+    const count = window.count;
+    window.count = 0;
+    if (count === 0) return;
+    try {
+      await log?.emit?.('memory.auto.skipped.summary', {
+        sessionId,
+        reason: window.reason,
+        count,
+        windowMs: SKIP_SUMMARY_WINDOW_MS,
+      });
+    } catch {
+      /* logging is best-effort */
+    }
+  };
 
   /** Zone used to resolve relative dates; a function keeps a live config change effective. */
   const zoneOf = () => resolveMemoryTimeZone(typeof timeZone === 'function' ? timeZone() : timeZone);
@@ -163,7 +199,22 @@ export function createAutoMemoryRecorder({
       const scope = scopeFor(session);
       if (scope !== 'in-scope') {
         if (event.type === 'user/message' || event.type === 'assistant/message') {
-          await log?.emit?.('memory.auto.skipped', { reason: scope, sessionId, type: event.type });
+          // One line per session, then one counting row per window (and one at turn/end): the
+          // skip decision is unchanged, only its event-log emission is aggregated.
+          let window = skipWindows.get(sessionId);
+          if (window !== undefined && window.reason !== scope) {
+            await flushSkipSummary(sessionId);
+            window = undefined;
+          }
+          if (window === undefined) {
+            skipWindows.set(sessionId, { reason: scope, count: 0, at: now() });
+            await log?.emit?.('memory.auto.skipped', { reason: scope, sessionId, type: event.type });
+          } else {
+            window.count += 1;
+            if (now() - window.at >= SKIP_SUMMARY_WINDOW_MS) await flushSkipSummary(sessionId);
+          }
+        } else if (event.type === 'turn/end') {
+          await flushSkipSummary(sessionId);
         }
         return;
       }

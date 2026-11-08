@@ -298,6 +298,8 @@ export class VtsClient {
       current: null,
       starts: 0,
       ends: 0,
+      /** Idle-loop Ends counted but not written: they repeat forever and say nothing new. */
+      idleEnds: 0,
       /** Starts suppressed inside ANIMATION_START_DEDUPE_MS (the idle loop repeats). */
       deduped: 0,
       resets: 0,
@@ -1277,7 +1279,9 @@ export class VtsClient {
    * model's own animation data, not something the Host can use.
    *
    * `animationLength` is seconds in the VTS protocol; 0 means "not reported", which leaves the
-   * runtime on its bounded estimate instead of inventing a duration.
+   * runtime on its bounded estimate instead of inventing a duration. An `End` is written as
+   * `avatar.animation.end` only for a non-idle animation: the idle loop's Ends are counted in
+   * `state.animations.idleEnds` instead of flooding the event log.
    */
   handleModelAnimation(data) {
     const event = data?.modelAnimationEvent ?? data ?? {};
@@ -1293,6 +1297,12 @@ export class VtsClient {
       // An End for another animation must not clear the one currently believed to be running.
       if (matched) this.animations.current = null;
       this.animations.ends += 1;
+      // An idle loop ends every few seconds and says nothing new: it is counted (`idleEnds`, in
+      // the animation state) but never written. A non-idle End stays per occurrence.
+      if (isIdle) {
+        this.animations.idleEnds += 1;
+        return;
+      }
       this.emitEvent('avatar.animation.end', {
         name,
         durationMs: durationMs > 0 ? durationMs : (matched ? previous.durationMs : 0),

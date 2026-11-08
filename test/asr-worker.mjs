@@ -739,14 +739,26 @@ test('l) 被跳过的句子不阻塞后续：仍按序交付，不倒退', async
   assert.equal(hearing.stats().dropped, 1, 'the silent sentence is still accounted as dropped');
 
   const order = ofType(events, 'asr.delivery.order').map((event) => event.payload);
-  assert.deepEqual(order.map((entry) => entry.seq), [1, 2, 3], 'slots settle in utterance order');
+  assert.deepEqual(order.map((entry) => entry.seq), [1, 3], 'delivered slots settle in utterance order');
   assert.deepEqual(
     order.map((entry) => [entry.delivered, entry.skipped]),
-    [[true, false], [false, true], [true, false]],
-    'the skipped slot is reported and the later utterance still delivers',
+    [[true, false], [true, false]],
+    'the later utterance still delivers after the skipped slot',
+  );
+  assert.equal(
+    ofType(events, 'asr.delivery.order.summary').length,
+    0,
+    'one skipped slot is counted, not written per slot',
   );
   assert.equal(hearing.stats().delivery.pending, 0);
   hearing.stop();
+  // The skipped slot is still reported: one counting row at session end, with its exact seq.
+  const [summary] = ofType(events, 'asr.delivery.order.summary').map((event) => event.payload);
+  assert.deepEqual(
+    { count: summary?.count, firstSeq: summary?.firstSeq, lastSeq: summary?.lastSeq },
+    { count: 1, firstSeq: 2, lastSeq: 2 },
+    'the skipped slot is reported and nothing is silently lost',
+  );
 });
 
 test('m) 熔断后 terminate() 的 exit 不重启：spawn 停在 3，状态保持 degraded', async (t) => {

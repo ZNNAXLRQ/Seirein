@@ -228,6 +228,19 @@ export function parseUtteranceId(value) {
 export const CONTINUATION_PROBE_MS = 1200;
 
 /**
+ * Event-log aggregation windows. They only decide whether a *log* row is written: every verdict
+ * they count is already made, and the window is flushed lazily by the next same-class row (or at
+ * session end) — no timer is ever created for a log.
+ */
+export const LOG_SUMMARY_WINDOW_MS = 60_000;
+
+/** One silence-only endpoint line out of this many reaches the log; the others are counted. */
+export const ENDPOINT_SILENCE_SAMPLE_EVERY = 10;
+
+/** Skipped delivery slots folded into one `asr.delivery.order.summary` row. */
+export const DELIVERY_SKIP_SUMMARY_MAX = 100;
+
+/**
  * Start streaming recognition.
  * @param {{ffmpegPath: string, modelDir: string, finalModelDir?: string, device: string,
  *          gainDb?: number, streamThreads?: number, finalThreads?: number, decodeCapSec?: number,
@@ -297,7 +310,8 @@ export function startHearing({
   onUpdate,
   /**
    * Lifecycle sink for `asr.worker.*`, `asr.decode`, `asr.decode.timeout`, `asr.queue.overflow`,
-   * `asr.delivery.order` `{ seq, delivered, skipped }` (worker sessions only), and the noise shadow
+   * `asr.delivery.order` `{ seq, delivered, skipped }` and its `asr.delivery.order.summary`
+   * `{ count, firstSeq, lastSeq }` (worker sessions only), and the noise shadow
    * (`hearing.noise.shadow` / `.suppressed`, worker sessions only). The host wires it to its event
    * log; without it the worker still runs, only its telemetry is dropped.
    */
@@ -389,8 +403,8 @@ export function startHearing({
    * Continuous dialogue capture (capture + boundary only; the rendered context is not injected).
    * `dialogueContext` is an instance the host may keep across capture sessions and `dialogueFactory`
    * is the test seam — it may return that same shared instance, or `null` to disable capture.
-   * Omitted, each session gets one fresh buffer. `now` is the capture clock the dialogue timestamps
-   * and the idle boundary read (test seam; the default is `Date.now`).
+   * Omitted, each session gets one fresh buffer. `now` is the capture clock the dialogue timestamps,
+   * the idle boundary and the log-window gates read (test seam; the default is `Date.now`).
    */
   dialogueContext = null,
   dialogueFactory = createDialogueContext,
@@ -939,6 +953,8 @@ export function startHearing({
     abortSpeakerDownload('shutdown');
     closeSpeakerLibrary();
     closeDeliveries();
+    // The session ended on its own: flush the log-window counters instead of losing them.
+    flushLogNoise();
     workerClient?.stop();
     resolveDone({ code, signal, error: lastError });
   });
@@ -987,6 +1003,25 @@ export function startHearing({
       /* an event sink must never break capture */
     }
   };
+  /**
+   * One `hearing.endpoint.detail` row, written without the generic `observe` cap: an endpoint that
+   * carries speech evidence (group, non-silence cut, offline split) must never be dropped by a
+   * throttle meant for per-frame chatter. The caller keeps the worker-session gate.
+   */
+  const emitDetail = (payload) => {
+    try {
+      onEvent?.('hearing.endpoint.detail', { level: 'debug', ...payload });
+    } catch {
+      /* an event sink must never break capture */
+    }
+  };
+  /**
+   * Silence-only endpoint rows counted into `hearing.endpoint.detail.summary` (log gate only: the
+   * endpoint itself, grouping, delivery and the shadow verdicts never read these numbers).
+   */
+  let endpointSilenceRows = 0;
+  let endpointSilenceSampled = 0;
+  let endpointSilenceAt = null;
   /**
    * Round-1 diagnostics. These are counters over decisions this session already made; no delivery
    * path reads them. `stats().diagnostics` is the queryable form, and the same summary is written
@@ -1135,6 +1170,12 @@ export function startHearing({
    * no delivery path reads this list, and a suppressed row changes nothing about `text`.
    */
   const shadowRows = [];
+  /**
+   * Suppressed noise-shadow rows counted since the last written `.suppressed` row. One counting
+   * row per `LOG_SUMMARY_WINDOW_MS` replaces the per-occurrence rows (log gate only).
+   */
+  let noiseSuppressed = 0;
+  let noiseSuppressedAt = null;
   /** Same words once tags/punctuation/space are gone — "similar text" for the shadow throttle. */
   const similarShadowText = (left, right) => left === right
     || (left.length >= 2 && right.length >= 2 && (left.includes(right) || right.includes(left)));
@@ -1162,7 +1203,8 @@ export function startHearing({
    *    `endpointReason: 'max-duration'` reports. The accurate-pass buffer cap (`maxUtteranceSec`)
    *    is a different bound and is surfaced by `truncated` on the delivery update.
    *  - a repeated suspect + similar text within `SHADOW_SUPPRESS_WINDOW_MS` writes one
-   *    `hearing.noise.shadow.suppressed { count }` instead of a second full row.
+   *    `hearing.noise.shadow.suppressed { count, windowMs }` per `LOG_SUMMARY_WINDOW_MS` (the
+   *    first suppression is written at once), never one row per suppression.
    */
   const noteNoiseShadow = (snapshot, outcome, delivered) => {
     try {
@@ -1171,7 +1213,7 @@ export function startHearing({
       // A text-less judgment is ordinary room tone (one endpoint every few seconds on an idle mic):
       // recording it would flood the log without adding evidence.
       if (outcome.text.length === 0) return;
-      const at = Date.now();
+      const at = captureNow();
       for (let index = shadowRows.length - 1; index >= 0; index -= 1) {
         if (at - shadowRows[index].at >= SHADOW_SUPPRESS_WINDOW_MS) shadowRows.splice(index, 1);
       }
@@ -1189,11 +1231,19 @@ export function startHearing({
         (row) => row.suspects === suspectKey && similarShadowText(row.text, textKey),
       );
       if (known !== undefined) {
-        known.count += 1;
-        onEvent?.('hearing.noise.shadow.suppressed', { level: 'debug', count: known.count });
+        // Visible count, not silence: the first suppression opens the window, then one counting
+        // row per window (the next suppressed row, or session end, flushes the rest).
+        noiseSuppressed += 1;
+        if (noiseSuppressedAt === null || at - noiseSuppressedAt >= LOG_SUMMARY_WINDOW_MS) {
+          onEvent?.('hearing.noise.shadow.suppressed', {
+            level: 'debug', count: noiseSuppressed, windowMs: LOG_SUMMARY_WINDOW_MS,
+          });
+          noiseSuppressed = 0;
+          noiseSuppressedAt = at;
+        }
         return;
       }
-      shadowRows.push({ at, suspects: suspectKey, text: textKey, count: 0 });
+      shadowRows.push({ at, suspects: suspectKey, text: textKey });
       if (shadowRows.length > 64) shadowRows.shift();
       const offlineText = typeof outcome.offlineText === 'string' ? outcome.offlineText : '';
       const playing = voiceSounding();
@@ -1408,6 +1458,9 @@ export function startHearing({
    * is never read by a delivery path.
    */
   const vadRows = [];
+  /** Suppressed VAD-shadow rows since the last counting row (log gate only; see `LOG_SUMMARY_WINDOW_MS`). */
+  let vadSuppressed = 0;
+  let vadSuppressedAt = null;
   /**
    * Record one `hearing.vad.shadow` row for an utterance whose energy metrics are already measured.
    *
@@ -1427,7 +1480,8 @@ export function startHearing({
    *  - `agree` compares the VAD verdict with the existing energy verdict at
    *    `VAD_AGREE_MIN_RATIO`: same side of "speech present", not a new threshold.
    *  - a repeated utterance with similar streaming text within `SHADOW_SUPPRESS_WINDOW_MS` writes
-   *    one `hearing.vad.shadow.suppressed { count }` instead of a second full row.
+   *    one `hearing.vad.shadow.suppressed { count, windowMs }` per `LOG_SUMMARY_WINDOW_MS` (the
+   *    first suppression is written at once), never one row per suppression.
    *
    * @returns the metrics (used to stamp delivery latency) or null when the shadow is off.
    */
@@ -1446,7 +1500,7 @@ export function startHearing({
     }
     if (metrics === null) return null;
     try {
-      const at = Date.now();
+      const at = captureNow();
       for (let index = vadRows.length - 1; index >= 0; index -= 1) {
         if (at - vadRows[index].at >= SHADOW_SUPPRESS_WINDOW_MS) vadRows.splice(index, 1);
       }
@@ -1455,11 +1509,17 @@ export function startHearing({
         (row) => row.device === device && similarShadowText(row.text, textKey),
       );
       if (known !== undefined) {
-        known.count += 1;
-        onEvent?.('hearing.vad.shadow.suppressed', { level: 'debug', count: known.count });
+        vadSuppressed += 1;
+        if (vadSuppressedAt === null || at - vadSuppressedAt >= LOG_SUMMARY_WINDOW_MS) {
+          onEvent?.('hearing.vad.shadow.suppressed', {
+            level: 'debug', count: vadSuppressed, windowMs: LOG_SUMMARY_WINDOW_MS,
+          });
+          vadSuppressed = 0;
+          vadSuppressedAt = at;
+        }
         return metrics;
       }
-      vadRows.push({ at, device, text: textKey, count: 0 });
+      vadRows.push({ at, device, text: textKey });
       if (vadRows.length > 64) vadRows.shift();
       onEvent?.('hearing.vad.shadow', {
         level: 'debug',
@@ -2012,12 +2072,51 @@ export function startHearing({
   /** seq -> { snapshot, outcome } for a delivery, or null for a skipped slot. */
   const pendingDeliveries = new Map();
   let deliveriesClosed = false;
+  /** Skipped slots folded into one `asr.delivery.order.summary` (60 s or `DELIVERY_SKIP_SUMMARY_MAX`). */
+  let deliverySkipCount = 0;
+  let deliverySkipFrom = 0;
+  let deliverySkipTo = 0;
+  let deliverySkipAt = 0;
 
+  const flushDeliverySkipSummary = () => {
+    if (deliverySkipCount === 0) return;
+    try {
+      onEvent?.('asr.delivery.order.summary', {
+        level: 'debug',
+        count: deliverySkipCount,
+        firstSeq: deliverySkipFrom,
+        lastSeq: deliverySkipTo,
+        windowMs: LOG_SUMMARY_WINDOW_MS,
+      });
+    } catch {
+      /* an event sink must never break capture */
+    }
+    deliverySkipCount = 0;
+  };
+
+  /**
+   * Delivery order, log-gated: every delivered slot is written as before; skipped slots (a gated
+   * sentence, a silent clip) are counted into `asr.delivery.order.summary {count, firstSeq,
+   * lastSeq}` instead of one row each. The order evidence survives — nothing is dropped silently.
+   */
   const emitDeliveryOrder = (seq, delivered, skipped) => {
     // The synchronous path delivers inline (already in order) and keeps its event log empty.
     if (!asrWorkerRequested) return;
     try {
-      onEvent?.('asr.delivery.order', { seq, delivered, skipped });
+      if (skipped !== true) {
+        onEvent?.('asr.delivery.order', { seq, delivered, skipped });
+        return;
+      }
+      const at = captureNow();
+      if (deliverySkipCount === 0) {
+        deliverySkipFrom = seq;
+        deliverySkipAt = at;
+      }
+      deliverySkipCount += 1;
+      deliverySkipTo = seq;
+      if (deliverySkipCount >= DELIVERY_SKIP_SUMMARY_MAX || at - deliverySkipAt >= LOG_SUMMARY_WINDOW_MS) {
+        flushDeliverySkipSummary();
+      }
     } catch {
       /* an event sink must never break capture */
     }
@@ -2067,6 +2166,8 @@ export function startHearing({
   const closeDeliveries = () => {
     deliveriesClosed = true;
     pendingDeliveries.clear();
+    // The final aggregation is written, so the skipped slots are never silently lost.
+    flushDeliverySkipSummary();
   };
 
   /**
@@ -2580,9 +2681,10 @@ export function startHearing({
       // Grouping starts before delivery: a natural end opens the commit buffer, an internal cut
       // just keeps collecting. `segment` is null only for a noise-only fragment with no open group.
       const segment = beginGroupSegment(snapshot);
-      observe('hearing.endpoint.detail', {
+      const endpointReason = snapshot.endReason;
+      const detail = {
         utteranceId: snapshot.utteranceId,
-        endpointReason: snapshot.endReason,
+        endpointReason,
         audioMs: snapshot.durationMs,
         // The VAD shadow is the one measured trailing silence. Without it the value is null — the
         // energy meter cannot derive it, and an unmeasured silence must never be reported as 0.
@@ -2592,7 +2694,34 @@ export function startHearing({
         // The accurate pass had to split this fragment internally (long audio); an orthogonal fact
         // to why the streaming endpoint fired, so a 20 s cut can be both max-duration and split.
         offlineSplit: snapshot.offlineSplit === true,
-      });
+      };
+      // Log gate only. A speech-bearing endpoint (group, internal cut, offline split) is written
+      // every time; a text-less silence-only fragment is sampled 1-in-10 and the rest are counted
+      // into one summary per window, so an idle mic never writes a row per endpoint.
+      const silenceOnly = segment === null && endpointReason === 'silence'
+        && detail.offlineSplit === false && snapshot.onlineText.length === 0;
+      if (asrWorkerRequested && !silenceOnly) {
+        emitDetail(detail);
+      } else if (asrWorkerRequested) {
+        const at = captureNow();
+        if (endpointSilenceAt === null) endpointSilenceAt = at;
+        if (at - endpointSilenceAt >= LOG_SUMMARY_WINDOW_MS) {
+          onEvent?.('hearing.endpoint.detail.summary', {
+            level: 'debug',
+            count: endpointSilenceRows,
+            sampled: endpointSilenceSampled,
+            windowMs: LOG_SUMMARY_WINDOW_MS,
+          });
+          endpointSilenceRows = 0;
+          endpointSilenceSampled = 0;
+          endpointSilenceAt = at;
+        }
+        endpointSilenceRows += 1;
+        if (endpointSilenceRows % ENDPOINT_SILENCE_SAMPLE_EVERY === 1) {
+          endpointSilenceSampled += 1;
+          emitDetail(detail);
+        }
+      }
       // The endpoint closed this utterance: a frozen probe candidate that never resumed is a
       // no-continuation row; either way the probe state restarts for the next utterance.
       settleEndpointProbe(snapshot.utteranceId, snapshot.endReason);
@@ -2708,6 +2837,41 @@ export function startHearing({
 
   child.stdout.on('data', processChunk);
 
+  /**
+   * Flush the log-only aggregation counters at session end: the same counting rows the lazy window
+   * would write, so no suppressed row is ever silent. Nothing here decides capture or delivery, and
+   * still no timer is created for a log.
+   */
+  const flushLogNoise = () => {
+    flushDeliverySkipSummary();
+    try {
+      if (noiseSuppressed > 0) {
+        onEvent?.('hearing.noise.shadow.suppressed', {
+          level: 'debug', count: noiseSuppressed, windowMs: LOG_SUMMARY_WINDOW_MS,
+        });
+        noiseSuppressed = 0;
+      }
+      if (vadSuppressed > 0) {
+        onEvent?.('hearing.vad.shadow.suppressed', {
+          level: 'debug', count: vadSuppressed, windowMs: LOG_SUMMARY_WINDOW_MS,
+        });
+        vadSuppressed = 0;
+      }
+      if (endpointSilenceRows > 0) {
+        onEvent?.('hearing.endpoint.detail.summary', {
+          level: 'debug',
+          count: endpointSilenceRows,
+          sampled: endpointSilenceSampled,
+          windowMs: LOG_SUMMARY_WINDOW_MS,
+        });
+        endpointSilenceRows = 0;
+        endpointSilenceSampled = 0;
+      }
+    } catch {
+      /* a diagnostic row must never break stop */
+    }
+  };
+
   return {
     device,
     /** This session's capture-instance id (`hearing.instance.*`, judgment rows, status). */
@@ -2779,6 +2943,8 @@ export function startHearing({
       abortSpeakerDownload('stopped');
       closeSpeakerLibrary();
       closeDeliveries();
+      // Stop is the last chance for a pending counting row: flush, never drop it silently.
+      flushLogNoise();
       workerClient?.stop();
       try {
         child.kill('SIGKILL');
