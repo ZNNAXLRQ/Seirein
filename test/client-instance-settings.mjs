@@ -157,7 +157,7 @@ test('1. 显示当前 root；选择后调用参数正确，成功/失败分支�
   let opened = 0;
   const cardTree = rootSection(api, { onOpen: () => { opened += 1; } });
   const cardText = textsOf(cardTree);
-  assert.ok(cardText.includes('当前存放位置'), 'the card shows the read-only root row');
+  assert.ok(cardText.includes('当前工作目录'), 'the card shows the read-only root row');
   assert.ok(cardText.includes('C:\\Users\\me\\Seirein'), 'the card shows the status root verbatim');
   assert.ok(cardText.includes('选择存放位置'), 'the card offers one explicit button');
   assert.equal(nodesOf(cardTree).filter((node) => node.type === 'input').length, 0,

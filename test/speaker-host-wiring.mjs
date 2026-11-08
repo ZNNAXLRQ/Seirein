@@ -494,7 +494,7 @@ test('5) 设置页：关闭/开启/模型缺失三种状态与开关动作', asy
   const downloading = render({ enabled: true, model: 'downloading', matches: 0, unsure: 0, noSpeakers: 0, errors: 1 });
   assert.ok(textsOf(downloading).some((text) => text.includes('模型下载中')), 'download progress is visible');
 
-  assert.match(clientSource, /speakerShadowRow\(h, \{ status, busy, act \}\),/u, 'the row is mounted in the 语音与听觉 card');
+  assert.match(clientSource, /speakerShadowRow\(h, \{ status, busy, act \}\),/u, 'the row is mounted in the 声纹 card');
   console.log('[speaker-host 5] off=已关闭/模型缺失 on=已开启/模型就绪 downloading=模型下载中 action=voice.speakerShadow');
 });
 

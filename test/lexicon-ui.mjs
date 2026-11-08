@@ -568,7 +568,7 @@ test('6. 接线检查：设置页挂载、五个动作、speakerId 来自宿主�
   const retentionMount = /(\n\s+)retentionSection\(h, \{/u.exec(clientSource);
   assert.ok(mount !== null && retentionMount !== null, 'both sections are mounted in the settings page');
   assert.ok(mount.index < retentionMount.index,
-    '个人语言库 stays in 二、记忆与人设, above 音频保留 in 三、诊断与维护');
+    '个人语言库 stays in 6、记忆与人设, above 音频保留 in 11、诊断与维护');
   assert.ok(clientSource.indexOf('    function lexiconSection(') > clientSource.indexOf('    function retentionSection('));
 
   assert.doesNotMatch(lexiconBlockSource, /fetch\(/u, 'the lexicon block never fetches by itself');

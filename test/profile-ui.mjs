@@ -194,9 +194,9 @@ test('1. 渲染：标题含容量 used/cap，卡片位于记忆与人设分区',
   const maintenanceAt = clientSource.indexOf("'记忆容量与维护'");
   assert.ok(profileAt > 0, 'the profile mount is present');
   assert.ok(profileBlockAt > 0 && profileBlockAt < profileAt,
-    `the profile card sits in 二、记忆与人设 (block ${profileBlockAt}, mount ${profileAt})`);
+    `the profile card sits in 6、记忆与人设 (block ${profileBlockAt}, mount ${profileAt})`);
   assert.ok(maintenanceAt > profileAt,
-    '人设在前、维护在后：记忆容量属于 三、诊断与维护');
+    '人设在前：记忆容量与自动记忆在 6、记忆与人设分区内，位于人设之后');
   console.log(`1) title=${textOf(title)} block=${profileBlockAt}<mount=${profileAt}<maintenance=${maintenanceAt}`);
 });
 

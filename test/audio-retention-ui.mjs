@@ -10,7 +10,7 @@
  *   3. a row shows time / duration / reason / size, 试听 asks only for a path (no auto-play),
  *      and delete is a two-step confirmation (single and all);
  *   4. an unwired / failed action renders the host's error text and never throws;
- *   5. client.js mounts the section in 三、诊断与维护 and talks to the four documented actions.
+ *   5. client.js mounts the section in 11、诊断与维护 and talks to the four documented actions.
  *
  * Run: node --test test/audio-retention-ui.mjs
  */
@@ -220,12 +220,12 @@ test('4. 错误分支：未接线 / 读取失败只显示文案，不崩溃', ()
 
 test('5. client.js 接线：诊断卡片挂载 + 四个动作 + 不自动播放', () => {
   assert.match(clientSource, /speakerShadowRow\(h, \{ status, busy, act \}\)/u,
-    'the voiceprint row stays mounted in 语音与听觉');
+    'the voiceprint row stays mounted in the 声纹 card');
   assert.match(clientSource, /retentionSection\(h, \{/u, '音频保留 is mounted in the settings page');
   assert.ok(
     clientSource.indexOf('speakerShadowRow(h, { status, busy, act })')
       < clientSource.indexOf('retentionSection(h, {'),
-    '音频保留 stays inside 三、诊断与维护, below the voiceprint row',
+    '音频保留 stays inside 11、诊断与维护, below the voiceprint row',
   );
   assert.match(clientSource, /const \[retentionData, setRetentionData\] = useState\(null\);/u);
   assert.match(clientSource, /action: 'audio\.retention\.list'/u);
