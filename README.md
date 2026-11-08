@@ -1,8 +1,8 @@
 # Seirein
 
-> 给 DeepSeek Harness（DSH）用的伴生插件：语音输入 / 输出、长期记忆、视觉、Live2D / VTube Studio 形象、字幕与 OBS 联动。
+> 基于 DeepSeek Harness（DSH）实现的 Nano 版类 Neuro 多模态助手插件，尝试实现可能没那么智能的基本功能：语音输入、语音输出、人设维持、长期记忆、视觉与听觉、Live2D 形象驱动、字幕展示，以及DSH本身具有的各种功能。
 
-| 项 | 值 |
+| 名称 | 具体内容 |
 | --- | --- |
 | 包名 | `@local/dsh-assistant` |
 | 插件 id | `dsh-assistant` |
@@ -11,14 +11,14 @@
 | 平台 | Windows（依赖 PowerShell / WPF / DPAPI / DirectShow） |
 | 许可证 | MIT |
 
-本文基于仓库当前状态（v0.99.0，HEAD `00a0887`，2026-11-09），只写代码里能核对的事实。带 `TODO(…)` 的条目标为未确认，阅读时不要当成结论。
+项目目前还在长期使用测试阶段，欢迎提出反馈，开发和维护看空闲进行
 
-本文四部分：
+**本文四部分：**
 
 - [1. 项目简介与参考对象](#1-项目简介与参考对象)
-- [2. 如何使用](#2-如何使用)
-- [3. 项目设计](#3-项目设计)
-- [4. 后续开发](#4-后续开发)
+- [2. 对用户的简单使用说明](#2-针对用户的简单使用说明)
+- [3. 项目设计与实现思路](#3-项目设计与实现思路)
+- [4. 对后续开发者的简单补充](#4-对后续开发者的简单补充)
 
 ---
 
@@ -28,7 +28,7 @@
 
 Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH 启动，把自己注册进宿主进程，向外提供 24 个工具、一套 HTTP 设置接口和一个 Web 设置页。
 
-它解决的是「把一个能听见、能看见、有记忆、有形象、会说话的桌面助手装进 DSH」这件事，而不是再造一个聊天前端。DSH 负责模型、会话、工具循环与 Agent 生命周期；Seirein 负责把语音、感知、形象与人设接到这条循环上。
+它将 DSH 变成了一个多模态助手, 完成了「把一个能听见、能看见、有人设、有记忆、有形象、会说话、能做事的桌面助手装进 DSH」这件事，而不只是再造一个语音聊天前端。DSH 负责模型、会话、工具循环与 Agent 生命周期；Seirein 负责把语音、感知、形象与人设接到这条循环上。
 
 必须知道的运行边界：
 
@@ -80,7 +80,7 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 
 ### 1.3 实现了什么效果
 
-以下描述都能在代码、事件日志或测试里找到对应，不宣称未验证的性能数字。
+以下描述的功能都能在代码、事件日志或测试里找到对应，是目前认为确定实现的功能。
 
 | 效果 | 实际行为 | 可核对位置 |
 | --- | --- | --- |
@@ -95,22 +95,41 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 记忆 | 相关记忆在 `agent/pre-step` 注入；固定记忆每轮注入（加密项只给索引）；普通记忆按容量衰退并归档 | `memory.recall`、`resource.inject.truncated`、`memory.*` |
 | 设置页 + 热键 | 插件页 / 设置分区里可切换组件、设备、语种、TTS、字幕、VTS、热键、记忆、人设；默认热键 `Ctrl+Alt+M`（麦克风）、`Ctrl+Alt+V`（视觉）、`Ctrl+Alt+E`（图层编辑）、`Ctrl+Alt+A`（环境音） | `client.js`、`assistant_hotkeys` |
 
-### 1.4 参考对象（待填写）
+### 1.4 参考对象
 
-此表留给仓库维护者补充「Seirein 参考了哪些项目 / 协议 / 交互」。不要凭猜测填写；没有核实的链接标 `TODO(确认链接)`。
+以下是在项目设计与实现过程中提供重要思路的仓库，非常感谢这些作者的开源，让我的后续实现成为可能
 
-| 仓库/项目 | 参考内容 | 对应模块 |
-| --- | --- | --- |
-|  |  |  |
-|  |  |  |
-|  |  |  |
-|  |  |  |
+| 仓库 | 作者 | 参考类别 | 具体内容 | 仓库链接 | B站视频链接 |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| ZerolanLiveRobot | 赤川鶴鳴 | 架构设计参考 + 语音链路参考 | 多模态助手架构、模型连接、语音流水线与降低延迟的思路 | https://github.com/AkagawaTsurunaki/ZerolanLiveRobot | https://bilibili.com/video/BV1aRq6BtE2M |
+| dsh-see-now | SAOS-3624 | 视觉实现参考 | 持续采集、变化帧筛选、多帧故事板；甚至代码直接使用其采集与管道模块 | https://github.com/SAOS-3624/dsh-see-now | https://www.bilibili.com/video/BV1c3xb6UEWE |
+| surfcore | Mieksido | 记忆设计参考 | 记忆清晰度、重要性、强化与衰退的源头思路；后续库机制在此基础上发展 | https://github.com/Mieksido/surfcore | https://www.bilibili.com/video/BV1Rbxg6WER5 |
+| airi | moeru-ai | 动作实现参考 | 	眨眼状态机、弹簧运动、视线平滑、口型释放与交接等多种动作的实现 | https://github.com/moeru-ai/airi | —— |
 
-填写建议：一行只写一个对象；「参考内容」写具体到协议 / 交互 / 数据结构的点（例如「WebSocket 认证流程」），不要写「整体参考」。
+### 1.5 依赖对象
+
+| 仓库 | 作者 | 实际用途 | 仓库链接 |
+| :---: | :---: | :---: | :---: |
+| deepseek-harness | deepseek-ai | 插件宿主、agent功能、会话、工具、事件、权限与压缩能力 | https://github.com/deepseek-ai/deepseek-harness|
+| VTubeStudio | DenchiSoft | Live2D 参数注入、认证、模型事件、热键和表情 | https://github.com/DenchiSoft/VTubeStudio |
+| electron-texture-bridge | naporin0624 | 	@napolab/texture-bridge，Spout 共享纹理接收 | https://github.com/naporin0624/electron-texture-bridge |
+| electron | electron | 可选独立透明显示窗口与 GPU 纹理呈现 | https://github.com/electron/electron |
+| obs-studio | obsproject | 可选场景选择、虚拟摄像头与场景视觉；通过 WebSocket 对接 | https://github.com/obsproject/obs-studio |
+| FFmpeg | FFmpeg | 音视频采集、截图、转码和播放 | https://github.com/FFmpeg/FFmpeg|
+| GPT-SoVITS | RVC-Boss | 可选本地语音合成与音色克隆 | https://github.com/RVC-Boss/GPT-SoVITS |
+| MsEdgeTTS | Migushthe2nd | msedge-tts，Edge 语音合成接入 | https://github.com/Migushthe2nd/MsEdgeTTS |
+| sherpa-onnx | k2-fsa | sherpa-onnx-node，流式／离线识别、VAD 和声纹推理 | https://github.com/k2-fsa/sherpa-onnx |
+| koffi | Koromix | Windows 原生接口调用，如热键与窗口相关能力 | https://github.com/Koromix/koffi |
+| ws | websockets | WebSocket 通信 | https://github.com/websockets/ws |
+| SenseVoice | QwenAudio | 离线终稿识别、语言与音频事件标签 | https://github.com/QwenAudio/SenseVoice |
+| silero-vad  | snakers4 | 语音活动检测 | https://github.com/snakers4/silero-vad |
+| 3D-Speaker | modelscope | 声纹特征提取；当前使用 sherpa 发布的 ONNX 模型 | https://github.com/modelscope/3D-Speaker |
+
+其他依赖：Node.js／SQLite、PowerShell／WPF（数据存储、宿主运行与 Windows 窗口／字幕／播放能力）、Zipformer，当前从 sherpa-onnx 模型发布取得（流式语音识别）
 
 ---
 
-## 2. 如何使用
+## 2. 针对用户的简单使用说明
 
 ### 2.1 前置条件
 
@@ -120,11 +139,34 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 宿主 | DSH Desktop | 插件是 DSH bundle；Host 以 Node 模式子进程运行 |
 | Node（仅开发） | `>=22.5` | `package.json` 的 `engines`；记忆与声纹使用内置 `node:sqlite` |
 | 包管理（仅开发） | pnpm | 仓库有 `pnpm-lock.yaml` |
-| DSH 版本 | 未在 `package.json` 里锁版本 | 开发记录使用 DSH `0.2.1-rc.5`、Electron `44.7.0` / Node `24.21.0`（2026-11-07 实测，`TODO(确认最低支持版本)`） |
+| DSH 版本 | 未在 `package.json` 里锁版本 | 开发记录使用 DSH `0.2.1-rc.5`、Electron `44.7.0` / Node `24.21.0` |
 
 ### 2.2 安装插件
 
-#### 已安装形态（本机验证过的 link 方式）
+#### 官方方式一：桌面端「插件」页（推荐）
+
+1. 打开 DSH 侧栏的 **插件** 页，点 **添加插件**（或 **安装第三方插件**）。
+2. 在包名输入框填入本仓库的 **本地绝对路径**（例如 `D:\Programs\Others\Seirein`），按 Enter 或点安装。
+   输入框接受：包名（可带版本）、Git 地址、压缩包、本地绝对路径；三种来源共用同一个安装流程。
+3. 安装完成后选 **立即启用**；首次以本地开发目录安装时，DSH 会把它保存为 `link:<仓库目录>` 依赖。
+   Host 侧改动通常需要重启 DSH 生效；只改 `client.js` 时刷新页面即可。
+4. 在插件页确认 **Seirein** 组合包已出现且处于启用状态，再按 2.3 做必须设置。
+
+> 卸载：同一插件页打开 **Seirein** 组合包 → 卸载（需要确认）。
+
+#### 官方方式二：CLI 安装（CLI 形态的 DSH）
+
+```powershell
+dsh plugin add D:\Programs\Others\Seirein
+```
+
+`dsh plugin add` 后面接受的就是插件页安装框里的同一段 spec：包名（可带版本）、Git 地址、压缩包或本地绝对路径。
+安装后按 CLI 提示重启，再用 `dsh` 启动。
+
+> 当前本机是桌面客户端（应用内已有插件页），所以以方式一为准；
+> 如果之后用 CLI 形态，请确认 `dsh plugin --help` 有 `add` 子命令（不同版本命令名可能略有差异）。
+
+#### 开发调试：手动 `link:` 方式（非官方，仅本地开发）
 
 profile 的 `package.json` 里以 `link:` 指向仓库，并把包加入 bundle 列表（下面只列与本插件相关的行，其余 bundle 省略）：
 
@@ -153,26 +195,15 @@ pnpm install
 
 首次以 link 方式安装后需要重启宿主；之后改 Host 代码用 `remove_bundle` → `install_bundle` 即可生效（无需重启 DSH）。只改 `client.js` 时刷新页面即可。
 
-#### plugin_manager 方式
+#### 更新已安装的插件
 
-在 DSH 内使用 `plugin_manager`：
+- 桌面端：插件页打开 **Seirein** → 重新安装/更新（或先卸载再按方式一安装）。
+- CLI：对同一 spec 再执行一次 `dsh plugin add`。
+- 开发中：Host 代码改动 → `remove_bundle` → `install_bundle`（target 与 `dsh plugin add` 的 spec 相同）；
+  只改 `client.js` → 刷新页面。
+- 需要重启的情形：首次安装、Host 组合包变化、插件注册的服务/preset/压缩能力变更；安装结果会明确提示是否需要重启。
 
-1. `action = install_bundle`，`target = @local/dsh-assistant`（本地目录 / 安装 spec 的写法以当前 DSH 版本为准，`TODO(确认 target 写法)`）。
-2. 安装后确认 bundle 自带的 `cordis.patch.yml` 已把下面这行插入插件树：
-
-```yaml
-- insert:
-    - id: dsh-assistant
-      name: '@local/dsh-assistant'
-      disabled: false
-      config: { ... }
-```
-
-3. 改 Host 代码后的更新流程：`remove_bundle` → `install_bundle`。改 `client.js` 后刷新页面。
-
-仓库自身的 `package.json` 把这些接起来：`main` / `exports['.']` 指向 `./src/host/index.js`，`dsh.bundle.patch` 指向 `./cordis.patch.yml`，`dsh.client` 声明 `platform: "web"` + `immediately: true` 的客户端入口。
-
-#### 首次加载检查
+#### 安装后确认
 
 - 打开 DSH 设置 → 插件 → **Seirein**（也出现在设置分区里）。
 - 首次使用先选「存放位置」；数据根默认是 `%LOCALAPPDATA%\Seirein`，旧目录 `%LOCALAPPDATA%\dsh-assistant` 会做一次可恢复的复制迁移。
@@ -280,7 +311,7 @@ pnpm install
 
 ---
 
-## 3. 项目设计
+## 3. 项目设计与实现思路
 
 ### 3.1 总体框架
 
@@ -542,7 +573,7 @@ Seirein/
 
 ---
 
-## 4. 后续开发
+## 4. 对后续开发者的简单补充
 
 ### 4.1 环境与依赖
 
