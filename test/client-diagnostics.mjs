@@ -7,8 +7,9 @@
  *   1. 五个分区在有数据 / 缺字段 / 读取失败时的渲染；
  *   2. 打开一次只发一个 `/assistant/status` 请求，渲染不会额外发请求；
  *   3. 复制的报告是纯文本 JSON，且不含转写/字幕/音频等用户内容；
- *   4. 「刷新」重新拉取一次，诊断代码里没有 setInterval；
- *   5. 回归：lexicon-ui、audio-retention-ui、hearing-ui、smoke。
+ *   4. 复制报告脱敏：路径/URL/用户名换成占位符或摘要，受控码保留，界面仍显示原文；
+ *   5. 「刷新」重新拉取一次，诊断代码里没有 setInterval；
+ *   6. 回归：lexicon-ui、audio-retention-ui、hearing-ui、smoke。
  *
  * Run: node --test test/client-diagnostics.mjs
  */
@@ -47,6 +48,8 @@ return {
   copyDiagnosticsReport,
   loadDiagnosticsStatus,
   diagnosticsSection,
+  sanitizeDiagnosticText,
+  reportField,
 };`,
 )(styles, '#c92a2a', '0.99.0', fetchImpl, setTimeout, clearTimeout, undefined);
 
@@ -277,7 +280,92 @@ test('3. 复制报告：纯文本 JSON，不含转写/字幕/音频等用户内�
   assert.equal(Object.hasOwn(failedReport.voice, 'captionText'), false);
 });
 
-test('4. 刷新重新拉取一次；诊断代码没有新增轮询', async () => {
+test('4. 复制报告脱敏：路径 / URL / 用户名不进报告，受控码保留，界面仍显示原文', async () => {
+  const api = loadDiagnostics();
+
+  // 纯函数：URL / 盘符路径 / home 路径 / UNC / 邮箱 一律换成占位符。
+  assert.equal(api.sanitizeDiagnosticText('C:\\Users\\PrivateName\\voice-private.wav'), '<path>');
+  assert.equal(api.sanitizeDiagnosticText('failed to open /home/foo/bar'), 'failed to open <path>');
+  assert.equal(api.sanitizeDiagnosticText('see https://x.y/z'), 'see <url>');
+  assert.equal(api.sanitizeDiagnosticText('\\\\server\\share\\voice.wav'), '<path>');
+  assert.equal(api.sanitizeDiagnosticText('mail: someone@example.com'), 'mail: <email>');
+  assert.equal(api.sanitizeDiagnosticText(null), '', 'a non-string never throws');
+
+  // 受控码原样保留；自由文本错误压成「阶段 + 错误类别」。
+  assert.equal(api.reportField('BLACK_FRAME'), 'BLACK_FRAME');
+  assert.equal(api.reportField('HTTP 503'), 'HTTP 503');
+  assert.equal(api.reportField('TTS_ABORTED'), 'TTS_ABORTED');
+  assert.equal(api.reportField('no-candidate'), 'no-candidate', 'an enum-like label survives');
+  assert.equal(
+    api.reportField('ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav', true),
+    'ffmpeg: error',
+  );
+  assert.equal(api.reportField('capture: failed /home/foo/bar', true), 'capture: error');
+
+  // 完整报告：lastError 里的真实 ffmpeg 原文被摘要，路径/用户名/文件名一个都不剩。
+  const hearing = statusWithData().hearing;
+  const leakyStatus = statusWithData({
+    hearing: { ...hearing, lastError: 'ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav' },
+  });
+  const report = api.diagnosticsReportOf(leakyStatus, { clientVersion: '0.99.0', at: 1_700_000_000_000 });
+  const parsed = JSON.parse(report);
+  assert.equal(parsed.voice.lastError, 'ffmpeg: error');
+  for (const secret of ['PrivateName', 'voice-private.wav', 'C:\\']) {
+    assert.equal(report.includes(secret), false, `the copied report leaked ${secret}`);
+  }
+
+  // 对照：同一份状态的界面文案仍是原始详细错误，脱敏只作用于复制报告。
+  const shown = textsOf(sectionOf(api, leakyStatus));
+  assert.ok(
+    shown.some((text) => text.includes('ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav')),
+    'the panel still shows the raw detailed error',
+  );
+
+  // /home、URL、UNC 三种泄漏走同一条路：只剩「阶段: error」。
+  const variants = [
+    { lastError: 'capture: failed to open /home/foo/bar', stage: 'capture', needle: '/home' },
+    { lastError: 'tts: https://x.y/z', stage: 'tts', needle: 'x.y' },
+    { lastError: 'asr: failed \\\\server\\share\\x', stage: 'asr', needle: 'share' },
+  ];
+  for (const { lastError, stage, needle } of variants) {
+    const variant = JSON.parse(api.diagnosticsReportOf(statusWithData({
+      hearing: { ...hearing, lastError },
+    })));
+    assert.equal(variant.voice.lastError, `${stage}: error`, `${lastError} becomes a stage summary`);
+    assert.equal(JSON.stringify(variant.voice).includes(needle), false, `${lastError} leaked ${needle}`);
+  }
+
+  // 其它字符串字段也过同一个脱敏函数：路径变占位符。
+  assert.equal(api.reportField('C:\\shots\\PRIVATE.png'), '<path>');
+  const sceneReport = JSON.parse(api.diagnosticsReportOf(statusWithData({
+    vision: { ...statusWithData().vision, scene: 'C:\\Users\\PrivateName\\scene.json' },
+  })));
+  assert.equal(sceneReport.vision.scene, '<path>');
+
+  // 读取失败与重启信息同样脱敏；受控码不动。
+  const failedReport = JSON.parse(api.diagnosticsReportOf(null, {
+    readError: 'HTTP 503',
+    localRestart: { ok: false, message: 'ffmpeg: \\\\server\\share\\voice.wav' },
+  }));
+  assert.equal(failedReport.readError, 'HTTP 503');
+  assert.equal(failedReport.restart.message, 'ffmpeg: error');
+  assert.equal(JSON.stringify(failedReport.restart).includes('server'), false);
+
+  const abortReport = JSON.parse(api.diagnosticsReportOf(statusWithData({
+    vision: { ...statusWithData().vision, virtualCamError: { code: 'TTS_ABORTED' } },
+  })));
+  assert.equal(abortReport.vision.virtualCamError, 'TTS_ABORTED');
+
+  // 复制出去的正是这份脱敏后的报告。
+  const written = [];
+  const copied = await api.copyDiagnosticsReport(report, {
+    writeText: async (text) => { written.push(text); },
+  });
+  assert.deepEqual(copied, { ok: true, error: '' });
+  assert.deepEqual(written, [report]);
+});
+
+test('5. 刷新重新拉取一次；诊断代码没有新增轮询', async () => {
   let calls = 0;
   const api = loadDiagnostics(async () => {
     calls += 1;
@@ -337,7 +425,7 @@ const runNode = (args) => new Promise((resolve) => {
   child.once('close', (code) => resolve({ code, stdout, stderr }));
 });
 
-test('5. 回归：lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (t) => {
+test('6. 回归：lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (t) => {
   t.timeout = 420_000;
   const suites = [
     ['--test', join('test', 'lexicon-ui.mjs')],
@@ -359,5 +447,5 @@ test('5. 回归：lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (
     }
   }
   const summary = results.map(({ args, code }) => `${args.join(' ')} => exit ${code}`).join('; ');
-  console.log(`[client-diagnostics 5] ${summary}`);
+  console.log(`[client-diagnostics 6] ${summary}`);
 });

@@ -2856,9 +2856,69 @@ window.__ModuleLoader__.load({
       return `${enabled} · ${count}`;
     };
 
+    // ---- P2 报告脱敏：本机界面照旧显示原文，只有「复制诊断报告」走这里 ----------------------
+    // 听觉/TTS 会把 ffmpeg 原始错误（如 `failed to open C:\Users\<name>\voice.wav`）留在
+    // lastError 里。这些自由文本可以出现在本机界面，但绝不能进入可复制的报告。
+    const DIAGNOSTIC_CONTROLLED_CODE =
+      /^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|HTTP[ /-]?\d{3}|E(?:RR)?_[A-Z0-9_]+|E[A-Z]{2,}\d*)$/u;
+    const DIAGNOSTIC_CATEGORY = [
+      [/(?:timeout|timed out|超时)/iu, 'timeout'],
+      [/(?:abort|cancel|取消|中止)/iu, 'aborted'],
+      [/(?:permission|denied|eacces|拒绝|无权限)/iu, 'denied'],
+      [/(?:not ?found|missing|enoent|no such|不存在)/iu, 'missing'],
+    ];
+    const DIAGNOSTIC_FILENAME =
+      /[^\s"'<>`]*\.(?:wav|mp3|m4a|ogg|flac|opus|aac|png|jpe?g|webp|gif|bmp|mp4|mkv|webm|jsonl?|log|txt|csv|db|sqlite|onnx|bin|dll|exe|mjs|cjs|js|ts|tsx|html|css|md|pdf|ya?ml|toml|ini|cfg)\b/giu;
+
+    /**
+     * 纯函数：URL → `<url>`；Windows 盘符路径、UNC、/home 与 /Users 等 home 路径、带扩展名的
+     * 文件路径 → `<path>`；邮箱 → `<email>`；控制字符与多余空白一并清掉。界面不使用这个结果。
+     */
+    const sanitizeDiagnosticText = (value) => {
+      if (typeof value !== 'string') return '';
+      // 先截断再替换：敏感路径的前缀仍在，替换依旧从盘符 / UNC / home 起整段吃掉。
+      return value.slice(0, 4096)
+        .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+        .replace(/(?:https?|wss?|ftp|file):\/\/[^\s"'<>`]+/giu, '<url>')
+        .replace(/\b[A-Za-z]:[\\/](?:[^\\/:*?"<>|\r\n]*[\\/])*[^\\/:*?"<>|\r\n]*/gu, '<path>')
+        .replace(/\\\\[^\s"'<>`]+/gu, '<path>')
+        .replace(/(^|[\s"'(\[=:,])\/(?:home|Users|root|tmp|var|opt|mnt|media|Volumes|private|usr|etc)\/[^\s"'<>`]*/gu, '$1<path>')
+        .replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/gu, '<email>')
+        .replace(DIAGNOSTIC_FILENAME, '<path>')
+        .replace(/\s{2,}/gu, ' ')
+        .trim()
+        .slice(0, 240);
+    };
+
+    /** 自由文本错误 → 「阶段 + 错误类别」；开头的受控码原样保留。 */
+    const diagnosticSummaryOf = (text) => {
+      const code = /^([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|HTTP[ /-]?\d{3}|E(?:RR)?_[A-Z0-9_]+|E[A-Z]{2,}\d*)\b/u.exec(text);
+      if (code !== null) return code[1];
+      const stage = /^([A-Za-z][A-Za-z0-9_.-]{0,23})\s*[:：]/u.exec(text);
+      const category = DIAGNOSTIC_CATEGORY.find(([pattern]) => pattern.test(text));
+      const name = category === undefined ? 'error' : category[1];
+      return stage === null ? name : `${stage[1].toLowerCase()}: ${name}`;
+    };
+
+    /**
+     * 报告字段的唯一出口（纯函数）：受控码/枚举原样保留，其余字符串一律过
+     * sanitizeDiagnosticText；freeText=true 的自由文本错误再压成摘要。
+     */
+    const reportField = (value, freeText = false) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'number' || typeof value === 'boolean') return value;
+      const text = typeof value === 'string' ? value.trim() : '';
+      if (text === '') return null;
+      if (DIAGNOSTIC_CONTROLLED_CODE.test(text)) return text;
+      const sanitized = sanitizeDiagnosticText(text);
+      if (sanitized === '') return null;
+      return freeText ? diagnosticSummaryOf(sanitized) : sanitized;
+    };
+
     /**
      * 纯文本 JSON 摘要。字段是上面投影的白名单子集：不包含转写、字幕、候音台词、环境声文本
-     * 或任何音频/文件路径；复制按钮只把这段文本写进剪贴板。
+     * 或任何音频/文件路径；每个字符串字段都经 reportField 脱敏（受控码保留，路径 → <path>，
+     * 自由文本错误 → 阶段 + 类别），因此剪贴板里的报告不含本机路径、URL 或用户名。
      */
     function diagnosticsReportOf(
       status,
@@ -2867,34 +2927,34 @@ window.__ModuleLoader__.load({
       const view = diagnosticsView(status, localRestart);
       const report = {
         schema: 1,
-        generatedAt: new Date(at).toISOString(),
-        clientVersion: String(clientVersion ?? ''),
-        readError: diagnosticsText(readError) || null,
-        serverVersion: view.about.serverVersion || null,
+        generatedAt: reportField(new Date(at).toISOString()),
+        clientVersion: reportField(String(clientVersion ?? '')),
+        readError: reportField(readError, true),
+        serverVersion: reportField(view.about.serverVersion),
         uptimeMs: view.about.uptimeMs,
-        instanceId: view.about.instanceId || null,
+        instanceId: reportField(view.about.instanceId),
         thresholdDb: view.about.thresholdDb,
         restart: view.about.restart === null ? null : {
           ok: view.about.restart.ok,
           restarted: view.about.restart.restarted,
-          instanceId: view.about.restart.instanceId || null,
+          instanceId: reportField(view.about.restart.instanceId),
           at: view.about.restart.at,
-          message: view.about.restart.message || null,
+          message: reportField(view.about.restart.message, true),
         },
         voice: {
-          lastError: view.voice.lastError || null,
-          ackSource: view.voice.ackSource || null,
-          ackHit: view.voice.ackHit || null,
+          lastError: reportField(view.voice.lastError, true),
+          ackSource: reportField(view.voice.ackSource),
+          ackHit: reportField(view.voice.ackHit),
           firstAudibleMs: view.voice.firstAudibleMs,
-          firstAudibleLane: view.voice.firstAudibleLane || null,
+          firstAudibleLane: reportField(view.voice.firstAudibleLane),
         },
         vision: {
           available: view.vision.available,
-          source: view.vision.source || null,
-          scene: view.vision.scene || null,
+          source: reportField(view.vision.source),
+          scene: reportField(view.vision.scene),
           privacy: view.vision.privacy,
           virtualCam: view.vision.virtualCam,
-          virtualCamError: view.vision.virtualCamError || null,
+          virtualCamError: reportField(view.vision.virtualCamError, true),
         },
         motion: {
           available: view.motion.available,
@@ -2902,7 +2962,7 @@ window.__ModuleLoader__.load({
           select: view.motion.select,
           skip: view.motion.skip,
           commit: view.motion.commit,
-          lastSkipReason: view.motion.lastSkipReason || null,
+          lastSkipReason: reportField(view.motion.lastSkipReason),
         },
         libraries: {
           lexicon: { ...view.libraries.lexicon },
