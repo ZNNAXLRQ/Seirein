@@ -259,7 +259,9 @@ async function mountRound(t, {
   };
 
   const spokenRequests = [];
-  const streamOf = (text) => (async function* generate() {
+  // `value` may be a string or a promise: a test can hold the organizer's answer (a late result).
+  const streamOf = (value) => (async function* generate() {
+    const text = await value;
     yield { type: 'text-delta', text };
     yield { type: 'finish', reason: { kind: 'stop' } };
   })();
@@ -922,5 +924,65 @@ test('9. a corrected never-spoken point is superseded and a later fallback canno
     `A="${A_PLAN}" B="${B_BODY}" superseded=${retired.superseded} deferred=${retired.deferred} `
     + `Bplayed="${captions[0]}" Cclips=${cClips.length} Cplayed="${captions.slice(1).join('|')}" `
     + `staleReplay=0 merges=1`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 10. P2: a late organizer result for B (version 2) never clears C's (version 3) carry
+// ---------------------------------------------------------------------------
+
+test('10. a late version-2 organizer result never clears version 3\'s carry', async (t) => {
+  const A_BODY = '第一轮：先重启软件。';
+  const B_BODY = '其实不用重启软件，先换一个采集源。';
+  const C_BODY = '第三轮：确认采集源的目标窗口就行。';
+  // B's organizer answer is held until AFTER C has opened version 3: the late result must not
+  // retire the points version 3 already owns.
+  const lateB = deferred();
+  t.after(() => lateB.resolve());
+  const app = await mountRound(t, {
+    holdSynth: (text) => text.includes('先重启软件'),
+    replyFor: ({ turn }) => (turn === 1 ? A_BODY : turn === 2 ? B_BODY : C_BODY),
+    spoken: (userText) => (userText.includes(B_BODY) ? lateB.promise.then(() => '') : ''),
+  });
+
+  app.say('OBS 全黑怎么调');
+  await waitUntil(() => state.held === 1, 'A\'s only clip is held before any sound');
+  const firstGroup = (await app.waitForEvent('voice.response.group.ready', (payload) => payload.version === 1)).groupId;
+
+  app.say('补充一下，那采集源呢');
+  const bCarry = await carryEventOf(app, (payload) => payload.answerVersion === 2 && payload.merged === true);
+  assert.equal(bCarry.priorGroupId, firstGroup, 'B carries A\'s never-spoken point');
+  assert.equal(bCarry.sentences, 1);
+  // B's spoken organizer is now in flight (held): its result will arrive late.
+  await waitUntil(
+    () => app.spokenRequests().some((request) => request.user.includes(B_BODY)),
+    'B\'s organizer was requested',
+  );
+
+  app.say('再补充一句，那编码器呢');
+  const cCarry = await carryEventOf(app, (payload) => payload.answerVersion === 3 && payload.merged === true);
+  assert.equal(cCarry.groupId, firstGroup, 'violation is about one group version');
+  assert.equal(cCarry.sentences, 2, 'C holds A\'s point plus B\'s body');
+
+  // B's late organizer result resolves now (still version 2): it must be refused as stale.
+  lateB.resolve();
+  const late = await app.waitForEvent(
+    'voice.carry.convey',
+    (payload) => payload.answerVersion === 2 && (payload.staleVersionRejected === true || payload.superseded > 0),
+  );
+  assert.equal(late.staleVersionRejected, true, 'the late version-2 retirement is refused');
+  assert.equal(late.reason, 'stale-version');
+  assert.equal(late.superseded, 0, 'nothing was retired from version 3');
+  assert.equal(late.currentVersion, 3);
+  const rows = await app.events();
+  const v2Rows = rows.filter((event) => event.type === 'voice.carry.convey' && event.payload.answerVersion === 2);
+  assert.equal(
+    v2Rows.filter((event) => event.payload.superseded > 0).length,
+    0,
+    'no version-2 row reports a retirement of version 3 points',
+  );
+  t.diagnostic(
+    `A="${A_BODY}" B(late,v2) refused=${late.reason} superseded=${late.superseded} `
+    + `C(v3)carry=${cCarry.sentences}句/${cCarry.chars}字 current=${late.currentVersion}`,
   );
 });

@@ -1597,3 +1597,176 @@ test('28. an ambiguous contradiction without a correction word is never carried'
     + `played="${fallback.text}" pending=0 carry=null`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// 29. P2: a late version-2 supersede never clears version 3's carry
+// ---------------------------------------------------------------------------
+
+test('29. a late version-2 supersede is refused and version 3 keeps its carry', (t) => {
+  const A1 = '第一轮结论：窗口采集要选中目标窗口。';
+  const A2 = '第一轮条件：如果还黑屏就先别删场景。';
+  const B = '第二轮正文：先确认采集源类型是窗口采集。';
+
+  /**
+   * A never sounded, B's body is ready but its spoken plan is still missing, C opens version 3:
+   * exactly the counterexample where B's late organizer result must not retire C's points.
+   */
+  const openToVersionThree = (sessionId) => {
+    const { store, clock, events } = groupStore();
+    const first = store.beginInput({ sessionId, text: 'OBS 全黑怎么调', at: clock.t });
+    store.noteAnswerPlan({ group: first.group, version: 1, text: `${A1}${A2}` });
+    store.adjustSpeech({ group: first.group, version: 1, text: `${A1}${A2}` });
+    assert.equal(store.get(first.group.id).speechStarted, false, 'A never started sounding');
+
+    clock.t += 2_000;
+    const second = store.beginInput({ sessionId, text: '补充一下，那采集源呢', at: clock.t });
+    assert.equal(second.answerVersion, 2);
+    // B's body is ready, but its spoken organization has not returned yet.
+    store.noteAnswerBody({ group: second.group, version: 2, text: B });
+
+    clock.t += 2_000;
+    const third = store.beginInput({ sessionId, text: '再补充一句，那编码器呢', at: clock.t });
+    assert.equal(third.answerVersion, 3);
+    return { store, clock, events, group: third.group };
+  };
+
+  const { store, events, group } = openToVersionThree('s-stale-v2');
+  const carryBefore = store.snapshot(group.id).carryConvey;
+  assert.equal(carryBefore.version, 3, 'C owns a fresh carry for version 3');
+  assert.deepEqual(carryBefore.sentences, [A1, A2, B]);
+  const pendingBefore = [...store.get(group.id).pendingSentences];
+  assert.deepEqual(pendingBefore, [A1, A2, B]);
+
+  // B's organizer finally returns (version 2) and reports a correction of A1.
+  const refused = store.supersedeCarry({ group, version: 2, sentences: [A1], reason: 'superseded' });
+  assert.deepEqual(refused, { ok: false, reason: 'stale-version' });
+  assert.deepEqual(store.snapshot(group.id).carryConvey, carryBefore, 'version 3 carry is untouched');
+  assert.deepEqual(store.get(group.id).pendingSentences, pendingBefore, 'version 3 pending is untouched');
+  assert.deepEqual(store.get(group.id).supersededCarry, [], 'nothing was retired by the stale result');
+  assert.deepEqual(store.carryForSpeech(group, 3).sentences, [A1, A2, B]);
+  const staleRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1).payload;
+  assert.equal(staleRow.staleVersionRejected, true, 'the refusal is reported');
+  assert.equal(staleRow.reason, 'stale-version');
+  assert.equal(staleRow.answerVersion, 2);
+  assert.equal(staleRow.currentVersion, 3);
+  assert.equal(staleRow.superseded, 0, 'a refused retirement reports no retired point');
+
+  // A correction inside version 3 still retires its own point normally.
+  const applied = store.supersedeCarry({ group, version: 3, sentences: [A1], reason: 'superseded' });
+  assert.equal(applied.ok, true);
+  assert.deepEqual(store.get(group.id).supersededCarry, [A1]);
+  assert.deepEqual(store.get(group.id).pendingSentences, [A2, B]);
+  assert.deepEqual(store.snapshot(group.id).carryConvey.sentences, [A2, B]);
+  const retiredRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1).payload;
+  assert.equal(retiredRow.superseded, 1, 'an in-version correction still retires');
+  assert.equal(retiredRow.answerVersion, 3);
+  t.diagnostic(
+    `v3carry=${carryBefore.sentences.length}句 stale(v2) rejected=${refused.reason} `
+    + `carryAfterStale=${carryBefore.sentences.length}句 pendingAfterStale=${pendingBefore.length}句 `
+    + `sameVersionSuperseded=${retiredRow.superseded} carryLeft=${store.snapshot(group.id).carryConvey.sentences.length}句`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 30. P2: a late version-3 supersede is refused once version 4 is current
+// ---------------------------------------------------------------------------
+
+test('30. a late version-3 supersede is refused once version 4 is current', (t) => {
+  const A1 = '第一轮结论：窗口采集要选中目标窗口。';
+  const A2 = '第一轮条件：如果还黑屏就先别删场景。';
+  const B = '第二轮正文：先确认采集源类型是窗口采集。';
+  const C = '第三轮正文：编码器改成硬件编码。';
+  const { store, clock, events } = groupStore();
+  const sessionId = 's-stale-v3';
+  const first = store.beginInput({ sessionId, text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: `${A1}${A2}` });
+  store.adjustSpeech({ group: first.group, version: 1, text: `${A1}${A2}` });
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId, text: '补充一下，那采集源呢', at: clock.t });
+  store.noteAnswerBody({ group: second.group, version: 2, text: B });
+  clock.t += 2_000;
+  const third = store.beginInput({ sessionId, text: '再补充一句，那编码器呢', at: clock.t });
+  store.noteAnswerBody({ group: third.group, version: 3, text: C });
+  clock.t += 2_000;
+  const fourth = store.beginInput({ sessionId, text: '再补充一句，那显示器呢', at: clock.t });
+  assert.equal(fourth.answerVersion, 4);
+  const carryBefore = store.snapshot(fourth.group.id).carryConvey;
+  assert.equal(carryBefore.version, 4);
+  assert.ok(carryBefore.sentences.includes(A1), 'version 4 still owns the never-spoken A points');
+  const pendingBefore = [...store.get(fourth.group.id).pendingSentences];
+
+  // Version 3's organizer returns late and reports a correction: version 4 must keep everything.
+  const refused = store.supersedeCarry({ group: fourth.group, version: 3, sentences: [A1] });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'stale-version');
+  assert.deepEqual(store.snapshot(fourth.group.id).carryConvey, carryBefore);
+  assert.deepEqual(store.get(fourth.group.id).pendingSentences, pendingBefore);
+  assert.deepEqual(store.get(fourth.group.id).supersededCarry, []);
+  const staleRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1).payload;
+  assert.equal(staleRow.staleVersionRejected, true);
+  assert.equal(staleRow.answerVersion, 3);
+  assert.equal(staleRow.currentVersion, 4);
+  assert.equal(staleRow.superseded, 0);
+
+  // Version 4 may still retire its own point.
+  const applied = store.supersedeCarry({ group: fourth.group, version: 4, sentences: [A1] });
+  assert.equal(applied.ok, true);
+  assert.deepEqual(store.get(fourth.group.id).supersededCarry, [A1]);
+  assert.ok(
+    !store.snapshot(fourth.group.id).carryConvey.sentences.includes(A1),
+    'the in-version correction trims version 4 only',
+  );
+  t.diagnostic(
+    `v4carry=${carryBefore.sentences.length}句 stale(v3) rejected=${refused.reason} `
+    + `pendingKept=${pendingBefore.length}句 current(v4) superseded=1`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 31. P2: a stale defer never writes the current version's carry
+// ---------------------------------------------------------------------------
+
+test('31. a stale defer is refused and never overwrites the current version\'s carry', (t) => {
+  const A1 = '第一轮结论：窗口采集要选中目标窗口。';
+  const A2 = '第一轮条件：如果还黑屏就先别删场景。';
+  const B = '第二轮正文：先确认采集源类型是窗口采集。';
+  const { store, clock, events } = groupStore();
+  const sessionId = 's-stale-defer';
+  const first = store.beginInput({ sessionId, text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: `${A1}${A2}` });
+  store.adjustSpeech({ group: first.group, version: 1, text: `${A1}${A2}` });
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId, text: '补充一下，那采集源呢', at: clock.t });
+  store.noteAnswerBody({ group: second.group, version: 2, text: B });
+  clock.t += 2_000;
+  const third = store.beginInput({ sessionId, text: '再补充一句，那编码器呢', at: clock.t });
+  assert.equal(third.answerVersion, 3);
+  const carryBefore = store.snapshot(third.group.id).carryConvey;
+  assert.equal(carryBefore.version, 3);
+
+  // Version 2's budget fallback is late: it must not replace version 3's carry with its own rows.
+  const refused = store.deferCarry({ group: third.group, version: 2, sentences: ['旧版本要延期的要点。'] });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'stale-version');
+  assert.deepEqual(store.snapshot(third.group.id).carryConvey, carryBefore, 'the carry is not overwritten');
+  const staleRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1).payload;
+  assert.equal(staleRow.staleVersionRejected, true);
+  assert.equal(staleRow.reason, 'stale-version');
+  assert.equal(staleRow.deferred, 0);
+  assert.equal(staleRow.answerVersion, 2);
+  assert.equal(staleRow.currentVersion, 3);
+
+  // The current version may still defer its own points.
+  const applied = store.deferCarry({ group: third.group, version: 3, sentences: [A1, A2, B] });
+  assert.equal(applied.ok, true);
+  assert.equal(store.snapshot(third.group.id).carryConvey.version, 3);
+  assert.equal(store.snapshot(third.group.id).carryConvey.deferred, true);
+  assert.deepEqual(store.snapshot(third.group.id).carryConvey.sentences, [A1, A2, B]);
+  const deferRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1).payload;
+  assert.equal(deferRow.deferred, 3);
+  assert.equal(deferRow.staleVersionRejected, undefined);
+  t.diagnostic(
+    `v3carry kept after stale defer=${carryBefore.sentences.length}句 `
+    + `staleDeferred=${staleRow.deferred} currentDeferred=${deferRow.deferred}句 version=${applied.carry.version}`,
+  );
+});

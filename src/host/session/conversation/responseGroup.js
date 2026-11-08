@@ -867,16 +867,44 @@ export function createResponseGroupStore({
   };
 
   /**
+   * P2: the 待传达 state belongs to ONE answer version. A late async result for an older version
+   * must not mutate it, so a refused mutation reports itself and leaves every field untouched.
+   */
+  const refuseStaleCarry = (group, version) => {
+    publish('voice.carry.convey', {
+      groupId: group.id,
+      priorGroupId: group.carryConvey?.priorGroupId ?? group.id,
+      sentences: group.carryConvey?.sentences.length ?? 0,
+      chars: group.carryConvey?.chars ?? 0,
+      merged: false, reason: 'stale-version', gapMs: 0,
+      answerVersion: Number.isSafeInteger(version) ? version : null,
+      currentVersion: group.currentAnswer?.version ?? 0,
+      superseded: 0, deferred: 0, staleVersionRejected: true,
+    });
+    return { ok: false, reason: 'stale-version' };
+  };
+
+  /**
+   * Report a stale result the host already caught with its own current-version check. Never mutates.
+   */
+  const noteStaleCarry = ({ group, version = null } = {}) => {
+    if (group === null || group === undefined) return { ok: false, reason: 'no-group' };
+    return refuseStaleCarry(group, version);
+  };
+
+  /**
    * A correcting answer retires the carried points: they stay in `supersededCarry` as internal
    * history but never enter `pendingSentences` or the carry pool again. This is NOT `deferCarry`:
    * a deferred point is still valid, a superseded one is dead.
    */
   const supersedeCarry = ({ group, version = null, sentences = [], reason = 'superseded' } = {}) => {
-    if (group === null || group === undefined) return null;
+    if (group === null || group === undefined) return { ok: false, reason: 'no-group' };
+    // P2: refuse a stale version BEFORE anything is retired or cleared (fail closed).
+    if (!isCurrentVersion(group, version)) return refuseStaleCarry(group, version);
     const rows = (Array.isArray(sentences) ? sentences : [])
       .map((sentence) => String(sentence ?? '').trim())
       .filter((sentence) => sentenceKey(sentence).length > 0);
-    if (rows.length === 0) return group.carryConvey ?? null;
+    if (rows.length === 0) return { ok: true, carry: group.carryConvey ?? null };
     const known = supersededKeySet(group);
     for (const sentence of rows) {
       const key = sentenceKey(sentence);
@@ -888,7 +916,8 @@ export function createResponseGroupStore({
     const retired = supersededKeySet(group);
     group.pendingSentences = group.pendingSentences.filter((sentence) => !retired.has(sentenceKey(sentence)));
     const carry = group.carryConvey ?? null;
-    if (carry !== null) {
+    // P2: only the carry stamped with THIS version may be trimmed; another version's points stay.
+    if (carry !== null && carry.version === version) {
       const kept = carry.sentences.filter((sentence) => !retired.has(sentenceKey(sentence)));
       group.carryConvey = kept.length === 0
         ? null
@@ -906,7 +935,7 @@ export function createResponseGroupStore({
       superseded: rows.length,
       deferred: group.carryConvey?.deferred === true ? group.carryConvey.sentences.length : 0,
     });
-    return group.carryConvey;
+    return { ok: true, carry: group.carryConvey ?? null };
   };
 
   /**
@@ -914,12 +943,14 @@ export function createResponseGroupStore({
    * those points as still-unfulfilled carry material for a later round.
    */
   const deferCarry = ({ group, version, sentences = [] } = {}) => {
-    if (group === null || group === undefined) return null;
+    if (group === null || group === undefined) return { ok: false, reason: 'no-group' };
+    // P2: a stale deferral must never overwrite the current version's 待传达 material.
+    if (!isCurrentVersion(group, version)) return refuseStaleCarry(group, version);
     const retired = supersededKeySet(group);
     const rows = (Array.isArray(sentences) ? sentences : [])
       .map((sentence) => String(sentence ?? '').trim())
       .filter((sentence) => sentenceKey(sentence).length > 0 && !retired.has(sentenceKey(sentence)));
-    if (rows.length === 0) return null;
+    if (rows.length === 0) return { ok: true, carry: group.carryConvey ?? null };
     const prior = group.carryConvey ?? null;
     group.carryConvey = {
       priorGroupId: prior?.priorGroupId ?? group.id,
@@ -942,7 +973,7 @@ export function createResponseGroupStore({
       superseded: 0,
       deferred: group.carryConvey.sentences.length,
     });
-    return group.carryConvey;
+    return { ok: true, carry: group.carryConvey };
   };
 
   /** The carried points this answer version's spoken organization must convey (null when none). */
@@ -1163,6 +1194,16 @@ export function createResponseGroupStore({
     && !TERMINAL_STATES.has(group.state)
     && group.currentAnswer.state !== 'cancelled'
     && group.currentAnswer.state !== 'failed'
+  );
+
+  /**
+   * P2: is `version` the group's current answer version (state-independent)? A late async result
+   * must be compared against this before it may touch the 待传达 state; a missing coordinate fails.
+   */
+  const isCurrentVersion = (group, version) => (
+    group !== null && group !== undefined
+    && Number.isSafeInteger(version) && version > 0
+    && group.currentAnswer?.version === version
   );
 
   /**
@@ -1583,6 +1624,7 @@ export function createResponseGroupStore({
     carryForSpeech,
     deferCarry,
     supersedeCarry,
+    noteStaleCarry,
     notePlaybackStart,
     notePlaybackEnd,
     notePlaybackSkipped,
@@ -1593,6 +1635,7 @@ export function createResponseGroupStore({
     preparePendingInternal,
     takePendingInternal,
     isCurrentAnswer,
+    isCurrentVersion,
     groupView: (group) => groupView(group),
     get: find,
     size: () => groups.size,

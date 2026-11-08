@@ -11856,6 +11856,9 @@ export function apply(ctx, config) {
             reason,
             turn: turnId,
             replyVersion,
+            // P2: the version this async result belongs to. A newer version may own the group's
+            // 待传达 state by the time this plan returns, so every carry mutation is gated on it.
+            answerVersion: voiceGroupVersion,
             // The body this expression was decided from (observability compares the two; it is
             // never spoken by itself and never replaces `text`).
             bodyText: full,
@@ -11943,11 +11946,16 @@ export function apply(ctx, config) {
        */
       const speakWholePlan = async (plan) => {
         spokenPlan = plan;
+        // P2: this async result belongs to ONE version. Confirm that version is still the group's
+        // current one BEFORE any carry mutation: a late result for an older version must never
+        // retire or defer the points a newer version currently owns.
+        const planVersion = Number.isSafeInteger(plan.answerVersion) ? plan.answerVersion : voiceGroupVersion;
+        const planVersionCurrent = () => responseGroups.isCurrentVersion(voiceGroup, planVersion);
         // Keep the decided plan even when a newer version already took over: the successor needs
         // its unvoiced sentences, while this version's audio must never start.
         responseGroups.noteAnswerPlan({
           group: voiceGroup,
-          version: voiceGroupVersion,
+          version: planVersion,
           turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
           text: plan.text,
           feedText: plan.feedText,
@@ -11955,22 +11963,27 @@ export function apply(ctx, config) {
           chars: plan.chars,
         });
         // P2: a correcting fallback retires the old points BEFORE any plan is adjusted: superseded
-        // points are never deferred, never prepended and never inherited by a later round.
+        // points are never deferred, never prepended and never inherited by a later round. Only the
+        // version that produced this plan may do it; a stale plan is reported and mutates nothing.
         if (Array.isArray(plan.carrySuperseded) && plan.carrySuperseded.length > 0) {
-          responseGroups.supersedeCarry({
-            group: voiceGroup,
-            version: voiceGroupVersion,
-            sentences: plan.carrySuperseded,
-            reason: plan.carrySupersededReason ?? 'superseded',
-          });
+          if (planVersionCurrent()) {
+            responseGroups.supersedeCarry({
+              group: voiceGroup,
+              version: planVersion,
+              sentences: plan.carrySuperseded,
+              reason: plan.carrySupersededReason ?? 'superseded',
+            });
+          } else {
+            responseGroups.noteStaleCarry({ group: voiceGroup, version: planVersion });
+          }
         }
-        if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
+        if (!responseGroups.isCurrentAnswer(voiceGroup, planVersion)) return null;
         if (plan.text.length === 0) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
         // The fallback could not fit the old points: they stay waiting instead of being forced in.
-        if (Array.isArray(plan.carryPending) && plan.carryPending.length > 0) {
+        if (Array.isArray(plan.carryPending) && plan.carryPending.length > 0 && planVersionCurrent()) {
           responseGroups.deferCarry({
-            group: voiceGroup, version: voiceGroupVersion, sentences: plan.carryPending,
+            group: voiceGroup, version: planVersion, sentences: plan.carryPending,
           });
         }
         // Batch 2: a continuation speaks past what was already heard — no restart from the top
@@ -12044,6 +12057,8 @@ export function apply(ctx, config) {
           reason: 'apply',
           turn: turnId,
           replyVersion,
+          // P2: same version coordinate as the whole-text plan (see `decideSpokenVersion`).
+          answerVersion: voiceGroupVersion,
           // Same observation seam as the whole-text decision: the body beside the spoken text.
           bodyText: full,
         };
