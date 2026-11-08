@@ -3,6 +3,8 @@
  *
  * These tests use a fake Host that mirrors the shipped contracts the wiring depends on, not the
  * real Harness:
+ *  - the shipped `initializeAgent` awaits `setup(agent.ctx, agent)` and then runs
+ *    `setupCommit?.commit()`, so a valid setup returns void or `{ commit() }` — never a state object;
  *  - `agentPresets.mount(agentCtx, id)` binds the Agent scope to a retained preset revision;
  *  - the preset's plugins register scoped `agent/pre-step` listeners and a scoped `/compact`
  *    command, visible only to Agents bound to that preset;
@@ -26,10 +28,10 @@ import {
   VOICE_COMPACTION_PRESET,
   VOICE_COMPACTION_PRESET_ID,
   createVoiceCompaction,
-  dailyAgentMeta,
   isVoiceSessionId,
 } from '../src/host/session/compaction/voice-compaction.js';
 import { apply } from '../src/host/index.js';
+import { ensureSession } from '../src/host/session/delivery/dispatch.js';
 import { cleanupRoot } from './helpers/cleanup.mjs';
 
 /** Four characters per token, like the shipped heuristic. */
@@ -53,6 +55,7 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
   const commands = new Map(); // scope -> Map(name -> handler)
   const createdListeners = [];
   const liveAgents = [];
+  const liveById = new Map();
   const events = [];
   const cleanups = [];
 
@@ -176,7 +179,16 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
     presetForSession(session) { return session?.agentPresetRecorded ?? null; },
   };
 
-  const getService = (name) => ({ agentPresets, agents: { list: () => liveAgents.slice() } })[name];
+  // The Harness services the dispatch entry reads. `agentLoop` is installed by a test that drives
+  // the real `ensureSession` path; `agents.get` is the live-Agent lookup (`ownerCtx.get`).
+  const services = {
+    agentPresets,
+    agents: {
+      list: () => liveAgents.slice(),
+      get: (id) => liveById.get(id),
+    },
+  };
+  const getService = (name) => services[name];
 
   function createAgent(sessionId) {
     const session = {
@@ -191,6 +203,7 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
     const agent = { id: sessionId, session };
     agent.ctx = { key: {}, agent };
     liveAgents.push(agent);
+    liveById.set(sessionId, agent);
     return agent;
   }
 
@@ -243,7 +256,7 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
   }
 
   return {
-    meter, log, events, mounts, liveAgents, ctx, agentPresets,
+    meter, log, events, mounts, liveAgents, services, ctx, agentPresets,
     createAgent, createAndAnnounce, announce, emit,
     listenersFor, commandFor, compactionFor, getService, cleanups,
     listenerCount: (agent, type) => listenersFor(agent, type).length,
@@ -251,9 +264,82 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
   };
 }
 
+/**
+ * Fake Harness loop for the REAL delivery entry (`dispatch.js#ensureSession`).
+ *
+ * It mirrors the shipped ordering (`@deepseek-ai/dsh-agent-loop/lib/index.js#initializeAgent`):
+ * the session enters the store, optional setup runs, the Agent enters the registry, and only then
+ * are the serial `agent/created` listeners awaited before the handle resolves. `source` is
+ * `startup` for create and `resume` for resume (`createAgent`/`resumeWith` pass their own source).
+ * A still-live Agent is reused as-is on the second delivery: the real loop refuses a second
+ * resume/create for the same id, and `ensureSession` falls back to `agents.get(sessionId)`.
+ */
+function createDispatchLoop(host) {
+  const state = { persisted: false, creates: [], resumes: [], announces: [] };
+
+  const announce = async (agent, source) => {
+    state.announces.push({ agentId: agent.id, source });
+    await host.announce(agent, source);
+  };
+
+  const agentLoop = {
+    async resume(_ownerCtx, options) {
+      state.resumes.push(options);
+      if (!state.persisted) throw new Error('not persisted yet');
+      const live = host.getService('agents').get(options.resumeSessionId);
+      // A live Agent is reused without a new announcement/realm.
+      if (live !== undefined) return { agent: live };
+      const agent = host.createAgent(options.resumeSessionId);
+      await announce(agent, 'resume');
+      return { agent };
+    },
+    async createAgent(_ownerCtx, options) {
+      state.creates.push(options);
+      const agent = host.createAgent(options.sessionId);
+      await announce(agent, 'startup');
+      state.persisted = true;
+      return { agent };
+    },
+  };
+  const ownerCtx = { get: (name) => host.getService(name) };
+  host.services.agentLoop = agentLoop;
+  return { state, agentLoop, ownerCtx };
+}
+
+/** Drive the real delivery entry for one session. */
+async function deliverTo(host, loop, sessionId) {
+  return await ensureSession({
+    sessionId,
+    cwd: '',
+    ownerCtx: loop.ownerCtx,
+    getService: host.getService,
+    log: host.log,
+  });
+}
+
 /** 20 x 800-char messages = 4000 fake tokens, far above the fake 1200-token threshold. */
 function fillHistory(agent) {
   for (let index = 0; index < 20; index += 1) agent.session.messages.push(createMessage(String(index).repeat(800)));
+}
+
+/**
+ * The shipped `initializeAgent` consumption of an Agent setup callback, verbatim:
+ * `const setupCommit = await setup(agent.ctx, agent); setupCommit?.commit();`.
+ * A void result and a `{ commit() }` handle are the only legal shapes; returning a state object
+ * makes the optional call throw `setupCommit?.commit is not a function` and the creation fails.
+ */
+async function consumeSetupLikeHost(setup, agent) {
+  const setupCommit = await setup(agent.ctx, agent);
+  assert.doesNotThrow(() => setupCommit?.commit(), 'the host commit call must not throw');
+  return setupCommit;
+}
+
+/** The shipped creation order: construct, await setup + commit, then announce `agent/created`. */
+async function createLikeHost(host, helper, sessionId, source = 'startup') {
+  const agent = host.createAgent(sessionId);
+  const setupCommit = await consumeSetupLikeHost(helper.setup, agent);
+  await host.announce(agent, source);
+  return { agent, setupCommit };
 }
 
 test('1. setup mounts the preset once, and a repeated setup adds no second instance', async () => {
@@ -261,16 +347,19 @@ test('1. setup mounts the preset once, and a repeated setup adds no second insta
   const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
   const agent = host.createAgent('seirein-2026-11-08');
 
-  const first = await helper.setup(agent.ctx, agent);
-  assert.equal(first.ok, true, 'setup reports a verified mount');
-  assert.equal(first.presetId, VOICE_COMPACTION_PRESET_ID);
-  assert.equal(first.reused, false);
+  const first = await consumeSetupLikeHost(helper.setup, agent);
+  assert.equal(first, undefined, 'AgentSetup resolves void: the mount is already applied');
+  const record = helper.evidenceOf(agent);
+  assert.equal(record.ok, true, 'setup reports a verified mount through evidence');
+  assert.equal(record.presetId, VOICE_COMPACTION_PRESET_ID);
+  assert.equal(record.reused, false);
   assert.equal(host.mounts.length, 1, 'exactly one mount call');
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1, 'exactly one compaction listener');
   assert.equal(host.commandCount(agent, 'compact'), 1, 'exactly one scoped /compact registration');
 
-  const second = await helper.setup(agent.ctx, agent);
-  assert.deepEqual(second, first, 'the second setup returns the same evidence');
+  const second = await consumeSetupLikeHost(helper.setup, agent);
+  assert.equal(second, undefined, 'a repeated setup is still void');
+  assert.equal(helper.evidenceOf(agent), record, 'the second setup returns the same evidence');
   assert.equal(host.mounts.length, 1, 'no second mount call');
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1, 'no second compaction listener');
 });
@@ -280,7 +369,8 @@ test('2. success evidence is mount + composedPreset + realm service, not the rec
   const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
   const agent = host.createAgent('seirein-2026-11-08');
 
-  const record = await helper.setup(agent.ctx, agent);
+  await consumeSetupLikeHost(helper.setup, agent);
+  const record = helper.evidenceOf(agent);
   assert.equal(record.ok, true);
   assert.equal(record.composed, VOICE_COMPACTION_PRESET_ID, 'registry reads the bound preset back');
   assert.equal(record.service, true);
@@ -293,29 +383,8 @@ test('2. success evidence is mount + composedPreset + realm service, not the rec
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1);
   assert.equal(host.compactionFor(agent) !== undefined, true);
 
-  // The daily-agent header marker is written only when the declaration resolves.
-  assert.deepEqual(dailyAgentMeta({ cwd: 'C:/s/workspace', presetReady: true }), {
-    cwd: 'C:/s/workspace',
-    agentPreset: VOICE_COMPACTION_PRESET_ID,
-  });
-  assert.deepEqual(dailyAgentMeta({ cwd: 'C:/s/workspace', presetReady: false }), { cwd: 'C:/s/workspace' });
-
-  // The daily-agent create options couple the marker to the verified setup: driving them mounts.
-  const daily = helper.dailyCreateOptions({
-    sessionId: 'seirein-2026-11-11',
-    cwd: 'C:/s/workspace',
-    presetReady: true,
-  });
-  assert.equal(daily.sessionId, 'seirein-2026-11-11');
-  assert.equal(daily.meta.agentPreset, VOICE_COMPACTION_PRESET_ID);
-  const dailyAgent = host.createAgent(daily.sessionId);
-  const dailyRecord = await daily.setup(dailyAgent.ctx, dailyAgent);
-  assert.equal(dailyRecord.ok, true);
-  assert.equal(dailyRecord.service, true);
-  assert.equal(host.mounts.length, 2, 'the daily create path mounts through its own setup');
-  assert.equal(host.listenerCount(dailyAgent, 'agent/pre-step'), 1);
-  assert.equal(dailyAgent.session.agentPresetRecorded, VOICE_COMPACTION_PRESET_ID);
-
+  // The dead `ensureDailyAgent` path and its marker-only helper were removed; the header marker
+  // is never evidence here — only the mount/service/listener facts above.
   const mountedEvent = host.events.find((event) => event.type === 'voice.compaction.mounted');
   assert.ok(mountedEvent !== undefined, 'the mount is observable');
   assert.equal(mountedEvent.payload.service, true);
@@ -438,12 +507,10 @@ test('7. no declared preset: the voice agent keeps running and reports an action
   const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
   const agent = host.createAgent('seirein-2026-11-08');
 
-  const record = await helper.setup(agent.ctx, agent);
-  assert.equal(record.ok, false);
-  assert.equal(record.reason, 'preset-missing');
+  const setupCommit = await consumeSetupLikeHost(helper.setup, agent);
+  assert.equal(setupCommit, undefined, 'a missing preset still resolves the setup callback void');
   assert.equal(host.mounts.length, 0, 'nothing was mounted');
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 0);
-  assert.equal(await helper.presetReady(), false);
   const skipped = host.events.find((event) => event.type === 'voice.compaction.skipped');
   assert.equal(skipped.payload.reason, 'preset-missing');
 });
@@ -495,4 +562,114 @@ test('8. apply() installs the binding for real voice Agents through agent/create
   assert.equal(isVoiceSessionId('seirein-2026-11-08'), true);
   assert.equal(isVoiceSessionId('session-2faa7245'), false);
   assert.equal(isVoiceSessionId('seirein-notes'), false);
+});
+
+test('9. the real dispatch entry creates the voice Agent and mounts compaction exactly once', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  // P0's only production coverage on this path: attach() registers the serial agent/created hook.
+  helper.attach(host.ctx);
+  const loop = createDispatchLoop(host);
+
+  const first = await deliverTo(host, loop, 'seirein-2026-11-08');
+  assert.equal(first.ok, true, 'the delivery entry resolved a live Agent');
+  assert.equal(first.created, true);
+  assert.equal(loop.state.resumes.length, 1, 'resume is attempted first and fails before create');
+  assert.equal(loop.state.creates.length, 1);
+  // The delivery path passes NO setup: the mount above can only have come from agent/created.
+  assert.equal(loop.state.resumes[0].setup, undefined, 'ensureSession passes no setup on resume');
+  assert.equal(loop.state.creates[0].setup, undefined, 'ensureSession passes no setup on create');
+  assert.deepEqual(loop.state.announces, [{ agentId: 'seirein-2026-11-08', source: 'startup' }]);
+  assert.equal(host.mounts.length, 1, 'mount called exactly once on the real entry');
+  assert.equal(host.listenerCount(first.agent, 'agent/pre-step'), 1, 'the compaction listener exists');
+  assert.equal(host.commandCount(first.agent, 'compact'), 1, 'the scoped command is registered');
+  assert.ok(host.compactionFor(first.agent) !== undefined, 'the compaction service exists in the realm');
+
+  // A second delivery to the same live Agent resumes/reuses it; the realm is not mounted again.
+  const second = await deliverTo(host, loop, 'seirein-2026-11-08');
+  assert.equal(second.ok, true);
+  assert.equal(second.resumed, true);
+  assert.equal(second.agent, first.agent, 'the same live Agent is reused');
+  assert.equal(loop.state.announces.length, 1, 'a reused Agent is not re-announced');
+  assert.equal(host.mounts.length, 1, 'no second mount for the same session');
+  assert.equal(host.listenerCount(first.agent, 'agent/pre-step'), 1);
+  assert.equal(host.commandCount(first.agent, 'compact'), 1);
+});
+
+test('10. a cold resume through the same dispatch entry still mounts exactly once', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+  const loop = createDispatchLoop(host);
+  // The session exists on disk but no Agent for it is live in this process: resume must announce.
+  loop.state.persisted = true;
+
+  const result = await deliverTo(host, loop, 'seirein-2026-11-09');
+  assert.equal(result.ok, true);
+  assert.equal(result.resumed, true);
+  assert.equal(loop.state.creates.length, 0, 'resume did not fall through to create');
+  assert.deepEqual(loop.state.announces, [{ agentId: 'seirein-2026-11-09', source: 'resume' }]);
+  assert.equal(host.mounts.length, 1, 'a resumed voice Agent is mounted exactly once');
+  assert.equal(host.listenerCount(result.agent, 'agent/pre-step'), 1);
+  assert.equal(host.commandCount(result.agent, 'compact'), 1);
+});
+
+test('11. a non-Seirein Session delivered through the same entry is never mounted', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+  const loop = createDispatchLoop(host);
+
+  const result = await deliverTo(host, loop, 'session-2faa7245');
+  assert.equal(result.ok, true);
+  assert.equal(host.mounts.length, 0, 'no preset mount for a non-Seirein Session');
+  assert.equal(host.listenerCount(result.agent, 'agent/pre-step'), 0);
+  assert.equal(host.commandCount(result.agent, 'compact'), 0);
+  assert.equal(helper.evidenceOf(result.agent), undefined);
+});
+
+test('12. host protocol with a preset: setup resolves void, creation completes, repeat stays single-instance', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  // The exact shipped order: construct, await setup, run `setupCommit?.commit()`, announce.
+  const first = await createLikeHost(host, helper, 'seirein-2026-11-08');
+  assert.equal(first.setupCommit, undefined, 'void is a legal AgentSetup result');
+  assert.equal(host.mounts.length, 1, 'creation mounted the preset once');
+  assert.equal(host.listenerCount(first.agent, 'agent/pre-step'), 1);
+  assert.equal(host.commandCount(first.agent, 'compact'), 1);
+  assert.equal(helper.evidenceOf(first.agent).ok, true, 'the composition is verified');
+
+  // Another creation path for the same live Agent (the resume fallback) must neither throw at the
+  // host commit call nor add a second listener/mount.
+  const second = await consumeSetupLikeHost(helper.setup, first.agent);
+  assert.equal(second, undefined);
+  assert.equal(host.mounts.length, 1, 'no second mount');
+  assert.equal(host.listenerCount(first.agent, 'agent/pre-step'), 1, 'no second listener');
+  assert.equal(host.commandCount(first.agent, 'compact'), 1, 'no second command');
+});
+
+test('13. host protocol without a preset: fail-open, creation completes, setup never rejects', async () => {
+  const host = createHost({ definitions: {} });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const created = await createLikeHost(host, helper, 'seirein-2026-11-08');
+  assert.equal(created.setupCommit, undefined, 'the setup callback still resolves void');
+  assert.equal(created.agent.id, 'seirein-2026-11-08', 'the Agent was still created');
+  assert.equal(host.mounts.length, 0, 'no preset was mounted');
+  assert.equal(host.listenerCount(created.agent, 'agent/pre-step'), 0);
+  assert.equal(host.commandCount(created.agent, 'compact'), 0);
+
+  // A broken service lookup is contained too: setup must not reject and roll creation back.
+  const broken = createVoiceCompaction({
+    getService: () => { throw new Error('service registry unavailable'); },
+    log: host.log,
+  });
+  const agent = host.createAgent('seirein-2026-11-10');
+  const setupCommit = await consumeSetupLikeHost(broken.setup, agent);
+  assert.equal(setupCommit, undefined);
+  const failed = host.events.find((event) => event.type === 'voice.compaction.failed');
+  assert.equal(failed.payload.reason, 'setup');
 });

@@ -60,16 +60,6 @@ export function isVoiceSessionId(id) {
 }
 
 /**
- * Fresh-session metadata for the daily voice agent. `agentPreset` is a MARKER only (the Session
- * header records it); it is written only when the preset is actually resolvable, so the header
- * never claims a composition the Agent does not run.
- * @param {{cwd: string, presetReady: boolean}} options
- */
-export function dailyAgentMeta({ cwd, presetReady }) {
-  return { cwd, ...(presetReady === true ? { agentPreset: VOICE_COMPACTION_PRESET_ID } : {}) };
-}
-
-/**
  * @param {{
  *   getService: (name: string) => any,
  *   log?: { emit?: (type: string, payload: object) => unknown } | null,
@@ -134,7 +124,7 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
    * leaves the voice agent running uncompacted instead of failing the turn.
    *
    * @param {any} agent live Agent (only its `seirein-YYYY-MM-DD` session is eligible)
-   * @param {any} [agentCtx] the Agent context supplied by `setup`
+   * @param {any} [agentCtx] the Agent context supplied by the Agent setup callback
    */
   const ensure = async (agent, agentCtx) => {
     if (!isVoiceSessionId(agent?.id)) return { ok: false, reason: 'not-voice-session' };
@@ -147,7 +137,7 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
       if (presets === undefined || typeof presets.mount !== 'function') {
         return skip(agent, 'preset-registry-unavailable');
       }
-      const ctx = agentCtx ?? agent.ctx;
+      const ctx = agentCtx ?? agent?.ctx;
       if (ctx === undefined || ctx === null) return skip(agent, 'agent-context-unavailable');
 
       // Another composition already owns this Agent: never yank its preset out from under it.
@@ -156,9 +146,10 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
       if (typeof composedBefore === 'string' && composedBefore.length > 0 && composedBefore !== presetId) {
         return skip(agent, 'other-preset', { composed: composedBefore });
       }
-      // A previous plugin instance (or setup) may already have bound the same revision. Verify it
-      // instead of mounting again: a second bind would be refused by the registry anyway, but the
-      // voice agent must not depend on that refusal to stay single-instance.
+      // A previous plugin instance (or another composition) may already have bound the same
+      // revision. Verify it instead of mounting again: a second bind would be refused by the
+      // registry anyway, but the voice agent must not depend on that refusal to stay
+      // single-instance.
       if (composedBefore === presetId && typeof presets.serviceFor === 'function') {
         const existingService = presets.serviceFor(agent, 'compaction');
         if (existingService !== undefined) {
@@ -235,11 +226,11 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
   };
 
   /**
-   * Install the coverage that `setup` alone cannot give: every Agent creation path.
+   * Install coverage for every Agent creation path.
    *
    * - new and resumed Agents: the loop awaits serial `agent/created` listeners before releasing
-   *   input, so the preset is bound before the first step (including a resume whose creator did
-   *   not pass `setup`, e.g. `dispatch.js#ensureSession`);
+   *   input, so the preset is bound before the first step (including a resume whose creator does
+   *   not compose it, e.g. `dispatch.js#ensureSession`);
    * - component reload / reconnection: Agents that were live before this instance mounted are
    *   swept once from `agents.list()`; a verified composition is reused, never mounted twice.
    *
@@ -275,32 +266,22 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
   /** Evidence recorded for an Agent (tests / status); `undefined` until verified. */
   const evidenceOf = (agent) => records.get(agent);
 
-  /** Whether the preset declaration currently resolves; used for the truthful header marker. */
-  const presetReady = async () => {
-    const presets = getService('agentPresets');
-    if (presets === undefined) return false;
+  /**
+   * Setup callback for `agentLoop.createAgent`/`resume`: the Agent context comes first there.
+   *
+   * The shipped host awaits this and then runs `setupCommit?.commit()` (agent-loop's
+   * `initializeAgent`); `AgentSetup` therefore returns either void or `{ commit() }`. Everything
+   * this wiring does is already applied when `ensure` resolves, so there is nothing to commit and
+   * the callback resolves void. A rejected setup would roll Agent creation back, so failures are
+   * contained here: the voice Agent keeps running uncompacted instead of failing its own creation.
+   */
+  const setup = async (agentCtx, agent) => {
     try {
-      const resolved = typeof presets.resolve === 'function' ? await presets.resolve(presetId) : undefined;
-      if (resolved !== undefined && resolved !== null) return typeof resolved.broken !== 'string';
-      return typeof presets.mount === 'function';
-    } catch {
-      return false;
+      await ensure(agent, agentCtx);
+    } catch (error) {
+      note('voice.compaction.failed', { sessionId: agent?.id ?? '', reason: 'setup', error: describe(error) });
     }
   };
 
-  /** Setup callback for `agentLoop.createAgent`/`resume`: the Agent context comes first there. */
-  const setup = (agentCtx, agent) => ensure(agent, agentCtx);
-
-  /**
-   * `agentLoop.createAgent` options for the daily voice agent: the header marker plus the setup
-   * that actually mounts (and verifies) the preset.
-   * @param {{sessionId: string, cwd: string, presetReady: boolean}} options
-   */
-  const dailyCreateOptions = ({ sessionId, cwd, presetReady }) => ({
-    sessionId,
-    meta: dailyAgentMeta({ cwd, presetReady }),
-    setup,
-  });
-
-  return { presetId, setup, ensure, attach, evidenceOf, presetReady, dailyCreateOptions };
+  return { presetId, setup, ensure, attach, evidenceOf };
 }
