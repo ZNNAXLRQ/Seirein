@@ -2874,9 +2874,13 @@ export function apply(ctx, config) {
     refreshAvatarAttention();
     // Privacy deliberately does NOT gate motion: it closes capture only, so a runtime created
     // while privacy is on still runs presets and idle. Nothing is added to the lock set here.
-    // A rebuilt runtime inherits the host's current activity instead of starting from idle.
-    if (playback !== null) avatarRuntime.setStatus('speaking', 'playback.active');
-    else if (hearing !== null) avatarRuntime.setStatus('listening', 'hearing.active');
+    // A rebuilt runtime inherits the host's CURRENT activity instead of starting from idle.
+    // An open microphone is deliberately NOT a seed: `listening` there has no exit under
+    // autoListen (no hearing stop ever arrives), which starved the waiting→tired→idle draw.
+    // Recorded through `avatarStatus`, so the inherited state and its reason are observable.
+    if (playback !== null) avatarStatus('speaking', 'playback.active');
+    else if (activeVoiceTurn !== null) avatarStatus('thinking', 'voice.request');
+    else avatarStatus('waiting', 'runtime.created');
     return avatarRuntime;
   };
 
@@ -2913,6 +2917,8 @@ export function apply(ctx, config) {
   const disposeAvatarRuntime = (reason = 'dispose') => {
     const current = avatarRuntime;
     if (current === null) return null;
+    // A disposed generation must not leave a listening deadline behind.
+    clearAvatarListeningIdle();
     let result = null;
     try {
       result = current.dispose();
@@ -2992,6 +2998,8 @@ export function apply(ctx, config) {
         conclusion: avatarWiringCalls.conclusion,
         confused: avatarWiringCalls.confused,
         relax: avatarWiringCalls.relax,
+        /** Times a silent `listening` state was degraded back to waiting (`listening-idle`). */
+        listeningIdle: avatarListeningIdleCount,
       },
       idleActions: {
         enabled: avatarIdleActions.length > 0,
@@ -3201,12 +3209,82 @@ export function apply(ctx, config) {
     }, 1500);
     avatarStyleRefreshTimer.unref?.();
   };
+  // ---- listening is temporary: it must never become a state with no exit -----------------
+  // An open microphone is NOT speech. Seeding `listening` from `hearing !== null` (and again from
+  // `hearing.start`) left the state stuck forever under autoListen (no stop/exit ever arrives), so
+  // the waiting→tired(10 min)→idle preset draw never ran again. Only real ASR activity may claim
+  // `listening`, and a silent listening state degrades back to `waiting` after a bounded window.
+  const AVATAR_LISTENING_IDLE_DEFAULT_MS = 60_000;
+  const AVATAR_LISTENING_IDLE_MIN_MS = 10_000;
+  const AVATAR_LISTENING_IDLE_MAX_MS = 10 * 60_000;
+  /** `config.avatarListeningIdleMs`, clamped to the documented 10 s – 10 min range. */
+  const avatarListeningIdleMs = () => {
+    const raw = Number(config?.avatarListeningIdleMs);
+    if (!Number.isFinite(raw)) return AVATAR_LISTENING_IDLE_DEFAULT_MS;
+    return Math.min(AVATAR_LISTENING_IDLE_MAX_MS, Math.max(AVATAR_LISTENING_IDLE_MIN_MS, Math.round(raw)));
+  };
+  let avatarListeningTimer = null;
+  let avatarListeningActivityAt = 0;
+  let avatarListeningIdleCount = 0;
+  const clearAvatarListeningIdle = () => {
+    if (avatarListeningTimer !== null) clearTimeout(avatarListeningTimer);
+    avatarListeningTimer = null;
+  };
+  /**
+   * One-shot deadline instead of polling: exact for any configured N, and only alive while
+   * `listening`. Every real ASR activity re-arms it. Fire → re-check (activity may have arrived
+   * between the deadline and this callback).
+   */
+  const armAvatarListeningIdle = () => {
+    clearAvatarListeningIdle();
+    const current = avatarRuntime;
+    if (current === null || current.snapshot().disposed === true || current.snapshot().status !== 'listening') return;
+    const remaining = avatarListeningIdleMs() - (Date.now() - avatarListeningActivityAt);
+    avatarListeningTimer = setTimeout(avatarListeningIdleCheck, Math.max(250, remaining));
+    avatarListeningTimer.unref?.();
+  };
+  /** Back to `waiting` — never a fabricated `idle`: the existing waiting→tired→idle draw owns that. */
+  const avatarListeningIdleCheck = () => {
+    clearAvatarListeningIdle();
+    const current = avatarRuntime;
+    if (current === null) return;
+    const snap = current.snapshot();
+    if (snap.disposed === true || snap.status !== 'listening') return;
+    const idleMs = Date.now() - avatarListeningActivityAt;
+    if (idleMs < avatarListeningIdleMs()) {
+      armAvatarListeningIdle();
+      return;
+    }
+    avatarListeningIdleCount += 1;
+    avatarStatus('waiting', 'listening-idle');
+    void log.emit('avatar.listening.idle', { level: 'debug', idleMs, count: avatarListeningIdleCount }).catch(() => {});
+  };
+  /**
+   * One real ASR event (partial/final). It refreshes the listening deadline even while a newer
+   * thinking/speaking state owns the motion, and only claims `listening` from a quiet state so a
+   * barge-in never overwrites the speaking path.
+   */
+  const avatarVoiceActivity = (reason) => {
+    avatarListeningActivityAt = Date.now();
+    if (avatarRuntime !== null && avatarRuntime.snapshot().status === 'listening') {
+      armAvatarListeningIdle();
+      return;
+    }
+    avatarStatusIf(['idle', 'waiting', 'tired'], 'listening', reason);
+  };
   /** Host event → temporary motion state; ignored while the runtime is absent/disposed. */
   const avatarStatus = (status, reason = '') => {
     const current = avatarRuntime;
     if (current === null || current.snapshot().disposed === true) return;
     const result = current.setStatus(status, { reason });
     if (result.changed === true) {
+      // `listening` is the only state with an expiry: entering starts the deadline, leaving clears it.
+      if (status === 'listening') {
+        avatarListeningActivityAt = Date.now();
+        armAvatarListeningIdle();
+      } else if (result.previous === 'listening') {
+        clearAvatarListeningIdle();
+      }
       void log.emit('avatar.state', { status, previous: result.previous, reason }).catch(() => {});
     }
   };
@@ -3405,7 +3483,13 @@ export function apply(ctx, config) {
   const avatarStyleHousekeeping = () => {
     void refreshAvatarStyle();
     const snap = avatarRuntime?.snapshot();
-    if (snap?.connected !== true) return;
+    if (snap === undefined) return;
+    // Belt and braces for the one-shot listening deadline: a suspended host may never run its
+    // timer. This only re-runs the same check — it never fabricates an idle event.
+    if (snap.status === 'listening' && Date.now() - avatarListeningActivityAt >= avatarListeningIdleMs()) {
+      avatarListeningIdleCheck();
+    }
+    if (snap.connected !== true) return;
     if (snap.status === 'waiting' && snap.idleSince !== null
       && Date.now() - snap.idleSince > AVATAR_STYLE_IDLE_TIRED_MS) {
       avatarStatus('tired', 'idle-timeout');
@@ -13407,6 +13491,13 @@ export function apply(ctx, config) {
             void log.emit(type, payload).catch(() => {});
           },
           onUpdate: (event) => {
+            // Real ASR activity — not an open microphone — is the only thing that may claim
+            // `listening`; silence then degrades it back to waiting (see avatar-listening-idle).
+            if (typeof event.partial === 'string' && event.partial.length > 0) {
+              avatarVoiceActivity('hearing.partial');
+            } else if (typeof event.final === 'string' && event.final.length > 0) {
+              avatarVoiceActivity('hearing.final');
+            }
             // Observation only: a Laughter tag opens the timed cue; the final text below can only
             // CLEAR it. Nothing here delays, filters or rewrites the transcript.
             nonverbalCue.observe({
@@ -13510,8 +13601,10 @@ export function apply(ctx, config) {
       // Capture is open: hold the shared summary open (a previous stop left it idle).
       dialogueSummary.acquire('mic');
       await log.emit('hearing.start', { device });
-      // Listening is a temporary state: slightly smaller motion + steady gaze, baseline unchanged.
-      avatarStatus('listening', 'hearing.start');
+      // Capture is open, but no speech has arrived yet: `waiting` keeps the idle mapping alive.
+      // The first real ASR partial/final (`avatarVoiceActivity`) or the turn's `voice.request`
+      // moves the state on; reopening the mic never clobbers a sounding/thinking round.
+      avatarStatusIf(['idle', 'tired', 'listening'], 'waiting', 'hearing.start');
       // A manual start (hotkey / tool / settings page) also clears an autostart failure note.
       hearingAutostart?.clearDeferred();
       return { ok: true, running: true, device, devices, error: '', instanceId: hearing?.instanceId ?? '' };
