@@ -844,6 +844,13 @@ test('8. a failed organizer plays the new conclusion and never spends the budget
 
   state.holdGate.resolve();
   await waitUntil(() => app.spokenRequests().length === 2, 'the carry round asked the organizer');
+  // P2-3: the whole-answer (blocking) outlet names the current question too; the carried points are
+  // extra context, never a replacement for what this turn actually asked.
+  const carryRequest = app.spokenRequests().at(-1);
+  assert.ok(String(carryRequest.system).includes('【当前用户问题】补充一下，那编码器呢'),
+    'the blocking answer rewrite carries the current user question');
+  assert.ok(String(carryRequest.user).includes('<上一轮待传达>'),
+    'the carried points are still passed beside the question');
   const fallback = await app.waitForEvent('voice.spoken.fallback');
   assert.equal(fallback.reason, 'empty', 'the organizer returned no usable spoken version');
 

@@ -158,6 +158,11 @@ const FULL_READ_UTTERANCE = '详细讲一下明天的天气';
 
 const spokenRequestOf = (options) => String(options?.system ?? '').includes('可直接朗读的口语版')
   || String(options?.messages?.[0]?.content?.[0]?.text ?? '').includes('<完整答复>');
+/** The two text halves a spoken-version request sends; used to compare/assert question input. */
+const requestTextOf = (options) => ({
+  system: String(options?.system ?? ''),
+  user: String(options?.messages?.[0]?.content?.[0]?.text ?? ''),
+});
 
 /**
  * Real mounted host: synthetic microphone + fake TTS/player/subtitle + a fake agent loop. The only
@@ -726,6 +731,8 @@ test('12. the typed spoken-version prompt is a five-step need-oriented guide wit
   const system = String(app.spokenRequests[0].system ?? '');
   assertNeedGuide(system, 'typed');
   assert.ok(system.includes(PERSONA_LINE), 'the persona content is still passed to the rewrite');
+  assert.ok(system.includes('【当前用户问题】明天出门要注意什么'),
+    'typed: the current user question is part of the request');
   assert.equal(app.spokenRequests.length, 1, 'one request: the five steps run inside it, no separate analysis call');
   await playText(app, RECOMMEND_SPOKEN);
   t.diagnostic(`lane=typed systemChars=${system.length} steps=5 separateAnalysisCalls=0`);
@@ -738,6 +745,8 @@ test('13. the answer/stream spoken-version prompt uses the same five-step guide'
   await waitUntil(() => app.spokenRequests.length >= 1, 'the streamed spoken-version request was made');
   const system = String(app.spokenRequests[0].system ?? '');
   assertNeedGuide(system, 'answer');
+  assert.ok(system.includes('【当前用户问题】推荐哪个'),
+    'streamed answer: the current user question is part of the request');
   assert.equal(app.spokenRequests.length, 1, 'one request: no extra analysis call');
   // The longer guide does not buy a larger output budget: the existing sizing is untouched.
   assert.equal(
@@ -753,6 +762,34 @@ test('13. the answer/stream spoken-version prompt uses the same five-step guide'
     `lane=answer systemChars=${system.length} requestCalls=${app.spokenRequests.length} `
     + `maxTokens=${app.spokenRequests[0].maxTokens} source=${version.source}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 13b. P2-3: every spoken-version request carries THIS turn's question
+// ---------------------------------------------------------------------------
+test('20. 相同正文 + 不同问题 → 口语版请求不同；相同问题 + 相同正文 → 请求稳定', async (t) => {
+  const questionA = '只比较 B 的维护成本，不要推荐 A';
+  const questionB = '只推荐 C，并说明理由';
+  const requestFor = async (utterance) => {
+    const app = await mountRound(t);
+    app.driveTyped(1, { body: RECOMMEND_BODY, utterance });
+    await waitUntil(() => app.spokenRequests.length >= 1, `the spoken-version request for "${utterance}"`);
+    return requestTextOf(app.spokenRequests[0]);
+  };
+  const first = await requestFor(questionA);
+  const second = await requestFor(questionB);
+  const repeated = await requestFor(questionA);
+
+  assert.ok(first.system.includes(`【当前用户问题】${questionA}`), 'question A is in the request');
+  assert.ok(first.system.includes('<完整答复>') || first.user.includes('<完整答复>'),
+    'the complete answer is still the request body');
+  assert.ok(!first.system.includes(questionB), 'a different turn\'s question is never mixed in');
+  assert.ok(second.system.includes(`【当前用户问题】${questionB}`), 'question B is in the request');
+  assert.notEqual(second.system, first.system, 'same body with a different question changes the request');
+  assert.equal(repeated.system, first.system, 'same question + same body keeps the request stable');
+  assert.equal(repeated.user, first.user, 'the answer body is unchanged by the question');
+  t.diagnostic(`qA=${first.system.length}chars qB=${second.system.length}chars `
+    + `different=${second.system !== first.system} stable=${repeated.system === first.system}`);
 });
 
 // 14. Recommendation: first choice + reason + tradeoff, never the whole table.

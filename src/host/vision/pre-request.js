@@ -16,9 +16,9 @@
  * turn can never overwrite a newer turn's frame; a late failure clears only its own entry. Scopes
  * are per session, so two sessions preparing concurrently never share or evict each other's frame.
  * `take()`/`peek()` accept the caller's `{sessionId, turn}`; a mismatch is a miss
- * (`session-changed` / `turn-changed`) and returns null. A caller that passes no ownership still
- * reads the scope opened by the last `beginTurn` — the index side does that today, and its two call
- * sites are the pending wiring, not this module's business.
+ * (`session-changed` / `turn-changed`) and returns null. `index` names that owner for both visual
+ * tools, so a late tool call cannot borrow a newer turn's frame. A caller that passes no ownership
+ * still reads the scope opened by the last `beginTurn` (the legacy tool-only fallback).
  *
  * Privacy (or a mode change) clears the channel; a cleared channel is a miss and is never read
  * as a fallback. Reuse only returns the existing shot object: the file, size, source label and
@@ -141,6 +141,17 @@ export function createPreRequestVision({
     });
   }
 
+  /**
+   * Resolve a write's owner: a scope handed back by `beginTurn`/`prepare`, a caller attribution
+   * `{sessionId, turn}`, or (no owner) the last scope opened by `beginTurn`. `null` means the
+   * write has no live scope and is refused.
+   */
+  function scopeOf(owner) {
+    if (owner === null || owner === undefined) return active;
+    const scope = typeof owner.key === 'string' ? owner : resolveScope(owner);
+    return scope !== null && scope !== undefined && isCurrent(scope) ? scope : null;
+  }
+
   /** Drop any frame this session published for another turn; reports whether one existed. */
   function dropOtherTurns(sessionId, keepKey) {
     let dropped = false;
@@ -162,11 +173,12 @@ export function createPreRequestVision({
   }
 
   /** Fresh frame for this exact scope, or null. Does not emit or mutate. */
-  function peek({ sessionId = '', turn, source = 'desktop', scene = '' } = {}) {
+  function peek({ sessionId = '', turn, source = 'desktop', scene = '', kind = null } = {}) {
     const scope = resolveScope({ sessionId, turn });
     if (scope === null) return null;
     const entry = snapshots.get(scope.key);
     if (entry === undefined) return null;
+    if (kind !== null && entry.kind !== kind) return null;
     if (entry.source !== source) return null;
     if ((entry.scene ?? '') !== (scene ?? '')) return null;
     const capturedAt = Number(entry.capturedAt);
@@ -183,9 +195,11 @@ export function createPreRequestVision({
    * `sessionId`/`turn` are the CALLER's ownership. When given, a frame published for another
    * session or another turn is never served: the read is a miss (`session-changed` /
    * `turn-changed`). Without them the last scope opened by `beginTurn` is used, which is the
-   * pre-wiring behavior.
+   * pre-wiring behavior. `kind` filters the product: `shot` is the one-shot frame `assistant_see`
+   * reuses, `storyboard` is a packed time sequence; asking for the other kind is a
+   * `kind-mismatch` miss and never a silent substitute.
    */
-  function take({ sessionId = '', turn, source = 'desktop', scene = '' } = {}) {
+  function take({ sessionId = '', turn, source = 'desktop', scene = '', kind = null } = {}) {
     if (blocked()) {
       snapshots.clear();
       miss('privacy');
@@ -233,6 +247,12 @@ export function createPreRequestVision({
         return null;
       }
       miss('no-snapshot');
+      return null;
+    }
+    // A one-shot frame and a storyboard are different products: a caller that asks for one kind
+    // never gets the other (watch must pack a real time sequence, see must get one frame).
+    if (kind !== null && entry.kind !== kind) {
+      miss('kind-mismatch');
       return null;
     }
     if (entry.source !== source) {
@@ -283,7 +303,7 @@ export function createPreRequestVision({
       miss('privacy');
       return null;
     }
-    const cached = peek({ sessionId, turn: scope.turn, source, scene });
+    const cached = peek({ sessionId, turn: scope.turn, source, scene, kind: 'shot' });
     if (cached !== null) return cached.shot;
     if (typeof runCapture !== 'function') {
       failed.add(scope.key);
@@ -322,14 +342,13 @@ export function createPreRequestVision({
    * (or `prepare`) may hold a snapshot: a tool-only flow without a pre-step stays uncached, which
    * keeps every existing "each look is a new capture" contract intact.
    *
-   * `owner` binds the write to the scope the frame was captured for; when that scope is no longer
-   * the current one the write is refused, so nothing can resurrect an old turn. Without `owner`
-   * the write belongs to the last scope opened by `beginTurn` (the index call sites today).
+   * `owner` binds the write to the scope the frame was captured for; a caller `{sessionId, turn}`
+   * is resolved through the live scope, and a stale one is refused, so nothing can resurrect an
+   * old turn. Without `owner` the write belongs to the last scope opened by `beginTurn` (legacy).
    */
   function remember(shot, { source = 'desktop', scene = '', kind = 'shot', owner = null } = {}) {
-    const scope = owner ?? active;
+    const scope = scopeOf(owner);
     if (scope === null || shot === null || shot === undefined) return null;
-    if (owner !== null && !isCurrent(owner)) return null;
     const capturedAt = Number(shot.capturedAt ?? shot.at);
     const entry = {
       shot,

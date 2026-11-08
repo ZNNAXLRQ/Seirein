@@ -232,13 +232,13 @@ export const CONTINUATION_PROBE_MS = 1200;
  * they count is already made, and the window is flushed lazily by the next same-class row (or at
  * session end) — no timer is ever created for a log.
  */
-export const LOG_SUMMARY_WINDOW_MS = 60_000;
+const LOG_SUMMARY_WINDOW_MS = 60_000;
 
 /** One silence-only endpoint line out of this many reaches the log; the others are counted. */
-export const ENDPOINT_SILENCE_SAMPLE_EVERY = 10;
+const ENDPOINT_SILENCE_SAMPLE_EVERY = 10;
 
 /** Skipped delivery slots folded into one `asr.delivery.order.summary` row. */
-export const DELIVERY_SKIP_SUMMARY_MAX = 100;
+const DELIVERY_SKIP_SUMMARY_MAX = 100;
 
 /**
  * Start streaming recognition.

@@ -5,7 +5,9 @@
  * attachments are doubles: no screen, ffmpeg, OBS process, virtual camera or real attachment store
  * is touched.
  *
- *   ① one preparation + two visual reads in the same turn -> ONE capture, reused event;
+ *   ① one preparation + assistant_see -> ONE capture; a watch take still packs a real
+ *     storyboard (a single prepared frame is never served as a time sequence);
+ *   ①b a late tool call names its own turn and never borrows the newer turn's frame;
  *   ② a new turn / an expired snapshot -> miss + a real re-capture;
  *   ③ a source/scene switch or privacy -> the cache is never reused (and privacy never captures);
  *   ④ a non-reuse delivery keeps the exact same result shape and image block;
@@ -16,7 +18,8 @@
  *   ⑦ a late failure clears only its own entry and keeps the new turn's frame;
  *   ⑧ two sessions preparing concurrently keep one frame each;
  *   ⑨ take() with a mismatched session/turn/source/scene is a miss and returns null;
- *   ⑩ same-turn reuse still holds (attributed and unattributed callers).
+ *   ⑩ same-turn reuse still holds (attributed and unattributed callers);
+ *   ⑪ `kind` separates a one-shot frame from a packed storyboard.
  *
  * Run: node --test test/vision-pre-request.mjs
  */
@@ -152,7 +155,10 @@ function fakeSession({ dir, source }) {
     sourceKind: source?.kind ?? 'screen',
     async take() {
       state.takeCalls += 1;
-      return writeShot(dir, Buffer.from('PNGDATA-STORYBOARD'), 'sheet.png');
+      const shot = await writeShot(dir, Buffer.from('PNGDATA-STORYBOARD'), 'sheet.png');
+      // A real storyboard packs the frames its buffer collected; the test keeps that shape so
+      // `framesInSheet` can prove the pack really happened.
+      return { ...shot, frames: 6, from: 1, to: 6 };
     },
     stats: () => ({ frames: 12, sheets: state.takeCalls, engine: 'fake' }),
     stop() { if (!stopped) { stopped = true; done.resolve(); } },
@@ -279,22 +285,28 @@ async function fixture(t, { preRequestTtlMs = 30_000 } = {}) {
   return { root, call, runPreStep, events, waitForEvent };
 }
 
-test('① 同一轮准备后两次视觉读取共享一次采集（see + watch take 复用）', async (t) => {
+test('① 同轮预取：see 复用单帧，watch take 不拿单帧冒充故事板，仍打包时序故事板', async (t) => {
   const app = await fixture(t);
   const decision = await app.runPreStep({ turn: 1, text: '帮我看看这个画面' });
   assert.notEqual(decision?.kind, 'reject', 'pre-step returns the base decision untouched');
   assert.equal(state.captures, 1, 'preparation captured once before the first request');
   assert.equal(state.starts, 0, 'preparation never starts a persistent storyboard by itself');
 
+  // assistant_see is the ONE consumer of the prepared single frame: it reuses it.
+  const look = await app.call('assistant_see', { reason: 'same turn' });
+  assert.equal(look.value.ok, true, look.value.reason);
+  assert.equal(state.captures, 1, 'see reused the one preparation capture');
+
   assert.equal((await app.call('assistant_watch', { action: 'start' })).value.ok, true);
   const take = await app.call('assistant_watch', { action: 'take' });
   assert.equal(take.value.ok, true, take.value.error);
   assert.equal(take.value.ready, true);
-  assert.equal(state.takeCalls, 0, 'watch take reused the prepared frame instead of packing a sheet');
-
-  const look = await app.call('assistant_see', { reason: 'same turn' });
-  assert.equal(look.value.ok, true, look.value.reason);
-  assert.equal(state.captures, 1, 'both visual reads reused the one preparation capture');
+  // P2-2 regression: a prepared single frame is a `shot`, never a storyboard. watch must pack.
+  assert.ok(take.value.framesInSheet > 0, `watch packed a storyboard (framesInSheet=${take.value.framesInSheet})`);
+  assert.ok(state.takeCalls > 0, `storyboard packing ran (takeCalls=${state.takeCalls})`);
+  assert.notEqual(take.value.file, look.value.file, 'watch delivered a packed sheet, not the one-shot frame');
+  assert.equal(take.value.framesInSheet, 6);
+  assert.equal(state.captures, 1, 'watch packing is not a second one-shot capture');
   assert.equal(state.saves.length, 2, 'each read still delivers its own attachment');
 
   const reused = await app.waitForEvent('vision.pre-request.reused', (event) => event.payload?.turn === 1);
@@ -304,7 +316,35 @@ test('① 同一轮准备后两次视觉读取共享一次采集（see + watch t
   assert.equal(typeof reused.payload.ageMs, 'number');
   assert.ok(reused.payload.ageMs >= 0 && reused.payload.ageMs < 30_000);
   t.diagnostic(`reuse: turn=${reused.payload.turn} ageMs=${reused.payload.ageMs} `
-    + `source=${reused.payload.source} captures=${state.captures} takeCalls=${state.takeCalls}`);
+    + `source=${reused.payload.source} captures=${state.captures} takeCalls=${state.takeCalls} `
+    + `framesInSheet=${take.value.framesInSheet}`);
+});
+
+test('①b P2-1 迟到的工具轮以自己 turn 归属：不复用新轮缓存', async (t) => {
+  const app = await fixture(t);
+  await app.runPreStep({ turn: 1, text: '看看屏幕上是什么' });
+  assert.equal(state.captures, 1);
+  // Turn 2 opens its own scope (no eager capture: it did not ask to look).
+  await app.runPreStep({ turn: 2, text: '今天聊点别的' });
+  await sleep(600); // leave the 500 ms same-source capture window
+
+  // A real turn-2 read captures and publishes turn 2's frame.
+  const current = await app.call('assistant_see', {}, { turn: 2 });
+  assert.equal(current.value.ok, true, current.value.reason);
+  assert.equal(state.captures, 2, 'turn 2 paid for its own frame');
+  await sleep(600);
+
+  // A tool call that still names turn 1 must not be served turn 2's frame. It reports the
+  // turn mismatch and takes its own capture (which cannot overwrite turn 2 either).
+  const late = await app.call('assistant_see', {}, { turn: 1 });
+  assert.equal(late.value.ok, true, late.value.reason);
+  assert.equal(state.captures, 3, 'the late turn-1 read paid for its own capture');
+  assert.notEqual(late.value.file, current.value.file, 'the late read did not receive turn 2 frame');
+  const miss = await app.waitForEvent('vision.pre-request.miss',
+    (event) => event.payload?.reason === 'turn-changed');
+  assert.ok(miss !== undefined, 'the late call is a turn-changed miss, not a cache hit');
+  t.diagnostic(`late-tool-call: turn1Late=${late.value.file !== current.value.file} `
+    + `captures=${state.captures} miss=${miss.payload.reason}`);
 });
 
 test('② 跨轮 / 过期不复用：miss + 真实重新采集', async (t) => {
@@ -597,5 +637,40 @@ test('⑩ P2-1 同轮复用回归：同一 owner 的读取命中同一帧', asyn
   assert.equal(app.misses().length, 0);
   t.diagnostic(`same-turn: reused=${app.reused().length} turn=${app.reused()[0].payload.turn} `
     + `ageMs=${app.reused().map((event) => event.payload.ageMs).join('/')} misses=${app.misses().length}`);
+});
+
+test('⑪ P2-2 kind 过滤：单帧不是故事板，kind 不匹配 miss 且不吞掉单帧', async (t) => {
+  const app = unitChannel();
+  const shot = app.shotOf('shot');
+  assert.equal(await app.channel.prepare({ sessionId: 's', turn: 1, capture: async () => shot }), shot);
+
+  // assistant_watch asks for a storyboard: the prepared shot must not be served as one.
+  assert.equal(app.channel.take({ sessionId: 's', turn: 1, kind: 'storyboard' }), null);
+  assert.deepEqual(app.misses(), ['kind-mismatch']);
+  assert.equal(app.reused().length, 0);
+
+  // A kind mismatch does not delete the shot: assistant_see still reuses it.
+  assert.equal(app.channel.take({ sessionId: 's', turn: 1, kind: 'shot' })?.file, shot.file);
+  assert.equal(app.reused().length, 1);
+
+  // A storyboard published for the turn is only served to a storyboard reader.
+  const sheet = { ...shot, file: '/fake/sheet.png', frames: 6, from: 1, to: 6 };
+  const entry = app.channel.remember(sheet, {
+    kind: 'storyboard', owner: { sessionId: 's', turn: 1 },
+  });
+  assert.notEqual(entry, null, 'a caller attribution resolves to the live turn scope');
+  assert.equal(app.channel.state().snapshot.kind, 'storyboard');
+  assert.equal(
+    app.channel.take({ sessionId: 's', turn: 1, kind: 'storyboard' })?.file,
+    sheet.file,
+    'watch reuses a storyboard it packed in the same turn',
+  );
+  assert.equal(
+    app.channel.take({ sessionId: 's', turn: 1, kind: 'shot' }),
+    null,
+    'a storyboard is never served as a one-shot frame',
+  );
+  t.diagnostic(`kind: mismatch=${app.misses().join(',')} shotReuse=${app.reused().length} `
+    + `storyboardReuse=1 state.kind=${app.channel.state().snapshot.kind}`);
 });
 

@@ -21,7 +21,7 @@ import { displayMessageSnippet, normalizeDomain, scoreImportance, tokenizeQuery 
 
 export function createHostTools(deps) {
   return {
-    async executeSee(args, exec) {
+    async executeSee(args, exec, owner = null) {
       const {
         assertVisionToken, captureForAgent, capturedTokens, deliverSight, discardUndelivered,
         features, log, perceptionEvent, perceptionStat, sightDeliveryCheck, sightFailure, vision,
@@ -61,7 +61,8 @@ export function createHostTools(deps) {
       let shot = null;
       let stage = 'capture';
       try {
-        shot = await captureForAgent(args.reason, callSignal);
+        // P2-1: the host names the turn this read belongs to, so a late turn never reuses its frame.
+        shot = await captureForAgent(args.reason, callSignal, owner);
         const token = capturedTokens.get(shot);
         stage = 'precheck';
         assertVisionToken(token);

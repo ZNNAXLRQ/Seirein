@@ -837,6 +837,17 @@ const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不�
 输出一段连贯口语，一句话说清一个意思。`;
 
 /**
+ * The current user question, appended to every spoken-version request. The guide's first step is
+ * "identify what THIS turn needs", which the body alone cannot answer; without the question the
+ * rewrite can organize around the wrong part (e.g. "只比较 B 的维护成本，不要推荐 A"). Empty input
+ * adds nothing: the request never invents a question.
+ */
+function spokenQuestionContext(question) {
+  const text = String(question ?? '').trim();
+  return text.length === 0 ? '' : `\n\n【当前用户问题】${text}`;
+}
+
+/**
  * Deliver one voice request into a session. When another waiter already owns the session the
  * wait resolves immediately as busy; sending anyway would queue the text behind the previous
  * turn and speak that turn's answer as if it belonged to this utterance. In that case the
@@ -7364,7 +7375,8 @@ export function apply(ctx, config) {
         return blocks;
       },
     },
-    execute: tools.executeSee,
+    // The execute body lives in runtime/tools.js, so the turn owner travels as its third argument.
+    execute: (args, exec) => tools.executeSee(args, exec, preRequestOwner(exec)),
   });
 
   register({
@@ -8292,6 +8304,23 @@ export function apply(ctx, config) {
     },
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
+  /**
+   * Session -> the turn the pre-step opened. A tool call does not carry the pre-step payload, so
+   * this is the one source of `{sessionId, turn}` for `assistant_see` / `assistant_watch`; it is
+   * written exactly where `beginTurn` is, so both always name the same turn.
+   */
+  const preRequestTurnBySession = new Map();
+  /** The owner of the turn a tool call belongs to; `null` when no turn was opened for it. */
+  const preRequestOwner = (exec) => {
+    const sessionId = typeof exec?.agent?.session?.id === 'string' ? exec.agent.session.id : '';
+    if (sessionId.length === 0) return null;
+    // The call's own turn wins: a tool call that lands after a newer turn began must not borrow
+    // the newer turn's cache. The pre-step map is the fallback for a host that omits `exec.turn`;
+    // it is written from the same `payload.turn` `beginTurn` received.
+    const tracked = preRequestTurnBySession.get(sessionId);
+    const turn = Number.isSafeInteger(exec?.turn) ? exec.turn : tracked;
+    return Number.isSafeInteger(turn) ? { sessionId, turn } : { sessionId };
+  };
   let watcherStarting = null;
   let watcherStopping = Promise.resolve();
   const capturedTokens = new WeakMap();
@@ -8878,7 +8907,7 @@ export function apply(ctx, config) {
    * share one real capture. Each caller still gets its own result object and token, so delivery
    * re-validates mode/generation per call and a refused call cannot borrow the other's state.
    */
-  const captureForAgent = async (reason, callSignal) => {
+  const captureForAgent = async (reason, callSignal, owner = null) => {
     const baseToken = visionToken();
     // The caller's own signal covers this call's delivery, never the shared capture: a cancelled
     // waiter must be able to leave without aborting the frame another waiter is still waiting for.
@@ -8899,7 +8928,9 @@ export function apply(ctx, config) {
       // while the preparation waited must invalidate the snapshot, not reuse it.
       await assertProgramScene(token);
       assertVisionToken(token);
-      const prepared = preRequestVision.take({ source: reuseSource, scene: reuseScene });
+      const prepared = preRequestVision.take({
+        ...(owner ?? {}), source: reuseSource, scene: reuseScene, kind: 'shot',
+      });
       if (prepared !== null) {
         const reused = { ...prepared, source: token.mode };
         capturedTokens.set(reused, token);
@@ -9013,6 +9044,7 @@ export function apply(ctx, config) {
           source: captureToken.mode === 'scene' ? 'obs' : 'desktop',
           scene: captureToken.mode === 'scene' ? captureToken.scene : '',
           kind: 'shot',
+          owner,
         });
         // A fresh observation may prove where the user is: republish attention only when BOTH the
         // verified gaze channel and this real position exist; otherwise it stays untouched.
@@ -9084,6 +9116,7 @@ export function apply(ctx, config) {
     // Always open the turn scope: a snapshot from the previous turn must not be reused even
     // when this turn does not ask to look.
     preRequestVision.beginTurn({ sessionId, turn, source, scene });
+    preRequestTurnBySession.set(sessionId, turn);
     if (vision.mode === 'privacy' || visionChanging || visionDisposed) return;
     let enabled = false;
     try {
@@ -9100,7 +9133,7 @@ export function apply(ctx, config) {
       source,
       scene,
       signal: payload?.signal ?? null,
-      capture: () => captureForAgent('pre-request', payload?.signal),
+      capture: () => captureForAgent('pre-request', payload?.signal, { sessionId, turn }),
     });
   };
 
@@ -9561,16 +9594,20 @@ export function apply(ctx, config) {
       if (watcher === null) return { ...base, ok: false, error: '未开始采集（先执行 action=start）' };
       const session = watcher;
       const token = visionToken();
+      const owner = preRequestOwner(exec);
       let sheet;
       let reusedSheet = false;
       try {
         assertVisionToken(token);
         await assertProgramScene(token);
-        // P-48: the turn's prepared frame is preferred over taking a fresh storyboard. It was
-        // already verified when captured, and it keeps its original file/size/source metadata.
+        // P-48/P2-2: only a packed storyboard may be reused here. A turn's prepared single frame
+        // is a `shot`; handing it to watch would report ready:true with framesInSheet:0. A
+        // different kind is a miss, so the normal storyboard capture below keeps its time series.
         const prepared = preRequestVision.take({
+          ...(owner ?? {}),
           source: token.mode === 'scene' ? 'obs' : 'desktop',
           scene: token.mode === 'scene' ? token.scene : '',
+          kind: 'storyboard',
         });
         if (prepared !== null) {
           sheet = prepared;
@@ -9613,7 +9650,8 @@ export function apply(ctx, config) {
           preRequestVision.remember(sheet, {
             source: token.mode === 'scene' ? 'obs' : 'desktop',
             scene: token.mode === 'scene' ? token.scene : '',
-            kind: 'sheet',
+            kind: 'storyboard',
+            owner,
           });
         }
         // The sheet is the newest observation too: status.lastCaptureAt and the preview card
@@ -11774,7 +11812,7 @@ export function apply(ctx, config) {
         // `SPOKEN_VERSION_GUIDE` replaces it. Passing the existing `instruction` option as '' keeps
         // that prompt from being appended a second time (it does not change the channel itself).
         instruction: '',
-        system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}`,
+        system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenQuestionContext(utterance)}`,
         user: `<完整答复>\n${full}\n</完整答复>`,
         maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
         timeoutMs: SPOKEN_VERSION_TIMEOUT_MS,
@@ -12633,7 +12671,7 @@ export function apply(ctx, config) {
             // Same as the typed path: the guide is the whole prompt, so the channel's old
             // compression instruction is explicitly suppressed instead of being appended.
             instruction: '',
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${carryBlock}`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${carryBlock}${spokenQuestionContext(spoken)}`,
             user: carryText.length > 0
               ? composeCarryConveyUser(carryText, source)
               : `<完整答复>\n${source}\n</完整答复>`,
@@ -12989,7 +13027,7 @@ export function apply(ctx, config) {
           })();
           const profileBlock = profileText.length > 0 ? `\n\n【用户画像】\n${profileText}` : '';
           const stream = await requestTaskStream({
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenQuestionContext(spoken)}`,
             user: `<完整答复>\n${full}\n</完整答复>`,
             maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
             signal: controller.signal,
