@@ -7,9 +7,10 @@
  *   1. first frame black, retry succeeds -> the normal frame is delivered + `vision.capture.retried`;
  *   2. both frames black -> an explicit error, nothing delivered, status.virtualCamError readable;
  *   3. a normal frame -> no retry at all;
- *   4. the pure judge: identical small frames are black, identical large static frames are not;
- *   5. privacy -> no capture and no retry;
- *   6. regressions run as separate suites (see the task report).
+ *   4. a bright 1280x720 static page (4455 B, identical after 1.5 s) -> delivered, never retried;
+ *   5. the pure judge: only near-black pixels are black; small/identical/stale is only `static`;
+ *   6. privacy -> no capture and no retry;
+ *   7. regressions run as separate suites (see the task report).
  *
  * The Host is mounted for real; sight.js and obs.js are deterministic doubles, so no screen,
  * ffmpeg, OBS process, virtual camera or attachment store is touched. PNGs are real files built
@@ -54,6 +55,32 @@ const BLACK_FRAME = pngOf(1280, 720, () => [0, 0, 0]);
 /** A normal desktop-like frame: varied pixels, hundreds of KB. */
 const NORMAL_FRAME = pngOf(1280, 720, (x, y) => [
   (x * 7 + y) % 256, (x + y * 11) % 256, (x * 3 + y * 5) % 256,
+]);
+
+/** White page with black text-like bars; a real static page, not a black frame. */
+function pngOfBars(width, height, bars) {
+  const rgb = Buffer.alloc(width * height * 3, 255);
+  for (const [y, x0, w] of bars) {
+    for (let x = x0; x < x0 + w; x += 1) {
+      const offset = (y * width + x) * 3;
+      rgb[offset] = 0;
+      rgb[offset + 1] = 0;
+      rgb[offset + 2] = 0;
+    }
+  }
+  return encodePng(rgb, width, height);
+}
+
+/**
+ * The review's repro: 1280x720 white page, black bars (12000 dark px in total). It encodes to
+ * exactly 4455 bytes with luma mean 251.68 / std 28.91 — small and bright at the same time.
+ */
+const STATIC_PAGE = pngOfBars(1280, 720, [
+  [40, 372, 437], [63, 299, 316], [86, 592, 634], [118, 235, 489], [168, 377, 500],
+  [204, 657, 452], [239, 103, 908], [274, 10, 983], [286, 347, 745], [309, 781, 110],
+  [359, 375, 780], [380, 383, 731], [416, 532, 664], [451, 38, 846], [488, 252, 642],
+  [505, 546, 492], [544, 896, 263], [566, 255, 597], [624, 367, 486], [646, 296, 665],
+  [676, 651, 260],
 ]);
 
 const state = {
@@ -365,38 +392,85 @@ test('③ 正常画面：不重试（0 次）且不影响交付', async (t) => {
   assert.equal(vision.virtualCamError, null);
 });
 
-test('④ 判定规则：同哈希且字节小算黑帧，同哈希但字节大（静态页面）不误判', () => {
-  // A small but colourful image: not near-black, so only the duplicate rules can catch it.
+test('④ 亮色静态页（1280×720、4455 B、同哈希、间隔 1.5 s）：不判黑、不重试、可交付', async (t) => {
+  assert.equal(STATIC_PAGE.length, 4455, 'the repro frame is small by design');
+  const app = await fixture(t);
+  await enterScene(app);
+
+  state.captures = [STATIC_PAGE];
+  const first = await app.call('assistant_see', {});
+  assert.equal(first.value.ok, true, first.value.reason);
+  assert.equal(first.value.bytes, STATIC_PAGE.length);
+  assert.equal(first.value.attachment?.id, 'att-1');
+
+  // The same pixels again after a real wait: identical + small + stale, but still a picture.
+  await sleep(1500);
+  state.captures = [STATIC_PAGE];
+  const second = await app.call('assistant_see', {});
+  assert.equal(second.value.ok, true, second.value.reason);
+  assert.equal(second.value.attachment?.id, 'att-2', 'the identical bright frame is delivered too');
+
+  assert.equal(state.captureCalls, 2, 'one capture per look; a static frame never triggers a retry');
+  assert.equal(state.saves.length, 2, 'nothing was discarded as a black frame');
+  const events = await app.events();
+  assert.equal(events.some((event) => event.type === 'vision.capture.retried'), false);
+  assert.equal(events.some((event) => event.type === 'vision.capture.black'), false);
+  const vision = (await app.call('assistant_vision', { action: 'status' })).value;
+  assert.equal(vision.virtualCamError, null);
+});
+
+test('⑤ 判定依据：只有近黑算黑帧；小文件/同哈希/长时间不变只标 static', () => {
+  // The review repro: bright static page, 4455 bytes, mean 251.68 / std 28.91.
+  const pageFirst = assessFrame({ data: STATIC_PAGE, at: 1000 });
+  assert.equal(pageFirst.black, false);
+  assert.equal(pageFirst.static, false);
+  assert.equal(pageFirst.reason, '');
+  assert.ok(Math.abs(pageFirst.frame.stats.mean - 251.68) < 0.01, `mean ${pageFirst.frame.stats.mean}`);
+  assert.ok(Math.abs(pageFirst.frame.stats.std - 28.91) < 0.01, `std ${pageFirst.frame.stats.std}`);
+  const pageAgain = assessFrame({ data: STATIC_PAGE, at: 2500, previous: pageFirst.frame });
+  assert.equal(pageAgain.black, false, 'bright identical pixels are never a black frame');
+  assert.equal(pageAgain.static, true, 'unchanged pixels are only a static clue');
+  assert.equal(pageAgain.reason, 'static-unchanged');
+
+  // A small bright image twice: static, never black (the old duplicate-small rule is gone).
   const tiny = pngOf(16, 16, () => [200, 40, 40]);
   const tinyFirst = assessFrame({ data: tiny, at: 1000 });
   assert.equal(tinyFirst.black, false, 'one small colourful frame is a normal frame');
   const tinyAgain = assessFrame({ data: tiny, at: 1100, previous: tinyFirst.frame });
-  assert.equal(tinyAgain.black, true, 'two identical small frames are a stuck/no-signal frame');
-  assert.equal(tinyAgain.reason, 'duplicate-small');
+  assert.equal(tinyAgain.black, false);
+  assert.equal(tinyAgain.static, true);
+  assert.equal(tinyAgain.reason, 'static-identical');
   const tinyLate = assessFrame({ data: tiny, at: 2600, previous: tinyFirst.frame });
-  assert.equal(tinyLate.black, true, 'the same small frame held across a wait is still black');
-  assert.equal(tinyLate.reason, 'identical-small-stale');
+  assert.equal(tinyLate.black, false, 'the same small frame held across a wait is still a picture');
+  assert.equal(tinyLate.static, true);
+  assert.equal(tinyLate.reason, 'static-unchanged');
 
   // A static page: the same sheet twice, hundreds of KB. Identical is NOT black by itself.
   const normalFirst = assessFrame({ data: NORMAL_FRAME, at: 1000 });
   assert.equal(normalFirst.black, false);
   const normalAgain = assessFrame({ data: NORMAL_FRAME, at: 3000, previous: normalFirst.frame });
   assert.equal(normalAgain.black, false, 'an unchanged large static page is not a black frame');
+  assert.equal(normalAgain.static, true);
 
-  // The startup frame itself: uniform black pixels.
+  // The startup frame itself: uniform black pixels, which is the only thing that is black.
   const black = assessFrame({ data: BLACK_FRAME, at: 1000 });
   assert.equal(black.black, true);
   assert.equal(black.reason, 'near-black');
+  assert.equal(black.static, false);
   assert.ok(BLACK_FRAME.length < 10 * 1024, `the failing frame shape is small (${BLACK_FRAME.length} bytes)`);
   const stats = pngLumaStats(BLACK_FRAME);
   assert.equal(stats.mean, 0);
   assert.equal(stats.std, 0);
+  const blackAgain = assessFrame({ data: BLACK_FRAME, at: 2500, previous: black.frame });
+  assert.equal(blackAgain.black, true, 'a second consecutive black frame is still black');
+  assert.equal(blackAgain.reason, 'near-black');
+  assert.equal(blackAgain.static, true);
 
   // Undecodable bytes are unknown, never "black": capture-format problems are not our call.
   assert.equal(assessFrame({ data: Buffer.from('PNGDATA-NOT-REAL'), at: 1 }), null);
 });
 
-test('⑤ 隐私期间：不抓取、不重试', async (t) => {
+test('⑥ 隐私期间：不抓取、不重试', async (t) => {
   const app = await fixture(t);
   await enterScene(app);
   const privacy = await app.call('assistant_vision', { action: 'set', mode: 'privacy' });

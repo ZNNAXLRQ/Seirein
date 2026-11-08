@@ -10,22 +10,20 @@
  * decoded is never called black — an unknown image is a capture problem the capture layer already
  * reports, and inventing a verdict here would refuse real frames (and every test double).
  *
- * Three independent rules mark a frame as a suspected black / not-yet-live frame:
- *   1. near-black pixels: dark and almost no variance (the camera's startup frame);
- *   2. two consecutive identical frames whose bytes are abnormally small (a repeated no-signal
- *      frame; a real screen capture that small is essentially impossible);
- *   3. the same identical, small frame held across a real wait (the source never advanced).
+ * Only pixels decide "black": a frame is a suspected black / not-yet-live frame when its luma is
+ * near-black (dark and almost no variance) — the camera's startup frame. File size and an
+ * unchanged hash are NOT evidence of a black frame: a simple page, a text screen or a static
+ * slide is a small, identical picture with normal brightness, and refusing it would delete real
+ * content. Those signals only mark the verdict `static: true` for observation.
  */
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
 
-/** A screen-quality PNG under 10 KB is suspicious: the 1280x720 startup frame was ~4.3 KB. */
-export const BLACK_FRAME_SMALL_BYTES = 10 * 1024;
 /** Luma (0..255) at or below this mean counts as "near black". */
 export const BLACK_FRAME_MAX_MEAN = 12;
 /** Luma standard deviation at or below this counts as "no variance" (one colour). */
 export const BLACK_FRAME_MAX_STD = 4;
-/** Identical frames separated by at least this long mean the source never advanced. */
+/** Identical frames separated by at least this long are annotated as held/stale (never black). */
 export const BLACK_FRAME_SAME_MS = 900;
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -141,11 +139,14 @@ export function pngLumaStats(data) {
 /**
  * Judge one captured frame against the previous frame of the same source.
  *
+ * `black` is decided by pixels alone (near-black luma). An unchanged hash is only a `static`
+ * annotation: a small or long-held identical frame is a normal picture of a still scene.
+ *
  * The returned `frame` is the fingerprint to keep as `previous` for the next capture; it is only
  * ever produced for a decodable PNG, so two undecodable test doubles are never compared.
  *
  * @param {{data: Buffer, at?: number, previous?: object|null}} input
- * @returns {{black: boolean, reason: string, bytes: number, frame: object} | null}
+ * @returns {{black: boolean, static: boolean, reason: string, bytes: number, frame: object} | null}
  *   null when the image cannot be decoded: an unknown picture is never called black.
  */
 export function assessFrame({ data, at = Date.now(), previous = null } = {}) {
@@ -153,13 +154,13 @@ export function assessFrame({ data, at = Date.now(), previous = null } = {}) {
   if (stats === null) return null;
   const digest = createHash('sha256').update(data).digest('hex');
   const frame = { digest, bytes: data.length, at, stats };
-  let reason = '';
-  if (stats.mean <= BLACK_FRAME_MAX_MEAN && stats.std <= BLACK_FRAME_MAX_STD) {
-    reason = 'near-black';
-  } else if (previous !== null && previous.digest === digest && data.length < BLACK_FRAME_SMALL_BYTES) {
-    reason = Number.isFinite(previous.at) && Number.isFinite(at) && at - previous.at >= BLACK_FRAME_SAME_MS
-      ? 'identical-small-stale'
-      : 'duplicate-small';
-  }
-  return { black: reason !== '', reason, bytes: data.length, frame };
+  const nearBlack = stats.mean <= BLACK_FRAME_MAX_MEAN && stats.std <= BLACK_FRAME_MAX_STD;
+  const identical = previous !== null && previous.digest === digest;
+  const held = identical
+    && Number.isFinite(previous.at) && Number.isFinite(at)
+    && at - previous.at >= BLACK_FRAME_SAME_MS;
+  const reason = nearBlack
+    ? 'near-black'
+    : held ? 'static-unchanged' : identical ? 'static-identical' : '';
+  return { black: nearBlack, static: identical, reason, bytes: data.length, frame };
 }
