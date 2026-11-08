@@ -452,6 +452,40 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     lastSentAt: Number.NEGATIVE_INFINITY,
     lastAttemptAt: Number.NEGATIVE_INFINITY,
   };
+  /**
+   * Sender-side transport evidence. These FIVE phases are separate by construction and may never
+   * masquerade as each other:
+   *
+   *   prepared   a frame's parameter rows were assembled (per frame) — nothing was sent yet;
+   *   attempted  a transport call really started for those rows — still no acknowledgement;
+   *   committed  the transport answered `ok:true` AND the send still belonged to its own connection
+   *              generation/epoch and preset action identity — carries the payload rows and `at`;
+   *   failed     `ok:false` or a thrown send (`failed`, with `errorCode`) — never a commit;
+   *   stale      a result discarded because its generation/action changed before it settled.
+   *
+   * This is transport-level evidence only: it never claims the VTS pixels or the rendered model
+   * were verified (`visible.verifiable` stays false).
+   */
+  const transportEvidence = {
+    prepared: 0,
+    preparedRows: 0,
+    attempted: 0,
+    attemptedRows: 0,
+    committed: 0,
+    committedRows: 0,
+    failed: 0,
+    failedRows: 0,
+    stale: 0,
+    staleRows: 0,
+    lastPreparedAt: null,
+    lastAttemptedAt: null,
+    lastCommittedAt: null,
+    lastFailedAt: null,
+    lastStaleAt: null,
+    lastError: null,
+    lastErrorCode: null,
+    lastStaleReason: '',
+  };
   /** Output generation: bumped by lock/disconnect/close, so a queued old frame can never send. */
   let motionEpoch = 0;
   let motionLocked = false;
@@ -1192,10 +1226,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     const snap = inner.snapshot();
     const entries = motionEntries(frame.pose, frame.at, snap);
-    reportPresetTransport(entries, snap, {
+    // `prepared` only: the rows this frame assembled. Nothing here proves a send happened.
+    const ticket = beginTransportEvidence(entries, snap, {
       valueOf: (channel) => frame.pose[channel],
       speaking: mouthActiveForIdle(frame.at, snap),
       writtenInputs: new Set(entries.map((entry) => entry.input)),
+      at: frame.at,
     });
     if (entries.length === 0) return;
     // The token records which frame generation this RESULT belongs to; sendId owns the gate and
@@ -1225,14 +1261,22 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       pose: { ...frame.pose },
       entries,
     };
+    const writer = typeof transport?.writeMotion === 'function'
+      ? () => transport.writeMotion(payload)
+      : typeof transport?.writeFrame === 'function'
+        ? () => transport.writeFrame(entries)
+        : null;
+    if (writer === null) {
+      releaseMotionSend(sendId);
+      return;
+    }
+    // `attempted`: the transport call really starts here; the outcome is still unknown.
+    noteTransportAttempted(ticket, entries, frame.at);
     let sent;
     try {
-      sent = typeof transport?.writeMotion === 'function'
-        ? transport.writeMotion(payload)
-        : typeof transport?.writeFrame === 'function'
-          ? transport.writeFrame(entries)
-          : null;
+      sent = writer();
     } catch (error) {
+      noteTransportFailed(ticket, entries, error, clockNow());
       releaseMotionSend(sendId);
       motionPump.errors += 1;
       recordError(AVATAR_ERROR_CODES.WRITE_FAILED, `motion frame failed: ${errorText(error)}`, {
@@ -1247,17 +1291,27 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     send.handle = sent;
     Promise.resolve(sent)
       .then((result) => {
-        if (admitMotionSettle(send) !== true) return;
+        if (admitMotionSettle(send) !== true) {
+          noteTransportStale(ticket, entries, 'out-of-order', clockNow());
+          return;
+        }
         // A send the transport really cancelled never acts on the model: do not adopt its result.
-        if (send.aborted === true) return;
+        if (send.aborted === true) {
+          noteTransportStale(ticket, entries, 'aborted', clockNow());
+          return;
+        }
         if (result !== null && typeof result === 'object' && result.ok === false) {
-          throw new Error(String(result.reason ?? 'motion frame rejected'));
+          throw transportRejection(result, 'motion frame rejected');
         }
         // Adoption is decided by the token + frame validity; neither touches `inFlight`.
         if (motionPump.token !== token || motionAlive(frame) !== true) {
           motionPump.stale += 1;
+          noteTransportStale(ticket, entries, 'generation', clockNow());
           return;
         }
+        // `committed` only now: the transport said ok AND the send still belongs to this generation
+        // and this preset action. A late result is discarded, never counted as a commit.
+        noteTransportCommitted(ticket, entries, clockNow());
         motionPump.sent += 1;
         motionPump.writes += entries.length;
         countBreathEntries(entries, frame.at);
@@ -1265,8 +1319,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         motionPump.lastSentAt = clockNow();
       })
       .catch((error) => {
-        if (send.settled !== true && admitMotionSettle(send) !== true) return;
-        if (send.aborted === true) return;
+        if (send.settled !== true && admitMotionSettle(send) !== true) {
+          noteTransportStale(ticket, entries, 'out-of-order', clockNow());
+          return;
+        }
+        if (send.aborted === true) {
+          noteTransportStale(ticket, entries, 'aborted', clockNow());
+          return;
+        }
+        // `failed`: ok:false or a thrown send. Never a commit, whatever the gate state is.
+        noteTransportFailed(ticket, entries, error, clockNow());
         if (motionPump.sendId !== sendId) return;
         motionPump.errors += 1;
         recordError(AVATAR_ERROR_CODES.WRITE_FAILED, `motion frame failed: ${errorText(error)}`, {
@@ -2452,29 +2514,179 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
-   * Report what the ONE writer really built to the preset executor. `committed` evidence comes
-   * from these rows only — never from the computed pose — and a requested channel that was
-   * skipped is reported with the sender's reason instead.
+   * Capture one send's identity and record `prepared` BEFORE the transport is called. The ticket
+   * carries the connection generation/epoch and the preset action identity at assembly time, so a
+   * later settle can be checked against exactly the send it belongs to. `prepared` is parameters
+   * only: nothing here proves anything left the process.
    */
-  function reportPresetTransport(entries, snap, { valueOf, speaking = false, writtenInputs = null } = {}) {
+  function beginTransportEvidence(entries, snap, {
+    valueOf, speaking = false, writtenInputs = null, at = null,
+  } = {}) {
+    const frameAt = Number.isFinite(at) ? at : clockNow();
+    const ticket = {
+      rows: entries.length,
+      generation: state.generation,
+      connectionGeneration: state.connectionGeneration,
+      epoch: motionEpoch,
+      at: frameAt,
+      owners: null,
+      presetChannels: null,
+    };
+    if (entries.length > 0) {
+      transportEvidence.prepared += 1;
+      transportEvidence.preparedRows += entries.length;
+      transportEvidence.lastPreparedAt = frameAt;
+    }
     const requested = presetRequestedChannels(snap);
-    if (requested.length === 0) return;
-    const written = [];
-    const writtenChannels = new Set();
+    if (requested.length === 0) return ticket;
+    const wanted = new Set(requested);
+    const rows = [];
+    const built = new Set();
     for (const entry of entries) {
-      if (typeof entry?.channel !== 'string') continue;
-      writtenChannels.add(entry.channel);
-      written.push({ channel: entry.channel, value: entry.value });
+      if (typeof entry?.channel !== 'string' || wanted.has(entry.channel) !== true) continue;
+      if (!Number.isFinite(entry.value)) continue;
+      rows.push({ channel: entry.channel, value: entry.value });
+      built.add(entry.channel);
     }
     const skipped = [];
     for (const channel of requested) {
-      if (writtenChannels.has(channel)) continue;
+      if (built.has(channel)) continue;
       skipped.push({
         channel,
         reason: transportSkipReason(channel, { valueOf, speaking, writtenInputs }),
       });
     }
-    inner.notePresetTransport({ written, skipped });
+    ticket.presetChannels = wanted;
+    // The action identity a late result is matched against: the live trajectory's start sequence
+    // (its stable action id), its action generation, and the preset id it was drawn for.
+    ticket.owners = (snap?.motion?.presets?.active ?? [])
+      .filter((item) => (item.channels ?? []).some((channel) => wanted.has(channel)))
+      .map((item) => ({ seq: item.seq, generation: item.generation, presetId: item.presetId }));
+    inner.notePresetTransport({ phase: 'prepared', rows, skipped, at: frameAt });
+    return ticket;
+  }
+
+  /** The subset of one send's rows that a preset actually asked for (empty = no preset evidence). */
+  function presetRowsFor(ticket, rows) {
+    const channels = ticket?.presetChannels;
+    if (channels === null || channels === undefined) return [];
+    const matched = [];
+    for (const entry of Array.isArray(rows) ? rows : []) {
+      if (typeof entry?.channel !== 'string' || channels.has(entry.channel) !== true) continue;
+      if (!Number.isFinite(entry.value)) continue;
+      matched.push({ channel: entry.channel, value: entry.value });
+    }
+    return matched;
+  }
+
+  /** True while the send's own connection generation/epoch is still the current one. */
+  function sendStillCurrent(ticket) {
+    return ticket !== null
+      && state.disposed !== true
+      && state.connected === true
+      && state.generation === ticket.generation
+      && state.connectionGeneration === ticket.connectionGeneration
+      && motionEpoch === ticket.epoch;
+  }
+
+  /** The transport refused with `ok:false`; keep the transport code so `failed` names a cause. */
+  function transportRejection(result, fallback) {
+    const error = new Error(String(result?.reason ?? fallback));
+    error.code = String(result?.code ?? AVATAR_ERROR_CODES.WRITE_FAILED);
+    return error;
+  }
+
+  /** `attempted`: the transport call really started for these rows. Not an acknowledgement. */
+  function noteTransportAttempted(ticket, rows = null, at = null) {
+    if (ticket === null) return false;
+    const sentRows = Array.isArray(rows) ? rows : [];
+    if (sentRows.length === 0) return false;
+    const now = Number.isFinite(at) ? at : clockNow();
+    transportEvidence.attempted += 1;
+    transportEvidence.attemptedRows += sentRows.length;
+    transportEvidence.lastAttemptedAt = now;
+    const presetRows = presetRowsFor(ticket, sentRows);
+    if (presetRows.length > 0) {
+      inner.notePresetTransport({
+        phase: 'attempted', rows: presetRows, at: now, owners: ticket.owners,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * `committed`: only after `ok:true`, and only while the send still belongs to its own connection
+   * generation/epoch AND its preset action identity. A late result is discarded as stale and never
+   * booked to the current (or any newer) action.
+   */
+  function noteTransportCommitted(ticket, rows = null, at = null) {
+    if (ticket === null) return false;
+    const sentRows = Array.isArray(rows) ? rows : [];
+    const now = Number.isFinite(at) ? at : clockNow();
+    if (sendStillCurrent(ticket) !== true) {
+      noteTransportStale(ticket, sentRows, 'generation', now);
+      return false;
+    }
+    const presetRows = presetRowsFor(ticket, sentRows);
+    if (presetRows.length > 0) {
+      const verdict = inner.notePresetTransport({
+        phase: 'committed', rows: presetRows, at: now, owners: ticket.owners,
+      });
+      if (verdict?.stale === true) {
+        // The controller already recorded the stale verdict for its trace; count it here as well.
+        noteTransportStale(ticket, sentRows, verdict.reason || 'action-changed', now, { notifyPreset: false });
+        return false;
+      }
+    }
+    transportEvidence.committed += 1;
+    transportEvidence.committedRows += sentRows.length;
+    transportEvidence.lastCommittedAt = now;
+    return true;
+  }
+
+  /** `failed`: `ok:false` or a thrown send. Never a commit, always carries the error code. */
+  function noteTransportFailed(ticket, rows = null, error = null, at = null) {
+    const sentRows = Array.isArray(rows) ? rows : [];
+    const now = Number.isFinite(at) ? at : clockNow();
+    const code = String(error?.code ?? error?.errorCode ?? AVATAR_ERROR_CODES.WRITE_FAILED);
+    transportEvidence.failed += 1;
+    transportEvidence.failedRows += sentRows.length;
+    transportEvidence.lastFailedAt = now;
+    transportEvidence.lastError = errorText(error);
+    transportEvidence.lastErrorCode = code;
+    const presetRows = presetRowsFor(ticket, sentRows);
+    if (presetRows.length > 0) {
+      inner.notePresetTransport({
+        phase: 'failed',
+        rows: presetRows,
+        at: now,
+        owners: ticket?.owners ?? null,
+        error: { code, message: transportEvidence.lastError },
+      });
+    }
+    return false;
+  }
+
+  /** `stale`: the result was discarded because its generation/action identity moved on. */
+  function noteTransportStale(ticket, rows = null, reason = 'stale', at = null, { notifyPreset = true } = {}) {
+    const sentRows = Array.isArray(rows) ? rows : [];
+    const now = Number.isFinite(at) ? at : clockNow();
+    transportEvidence.stale += 1;
+    transportEvidence.staleRows += sentRows.length;
+    transportEvidence.lastStaleAt = now;
+    transportEvidence.lastStaleReason = String(reason ?? 'stale');
+    if (notifyPreset !== true) return false;
+    const presetRows = presetRowsFor(ticket, sentRows);
+    if (presetRows.length > 0) {
+      inner.notePresetTransport({
+        phase: 'stale',
+        rows: presetRows,
+        at: now,
+        owners: ticket?.owners ?? null,
+        reason: transportEvidence.lastStaleReason,
+      });
+    }
+    return false;
   }
 
   function recordIdleEvent(type, data = {}) {
@@ -3483,12 +3695,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       entries.push(breath);
       writtenInputs.add(breath.input);
     }
-    // Preset evidence is taken from the rows this flush really built, never from the pose: a
+    // `prepared` evidence is taken from the rows this flush really built, never from the pose: a
     // skipped channel is reported with the reason and cannot masquerade as committed.
-    reportPresetTransport(entries, snap, {
+    const ticket = beginTransportEvidence(entries, snap, {
       valueOf: (channel) => frame.get(channel),
       speaking,
       writtenInputs,
+      at,
     });
     if (entries.length === 0) return;
     lastIdleFrameAt = at;
@@ -3535,41 +3748,67 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       && state.generation === sentGeneration
       && state.connectionGeneration === sentConnection
       && motionEpoch === sentEpoch;
-    const sent = typeof transport?.writeFrame === 'function'
-      ? Promise.resolve(transport.writeFrame(entries)).then((result) => {
-        if (result !== null && typeof result === 'object' && result.ok === false) {
-          throw new Error(String(result.reason ?? 'idle frame rejected'));
-        }
-        if (stillCurrent() !== true) {
-          // A lock/disconnect/model switch landed while the send was in flight: this frame belongs
-          // to the old generation and must not update the live counters.
-          idleStats.stale += entries.length;
-          return;
-        }
-        idleStats.writes += entries.length;
-        countBreathEntries(entries, at);
-      })
-      : entries.reduce((chain, entry) => chain.then(async () => {
+    // One frame is either one coalesced `writeFrame` call or one call per row. Both paths record
+    // `attempted` only when the call really starts and `committed` only after `ok:true`.
+    const buildIdleSend = () => {
+      if (typeof transport?.writeFrame === 'function') {
+        noteTransportAttempted(ticket, entries, at);
+        return Promise.resolve(transport.writeFrame(entries)).then((result) => {
+          if (result !== null && typeof result === 'object' && result.ok === false) {
+            throw transportRejection(result, 'idle frame rejected');
+          }
+          if (stillCurrent() !== true) {
+            // A lock/disconnect/model switch landed while the send was in flight: this frame belongs
+            // to the old generation and must not update the live counters or become a commit.
+            idleStats.stale += entries.length;
+            noteTransportStale(ticket, entries, 'generation', clockNow());
+            return;
+          }
+          idleStats.writes += entries.length;
+          noteTransportCommitted(ticket, entries, clockNow());
+          countBreathEntries(entries, at);
+        });
+      }
+      return entries.reduce((chain, entry) => chain.then(async () => {
         if (stillCurrent() !== true) {
           idleStats.stale += 1;
+          noteTransportStale(ticket, [entry], 'generation', clockNow());
           return;
         }
-        const result = await writeThroughTransport(entry);
+        noteTransportAttempted(ticket, [entry], at);
+        let result;
+        try {
+          result = await writeThroughTransport(entry);
+        } catch (error) {
+          error.evidenceRows = [entry];
+          throw error;
+        }
         if (result !== null && typeof result === 'object' && result.ok === false) {
-          throw new Error(String(result.reason ?? 'idle write rejected'));
+          throw transportRejection(result, 'idle write rejected');
         }
         if (stillCurrent() !== true) {
           idleStats.stale += 1;
+          noteTransportStale(ticket, [entry], 'generation', clockNow());
           return;
         }
         idleStats.writes += 1;
+        noteTransportCommitted(ticket, [entry], clockNow());
         if (entry.channel === 'breath') {
           breathStats.writes += 1;
           breathStats.lastAt = at;
         }
       }), Promise.resolve());
+    };
+    let sent;
+    try {
+      sent = buildIdleSend();
+    } catch (error) {
+      // A synchronous throw from the transport is still one failed send: never a commit.
+      sent = Promise.reject(error);
+    }
     sent
       .catch((error) => {
+        noteTransportFailed(ticket, error?.evidenceRows ?? entries, error, clockNow());
         idleStats.skipped += entries.length;
         recordError(AVATAR_ERROR_CODES.WRITE_FAILED, `idle frame failed: ${errorText(error)}`, {
           source: 'idle-frame',
@@ -4215,6 +4454,31 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         lastFrameAt: motionPump.lastFrameAt,
         lastSentAt: motionPump.lastSentAt,
         ...innerSnap.motion,
+        /**
+         * Sender evidence, five phases kept apart: a prepared frame is not an attempted send, an
+         * attempted send is not a commit, and failed/stale results are never commits. Transport
+         * level only — it never claims the rendered model or the VTS pixels were verified.
+         */
+        transport: {
+          prepared: transportEvidence.prepared,
+          preparedRows: transportEvidence.preparedRows,
+          attempted: transportEvidence.attempted,
+          attemptedRows: transportEvidence.attemptedRows,
+          committed: transportEvidence.committed,
+          committedRows: transportEvidence.committedRows,
+          failed: transportEvidence.failed,
+          failedRows: transportEvidence.failedRows,
+          stale: transportEvidence.stale,
+          staleRows: transportEvidence.staleRows,
+          lastPreparedAt: transportEvidence.lastPreparedAt,
+          lastAttemptedAt: transportEvidence.lastAttemptedAt,
+          lastCommittedAt: transportEvidence.lastCommittedAt,
+          lastFailedAt: transportEvidence.lastFailedAt,
+          lastStaleAt: transportEvidence.lastStaleAt,
+          lastError: transportEvidence.lastError,
+          lastErrorCode: transportEvidence.lastErrorCode,
+          lastStaleReason: transportEvidence.lastStaleReason,
+        },
         /**
          * Evidence only: the last 5 ended-action traces (`avatar.action.trace`), newest last.
          * Read-only copies so a caller can never mutate the runtime's records.

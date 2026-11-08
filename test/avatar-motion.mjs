@@ -2794,3 +2794,130 @@ test('47. 只影响表情层：说话 headY 微动照常，眉回位后释放', 
   runtime.dispose();
 });
 
+// ---------------------------------------------------------------------------------------------
+// 48. sender evidence does not depend on a preset: prepared / attempted / committed / failed /
+//     stale stay separated on BOTH write paths (30 Hz pump and the legacy idle flush).
+// ---------------------------------------------------------------------------------------------
+test('48. 发送层证据不依赖预设：ok:false/异常不记 committed，成功才记，作废记 stale', async () => {
+  const transportStatus = (runtime) => runtime.snapshot().motion.transport;
+
+  // (a) 30 Hz continuous path, every send rejected with ok:false.
+  let clock = 0;
+  const rejected = [];
+  const rejecting = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: () => ({ ok: true }),
+    writeMotion: (payload) => {
+      rejected.push(payload.entries.map((entry) => ({ ...entry })));
+      return { ok: false, code: 'VTS_REJECTED', reason: 'rejected' };
+    },
+  };
+  const rejectedRuntime = await connectRuntime({
+    transport: rejecting,
+    now: () => clock,
+    config: motionConfig({ motionWrites: true, motionOutputHz: 30, seed: 3 }),
+  });
+  for (let index = 0; index < 6; index += 1) {
+    clock = index * DT;
+    rejectedRuntime.tick(clock);
+    await flushMicrotasks();
+  }
+  const rejectedStatus = transportStatus(rejectedRuntime);
+  assert.equal(rejectedStatus.attempted, rejected.length);
+  assert.equal(rejectedStatus.failed, rejected.length, 'every ok:false send is failed');
+  assert.equal(rejectedStatus.committed, 0, 'a rejected send never becomes a commit');
+  assert.equal(rejectedStatus.committedRows, 0);
+  assert.ok(rejectedStatus.prepared >= rejectedStatus.attempted);
+  assert.equal(rejectedStatus.lastErrorCode, 'VTS_REJECTED');
+  rejectedRuntime.dispose();
+
+  // (b) the same path with ok:true: every acknowledged send is one commit.
+  let okClock = 0;
+  const accepted = [];
+  const accepting = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: () => ({ ok: true }),
+    writeMotion: (payload) => {
+      accepted.push(payload.entries.map((entry) => ({ ...entry })));
+      return { ok: true };
+    },
+  };
+  const acceptedRuntime = await connectRuntime({
+    transport: accepting,
+    now: () => okClock,
+    config: motionConfig({ motionWrites: true, motionOutputHz: 30, seed: 5 }),
+  });
+  for (let index = 0; index < 6; index += 1) {
+    okClock = index * DT;
+    acceptedRuntime.tick(okClock);
+    await flushMicrotasks();
+  }
+  const acceptedStatus = transportStatus(acceptedRuntime);
+  assert.equal(acceptedStatus.attempted, accepted.length);
+  assert.equal(acceptedStatus.committed, accepted.length, 'one commit per ok:true send');
+  assert.equal(acceptedStatus.failed, 0);
+  assert.ok(Number.isFinite(acceptedStatus.lastCommittedAt));
+  acceptedRuntime.dispose();
+
+  // (c) a synchronous throw on the LEGACY idle path is a failed send, never a commit.
+  let idleClock = 0;
+  const throwing = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: () => ({ ok: true }),
+    writeFrame: () => { throw new Error('frame boom'); },
+  };
+  const throwingRuntime = await connectRuntime({
+    transport: throwing,
+    now: () => idleClock,
+    config: motionConfig({ motionWrites: false, idleWriteHz: 8, seed: 9 }),
+  });
+  for (let index = 0; index < 5; index += 1) {
+    idleClock = index * 50;
+    throwingRuntime.tick(idleClock);
+    await flushMicrotasks();
+  }
+  const throwingStatus = transportStatus(throwingRuntime);
+  assert.ok(throwingStatus.failed >= 1, `the thrown idle send was failed (${throwingStatus.failed})`);
+  assert.equal(throwingStatus.committed, 0);
+  assert.match(throwingStatus.lastError, /frame boom/);
+  assert.equal(throwingStatus.lastErrorCode, 'WRITE_FAILED');
+  throwingRuntime.dispose();
+
+  // (d) an in-flight send invalidated by a lock settles late: stale, never a commit.
+  let slowClock = 0;
+  let resolveSlow = null;
+  const slow = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: () => ({ ok: true }),
+    writeMotion: () => new Promise((resolve) => { resolveSlow = () => resolve({ ok: true }); }),
+  };
+  const slowRuntime = await connectRuntime({
+    transport: slow,
+    now: () => slowClock,
+    config: motionConfig({ motionWrites: true, motionOutputHz: 30, seed: 11 }),
+  });
+  slowClock = 0;
+  slowRuntime.tick(0);
+  assert.equal(transportStatus(slowRuntime).attempted, 1);
+  const committedBefore = transportStatus(slowRuntime).committed;
+  slowRuntime.lock('privacy');
+  resolveSlow();
+  await flushMicrotasks();
+  await flushMicrotasks();
+  const slowStatus = transportStatus(slowRuntime);
+  assert.equal(slowStatus.committed, committedBefore, 'the invalidated result is not a commit');
+  assert.ok(slowStatus.stale >= 1);
+  assert.equal(slowStatus.lastStaleReason, 'generation');
+  slowRuntime.dispose();
+
+  console.log(
+    `[transport-evidence] rejectedAttempted=${rejectedStatus.attempted} rejectedFailed=${rejectedStatus.failed}`
+    + ` rejectedCommitted=${rejectedStatus.committed} acceptedCommitted=${acceptedStatus.committed}`
+    + ` throwFailed=${throwingStatus.failed} stale=${slowStatus.stale}`,
+  );
+});
+

@@ -584,7 +584,29 @@ function clonePresetTrace(trace) {
       })),
       /** The controller's own pose (never a commit) and the rows the sender really built. */
       computed: { ...(trace.output?.computed ?? {}) },
+      /**
+       * Sender evidence, FIVE phases that may never masquerade as each other:
+       * prepared → assembled, attempted → transport call started, committed → `ok:true` acknowledged,
+       * failed → rejected/thrown, stale → result discarded because its generation/action moved on.
+       */
+      prepared: { ...(trace.output?.prepared ?? {}) },
+      preparedFrames: trace.output?.preparedFrames ?? 0,
+      attempted: { ...(trace.output?.attempted ?? {}) },
+      attemptedFrames: trace.output?.attemptedFrames ?? 0,
       committed: { ...(trace.output?.committed ?? {}) },
+      committedAt: { ...(trace.output?.committedAt ?? {}) },
+      failed: {
+        count: trace.output?.failed?.count ?? 0,
+        at: trace.output?.failed?.at ?? null,
+        codes: { ...(trace.output?.failed?.codes ?? {}) },
+        lastCode: trace.output?.failed?.lastCode ?? '',
+      },
+      stale: {
+        count: trace.output?.stale?.count ?? 0,
+        at: trace.output?.stale?.at ?? null,
+        reasons: { ...(trace.output?.stale?.reasons ?? {}) },
+        lastReason: trace.output?.stale?.lastReason ?? '',
+      },
       skippedByTransport: { ...(trace.output?.skippedByTransport ?? {}) },
       reason: trace.output?.reason ?? '',
     },
@@ -870,6 +892,22 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       recentActions: [],
       lastSign: Object.create(null),
       random: createSeededRandom(`preset:${cfg.seed === undefined ? 'default' : String(cfg.seed)}`),
+      /**
+       * Sender evidence counters across the whole controller life. Five phases, separate by
+       * construction: a prepared frame is not a sent one, a sent one is not an acknowledged one,
+       * and a stale/failed result is never counted as committed.
+       */
+      transport: {
+        prepared: 0,
+        attempted: 0,
+        committed: 0,
+        failed: 0,
+        stale: 0,
+        lastAt: null,
+        lastError: '',
+        lastErrorCode: '',
+        lastStaleReason: '',
+      },
     },
   };
 
@@ -1837,8 +1875,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         samples: [],
         /** Controller-computed pose only; it is NEVER copied into `committed`. */
         computed: {},
-        /** Payload rows that really entered the ONE transport writer (sender acknowledgement). */
+        /** Rows this frame assembled for the preset: parameters, NOT evidence of a send. */
+        prepared: {},
+        preparedFrames: 0,
+        /** Rows really handed to the transport; still no acknowledgement. */
+        attempted: {},
+        attemptedFrames: 0,
+        /** Values the transport acknowledged with `ok:true`, plus the time of that acknowledgement. */
         committed: {},
+        committedAt: {},
+        /** Rejected/thrown sends (`ok:false` or an exception), never a commit. */
+        failed: { count: 0, at: null, codes: {}, lastCode: '' },
+        /** Results discarded because their connection generation or preset identity moved on. */
+        stale: { count: 0, at: null, reasons: {}, lastReason: '' },
         /** Requested channels the sender refused, with its reason (e.g. `shared-input`). */
         skippedByTransport: {},
         peak: 0,
@@ -2390,40 +2439,164 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   /**
-   * Sender acknowledgement for the ONE transport write path. `written` lists the rows the sender
-   * really built (`{channel, value}`, value = the payload it received); `skipped` lists requested
-   * channels it refused (`{channel, reason}`). A channel counts as committed only here, never from
-   * the computed pose. A transient skip is kept as evidence even if a later frame writes it.
+   * Sender evidence for the ONE transport write path, in five phases that never masquerade:
+   *
+   *   prepared   rows this frame assembled (`output.prepared`, `preparedFrames`). A computed frame
+   *              is not a send: nothing left the process yet.
+   *   attempted  rows really handed to the transport (`output.attempted`, `attemptedFrames`). The
+   *              call started; the transport has NOT acknowledged anything yet.
+   *   committed  only after an `ok:true` answer, with the acknowledgement time (`committedAt`) and
+   *              the payload value. Requires every captured `owners` identity to still be the live
+   *              trajectory: a late success from an old preset may never land on the current one.
+   *   failed     `ok:false` or a thrown send (`failed.count`, `failed.codes`, `failed.lastCode`).
+   *              A failed send is never a commit.
+   *   stale      a result discarded because its connection generation or its preset identity moved
+   *              on before it settled (`stale.count`, `stale.reasons`). Never a commit either.
+   *
+   * `owners` is the active preset identity captured when the rows were built (`{seq, generation}`);
+   * a live item only receives evidence when its own identity is in that captured set.
    */
-  function notePresetTransport({ written = [], skipped = [] } = {}) {
-    if (state.presets.active.length === 0) return 0;
-    const values = new Map();
-    for (const entry of written) {
-      if (entry !== null && typeof entry === 'object' && typeof entry.channel === 'string') {
-        values.set(entry.channel, entry.value);
+  function notePresetTransport({
+    phase = 'prepared', rows = [], skipped = [], at = null, owners = null,
+    error = null, reason = '',
+  } = {}) {
+    const now = Number.isFinite(at) ? at : clockNow();
+    const stats = state.presets.transport;
+    if (phase === 'prepared') {
+      if (state.presets.active.length === 0) return { committed: false, stale: false, reason: '' };
+      const values = presetRowValues(rows);
+      const reasons = presetRowReasons(skipped);
+      for (const item of state.presets.active) {
+        const output = item.trace.output;
+        for (const channel of item.channels) {
+          if (values.has(channel)) output.prepared[channel] = values.get(channel);
+          else if (reasons.has(channel)) output.skippedByTransport[channel] = reasons.get(channel);
+        }
+        output.preparedFrames += 1;
       }
+      stats.prepared += 1;
+      stats.lastAt = now;
+      return { committed: false, stale: false, reason: '' };
     }
-    const reasons = new Map();
-    for (const entry of skipped) {
-      if (entry !== null && typeof entry === 'object' && typeof entry.channel === 'string') {
-        reasons.set(entry.channel, String(entry.reason ?? 'skipped'));
+    if (phase === 'attempted') {
+      if (state.presets.active.length === 0) return { committed: false, stale: false, reason: '' };
+      const values = presetRowValues(rows);
+      const allow = presetOwnerSet(owners);
+      for (const item of state.presets.active) {
+        if (allow !== null && allow.has(presetOwnerKey(item)) !== true) continue;
+        const output = item.trace.output;
+        for (const channel of item.channels) {
+          if (values.has(channel)) output.attempted[channel] = values.get(channel);
+        }
+        output.attemptedFrames += 1;
       }
+      stats.attempted += 1;
+      stats.lastAt = now;
+      return { committed: false, stale: false, reason: '' };
     }
-    let committed = 0;
-    for (const item of state.presets.active) {
-      const output = item.trace.output;
-      for (const channel of item.channels) {
-        if (values.has(channel)) {
+    if (phase === 'committed') {
+      // A late/foreign result never becomes a commit: the captured action must still be current.
+      if (presetOwnersCurrent(owners) !== true) {
+        markPresetStale('action-changed', now, owners);
+        return { committed: false, stale: true, reason: 'action-changed' };
+      }
+      const values = presetRowValues(rows);
+      const allow = presetOwnerSet(owners);
+      let committed = 0;
+      for (const item of state.presets.active) {
+        if (allow !== null && allow.has(presetOwnerKey(item)) !== true) continue;
+        const output = item.trace.output;
+        for (const channel of item.channels) {
           const value = values.get(channel);
           if (!Number.isFinite(value)) continue;
           output.committed[channel] = value;
+          output.committedAt[channel] = now;
           committed += 1;
-        } else if (reasons.has(channel)) {
-          output.skippedByTransport[channel] = reasons.get(channel);
         }
       }
+      stats.committed += 1;
+      stats.lastAt = now;
+      return { committed: committed > 0, stale: false, reason: '' };
     }
-    return committed;
+    if (phase === 'failed') {
+      const code = String(error?.code ?? error?.errorCode ?? 'WRITE_FAILED');
+      stats.failed += 1;
+      stats.lastAt = now;
+      stats.lastErrorCode = code;
+      stats.lastError = String(error?.message ?? error ?? '');
+      const allow = presetOwnerSet(owners);
+      for (const item of state.presets.active) {
+        if (allow !== null && allow.has(presetOwnerKey(item)) !== true) continue;
+        const output = item.trace.output;
+        output.failed.count += 1;
+        output.failed.at = now;
+        output.failed.codes[code] = (output.failed.codes[code] ?? 0) + 1;
+        output.failed.lastCode = code;
+      }
+      return { committed: false, stale: false, reason: '' };
+    }
+    if (phase === 'stale') {
+      markPresetStale(String(reason ?? 'stale'), now, owners);
+      return { committed: false, stale: true, reason: String(reason ?? 'stale') };
+    }
+    return { committed: false, stale: false, reason: '' };
+  }
+
+  /** Map `{channel, value}` rows to finite values only; anything else is not evidence. */
+  function presetRowValues(rows) {
+    const values = new Map();
+    for (const entry of Array.isArray(rows) ? rows : []) {
+      if (entry === null || typeof entry !== 'object' || typeof entry.channel !== 'string') continue;
+      if (!Number.isFinite(entry.value)) continue;
+      values.set(entry.channel, entry.value);
+    }
+    return values;
+  }
+
+  function presetRowReasons(skipped) {
+    const reasons = new Map();
+    for (const entry of Array.isArray(skipped) ? skipped : []) {
+      if (entry === null || typeof entry !== 'object' || typeof entry.channel !== 'string') continue;
+      reasons.set(entry.channel, String(entry.reason ?? 'skipped'));
+    }
+    return reasons;
+  }
+
+  /** Identity of one preset trajectory: its monotonic start sequence plus its action generation. */
+  function presetOwnerKey(item) {
+    return `${item?.seq}:${item?.generation ?? ''}`;
+  }
+
+  function presetOwnerSet(owners) {
+    if (Array.isArray(owners) !== true || owners.length === 0) return null;
+    return new Set(owners.map(presetOwnerKey));
+  }
+
+  /** Every captured owner must still be the live trajectory, or the result is stale. */
+  function presetOwnersCurrent(owners) {
+    if (Array.isArray(owners) !== true || owners.length === 0) return false;
+    const live = new Set(state.presets.active.map(presetOwnerKey));
+    return owners.every((owner) => live.has(presetOwnerKey(owner)));
+  }
+
+  /** Discard one result: counted as stale, never as committed; the trace keeps it separated. */
+  function markPresetStale(reason, at, owners = null) {
+    const stats = state.presets.transport;
+    const label = String(reason ?? 'stale');
+    stats.stale += 1;
+    stats.lastAt = at;
+    stats.lastStaleReason = label;
+    const allow = presetOwnerSet(owners);
+    for (const item of state.presets.active) {
+      if (allow !== null && allow.has(presetOwnerKey(item)) !== true) continue;
+      const output = item.trace.output;
+      output.stale.count += 1;
+      output.stale.at = at;
+      output.stale.reasons[label] = (output.stale.reasons[label] ?? 0) + 1;
+      output.stale.lastReason = label;
+    }
+    recordEvent('avatar.preset.transport.stale', { reason: label, at });
+    return 0;
   }
 
   /** Low-frequency autonomous idle boundary. Never samples a sentence gap without playback. */
@@ -2517,6 +2690,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       },
       overrides: JSON.parse(JSON.stringify(presetOverridesValue())),
       active: state.presets.active.map((item) => ({
+        /** Identity of THIS trajectory: a late send result is matched against it, never adoption. */
+        seq: item.seq,
+        generation: item.generation,
         presetId: item.presetId,
         family: item.family,
         recipe: item.recipe,
@@ -2528,6 +2704,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         remainingMs: Math.max(0, item.durationMs - ((state.lastAt ?? 0) - item.startedAt)),
         cancelled: item.cancelledAt !== null,
       })),
+      /**
+       * Sender evidence across the controller life. The five phases stay separate: only an
+       * acknowledged, still-current send increments `committed`.
+       */
+      transport: {
+        prepared: state.presets.transport.prepared,
+        attempted: state.presets.transport.attempted,
+        committed: state.presets.transport.committed,
+        failed: state.presets.transport.failed,
+        stale: state.presets.transport.stale,
+        lastAt: state.presets.transport.lastAt,
+        lastError: state.presets.transport.lastError,
+        lastErrorCode: state.presets.transport.lastErrorCode,
+        lastStaleReason: state.presets.transport.lastStaleReason,
+      },
       lastSelection: state.presets.lastSelection === null
         ? null : JSON.parse(JSON.stringify(state.presets.lastSelection)),
       lastTrace: clonePresetTrace(state.presets.lastTrace),
