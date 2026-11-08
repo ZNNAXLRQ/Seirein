@@ -949,13 +949,22 @@ test('a dropped VTS socket still closes the motion gate as disconnect', async (t
     return motion?.locked === true && motion?.lockReason === 'disconnect';
   }, 3000);
   assert.equal(locked, true, 'the dead socket closes the gate as disconnect');
-  const lockEvents = (await host.events()).filter((event) => event.type === 'avatar.motion.locked');
-  assert.equal(lockEvents.at(-1)?.payload?.reason, 'disconnect', 'the disconnect lock is recorded');
+  // The gate closes synchronously, but its record is appended asynchronously (the lock path never
+  // blocks on I/O). Wait for that record instead of assuming it is already on disk; the event and
+  // its reason are still required.
+  let lockRecord = null;
+  const recorded = await waitFor(async () => {
+    lockRecord = (await host.events()).filter((event) => event.type === 'avatar.motion.locked').at(-1) ?? null;
+    return lockRecord?.payload?.reason === 'disconnect';
+  }, 3000);
+  assert.equal(recorded, true, 'the disconnect lock is recorded');
+  assert.equal(lockRecord?.payload?.reason, 'disconnect', 'the recorded lock names the disconnect reason');
 
   const framesAfterLock = fake.frames.length;
   await sleep(300);
   assert.equal(fake.frames.length, framesAfterLock, 'a disconnected runtime writes nothing');
-  console.log(`[disconnect] lockEvents=${lockEvents.length} reason=${lockEvents.at(-1)?.payload?.reason}`
+  const lockEvents = (await host.events()).filter((event) => event.type === 'avatar.motion.locked');
+  console.log(`[disconnect] lockEvents=${lockEvents.length} reason=${lockRecord?.payload?.reason}`
     + ` framesAfterLock=${fake.frames.length - framesAfterLock}`);
 });
 

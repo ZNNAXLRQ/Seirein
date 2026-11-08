@@ -7733,6 +7733,19 @@ export function apply(ctx, config) {
             ],
           },
           scenes: { type: 'array', items: { type: 'string' } },
+          attention: {
+            description: '鼠标注视目标：相对形象窗口中心归一化的坐标；未读到时 verified:false 且坐标为空',
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              source: { type: 'string' },
+              x: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+              y: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+              at: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+              verified: { type: 'boolean' },
+            },
+            required: ['source', 'x', 'y', 'at', 'verified'],
+          },
           warning: { type: 'string' },
           error: { type: 'string' },
         },
@@ -12353,6 +12366,10 @@ export function apply(ctx, config) {
         plan.ms = spokenMarks.firstUnitAt > 0
           ? Math.max(0, spokenMarks.firstUnitAt - startedAt)
           : Math.max(0, Date.now() - startedAt);
+        // Ownership is read BEFORE `noteAnswerPlan`: sealing the plan may complete an answer whose
+        // units already played (`voice.response.group.done`). That completion is this answer's own
+        // success, not a supersession, and must not drop the first-sentence/latency observation.
+        const ownedAtDecision = responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion);
         await emitSpokenVersion(plan, plan.source, plan.chars, plan.ms, plan.fallback ?? '');
         spokenPlan = plan;
         responseGroups.noteAnswerPlan({
@@ -12371,7 +12388,13 @@ export function apply(ctx, config) {
           // "all units completed" test count these, never punctuation sentences.
           units: fedUnits.length,
         });
-        if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
+        // Still the same answer version (a done group keeps its currentAnswer); only a stale,
+        // cancelled or failed version skips the outlet. `noteAnswerPlan` may itself complete an
+        // answer whose units already played, and that `done` is this answer's success.
+        const completedOwnAnswer = !responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)
+          && responseGroups.isCurrentVersion(voiceGroup, voiceGroupVersion)
+          && responseGroups.snapshot(voiceGroup.id)?.state === 'done';
+        if (!ownedAtDecision && !completedOwnAnswer) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
         // The streamed answer outlet: the decided expression of this round, never the raw units.
         emitSpokenText({

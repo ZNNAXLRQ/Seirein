@@ -447,8 +447,11 @@ test('the voice delivery path wires the ready event, the C2 pre-step and the dat
   assert.ok(/digest: todaysDigest\(\),/u.test(source), 'the ready event reports whether the day digest is injected');
   // 语音不再注入，改由 C2：the injector lives at agent/pre-step, not in the voice lane.
   assert.ok(/const memoryPreStep = createMemoryPreStep\(\{/u.test(source), 'C2 builds the pre-step injector');
+  // The registered handler must delegate to that injector with the waterfall's own payload/next.
+  // It is wrapped (the fault notice is appended after it) and async now, so assert the delegation
+  // itself instead of the old one-line arrow shape.
   assert.ok(
-    /ctx\.on\('agent\/pre-step', \(payload, next\) => memoryPreStep\.handle\(payload, next\)\)/u.test(source),
+    /ctx\.on\('agent\/pre-step',[\s\S]{0,600}?memoryPreStep\.handle\(payload, next\)/u.test(source),
     'C2 is wired to agent/pre-step',
   );
   assert.ok(/inScope: \(agent\) => inWorkspaceScope\(\{ agent \}\)/u.test(source), 'the C2 recall obeys the workspace scope');
