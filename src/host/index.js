@@ -27,6 +27,13 @@ export {
   DIALOGUE_INJECTION_ORDER,
   createDialogueSummaryRunner,
 } from './session/conversation/dialogue-summary.js';
+import { createVoiceCompaction } from './session/compaction/voice-compaction.js';
+export {
+  VOICE_COMPACTION_PRESET,
+  VOICE_COMPACTION_PRESET_ID,
+  createVoiceCompaction,
+  isVoiceSessionId,
+} from './session/compaction/voice-compaction.js';
 import {
   PROFILE_STATUS_ENTRY_LIMIT,
   profileAutoMaintainEnabled,
@@ -1157,6 +1164,12 @@ export function apply(ctx, config) {
       return undefined;
     }
   };
+
+  // P0: Seirein's dated voice agent mounts a compaction-only preset in its OWN scope. The profile
+  // declares the preset (draft handed to the user); the plugin only binds it per Agent and never
+  // enables host-global compaction. Covers new, resumed and reload-swept Agents.
+  const voiceCompaction = createVoiceCompaction({ getService, log });
+  voiceCompaction.attach(ctx);
 
   /**
    * DSH's official per-session sandbox write path. A build that exposes the helper as a service
@@ -11316,10 +11329,14 @@ export function apply(ctx, config) {
     if (dailyAgent.date === date && dailyAgent.agent !== null) return dailyAgent.agent;
     const agentLoop = getService('agentLoop');
     if (agentLoop === undefined) throw new Error('agentLoop 服务不可用');
-    const handle = await agentLoop.createAgent(ctx, {
+    // `agentPreset` is only a header marker: write it when the declaration resolves, and let the
+    // setup's verified mount (not the marker) decide whether compaction is actually composed.
+    const presetReady = await voiceCompaction.presetReady();
+    const handle = await agentLoop.createAgent(ctx, voiceCompaction.dailyCreateOptions({
       sessionId: dailySessionId(),
-      meta: { cwd: join(root, 'workspace') },
-    });
+      cwd: join(root, 'workspace'),
+      presetReady,
+    }));
     dailyAgent = { date, agent: handle.agent };
     await log.emit('voice.session', { sessionId: handle.agent.id });
     return handle.agent;
