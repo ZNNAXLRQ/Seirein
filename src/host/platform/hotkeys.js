@@ -191,6 +191,38 @@ export function findHotkeyConflicts(bindings) {
   return conflicts;
 }
 
+/**
+ * Actions whose stored binding fires for a synthesized combo. Simulation holds `combo`'s keys
+ * down, so a binding fires when its trigger key matches and every one of its modifiers is held —
+ * a combo with EXTRA modifiers still reaches a less-modified binding (Ctrl+Alt+Shift+V reaches a
+ * Ctrl+Alt+V binding), which is why set-inclusion rather than equality is used.
+ *
+ * @param {unknown} bindings - action -> combo table.
+ * @param {string} combo - combo that is about to be synthesized.
+ * @returns {string[]} matching action names.
+ */
+export function hotkeyActionsForCombo(bindings, combo) {
+  let target;
+  try {
+    target = parseBinding(combo);
+  } catch {
+    return [];
+  }
+  if (bindings === null || typeof bindings !== 'object' || Array.isArray(bindings)) return [];
+  const actions = [];
+  for (const [action, stored] of Object.entries(bindings)) {
+    let parsed;
+    try {
+      parsed = parseBinding(stored);
+    } catch {
+      continue; // an invalid saved binding can never fire
+    }
+    if (parsed.vk !== target.vk) continue;
+    if (parsed.mods.every((vk) => target.mods.includes(vk))) actions.push(action);
+  }
+  return actions;
+}
+
 /** Load koffi and bind the user32 entry points we need. */
 function loadUser32() {
   const koffi = require('koffi');

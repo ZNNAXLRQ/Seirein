@@ -345,7 +345,7 @@ import {
   scoreImportance,
   tokenizeQuery,
 } from './memory/store.js';
-import { readInstance, resolveInstanceRoot, writeInstance } from './runtime/root.js';
+import { readInstance, resolveInstanceRoot, validateInstanceRoot, writeInstance } from './runtime/root.js';
 import {
   DEFAULT_MEMORY_TIME_ZONE,
   normalizeForMemory,
@@ -7948,6 +7948,7 @@ export function apply(ctx, config) {
           lastCombo: { type: 'string' },
           lastAt: { type: 'string' },
         pollerError: { type: 'string' },
+          reason: { type: 'string' },
           error: { type: 'string' },
         },
         required: ['ok', 'running', 'bindings', 'lastAction', 'lastCombo', 'lastAt'],
@@ -14547,6 +14548,33 @@ export function apply(ctx, config) {
     defaultSessionId: () => voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId,
   });
 
+  /**
+   * `instance.setRoot` only persists the chosen parent. Re-rooting the live mount would need a
+   * data migration under a running store, so the current root is untouched and the answer says a
+   * restart is required. Rejections carry a reason code, never the path itself.
+   */
+  const setInstanceRoot = async (body) => {
+    const checked = validateInstanceRoot(body?.root);
+    if (!checked.ok) {
+      await log.emit('instance.root.refused', { code: checked.code });
+      return { ok: false, code: checked.code, error: checked.code };
+    }
+    try {
+      writeInstance({ root: checked.parent });
+    } catch {
+      await log.emit('instance.root.refused', { code: 'WRITE_FAILED' });
+      return { ok: false, code: 'WRITE_FAILED', error: 'WRITE_FAILED' };
+    }
+    await log.emit('instance.root.set', { applied: false, reason: 'restart-required' });
+    return {
+      ok: true,
+      root: checked.parent,
+      dataRoot: checked.root,
+      applied: false,
+      reason: 'restart-required',
+    };
+  };
+
   const dispatchUiAction = createSettingsRouter([
 { actions: hearingActions, handle: createHearingSettingsActions({
     get ambientAutostart() { return ambientAutostart; },
@@ -14721,7 +14749,9 @@ export function apply(ctx, config) {
     get writeSettings() { return writeSettings; }
   }) },
   // The one manual entry point: never wired to a timer, an event listener or a delivery path.
-  { actions: [VOICE_SESSION_RECOVER_ACTION], handle: recoverVoiceSession }
+  { actions: [VOICE_SESSION_RECOVER_ACTION], handle: recoverVoiceSession },
+  // Re-rooting is only persisted; the running mount keeps its root until the next start.
+  { actions: ['instance.setRoot'], handle: setInstanceRoot }
   ]);
   /**
    * The hearing actions own the switch; the host owns the download subscription. An explicit OFF

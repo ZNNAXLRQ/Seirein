@@ -16,7 +16,7 @@
 import { AVATAR_ERROR_CODES } from '../avatar/avatarRuntime.js';
 import { truncationNotice } from '../hearing/hearing.js';
 import { deliveredRecallRows, memoryReferentRecord } from '../memory/memory-injection.js';
-import { DEFAULT_HOTKEYS, HOTKEY_ACTIONS, parseBinding } from '../platform/hotkeys.js';
+import { DEFAULT_HOTKEYS, HOTKEY_ACTIONS, hotkeyActionsForCombo, parseBinding } from '../platform/hotkeys.js';
 import { displayMessageSnippet, normalizeDomain, scoreImportance, tokenizeQuery } from '../memory/store.js';
 
 export function createHostTools(deps) {
@@ -481,7 +481,7 @@ export function createHostTools(deps) {
       };
     },
     async executeHotkeys(args) {
-      const { hotkeyState, log, poller, saveBindings, startPoller } = deps;
+      const { hotkeyState, log, poller, saveBindings, startPoller, vision } = deps;
       const snapshot = () =>
         Object.entries(hotkeyState.bindings).map(([action, combo]) => {
           let valid = true;
@@ -541,6 +541,13 @@ export function createHostTools(deps) {
       }
 
       if (args.action === 'simulate') {
+        // A synthesized press is indistinguishable from a human one to the poller, so simulate
+        // must not become an agent path out of privacy (vision) or around the mic switch.
+        const targets = hotkeyActionsForCombo(hotkeyState.bindings, args.combo);
+        if (vision.mode === 'privacy' && targets.some((action) => action === 'vision' || action === 'mic')) {
+          await log.emit('hotkey.simulate.refused', { reason: 'privacy-blocked' });
+          return { ...reply(false, '隐私模式已开启：不能用模拟热键代替用户退出隐私'), reason: 'privacy-blocked' };
+        }
         try {
           await poller.simulate(args.combo, Number.isInteger(args.holdMs) ? args.holdMs : 120);
           await new Promise((resolve) => setTimeout(resolve, 200));

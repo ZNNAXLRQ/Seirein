@@ -12,8 +12,11 @@
  * Dependency downloads (ffmpeg, ASR models) are resolved before this and stay in their own
  * location; nothing here depends on them.
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import {
+  accessSync, constants as fsConstants, cpSync, existsSync, mkdirSync, readFileSync, renameSync,
+  rmSync, statSync, writeFileSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 const APP_DIR = 'Seirein';
@@ -40,6 +43,32 @@ export function writeInstance(patch) {
   const file = instanceFile();
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, `${JSON.stringify({ ...readInstance(), ...patch }, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * Validate a candidate parent without touching the running root. Answers a reason code only:
+ * a rejected path may name a private directory, so it is never echoed back. The chosen parent is
+ * created together with the `Seirein` data directory it will own, and both are probed for writes.
+ */
+export function validateInstanceRoot(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (text.length === 0) return { ok: false, code: 'EMPTY_ROOT' };
+  if (!isAbsolute(text)) return { ok: false, code: 'RELATIVE_ROOT' };
+  const parent = resolve(text);
+  const root = join(parent, APP_DIR);
+  try {
+    for (const dir of [parent, root]) {
+      if (existsSync(dir) && !statSync(dir).isDirectory()) return { ok: false, code: 'NOT_A_DIRECTORY' };
+      mkdirSync(dir, { recursive: true });
+      accessSync(dir, fsConstants.W_OK);
+      const probe = join(dir, `.seirein-write-probe-${process.pid}`);
+      writeFileSync(probe, '');
+      rmSync(probe, { force: true });
+    }
+  } catch {
+    return { ok: false, code: 'NOT_WRITABLE' };
+  }
+  return { ok: true, parent, root };
 }
 
 /**
