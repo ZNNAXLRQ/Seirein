@@ -304,6 +304,8 @@ import {
 // Namespace access for the loopback guard: the named import above is the stable contract, and a test
 // build that replaces hearing.js with a stub (test/asr-events.mjs) still links.
 import * as hearingRuntime from './hearing/hearing.js';
+// Opt-in diagnosis clips (`voice.audioRetention`): the Host owns the one store both lanes borrow.
+import { openAudioRetention } from './hearing/audio-retention.js';
 import { ensureSpeakerModel, isSharedModelTarget, speakerModelTarget } from './platform/modelDownload.js';
 import { createDialogueContext } from './session/conversation/dialogueContext.js';
 import { FeatureStore } from './runtime/features.js';
@@ -560,7 +562,7 @@ export {
 export const name = 'dsh-assistant';
 
 /** Single source of truth for the host version shown in the UI. */
-const PLUGIN_VERSION = '0.98.9';
+const PLUGIN_VERSION = '0.99.0';
 
 /** Only the tool registry is required; everything else stays optional. */
 export const inject = ['tools'];
@@ -7802,6 +7804,18 @@ export function apply(ctx, config) {
     scene: runtime.vision?.scene ?? '',
   });
   /**
+   * Opt-in diagnosis clips (`voice.audioRetention`, **off by default**). The Host owns the one
+   * store (`<root>/cache/retention`); both capture lanes only borrow it. The switch is read live,
+   * so the settings page applies without a restart, and privacy refuses at write time.
+   */
+  const audioRetention = openAudioRetention({
+    root,
+    enabled: () => readSettings()?.voice?.audioRetention === true,
+    isPrivacy: () => vision.mode === 'privacy',
+    emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+  });
+  void audioRetention.cleanup();
+  /**
    * The source/scene to restore when the user leaves privacy. Privacy is a plugin-side capture
    * lock only: it never changes the OBS program scene, so the previous source and scene survive
    * the lock and are re-established (and re-captured) on the way out.
@@ -12800,6 +12814,10 @@ export function apply(ctx, config) {
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
           device,
+          // Diagnosis clips (opt-in): the Host's one store, its root and the privacy probe.
+          audioRetention,
+          retentionRoot: root,
+          isPrivacy: () => vision.mode === 'privacy',
           // Observation only: the endpoint-continuation shadow probe and its silence point.
           endpointProbe: config?.voice?.endpointProbe !== false,
           endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
@@ -13045,6 +13063,10 @@ export function apply(ctx, config) {
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
           device,
+          // Diagnosis clips (opt-in): the Host's one store, its root and the privacy probe.
+          audioRetention,
+          retentionRoot: root,
+          isPrivacy: () => vision.mode === 'privacy',
           // Observation only: the endpoint-continuation shadow probe and its silence point.
           endpointProbe: config?.voice?.endpointProbe !== false,
           endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
@@ -13484,6 +13506,9 @@ export function apply(ctx, config) {
     const status = await buildStatus();
     return {
       ...status,
+      // The 听觉 card's 音频保留 switch follows the persisted setting (default off), not a local
+      // toggle; the clips themselves are read through `audio.retention.list`.
+      retention: { enabled: audioRetention.isEnabled(), limits: { ...audioRetention.limits } },
       hearing: projectHearingStatus(status?.hearing, {
         session: hearing,
         restart: hearingThresholdRestart,
@@ -13850,6 +13875,7 @@ export function apply(ctx, config) {
     get isLoopbackName() { return isLoopbackName; },
     get log() { return log; },
     get openContainer() { return openContainer; },
+    get retentionStore() { return audioRetention; },
     get runtime() { return runtime; },
     get saveCallNames() { return saveCallNames; },
     get speakerModelState() { return speakerModelState; },

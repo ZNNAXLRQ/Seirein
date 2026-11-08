@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
     const { useCallback, useEffect, useRef, useState } = React;
 
     // Bump together with package.json. Shown in the UI so a stale browser bundle is obvious.
-    const CLIENT_VERSION = '0.98.9';
+    const CLIENT_VERSION = '0.99.0';
 
     const MUTED = '#6b7280';
     const BORDER = '#d8dce3';
@@ -2113,6 +2113,101 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * 「听觉 → 音频保留（诊断）」：默认关闭的开关 + 可疑片段列表 + 试听 / 删除。
+     * 列表来自 audio.retention.list；试听只显示宿主返回的文件路径（绝不自动播放），
+     * 删除先确认；任何失败只渲染错误文案，不向调用方抛出。
+     */
+    function retentionSection(h, {
+      status, data, busy, preview, confirm, onToggle, onPreview, onAskDelete, onDelete, onCancel, onDeleteAll,
+    }) {
+      const enabled = status?.retention?.enabled === true;
+      const limits = data?.limits ?? {};
+      const maxClips = Number(limits.maxClips ?? 20);
+      const maxMinutes = Math.max(1, Math.round(Number(limits.maxDurationMs ?? 300000) / 60000));
+      const maxMb = Math.max(1, Math.round(Number(limits.maxBytes ?? 50 * 1024 * 1024) / 1024 / 1024));
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const error = String(data?.error ?? '');
+      const reasonLabel = { 'low-evidence': '证据不足', echo: '回声', noise: '噪声', filtered: '被过滤' };
+      const stopped = busy !== '';
+      const timeOf = (item) => {
+        const at = Date.parse(item.createdAt ?? '');
+        return Number.isFinite(at) ? new Date(at).toLocaleString() : '—';
+      };
+      const rowOf = (item) => h('div', { key: item.id, style: styles.row },
+        h('span', { style: styles.mono },
+          `${timeOf(item)} · ${(Number(item.durationMs ?? 0) / 1000).toFixed(1)} 秒 · `
+          + `${reasonLabel[item.reason] ?? item.reason ?? '未知'} · `
+          + `${Math.max(1, Math.round(Number(item.bytes ?? 0) / 1024))} KB`
+          + `${item.missing === true ? ' · 文件缺失' : ''}`),
+        h('span', { style: { display: 'flex', gap: 8 } },
+          h('button', {
+            style: { ...styles.btn, ...(stopped ? styles.off : {}) },
+            disabled: stopped,
+            onClick: () => void onPreview(item.id),
+          }, '试听'),
+          confirm === item.id
+            ? h('span', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                h('span', { style: styles.value }, '确认删除？'),
+                h('button', {
+                  style: { ...styles.btnDanger, ...(stopped ? styles.off : {}) },
+                  disabled: stopped,
+                  onClick: () => void onDelete(item.id),
+                }, '确认'),
+                h('button', {
+                  style: { ...styles.btn, ...(stopped ? styles.off : {}) },
+                  disabled: stopped,
+                  onClick: () => void onCancel(),
+                }, '取消'))
+            : h('button', {
+                style: { ...styles.btnDanger, ...(stopped ? styles.off : {}) },
+                disabled: stopped,
+                onClick: () => void onAskDelete(item.id),
+              }, '删除')));
+      return h('div', { style: styles.field },
+        h('div', { style: styles.row },
+          h('span', { style: styles.value }, '音频保留（诊断）'),
+          h('button', {
+            style: { ...(enabled ? styles.btnActive : styles.btn), ...(stopped ? styles.off : {}) },
+            disabled: stopped,
+            onClick: () => void onToggle(enabled !== true),
+          }, enabled ? '已开启' : '已关闭')),
+        h('div', { style: styles.hint },
+          `开启后仅保留可疑片段的短期音频（最多 ${maxClips} 条/${maxMinutes} 分钟/${maxMb} MB）`),
+        h('div', { style: styles.hint }, '默认关闭；判定与投递完全不受影响，删除或试听都只作用于这些片段。'),
+        error === '' ? null : h('div', { style: { ...styles.hint, color: DANGER } }, `音频保留不可用：${error}`),
+        data === null || data === undefined || data.loading === true
+          ? h('div', { style: styles.hint }, '正在读取保留列表…')
+          : (items.length === 0
+              ? h('div', { style: styles.hint }, '暂时没有保留的片段')
+              : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, items.map(rowOf))),
+        preview === null || preview === undefined
+          ? null
+          : h('div', { style: styles.field },
+              h('span', { style: styles.mono }, `试听路径（用系统播放器打开，不自动播放）：${String(preview.path ?? '')}`)),
+        h('div', { style: styles.row },
+          h('button', {
+            style: { ...styles.btnDanger, ...(stopped || items.length === 0 ? styles.off : {}) },
+            disabled: stopped || items.length === 0,
+            onClick: () => void onAskDelete('all'),
+          }, '全部删除'),
+          confirm === 'all'
+            ? h('span', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                h('span', { style: styles.value }, '确认删除全部？'),
+                h('button', {
+                  style: { ...styles.btnDanger, ...(stopped ? styles.off : {}) },
+                  disabled: stopped,
+                  onClick: () => void onDeleteAll(),
+                }, '确认全部删除'),
+                h('button', {
+                  style: { ...styles.btn, ...(stopped ? styles.off : {}) },
+                  disabled: stopped,
+                  onClick: () => void onCancel(),
+                }, '取消'))
+            : null),
+      );
+    }
+
     function Panel() {
       const [status, setStatus] = useState(null);
       const [error, setError] = useState('');
@@ -2168,6 +2263,10 @@ window.__ModuleLoader__.load({
       const [motionQuery, setMotionQuery] = useState('');
       const [motionFilters, setMotionFilters] = useState({ family: '', style: '', availability: '' });
       const [motionDrafts, setMotionDrafts] = useState({});
+      // 「音频保留（诊断）」：列表/限制/错误来自 audio.retention.list；删除与试听都先经此处。
+      const [retentionData, setRetentionData] = useState(null);
+      const [retentionPreview, setRetentionPreview] = useState(null);
+      const [retentionConfirm, setRetentionConfirm] = useState('');
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
       const [expandedAmbient, setExpandedAmbient] = useState(false);
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
@@ -2266,6 +2365,81 @@ window.__ModuleLoader__.load({
         if (result?.ok === true) await loadMotionPresets();
         return result;
       }, [act, loadMotionPresets]);
+
+      /**
+       * 音频保留列表：只在挂载/开关/删除/试听后读取，不跟随 3 秒状态轮询。
+       * 未接线（AUDIO_RETENTION_UNAVAILABLE）或文件读失败时保留宿主的错误文案，卡片只显示，
+       * 不抛出、不影响同一张「听觉」卡片上的其它控件。
+       */
+      const loadRetention = useCallback(async () => {
+        try {
+          const response = await fetch('/assistant/action', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ action: 'audio.retention.list' }),
+          });
+          const result = await response.json();
+          setRetentionData(result?.ok === true
+            ? {
+                items: Array.isArray(result.items) ? result.items : [],
+                limits: result.limits ?? null,
+                loading: false,
+                error: '',
+              }
+            : {
+                items: [],
+                limits: null,
+                loading: false,
+                error: String(result?.error ?? result?.code ?? '读取失败'),
+              });
+        } catch (cause) {
+          setRetentionData({
+            items: [],
+            limits: null,
+            loading: false,
+            error: cause && cause.message ? cause.message : String(cause),
+          });
+        }
+      }, []);
+
+      const retentionFailure = useCallback((result) => {
+        setRetentionData((current) => ({
+          items: current?.items ?? [],
+          limits: current?.limits ?? null,
+          loading: false,
+          error: String(result?.error ?? result?.code ?? '操作失败'),
+        }));
+      }, []);
+
+      const toggleRetention = useCallback(async (enabled) => {
+        const result = await act({ action: 'voice.audioRetention', enabled }, 'audio-retention');
+        if (result?.ok === true) {
+          show(enabled ? '已开启音频保留（默认关闭）' : '已关闭音频保留');
+          await loadRetention();
+        }
+      }, [act, loadRetention, show]);
+
+      const previewRetention = useCallback(async (id) => {
+        // 只取路径：不自动播放，避免诊断音频在用户没有要求时出声。
+        const result = await act({ action: 'audio.retention.export', id }, 'audio-retention-export');
+        if (result?.ok === true) setRetentionPreview({ id, path: String(result.path ?? '') });
+        else retentionFailure(result);
+      }, [act, retentionFailure]);
+
+      const deleteRetention = useCallback(async (id) => {
+        const body = id === 'all'
+          ? { action: 'audio.retention.delete', all: true }
+          : { action: 'audio.retention.delete', id };
+        const result = await act(body, 'audio-retention-delete');
+        setRetentionConfirm('');
+        if (result?.ok !== true) {
+          retentionFailure(result);
+          return;
+        }
+        setRetentionPreview((current) => (current !== null && current?.id === id ? null : current));
+        show(id === 'all' ? `已全部删除 ${Number(result.removed ?? 0)} 条` : '已删除该片段');
+        await loadRetention();
+      }, [act, loadRetention, retentionFailure, show]);
 
       // ---- P-116 问卷弹窗 handlers -----------------------------------------------------------
       // Every async step captures an epoch: closing the dialog (or a newer open) invalidates the
@@ -2436,6 +2610,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         void loadMotionPresets();
       }, [loadMotionPresets]);
+
+      // 音频保留列表同样只在挂载时读一次；开关/删除/试听之后由上面的处理器刷新。
+      useEffect(() => {
+        void loadRetention();
+      }, [loadRetention]);
 
       // A queued round is finished by the host later: the 3 s status poll is what releases the
       // silent button, so the card can never stay on 「已排队…」 after the queue drained.
@@ -3041,6 +3220,19 @@ window.__ModuleLoader__.load({
               onClick: () => act({ action: 'hearing.autoListen', enabled: status.hearing?.autoListen !== true }, 'hearing-autoListen'),
             }, status.hearing?.autoListen ? '已开启' : '已关闭')),
           speakerShadowRow(h, { status, busy, act }),
+          retentionSection(h, {
+            status,
+            data: retentionData,
+            busy,
+            preview: retentionPreview,
+            confirm: retentionConfirm,
+            onToggle: (enabled) => void toggleRetention(enabled),
+            onPreview: (id) => void previewRetention(id),
+            onAskDelete: (id) => setRetentionConfirm(String(id)),
+            onDelete: (id) => void deleteRetention(id),
+            onCancel: () => setRetentionConfirm(''),
+            onDeleteAll: () => void deleteRetention('all'),
+          }),
         ),
 
         (() => {
