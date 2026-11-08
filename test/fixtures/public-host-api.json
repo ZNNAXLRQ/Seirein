@@ -410,6 +410,7 @@
     "offlineLimitedNote",
     "onFixedCutGrid",
     "onlineOfflineAgree",
+    "parseUtteranceId",
     "planSegmentedDecodes",
     "resolveEndpointRules",
     "segmentEndReasonOf",
