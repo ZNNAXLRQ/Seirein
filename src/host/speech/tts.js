@@ -1540,6 +1540,30 @@ export async function speakChunks({
     task.catch(() => {});
     return task;
   };
+  /** A cancelled block settles with a stable code; a player may never settle its `done` at all. */
+  const abortedBlock = () => Object.defineProperty(
+    new DOMException('Speech chunk cancelled', 'AbortError'),
+    'code', { value: 'TTS_ABORTED', enumerable: true },
+  );
+  /**
+   * Wait for the sounding block, but never past the lane: cancel / replacement / teardown ends
+   * this wait at once instead of pinning the driver on a `done` the player may never settle. A
+   * settlement that arrives later is consumed here and can never resume the queue, play a later
+   * block, or write a block the cancellation already abandoned.
+   */
+  const waitBlock = (started) => {
+    const done = started?.done;
+    if (done === undefined || done === null) return Promise.resolve();
+    if (lane.aborted) return Promise.reject(abortedBlock());
+    return new Promise((resolve, reject) => {
+      const onAbort = () => { lane.removeEventListener('abort', onAbort); reject(abortedBlock()); };
+      lane.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve(done).then(
+        (value) => { lane.removeEventListener('abort', onAbort); resolve(value); },
+        (error) => { lane.removeEventListener('abort', onAbort); reject(error); },
+      );
+    });
+  };
   let audio = null;
   let ownsAudio = false;
   let pending = null;
@@ -1590,7 +1614,7 @@ export async function speakChunks({
         chars: [...list[index]].length, audioStartedAt,
       });
       try { onStart?.({ index, chunkId: chunkIds[index], count: list.length, started }); } catch { /* observation only */ }
-      await started?.done;
+      await waitBlock(started);
       // A barge-in during this block does not change the fact that it reached the player: stop the
       // queue and let the caller count it, exactly like a sentence whose tail was cut.
       if (lane.aborted) {
