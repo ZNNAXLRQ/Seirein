@@ -33,7 +33,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { DIALOGUE_INJECTION_ORDER, apply } from '../src/host/index.js';
+import { DIALOGUE_INJECTION_ORDER, apply, voiceSessionTarget } from '../src/host/index.js';
 import { createDialogueContext } from '../src/host/session/conversation/dialogueContext.js';
 
 const PERSONA_HEADER = '# 人设与用户画像\n\n> 由助手在对话中维护，用户不需要编辑本文件。\n';
@@ -146,8 +146,11 @@ function mount(root, { dialogueContext } = {}) {
     promptStabilityThrottleMs: 0,
     ...(dialogueContext === undefined ? {} : { dialogueContext }),
   });
-  // Workspace scope for `scopedText`; the same fact the real agent session header carries.
-  const entry = { agent: { session: { header: { cwd: join(root, 'workspace') } } } };
+  // Workspace scope for `scopedText`; the same fact the real agent session header carries. The id
+  // is the companion identity the observation gate keys on (a plain GUI session must not see it).
+  const entry = {
+    agent: { id: voiceSessionTarget({ root }).sessionId, session: { header: { cwd: join(root, 'workspace') } } },
+  };
   const assemble = () => {
     const prompt = [...sections.values()]
       .sort((left, right) => left.order - right.order)
@@ -391,5 +394,7 @@ test('4. 上下文顺序与文本和旧 section 逐字一致', async (t) => {
 
 /** The same workspace scope fact `assemble()` uses, for direct provider calls. */
 function entryOf(root) {
-  return { agent: { session: { header: { cwd: join(root, 'workspace') } } } };
+  return {
+    agent: { id: voiceSessionTarget({ root }).sessionId, session: { header: { cwd: join(root, 'workspace') } } },
+  };
 }

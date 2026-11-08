@@ -272,8 +272,9 @@ async function mountHost(t, { nonverbalCue }) {
       await tick(10);
     }
   };
-  const context = { agent: { session: { header: { cwd: WORKSPACE(root) } } } };
+  // The companion identity that owns the microphone: the only session the cue may be shown to.
   const sessionId = voiceSessionTarget({ root }).sessionId;
+  const context = { agent: { id: sessionId, session: { header: { cwd: WORKSPACE(root) } } } };
   t.after(() => cleanupRoot(root, cleanups.splice(0)));
 
   return {

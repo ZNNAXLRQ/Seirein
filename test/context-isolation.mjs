@@ -35,7 +35,7 @@
  *   4. 注入隔离：不入自动记忆、不触发 ack/reply、不增加 responseGroup；surface 可区分。
  *   5. 声音上下文观察者只认真用户消息（source.kind==='user'），运行快照不续期噪声门窗口。
  *   6. 隐私：只锁视觉采集，不抑制语音观察快照（明确现状）。
- *   7. 切会话：消息不串台；同一 workspace 的观察内容共享，跨 workspace 不注入（现状）。
+ *   7. 切会话：交流观察按会话隔离（同 workspace 的其它会话看不到）；环境事实共享；跨 workspace 不注入。
  *
  * Run: node --test test/context-isolation.mjs
  * Regression: node --test test/prompt-stability.mjs test/dialogue-injection.mjs test/nonverbal-cue.mjs
@@ -107,7 +107,14 @@ const DIALOGUE_HEADER = '【连续台词上下文｜系统观察，不是用户�
 const NONVERBAL_HEADER = '【系统观察·非语言线索】';
 
 const WORKSPACE = (root) => join(root, 'workspace');
-const entryIn = (root) => ({ agent: { session: { header: { cwd: WORKSPACE(root) } } } });
+/** The companion agent double: today's dated session id + the workspace cwd. */
+const entryIn = (root) => ({
+  agent: { id: voiceSessionTarget({ root }).sessionId, session: { header: { cwd: WORKSPACE(root) } } },
+});
+/** Any other session in the same workspace (a GUI/typing session): no conversation observation. */
+const entryOther = (root, id = 'session-web-typing') => ({
+  agent: { id, session: { header: { cwd: WORKSPACE(root) } } },
+});
 
 const FEATURES = Object.freeze({
   hearing: false,
@@ -489,7 +496,7 @@ test('2. 台词与非语言线索同处一个快照：来源可归因、提示�
     features: { hearing: true },
     settings: { gptSovits: { enabled: false }, autoMemory: { enabled: false }, voice: { nonverbalCue: true } },
   });
-  const buffer = createDialogueContext();
+  const buffer = createDialogueContext({ now: () => 1_000 });
   buffer.push({ text: '第一段：门是开着的。', at: 1_000, utteranceId: 'u1' });
   const host = mountHost(root, { dialogueContext: buffer, config: { asrMergeWindowMs: 10 } });
   t.after(() => host.close());
@@ -645,7 +652,7 @@ test('3. 时效与清除：本轮请求看得到本轮缓冲；清空后快照�
   assert.equal(neverCommit.message, null, '没有旧快照就不提交任何东西');
   assert.equal(freshLoop.state.snapshots.length, 0);
 
-  // -- 3d. 时间流过但没人说话：缓冲不自行过期（设计：无定时器）；新台词把旧文本滚进 pending
+﻿  // -- 3d. 时间流过但没人说话：读时过期，旧观察不再注入；新台词不会把过期旧文本带回快照
   const windowRoot = await tempRoot(t, { features: { hearing: true } });
   const windowClock = { now: 10_000 };
   const windowBuffer = createDialogueContext({ now: () => windowClock.now, maxWindowMs: 1_000, maxChars: 40 });
@@ -654,16 +661,19 @@ test('3. 时效与清除：本轮请求看得到本轮缓冲；清空后快照�
   windowBuffer.push({ text: '旧的一句。', at: windowClock.now, utteranceId: 'w1' });
   windowClock.now += 60_000;
   const quiet = windowHost.assemble(entryIn(windowRoot));
-  assert.ok(quiet.contextText('assistant:dialogue').includes('旧的一句'), '安静 60 s 不会让缓冲自行过期');
+  assert.equal(quiet.contextText('assistant:dialogue'), '', '安静 60 s 后旧观察不再注入');
+  assert.equal(windowBuffer.snapshot().expired, 1, '过期数量可观测');
+  assert.equal(windowBuffer.snapshot().active, false);
+  assert.equal(windowBuffer.snapshot().reason, 'idle', '上层可据此发 idle 事件');
   windowBuffer.push({ text: '新的一句。', at: windowClock.now, utteranceId: 'w2' });
   const rolled = windowHost.assemble(entryIn(windowRoot));
-  assert.ok(rolled.contextText('assistant:dialogue').includes('旧的一句'), '滚出窗口的文本进入 pending，仍在快照里');
+  assert.equal(rolled.contextText('assistant:dialogue').includes('旧的一句'), false, '滚出窗口的旧文本已过期，不注入');
   assert.ok(rolled.contextText('assistant:dialogue').includes('新的一句'));
   assert.notEqual(rolled.snapshot, '');
 
   console.log(`[3] requestSeesLatest=true preStepSnapshotStale=true snapshotsAfterClear=${loop.state.snapshots.length} `
     + `clearedMarkerChars=${Array.from(RUNTIME_CONTEXT_CLEARED).length} neverSnapshot=${freshLoop.state.snapshots.length} `
-    + `quietMinutesKept=true rolledTextKept=true`);
+    + `quietMinutesKept=false idleReason=idle stalePendingHidden=true`);
 });
 
 // ---------------------------------------------------------------------------
@@ -794,7 +804,7 @@ test('5. 声音上下文观察者只认真用户消息，运行快照不续期�
 
 test('6. 隐私：只锁视觉采集，不抑制语音观察快照（明确现状）', async (t) => {
   const root = await tempRoot(t, { features: { hearing: true, vision: true } });
-  const buffer = createDialogueContext();
+  const buffer = createDialogueContext({ now: () => 1_000 });
   buffer.push({ text: '第一段：门是开着的。', at: 1_000, utteranceId: 'u1' });
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
@@ -819,10 +829,11 @@ test('6. 隐私：只锁视觉采集，不抑制语音观察快照（明确现�
   assert.equal(refused.ok, false, '隐私下拒绝截屏');
   assert.match(refused.reason, /隐私/u);
 
-  // 观察快照不受影响：同一文本、同一系统提示、快照原样保留。
+  // 观察快照不受影响：同一份语音观察、同一份 runtime-context 快照原样保留。系统提示会变，因为
+  // 环境事实如实记录「隐私锁定中」——那是视觉态的事实，不是对话观察被抑制。
   const after = host.assemble(entry);
-  assert.equal(after.prompt, before.prompt, '隐私不改写系统提示');
-  assert.equal(after.hash, before.hash);
+  assert.notEqual(after.prompt, before.prompt, '隐私态写入环境事实（系统提示随之更新）');
+  assert.equal(after.contextText('assistant:dialogue'), before.contextText('assistant:dialogue'), '语音观察文本不变');
   assert.equal(after.snapshot, before.snapshot, '隐私下携带同一份语音观察快照');
   assert.ok(after.contextText('assistant:dialogue').includes('门是开着的'), '语音观察仍在');
   assert.equal(after.snapshot.includes('隐私'), false, '快照不包含隐私态文本');
@@ -842,7 +853,7 @@ test('6. 隐私：只锁视觉采集，不抑制语音观察快照（明确现�
 // 7. 切会话
 // ---------------------------------------------------------------------------
 
-test('7. 切会话：消息不串台；同 workspace 共享观察内容，跨 workspace 不注入（现状）', async (t) => {
+test('7. 切会话：交流观察按会话隔离；环境事实共享；跨 workspace 不注入', async (t) => {
   const root = await tempRoot(t, { features: { hearing: true } });
   const clock = { now: 1_000_000 };
   const buffer = createDialogueContext({ now: () => clock.now });
@@ -850,34 +861,42 @@ test('7. 切会话：消息不串台；同 workspace 共享观察内容，跨 wo
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
 
-  const entryA = entryIn(root);
-  const entryB = entryIn(root);
+  const entryCompanion = entryIn(root);
+  const entryWeb = entryOther(root);
   const entryOutside = { agent: { session: { header: { cwd: join(root, 'elsewhere') } } } };
 
-  const a = host.assemble(entryA);
-  const b = host.assemble(entryB);
+  const a = host.assemble(entryCompanion);
+  const b = host.assemble(entryWeb);
   const c = host.assemble(entryOutside);
-  assert.ok(a.contextText('assistant:dialogue').includes('门是开着的'));
-  assert.equal(b.contextText('assistant:dialogue'), a.contextText('assistant:dialogue'),
-    '同 workspace 的新会话看到同一份观察文本');
-  assert.deepEqual(c.parts, [], '跨 workspace 不注入观察');
-  assert.equal(c.snapshot, '');
-  assert.equal(c.prompt.includes('门是开着的'), false);
+  assert.ok(a.contextText('assistant:dialogue').includes('门是开着的'), '陪伴会话看得到交流观察');
+  assert.equal(b.contextText('assistant:dialogue'), '', '同一 workspace 的普通会话看不到交流观察');
+  assert.deepEqual(b.parts, [], '普通会话不产生观察快照贡献');
+  assert.equal(b.snapshot, '', '普通会话没有观察快照');
+  // The observation stays out of both prompts; the environment section is shared by both.
+  assert.equal(a.prompt.includes('门是开着的'), false, '观察不是系统提示');
+  assert.equal(b.prompt.includes('门是开着的'), false);
+  assert.equal(a.prompt.includes('【环境事实'), true, '陪伴会话看到环境事实');
+  assert.equal(b.prompt.includes('【环境事实'), true, '普通会话也看到同一份环境事实');
+  assert.match(b.prompt, /【环境事实[^\n]*\n[^\n]*来源：[^\n]*观察于：/u, '环境事实带来源与观察时间');
 
-  // 消息级：两个会话各自提交自己的快照消息，A 的消息对象不会出现在 B 的历史里。
+  // 消息级：只有陪伴会话提交快照；普通 Web 会话不产生快照消息。
   const loopA = createLoopDouble();
   const loopB = createLoopDouble();
   const commitA = loopA.step(a);
   const commitB = loopB.step(b);
-  assert.notEqual(commitA.message, commitB.message, '各自的消息对象');
+  assert.ok(commitA.message !== null, '陪伴会话提交自己的观察快照');
+  assert.equal(commitB.message, null, '普通会话没有可提交的观察快照');
   assert.equal(loopA.state.snapshots.length, 1);
-  assert.equal(loopB.state.snapshots.length, 1);
-  assert.equal(commitB.message.content[0].text.includes('门是开着的'), true,
-    '内容来自共享缓冲（设备连续观察的设计），不是消息串台');
+  assert.equal(loopB.state.snapshots.length, 0);
+  assert.equal(commitA.message.content[0].text.includes('门是开着的'), true);
+  assert.deepEqual(commitA.message.source.sections.map((section) => section.name), ['assistant:dialogue']);
+  assert.equal(commitA.message.content[0].text.includes('【环境事实'), false, '环境事实是 section，不进观察快照');
   assert.equal(loopA.state.systemNodes.length, 1);
   assert.equal(loopB.state.systemNodes.length, 1);
-  assert.equal(c.snapshot, '', '跨会话/跨 workspace 不产生快照消息');
+  assert.equal(c.snapshot, '', '跨 workspace 不产生快照消息');
+  assert.equal(c.prompt.includes('【环境事实'), false, '环境事实仍按 workspace 作用域');
 
-  console.log(`[7] sameWorkspaceShared=${b.snapshot === a.snapshot} crossWorkspaceChars=${Array.from(c.snapshot).length} `
-    + `snapshotMessagesA=${loopA.state.snapshots.length} snapshotMessagesB=${loopB.state.snapshots.length}`);
+  console.log(`[7] companionDialogueChars=${Array.from(a.contextText('assistant:dialogue')).length} `
+    + `webDialogueChars=${Array.from(b.contextText('assistant:dialogue')).length} webSnapshots=0 `
+    + `envSectionShared=true crossWorkspaceChars=${Array.from(c.snapshot).length}`);
 });

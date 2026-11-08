@@ -699,6 +699,13 @@ let cachedObs = null;
  * (assistant_obs, scene refreshes, one boot probe) are the only writers.
  */
 let lastObsScene = '';
+/** When `lastObsScene` was last observed (ms; 0 = unknown). Lets the environment section say WHEN. */
+let lastObsSceneAt = 0;
+/** The only writer of the scene cache: value and observation time always move together. */
+function recordObsScene(scene) {
+  lastObsScene = String(scene ?? '');
+  lastObsSceneAt = Date.now();
+}
 
 /** Resolve the OBS executable: explicit config, then a shallow scan of every drive. */
 function findObs(config) {
@@ -7638,7 +7645,7 @@ export function apply(ctx, config) {
         const list = await client.request('GetSceneList');
         const current = String(list.currentProgramSceneName ?? '');
         const scenes = (list.scenes ?? []).map((entry) => String(entry.sceneName));
-        lastObsScene = current;
+        recordObsScene(current);
         obsScenes = scenes;
         obsScenesAt = Date.now();
         if (args.action === 'set') {
@@ -7652,7 +7659,7 @@ export function apply(ctx, config) {
             if (!result.ok) throw new Error(result.error);
           } else {
             await client.request('SetCurrentProgramScene', { sceneName: args.scene });
-            lastObsScene = args.scene;
+            recordObsScene(args.scene);
           }
           await log.emit('obs.scene', { from: current, to: args.scene });
           return { ok: true, action: 'set', current: args.scene, scenes };
@@ -7953,6 +7960,10 @@ export function apply(ctx, config) {
   const sceneIdleMs = () => Math.max(5000, Number(config?.sceneIdleMs ?? 60000));
 
   let virtualCamOn = false;
+  /** When the capture source last changed (ms; 0 = unknown), for the environment section. */
+  let visionSourceAt = 0;
+  /** When the virtual camera last started/stopped (ms; 0 = unknown), same reason. */
+  let virtualCamAt = 0;
   /** Last frame captured for the agent, so the settings card can preview it. */
   let lastVision = null;
   /** Previous judged frame per source: the "two identical frames" rule needs its predecessor. */
@@ -8141,7 +8152,7 @@ export function apply(ctx, config) {
       autostartRunning.obs = true;
       obsScenes = await withObs(async (client) => {
         const list = await client.request('GetSceneList');
-        lastObsScene = String(list.currentProgramSceneName ?? '');
+        recordObsScene(list.currentProgramSceneName ?? '');
         return (list.scenes ?? []).map((entry) => String(entry.sceneName));
       });
       obsScenesAt = Date.now();
@@ -8198,7 +8209,7 @@ export function apply(ctx, config) {
       const names = (list.scenes ?? []).map((entry) => String(entry.sceneName));
       if (!names.includes(sceneName)) throw new Error(`OBS 场景不存在：${sceneName}`);
       if (current !== sceneName) await client.request('SetCurrentProgramScene', { sceneName });
-      lastObsScene = sceneName;
+      recordObsScene(sceneName);
       obsScenes = names;
       obsScenesAt = Date.now();
       return { current, names };
@@ -8218,6 +8229,7 @@ export function apply(ctx, config) {
       }
     });
     virtualCamOn = true;
+    virtualCamAt = Date.now();
     try {
       assertCurrent();
     } catch (error) {
@@ -8242,6 +8254,7 @@ export function apply(ctx, config) {
     // A camera the user had already started belongs to their stream; only release our mark.
     if (!virtualCamOwned) {
       virtualCamOn = false;
+      virtualCamAt = Date.now();
       return false;
     }
     try {
@@ -8253,6 +8266,7 @@ export function apply(ctx, config) {
       // OBS may already be gone; the camera is gone with it.
     }
     virtualCamOn = false;
+    virtualCamAt = Date.now();
     virtualCamOwned = false;
     await log.emit('vision.virtualcam', { active: false, reason });
     return true;
@@ -8407,6 +8421,8 @@ export function apply(ctx, config) {
     });
     visionModeQueue = operation.then(() => {}, () => {});
     const settled = await operation;
+    // The source/scene fact is observed at the moment the transition succeeds (environment section).
+    if (settled.ok === true) visionSourceAt = Date.now();
     if (settled.ok === true && resumeAfter) {
       try {
         await startWatcher(visionToken());
@@ -8943,10 +8959,10 @@ export function apply(ctx, config) {
             return;
           }
           autostartRunning.obs = true;
-          lastObsScene = await withObs(async (client) => {
+          recordObsScene(await withObs(async (client) => {
             const list = await client.request('GetSceneList');
             return String(list.currentProgramSceneName ?? '');
-          });
+          }));
         } catch {
           /* OBS down: keep the cache empty, the card shows 未连接 / 未知 */
         }
@@ -10013,13 +10029,18 @@ export function apply(ctx, config) {
           return value;
         };
       },
-      context(name, text) {
+      context(name, text, status = null) {
         return (context) => {
           const value = typeof text === 'function' ? text(context) : text;
           const previous = contextText.get(name);
           contextText.set(name, value);
           if (previous !== value && allow(`context:${name}`)) {
-            emit('assistant.context.refreshed', { name, chars: value.length, active: value.length > 0 });
+            let extra = null;
+            try { extra = status === null ? null : (typeof status === 'function' ? status() : status); } catch { extra = null; }
+            emit('assistant.context.refreshed', {
+              name, chars: value.length, active: value.length > 0,
+              ...(extra !== null && typeof extra === 'object' ? extra : {}),
+            });
           }
           // Fallback end-of-assembly: `assistant:resources` normally settled already; if another
           // scoped layer shadowed it, settle here so the diagnostics still cover this assembly.
@@ -10029,6 +10050,63 @@ export function apply(ctx, config) {
       },
     };
   })();
+
+  // ---- conversation observation gate + shared environment facts ------------
+  /**
+   * The one companion session for the current day (04:00 rollover). Everything else — a GUI/typing
+   * session, a subagent, a coding agent, an unreadable identity — must not see the conversation
+   * observations below. Identity is judged per render, so a rollover naturally selects the new id.
+   */
+  const isCompanionAgent = (agent) => {
+    try {
+      if (isSubagentAgent(agent)) return false;
+      const id = typeof agent?.id === 'string' ? agent.id : '';
+      return id.length > 0 && id === voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId;
+    } catch {
+      return false; // an unreadable identity fails closed
+    }
+  };
+  /** Wrap one observation text: companion-only; any other session renders '' (no snapshot). */
+  const companionObservation = (text) => (context) => {
+    let agent;
+    try {
+      agent = context?.agent; // a throwing identity accessor must not break assembly
+    } catch {
+      return '';
+    }
+    if (!isCompanionAgent(agent)) return '';
+    return typeof text === 'function' ? text(context) : text;
+  };
+  /**
+   * Bottom-layer environment facts (OBS scene, capture source, camera/device) are host facts, not
+   * conversation: every session in the workspace may see them. Each line carries its source and the
+   * moment it was observed; a fact with no recorded observation says 未知. The stored timestamps
+   * keep the rendered text byte-identical between changes (a section, not a per-step context).
+   */
+  const environmentStamp = (at) => {
+    const value = Number(at);
+    return Number.isFinite(value) && value > 0 ? new Date(value).toISOString() : '未知';
+  };
+  const renderEnvironment = () => {
+    try {
+      const locked = vision.mode === 'privacy';
+      const mode = locked ? visionReturn.mode : vision.mode;
+      const scene = locked ? visionReturn.scene : vision.scene;
+      const source = mode === 'scene' ? `OBS 场景「${scene.length > 0 ? scene : '未选择'}」` : '桌面屏幕';
+      const observed = lastObsScene.length > 0 ? `「${lastObsScene}」` : '未知';
+      const camera = virtualCamOn
+        ? `已连接（设备：${virtualCamDevice()}）`
+        : `未连接（设备：${virtualCamDevice()}）`;
+      return [
+        '【环境事实｜机器状态，不是对话内容，所有会话共享】',
+        `- OBS 当前场景：${observed}（来源：OBS WebSocket；观察于：${environmentStamp(lastObsSceneAt)}）`,
+        `- 采集来源：${source}${locked ? '（隐私锁定中）' : ''}（来源：视觉模式；观察于：${environmentStamp(visionSourceAt)}）`,
+        `- 虚拟摄像头：${camera}（来源：视觉采集；观察于：${environmentStamp(virtualCamAt)}）`,
+      ].join('\n');
+    } catch {
+      return '';
+    }
+  };
 
   const registerPromptSections = (scope) => {
     const registerSection = (declaration, final = false) => scope.systemPrompt.section({
@@ -10040,13 +10118,14 @@ export function apply(ctx, config) {
     // copies are compacted away). An empty text yields no snapshot. The
     // section fallback only keeps legacy/Host-double mounts (no `context()`) from throwing.
     const registerContext = (declaration) => {
-      const text = promptStability.context(declaration.name, declaration.text);
+      const { status = null, ...serviceDeclaration } = declaration;
+      const text = promptStability.context(serviceDeclaration.name, serviceDeclaration.text, status);
       if (typeof scope.systemPrompt.context === 'function') {
-        return scope.systemPrompt.context({ ...declaration, text });
+        return scope.systemPrompt.context({ ...serviceDeclaration, text });
       }
       return scope.systemPrompt.section({
         ...declaration,
-        text: promptStability.section(declaration.name, text),
+        text: promptStability.section(serviceDeclaration.name, text),
       });
     };
     scope.effect(() =>
@@ -10056,13 +10135,23 @@ export function apply(ctx, config) {
         text: scopedText(() => persona.render()),
       }),
     );
+    // Environment facts right after the persona: shared machine state (no companion gate). order
+    // 102 sorts just AFTER persona 100; the facts themselves are timestamped, not per-step.
+    scope.effect(() =>
+      registerSection({
+        name: 'assistant:environment',
+        order: 102,
+        text: scopedText(renderEnvironment),
+      }),
+    );
     // Nonverbal cue, right after the persona: a temporary observation for THIS step only.
     // It is never a user message and never enters the session history; expiry/no-cue renders empty.
+    // The companion gate keeps it inside the one conversation that owns the microphone.
     scope.effect(() =>
       registerContext({
         name: 'assistant:nonverbal',
         order: 105,
-        text: scopedText(() => nonverbalCue.render()),
+        text: companionObservation(scopedText(() => nonverbalCue.render())),
       }),
     );
     // Continuous dialogue: an independent observation block, never a user message. The body is
@@ -10072,7 +10161,18 @@ export function apply(ctx, config) {
       registerContext({
         name: 'assistant:dialogue',
         order: DIALOGUE_INJECTION_ORDER,
-        text: scopedText(() => (features.enabled('hearing') ? dialogueSummary.render() : '')),
+        text: companionObservation(scopedText(() => (features.enabled('hearing') ? dialogueSummary.render() : ''))),
+        status: () => {
+          const snapshot = dialogueContext.snapshot();
+          const stats = snapshot?.stats !== null && typeof snapshot?.stats === 'object' ? snapshot.stats : {};
+          return {
+            idle: snapshot?.active === false,
+            reason: snapshot?.reason ?? '',
+            expired: Number(snapshot?.expired ?? 0),
+            truncatedChars: Number(snapshot?.truncatedChars ?? stats.truncatedChars ?? 0),
+            droppedPendingChars: Number(stats.droppedPendingChars ?? 0),
+          };
+        },
       }),
     );
     // The compiled library replaces the persona text on the next request after a compile; while
