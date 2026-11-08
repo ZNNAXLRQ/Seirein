@@ -331,6 +331,9 @@ import {
 import * as hearingRuntime from './hearing/hearing.js';
 // Opt-in diagnosis clips (`voice.audioRetention`): the Host owns the one store both lanes borrow.
 import { openAudioRetention } from './hearing/audio-retention.js';
+// Voiceprint enrollment (`<root>/data/speaker-enrollment.json`): the Host owns the one store the
+// settings card reads and writes through its four explicit actions.
+import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
 import { ensureSpeakerModel, isSharedModelTarget, speakerModelTarget } from './platform/modelDownload.js';
 import { createDialogueContext } from './session/conversation/dialogueContext.js';
 import { FeatureStore } from './runtime/features.js';
@@ -1382,6 +1385,9 @@ export function apply(ctx, config) {
   // 之后每次动作/合并都重新读盘。这里不确认任何词；只有用户的 lexicon.confirm 动作才算数。
   const lexiconStore = createLexiconStore({ root, log });
   lexiconStore.list();
+  // 声纹登记：`<root>/data/speaker-enrollment.json`。读取永不建文件，写入只由用户的
+  // speaker.enroll.confirm / reject / remove 触发；这里不自动确认、不自动拒绝任何条目。
+  const speakerEnrollmentStore = createSpeakerEnrollmentStore({ root, log });
   /**
    * A5: the one `voice.speechMaxChars` value every speaking lane reads. The runtime setting wins;
    * the plugin config is the fallback; `undefined` keeps `resolveSpeechBudget`'s 1200 default
@@ -13732,6 +13738,9 @@ export function apply(ctx, config) {
     });
   };
   const speakerCounts = { matches: 0, unsure: 0, noSpeakers: 0, errors: 0 };
+  // `speaker.status.shadow` contract: exactly the three observable verdicts (a `no-speakers` row
+  // says the library is empty, so it is not a judgement and is counted separately above).
+  const speakerShadowCounts = { match: 0, mismatch: 0, unsure: 0 };
   let speakerLastShadow = null;
   let speakerDownloading = false;
   let speakerStatusAt = 0;
@@ -13776,10 +13785,15 @@ export function apply(ctx, config) {
       if (decision === 'match') speakerCounts.matches += 1;
       else if (decision === 'unsure') speakerCounts.unsure += 1;
       else if (decision === 'no-speakers') speakerCounts.noSpeakers += 1;
+      if (decision === 'match' || decision === 'mismatch' || decision === 'unsure') {
+        speakerShadowCounts[decision] += 1;
+      }
       speakerLastShadow = {
         decision,
         score: Number.isFinite(Number(payload?.score)) ? Number(payload.score) : 0,
         speakerId: typeof payload?.speakerId === 'string' ? payload.speakerId : null,
+        class: typeof payload?.class === 'string' ? payload.class : '',
+        quality: typeof payload?.quality === 'string' ? payload.quality : '',
         at: Date.now(),
       };
       emitSpeakerStatus(false);
@@ -13788,6 +13802,16 @@ export function apply(ctx, config) {
     if (type === 'speaker.model.failed') speakerCounts.errors += 1;
     if (type === 'speaker.model.failed' || type === 'speaker.model.ready') emitSpeakerStatus(true);
   };
+  /**
+   * `speaker.status.shadow` projection: observation data only. `at` is an ISO instant (the card
+   * shows it as text); it never feeds a gate, a delivery or an identity decision.
+   */
+  const speakerShadowSummary = () => ({
+    lastShadow: speakerLastShadow === null
+      ? null
+      : { ...speakerLastShadow, at: new Date(speakerLastShadow.at).toISOString() },
+    counts: { ...speakerShadowCounts },
+  });
   /** T1: the pinned speaker model, fetched on demand. Never awaited by capture or delivery. */
   const startSpeakerDownload = () => {
     try {
@@ -15193,6 +15217,8 @@ export function apply(ctx, config) {
     get poller() { return poller; },
     get runtime() { return runtime; },
     get saveBindings() { return saveBindings; },
+    get speakerEnrollmentStore() { return speakerEnrollmentStore; },
+    get speakerShadowSummary() { return speakerShadowSummary; },
     get startCompanion() { return startCompanion; },
     get writeSettings() { return writeSettings; }
   }) },

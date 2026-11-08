@@ -1,4 +1,4 @@
-/** Settings actions for component switches, dependency startup, diagnostics and hotkeys. */
+/** Settings actions for component switches, dependency startup, diagnostics, hotkeys and voiceprint enrollment/shadow. */
 import { DEFAULT_HOTKEYS } from '../../platform/hotkeys.js';
 import { HOTKEY_ACTIONS } from '../../platform/hotkeys.js';
 import { parseBinding } from '../../platform/hotkeys.js';
@@ -12,9 +12,28 @@ export const ACTIONS = Object.freeze([
   'hotkey.reset',
   'feature.set',
   'diagnostics.query',
+  /** Voiceprint enrollment: list/confirm/reject/remove are the only writes, each user-explicit. */
+  'speaker.enroll.list',
+  'speaker.enroll.confirm',
+  'speaker.enroll.reject',
+  'speaker.enroll.remove',
+  /** Shadow observation read only: never an identity decision and never a gate. */
+  'speaker.status.shadow',
 ]);
 
 export function createRuntimeSettingsActions(services) {
+  /** The Host-owned enrollment store; a missing one is a controlled refusal, never a throw. */
+  const enrollStore = () => services.speakerEnrollmentStore ?? null;
+  const ENROLL_UNAVAILABLE = Object.freeze({ ok: false, reason: 'unavailable' });
+  /** The card's read shape: a sample COUNT and total duration, not the raw sample rows. */
+  const enrollRow = (entry) => ({
+    speakerId: entry.speakerId,
+    label: entry.label,
+    status: entry.status,
+    samples: entry.samples.length,
+    totalDurationMs: entry.samples.reduce((total, sample) => total + sample.durationMs, 0),
+    confirmedAt: entry.confirmedAt ?? '',
+  });
   const handler = async (body) => {
     switch (body.action) {
       case 'pick.file': {
@@ -131,6 +150,73 @@ export function createRuntimeSettingsActions(services) {
       case 'diagnostics.query': {
         // Read-only, bounded, whitelisted probes. Disabled by default; see diagnosticsEnabled().
         return services.diagnostics.query({ probe: body.probe, limit: body.limit, includePhases: body.includePhases === true });
+      }
+      case 'speaker.enroll.list': {
+        const store = enrollStore();
+        if (store === null) return ENROLL_UNAVAILABLE;
+        try {
+          const entries = [];
+          for (const status of ['pending', 'confirmed', 'rejected']) entries.push(...store.list({ status }));
+          entries.sort((left, right) => (left.createdAt === right.createdAt
+            ? left.speakerId.localeCompare(right.speakerId)
+            : left.createdAt.localeCompare(right.createdAt)));
+          return { ok: true, selfId: store.getConfirmedSelf()?.speakerId ?? '', entries: entries.map(enrollRow) };
+        } catch {
+          return { ok: false, reason: 'read-failed' };
+        }
+      }
+      case 'speaker.enroll.confirm': {
+        // Explicit user action only. `store.confirm` owns the 3-second rule and the rejected tombstone.
+        const store = enrollStore();
+        const speakerId = String(body.speakerId ?? '');
+        if (store === null) return { ...ENROLL_UNAVAILABLE, speakerId };
+        try {
+          const result = store.confirm({ speakerId });
+          return result.ok
+            ? { ok: true, speakerId: result.entry.speakerId }
+            : { ok: false, speakerId, reason: result.reason };
+        } catch {
+          return { ok: false, speakerId, reason: 'write-failed' };
+        }
+      }
+      case 'speaker.enroll.reject': {
+        const store = enrollStore();
+        const speakerId = String(body.speakerId ?? '');
+        if (store === null) return { ...ENROLL_UNAVAILABLE, speakerId };
+        try {
+          const result = store.reject({ speakerId });
+          return result.ok ? { ok: true, speakerId } : { ok: false, speakerId, reason: result.reason };
+        } catch {
+          return { ok: false, speakerId, reason: 'write-failed' };
+        }
+      }
+      case 'speaker.enroll.remove': {
+        // Whole entry by default; an explicit sampleId prunes one sample and keeps the entry/status.
+        const store = enrollStore();
+        const speakerId = String(body.speakerId ?? '');
+        const sampleId = String(body.sampleId ?? '');
+        if (store === null) return { ...ENROLL_UNAVAILABLE, speakerId };
+        try {
+          const result = sampleId === ''
+            ? store.removeEntry({ speakerId })
+            : store.removeSample({ speakerId, sampleId });
+          if (result.ok !== true) return { ok: false, speakerId, reason: result.reason };
+          return sampleId === ''
+            ? { ok: true, speakerId }
+            : { ok: true, speakerId, sampleId: result.sample.id };
+        } catch {
+          return { ok: false, speakerId, reason: 'write-failed' };
+        }
+      }
+      case 'speaker.status.shadow': {
+        // Observation read only: the three verdict counts and the last row; never a decision.
+        try {
+          const summary = (0, services.speakerShadowSummary)();
+          if (summary === null || typeof summary !== 'object') return { ok: false, reason: 'unavailable' };
+          return { ok: true, lastShadow: summary.lastShadow ?? null, counts: summary.counts };
+        } catch {
+          return { ok: false, reason: 'unavailable' };
+        }
       }
   }
 };
