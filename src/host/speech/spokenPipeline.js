@@ -350,7 +350,24 @@ export async function collectModelStream(stream, {
 
 const unitCount = (text) => codePoints(String(text ?? '').trim());
 /** A speakable unit carries at least one letter or digit; a pause-only leftover is not a unit. */
-const hasSpeakableText = (text) => /[\p{L}\p{N}]/u.test(String(text ?? ''));
+export const hasSpeakableText = (text) => /[\p{L}\p{N}]/u.test(String(text ?? ''));
+
+/**
+ * The plan text whose SENTENCE boundaries are exactly the semantic units that were fed to the
+ * speaker. A streamed spoken version cuts long sentences at a comma, and the speaker turns each
+ * unit into one played sentence (the `\n` it appends is a terminator); grouping the same text by
+ * its punctuation alone would count fewer sentences and let the response group close before the
+ * last unit played. The spoken characters are unchanged — only the unit separators are explicit.
+ *
+ * @param {string[]} units the semantic units handed to the speaker, in playback order
+ * @returns {string} unit-separated plan text ('' when nothing speakable was fed)
+ */
+export function joinSpokenUnits(units) {
+  return (Array.isArray(units) ? units : [])
+    .map((unit) => String(unit ?? '').trim())
+    .filter((unit) => hasSpeakableText(unit))
+    .join('\n');
+}
 
 /**
  * Consume model deltas and hand every stable semantic unit straight to `onUnit`.

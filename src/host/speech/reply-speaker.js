@@ -6,6 +6,7 @@ import { rm } from 'node:fs/promises';
 import { speechCharCount } from '../shared/text.js';
 import { takeSentences } from '../shared/text.js';
 import { chunkPlayer } from './chunk-capabilities.js';
+import { hasSpeakableText } from './spokenPipeline.js';
 
 /** `voice.prefetchDepth` bounds: how many sentences may be synthesized ahead of playback. */
 export const DEFAULT_VOICE_PREFETCH_DEPTH = 2;
@@ -338,6 +339,12 @@ export function createReplySpeaker({
   let cancelled = false;
   let failure = null;
   let running = null;
+  /** True once the current run() settled; a sentence pushed after close may start one more drain. */
+  let runSettled = false;
+  /** True while finish() is draining, so a just-late sentence is spoken instead of reported. */
+  let finishing = false;
+  /** Extra drains a late sentence may start before it is reported as dropped. */
+  const LATE_DRAIN_ROUNDS = 4;
   /** True once any clip really produced sound; the fallback decision uses this, not `played`. */
   let playedAny = false;
   /** A5: `voice.speech.budget` is reported once, after the last sentence was considered. */
@@ -368,6 +375,22 @@ export function createReplySpeaker({
     lastPrefetchEvent = signature;
     try {
       onEvent({ type: 'voice.prefetch', depth, prepared, maxAhead });
+    } catch {
+      /* observation cannot break playback */
+    }
+  };
+
+  /**
+   * A speakable sentence that cannot reach the player is reported, never silently swallowed.
+   * `count` is false for a cancellation (already explicit through `stats.cancelled`/lifecycle).
+   */
+  const reportDropped = (text, reason, { count = true } = {}) => {
+    const value = String(text ?? '').trim();
+    if (!hasSpeakableText(value)) return;
+    const chars = speechCharCount(value);
+    if (count) stats.droppedSentences += 1;
+    try {
+      onEvent?.({ type: 'voice.speech.dropped', reason, text: value, chars });
     } catch {
       /* observation cannot break playback */
     }
@@ -642,15 +665,21 @@ export function createReplySpeaker({
       // `finish()` awaits this promise, so releasing here is what prevents a stuck "still playing".
       emitLifecycle(cancelled ? 'cancelled' : (failure !== null ? 'failed' : 'finished'), 'run-settled');
       releaseActive(cancelled ? 'cancelled' : (failure !== null ? 'failed' : 'finished'));
+      runSettled = true;
     }
   };
   const start = () => {
-    if (running === null) running = run();
+    if (running === null || runSettled) {
+      runSettled = false;
+      running = run();
+    }
   };
 
   const enqueue = (sentence) => {
     const text = String(sentence).trim();
-    if (text.length === 0 || stopped()) return;
+    // An empty or punctuation-only fragment is not a sentence: it must not open a player, count
+    // against the budget or keep the run alive.
+    if (text.length === 0 || stopped() || !hasSpeakableText(text)) return;
     const chars = speechCharCount(text);
     stats.requestedChars += chars;
     // A5: a sentence is the smallest unit the budget may drop — never a character. The first
@@ -680,9 +709,25 @@ export function createReplySpeaker({
   };
 
   const push = (delta) => {
-    if (closed || stopped()) return;
+    if (stopped()) return;
     const text = typeof delta === 'string' ? delta : '';
     if (text.length === 0) return;
+    if (closed) {
+      // finish() already flushed the source. A sentence that still arrives before finish returns
+      // is drained and spoken; one that arrives after it returned is reported as dropped. Either
+      // way the tail can never vanish silently.
+      const late = split(text);
+      const lateSentences = Array.isArray(late?.sentences) ? [...late.sentences] : [];
+      const lateRest = typeof late?.rest === 'string' ? late.rest.trim() : '';
+      if (lateRest.length > 0) lateSentences.push(lateRest);
+      if ((runSettled || running === null) && !finishing) {
+        for (const sentence of lateSentences) reportDropped(sentence, 'late-after-finish');
+        return;
+      }
+      for (const sentence of lateSentences) enqueue(sentence);
+      start();
+      return;
+    }
     buffer += text;
     let taken;
     try {
@@ -724,9 +769,23 @@ export function createReplySpeaker({
     }
   };
 
-  const finish = async ({ fullText = '' } = {}) => {
+  const finishCore = async ({ fullText = '' } = {}) => {
     closeSource();
-    if (running !== null) await running;
+    // A sentence may arrive just after the source closed. Drain every run it starts, in order,
+    // before deciding the answer is complete; a tail that still cannot play is reported below.
+    for (let round = 0; running !== null; round += 1) {
+      const observed = running;
+      await observed;
+      if (running !== observed) continue; // a late push already started the next drain
+      if (queue.length === 0) break;
+      if (stopped() || round >= LATE_DRAIN_ROUNDS) {
+        const reason = stopped() ? (failure !== null ? 'failed' : 'cancelled') : 'late-after-finish';
+        for (const item of queue.splice(0)) reportDropped(item.text, reason);
+        break;
+      }
+      runSettled = true;
+      start();
+    }
     if (stats.firstQueuedAt > 0) {
       const origin = Number.isFinite(startedAt) && startedAt > 0 ? startedAt : stats.firstQueuedAt;
       stats.firstQueuedMs = Math.max(0, stats.firstQueuedAt - origin);
@@ -778,7 +837,7 @@ export function createReplySpeaker({
           stats.keptSentences = limited.keptSentences;
           stats.droppedSentences = limited.droppedSentences;
         }
-        if (limited.text.length > 0) {
+        if (limited.text.length > 0 && hasSpeakableText(limited.text)) {
           stats.fallback = true;
           let fallback = null;
           const recordFallback = (spoken) => {
@@ -835,12 +894,23 @@ export function createReplySpeaker({
     return stats;
   };
 
+  /**
+   * Mark the late window while finish() drains: a push that still arrives is spoken if it can be,
+   * and reported as dropped once this promise has returned.
+   */
+  const finish = ({ fullText = '' } = {}) => {
+    finishing = true;
+    return finishCore({ fullText }).finally(() => { finishing = false; });
+  };
+
   const cancel = (reason = 'cancel') => {
     if (cancelled) return false;
     cancelled = true;
     stats.cancelled = true;
     // P2: a user/new-version stop is EXTERNAL and may interrupt an in-flight fallback in finish().
     markExternalCancel();
+    // Queued sentences were accepted but will never be spoken: report them explicitly.
+    for (const item of queue) reportDropped(item.text, 'cancelled', { count: false });
     buffer = '';
     queue = [];
     release(null);
