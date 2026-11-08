@@ -13,6 +13,9 @@
  *   5. 未接线/读取失败/坏数据只显示错误，不抛出（含宿主当前不带 ok 的 list 形状）；
  *   6. client.js 接线检查（回归套件 audio-retention-ui / motion-presets-ui / hearing-ui /
  *      node test/smoke.mjs 单独执行，结果见交付说明）。
+ *   7. 两步保存（P2，tests 7-9）：confirm 成功但补存误识别形式失败 → 弹窗保留并显示
+ *      「已确认但误识别形式未保存：<原因>」+ [重试保存]；重试只发 lexicon.edit；取消重试时
+ *      关闭并刷新，同时保留提示；confirm 失败/纯编辑成功保持原行为（不关闭 / 一次关闭）。
  *
  * Run: node --test test/lexicon-ui.mjs
  */
@@ -41,6 +44,8 @@ const lexicon = new Function(
   `${lexiconBlockSource}
 return {
   lexiconSpeakerId, lexiconListData, lexiconObservedForms, lexiconDialogOf, lexiconSaveBody, lexiconSection,
+  lexiconFailureReason, lexiconPartialNotice, lexiconWrongFormsBody,
+  lexiconSaveSteps, lexiconRetryStep, settleLexiconSave, closeLexiconDialogState,
 };`,
 )(styles, '#d8dce3', '#c92a2a');
 
@@ -126,10 +131,11 @@ const mount = (overrides = {}) => {
     refresh: 0,
     openConfirm: [],
     openEdit: [],
-    close: 0,
+    close: [],
     change: [],
     removeForm: [],
     save: [],
+    retry: [],
     askIgnore: [],
     ignore: [],
     askRemove: [],
@@ -156,7 +162,7 @@ const mount = (overrides = {}) => {
       state.pending = null;
       state.dialog = lexicon.lexiconDialogOf(entry, 'edit');
     },
-    closeDialog: () => { calls.close += 1; state.dialog = null; },
+    closeDialog: (dialog) => { calls.close.push(dialog); state.dialog = null; },
     changeDialog: (patch) => {
       calls.change.push(patch);
       state.dialog = state.dialog === null ? null : { ...state.dialog, ...patch, error: '' };
@@ -171,6 +177,7 @@ const mount = (overrides = {}) => {
       }
     },
     saveDialog: (dialog, speakerId) => { calls.save.push([dialog, speakerId]); },
+    retrySave: (dialog) => { calls.retry.push(dialog); },
     askIgnore: (id) => {
       calls.askIgnore.push(id);
       state.pending = { kind: 'ignore', id: String(id) };
@@ -191,6 +198,35 @@ const mount = (overrides = {}) => {
     speakerId: state.speakerId,
   }, handlers);
   return { state, calls, render };
+};
+
+/** 假 act：按脚本逐次返回宿主结果，并记录每次 (body, tag)；第二步失败就是脚本里的 ok:false。 */
+const makeAct = (results) => {
+  const calls = [];
+  const act = async (body, tag) => {
+    calls.push({ body, tag });
+    return results.shift();
+  };
+  return { act, calls };
+};
+
+/** 假 setLexiconDialog：支持函数式更新，`get()` 读当前弹窗（Panel 用同一种写法）。 */
+const makeDialogState = (initial = null) => {
+  let dialog = initial;
+  const setDialog = (value) => {
+    dialog = typeof value === 'function' ? value(dialog) : value;
+  };
+  return { setDialog, get: () => dialog, set: (value) => { dialog = value; } };
+};
+
+/** 记录 loadLexicon / show 的调用；某些分支不该刷新或提示时用会抛错的实现。 */
+const makeEffects = () => {
+  const seen = { refresh: 0, shown: [] };
+  return {
+    seen,
+    loadLexicon: async () => { seen.refresh += 1; },
+    show: (text) => { seen.shown.push(text); },
+  };
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -533,8 +569,13 @@ test('6. 接线检查：听觉卡片挂载、五个动作、speakerId 来自宿�
   assert.ok(retentionAt > 0 && mountAt > retentionAt, 'the section mounts right after 音频保留 in the 听觉 card');
   assert.ok(clientSource.indexOf('    function lexiconSection(') > clientSource.indexOf('    function retentionSection('));
 
-  assert.doesNotMatch(lexiconBlockSource, /fetch\(/u, 'the section never fetches by itself');
-  assert.doesNotMatch(lexiconBlockSource, /\bact\(/u, 'the section has no host side effects; Panel owns act');
+  assert.doesNotMatch(lexiconBlockSource, /fetch\(/u, 'the lexicon block never fetches by itself');
+  // The rendering section stays pure; the two-step save flow takes `act` by injection and is
+  // exercised directly by tests 7-9 (so this check is scoped to lexiconSection, not the block).
+  const sectionFrom = lexiconBlockSource.indexOf('    function lexiconSection(');
+  assert.ok(sectionFrom > 0, 'the block still ships the rendering section');
+  assert.doesNotMatch(lexiconBlockSource.slice(sectionFrom), /\bact\(/u,
+    'the rendering section has no host side effects; the save flow receives act by injection');
   assert.match(clientSource, /const body = lexiconSaveBody\(dialog, speakerId\);/u);
   assert.match(clientSource, /await act\(body, body\.action === 'lexicon\.edit' \? 'lexicon-edit' : 'lexicon-confirm'\);/u,
     'both dialog modes go through the one act() write path');
@@ -542,8 +583,237 @@ test('6. 接线检查：听觉卡片挂载、五个动作、speakerId 来自宿�
     'ignore/remove share the same act() write path');
   assert.match(clientSource, /saveDialog: \(dialog, speakerId\) => void saveLexiconDialog\(dialog, speakerId\),/u,
     'the section passes the status-derived identity into the Panel save');
-  assert.match(clientSource, /await act\(\{ action: 'lexicon\.edit', id: String\(result\.entry\.id\), wrongForms: dialog\.wrongForms \}, 'lexicon-edit'\);/u,
+  assert.match(clientSource, /const second = await act\(lexiconWrongFormsBody\(dialog, entryId\), 'lexicon-edit'\);/u,
     'a trimmed confirm dialog is followed by one edit call');
+  assert.match(clientSource, /if \(second\?\.ok !== true\) \{\s+return \{ stage: 'partial', entryId, notice:/u,
+    'the second step result is inspected instead of ignored');
+  assert.match(clientSource, /retrySave: \(dialog\) => void retryLexiconSave\(dialog\),/u,
+    'a partial dialog wires its own retry handler');
+  assert.match(clientSource, /const outcome = await lexiconRetryStep\(\{ dialog, act \}\);/u,
+    'the retry runs the retry step, not the save step');
+  assert.match(clientSource, /closeDialog: \(dialog\) => void closeLexiconDialog\(dialog\),/u,
+    'closing a partial dialog keeps the dialog state so the Panel can refresh and hint');
+  const retryFrom = clientSource.indexOf('    async function lexiconRetryStep(');
+  const retryTo = clientSource.indexOf('    async function settleLexiconSave(', retryFrom);
+  assert.ok(retryFrom > 0 && retryTo > retryFrom, 'the retry step is its own shipped function');
+  assert.doesNotMatch(clientSource.slice(retryFrom, retryTo), /lexicon\.confirm/u,
+    'the retry never repeats the confirmation');
+  assert.doesNotMatch(clientSource.slice(retryFrom, retryTo), /saveLexiconDialog/u,
+    'the retry never goes back through the two-step save');
 
-  console.log('[lexicon-ui 6] mounted=听觉 actions=5 listParser=ok|bare speakerId=status');
+  console.log('[lexicon-ui 6] mounted=听觉 actions=5 listParser=ok|bare speakerId=status retry=edit-only');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. P2: confirm ok + the follow-up edit fails → the dialog stays open with partial success
+// ---------------------------------------------------------------------------------------------
+test('7. confirm 成功 + 补存 edit 失败：弹窗保留、显示部分成功、内容不丢', async () => {
+  const base = lexicon.lexiconDialogOf(
+    candidate({ kind: 'correction', wrongForms: ['像晚', '想晚'] }), 'confirm');
+  const trimmed = { ...base, wrongForms: ['想晚'] }; // 用户在弹窗里删掉了一条误识别形式
+  const { act, calls } = makeAct([
+    { ok: true, entry: { id: 'cand-1' } },
+    { ok: false, reason: 'write-failed' }, // 审查复现的真实回调：第二步 write-failed
+  ]);
+  const outcome = await lexicon.lexiconSaveSteps({ dialog: trimmed, speakerId: 'spk-1', act });
+
+  assert.equal(calls.length, 2, 'confirm then the follow-up edit both run');
+  assert.deepEqual(calls[0].body, {
+    action: 'lexicon.confirm', speakerId: 'spk-1', id: 'cand-1', canonical: '向晚',
+  });
+  assert.deepEqual(calls[1].body, { action: 'lexicon.edit', id: 'cand-1', wrongForms: ['想晚'] },
+    'the second step saves only the forms the user kept');
+  assert.equal(calls[1].tag, 'lexicon-edit');
+  assert.equal(outcome.stage, 'partial', 'the failed second step is not swallowed');
+  assert.equal(outcome.entryId, 'cand-1');
+  assert.equal(outcome.notice, '已确认但误识别形式未保存：write-failed');
+
+  const effects = makeEffects();
+  const ui = makeDialogState(trimmed);
+  await lexicon.settleLexiconSave({
+    dialog: trimmed, outcome, setDialog: ui.setDialog,
+    loadLexicon: effects.loadLexicon, show: effects.show,
+  });
+  const kept = ui.get();
+  assert.ok(kept !== null && kept !== undefined, 'the dialog is NOT closed');
+  assert.equal(kept.retryId, 'cand-1', 'the confirmed entry id is kept for the retry');
+  assert.equal(kept.notice, '已确认但误识别形式未保存：write-failed');
+  assert.deepEqual(kept.wrongForms, ['想晚'], 'the trimmed content survives the failure');
+  assert.equal(kept.canonical, '向晚');
+  assert.equal(effects.seen.refresh, 1, 'the confirmed state is refreshed in the list');
+  assert.deepEqual(effects.seen.shown, [], 'no full-success toast');
+
+  // Render: notice + retry button; the user's content is still in the inputs.
+  const view = mount({ dialog: kept, data: { unassigned: [], entries: [word()], error: '' } });
+  const node = nodeOf(view.render(), 'data-lexicon-dialog', 'confirm');
+  assert.ok(node !== undefined, 'the confirm dialog is still rendered');
+  assert.equal(node.props['data-lexicon-partial'], '1');
+  assert.ok(textsOf(node).includes('已确认但误识别形式未保存：write-failed'),
+    'the partial reason is visible');
+  assert.equal(inputOf(node, (item) => item.props.value === '向晚').props.value, '向晚',
+    'the spelling field is preserved');
+  assert.ok(textsOf(node).includes('想晚'), 'the kept wrong form is still listed');
+  assert.ok(!textsOf(node).includes('像晚'), 'the removed wrong form stays removed');
+  const retry = buttonOf(node, '重试保存');
+  assert.equal(retry.props.disabled, false, 'the retry is available');
+  buttonOf(node, '关闭');
+  assert.ok(!nodesOf(node).some((item) => item.type === 'button' && (item.children ?? []).includes('确认')),
+    'the partial dialog cannot run the confirm step again');
+  await retry.props.onClick();
+  assert.equal(view.calls.save.length, 0, 'the retry button does not use the save path');
+  assert.deepEqual(view.calls.retry, [kept], 'the retry receives the current (re-trimmed) dialog');
+
+  console.log('[lexicon-ui 7] first=confirm(ok) second=edit(write-failed) stage=partial open=yes',
+    'notice=已确认但误识别形式未保存：write-failed content=[想晚] refresh=1');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 8. Retry: only lexicon.edit (never confirm); success closes + refreshes, failure stays open
+// ---------------------------------------------------------------------------------------------
+test('8. 点击[重试保存] 只调用 lexicon.edit：成功关闭并刷新，失败留在弹窗', async () => {
+  const base = lexicon.lexiconDialogOf(
+    candidate({ kind: 'correction', wrongForms: ['像晚', '想晚'] }), 'confirm');
+  const partial = {
+    ...base,
+    wrongForms: ['想晚'],
+    retryId: 'cand-1',
+    notice: '已确认但误识别形式未保存：write-failed',
+  };
+
+  const { act, calls } = makeAct([{ ok: true, entry: { id: 'cand-1' } }]);
+  const effects = makeEffects();
+  const ui = makeDialogState(partial);
+  const outcome = await lexicon.lexiconRetryStep({ dialog: partial, act });
+
+  assert.equal(calls.length, 1, 'the retry performs exactly one write');
+  assert.equal(calls[0].body.action, 'lexicon.edit');
+  assert.deepEqual(calls[0].body, { action: 'lexicon.edit', id: 'cand-1', wrongForms: ['想晚'] });
+  assert.equal(calls[0].tag, 'lexicon-edit');
+  assert.equal(outcome.stage, 'done');
+
+  await lexicon.settleLexiconSave({
+    dialog: partial, outcome, setDialog: ui.setDialog,
+    loadLexicon: effects.loadLexicon, show: effects.show,
+  });
+  assert.equal(ui.get(), null, 'a successful retry closes the dialog');
+  assert.equal(effects.seen.refresh, 1, 'a successful retry refreshes the list');
+  assert.deepEqual(effects.seen.shown, ['已确认「向晚」']);
+
+  // A failing retry keeps the dialog with the fresh reason and the same retry id.
+  const fail = makeAct([{ ok: false, reason: 'not-found' }]);
+  ui.set(partial);
+  const failed = await lexicon.lexiconRetryStep({ dialog: partial, act: fail.act });
+  assert.equal(failed.stage, 'partial');
+  assert.equal(failed.notice, '已确认但误识别形式未保存：not-found');
+  assert.equal(fail.calls.length, 1, 'a failing retry does not loop by itself');
+  await lexicon.settleLexiconSave({
+    dialog: partial, outcome: failed, setDialog: ui.setDialog,
+    loadLexicon: effects.loadLexicon, show: effects.show,
+  });
+  assert.ok(ui.get() !== null, 'the dialog stays open after a failed retry');
+  assert.equal(ui.get().notice, '已确认但误识别形式未保存：not-found');
+  assert.equal(ui.get().retryId, 'cand-1');
+
+  // Without a confirmed entry id there is nothing to retry, and nothing is written.
+  const skipped = await lexicon.lexiconRetryStep({ dialog: { ...base }, act: fail.act });
+  assert.equal(skipped.stage, 'skipped');
+  assert.equal(fail.calls.length, 1, 'no write is attempted without a confirmed id');
+
+  console.log('[lexicon-ui 8] retryCalls=1 action=lexicon.edit closed=yes refresh=1',
+    'retryFail=partial open=yes retryId=cand-1 skipped=no-write');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 9. Regressions: confirm failure stays open, edit closes once, cancelling a partial keeps a hint
+// ---------------------------------------------------------------------------------------------
+test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重试刷新并保留提示', async () => {
+  const base = lexicon.lexiconDialogOf(
+    candidate({ kind: 'correction', wrongForms: ['像晚', '想晚'] }), 'confirm');
+  const trimmed = { ...base, wrongForms: ['想晚'] };
+
+  // confirm failed: the error stays in the dialog; nothing refreshes and nothing toasts.
+  const denied = makeAct([{ ok: false, reason: 'speaker-required' }]);
+  const ui = makeDialogState(trimmed);
+  const failed = await lexicon.lexiconSaveSteps({ dialog: trimmed, speakerId: '', act: denied.act });
+  assert.equal(failed.stage, 'failed');
+  assert.equal(denied.calls.length, 1, 'a failed confirm never reaches the second step');
+  await lexicon.settleLexiconSave({
+    dialog: trimmed,
+    outcome: failed,
+    setDialog: ui.setDialog,
+    loadLexicon: async () => { throw new Error('a failed confirm must not refresh'); },
+    show: () => { throw new Error('a failed confirm must not toast'); },
+  });
+  assert.ok(ui.get() !== null, 'the dialog stays open');
+  assert.equal(ui.get().error, 'speaker-required');
+  const failNode = nodeOf(mount({
+    dialog: ui.get(), data: { unassigned: [], entries: [word()], error: '' },
+  }).render(), 'data-lexicon-dialog', 'confirm');
+  assert.ok(textsOf(failNode).includes('speaker-required'), 'the host reason is visible');
+
+  // edit mode: one write, one close, one refresh.
+  const editDialog = lexicon.lexiconDialogOf(word(), 'edit');
+  const single = makeAct([{ ok: true, entry: { id: 'word-1' } }]);
+  const editUi = makeDialogState(editDialog);
+  const effects = makeEffects();
+  const done = await lexicon.lexiconSaveSteps({ dialog: editDialog, speakerId: 'spk-1', act: single.act });
+  assert.equal(done.stage, 'done');
+  assert.equal(single.calls.length, 1, 'an edit dialog writes exactly once');
+  assert.equal(single.calls[0].body.action, 'lexicon.edit');
+  await lexicon.settleLexiconSave({
+    dialog: editDialog, outcome: done, setDialog: editUi.setDialog,
+    loadLexicon: effects.loadLexicon, show: effects.show,
+  });
+  assert.equal(editUi.get(), null, 'the dialog closes once');
+  assert.equal(effects.seen.refresh, 1);
+  assert.deepEqual(effects.seen.shown, ['词库已更新']);
+
+  // confirm ok + nothing trimmed: one write, one close.
+  const plain = { ...base, wrongForms: ['像晚', '想晚'] };
+  const keep = makeAct([{ ok: true, entry: { id: 'cand-1' } }]);
+  const plainUi = makeDialogState(plain);
+  const plainEffects = makeEffects();
+  const keptOutcome = await lexicon.lexiconSaveSteps({
+    dialog: plain, speakerId: 'spk-1', act: keep.act,
+  });
+  assert.equal(keptOutcome.stage, 'done');
+  assert.equal(keep.calls.length, 1, 'an untouched confirm does not call edit');
+  await lexicon.settleLexiconSave({
+    dialog: plain, outcome: keptOutcome, setDialog: plainUi.setDialog,
+    loadLexicon: plainEffects.loadLexicon, show: plainEffects.show,
+  });
+  assert.equal(plainUi.get(), null);
+  assert.deepEqual(plainEffects.seen.shown, ['已确认「向晚」']);
+
+  // Cancel a partial dialog: close + refresh + keep the "not saved" hint.
+  const partial = {
+    ...trimmed, retryId: 'cand-1', notice: '已确认但误识别形式未保存：write-failed',
+  };
+  const cancelUi = makeDialogState(partial);
+  const cancelEffects = makeEffects();
+  const view = mount({ dialog: partial, data: { unassigned: [], entries: [word()], error: '' } });
+  await buttonOf(nodeOf(view.render(), 'data-lexicon-dialog', 'confirm'), '关闭').props.onClick();
+  assert.deepEqual(view.calls.close, [partial], 'the close handler receives the partial dialog');
+  assert.equal(view.calls.save.length + view.calls.retry.length, 0, 'closing writes nothing');
+  await lexicon.closeLexiconDialogState({
+    dialog: partial, setDialog: cancelUi.setDialog,
+    loadLexicon: cancelEffects.loadLexicon, show: cancelEffects.show,
+  });
+  assert.equal(cancelUi.get(), null, 'closing a partial dialog closes it');
+  assert.equal(cancelEffects.seen.refresh, 1, 'closing refreshes the now-confirmed list');
+  assert.deepEqual(cancelEffects.seen.shown, ['已确认「向晚」，误识别形式未保存']);
+
+  // A normal cancel (no partial state) stays silent and does not refresh.
+  const normalUi = makeDialogState(base);
+  const normalEffects = makeEffects();
+  await lexicon.closeLexiconDialogState({
+    dialog: base, setDialog: normalUi.setDialog,
+    loadLexicon: normalEffects.loadLexicon, show: normalEffects.show,
+  });
+  assert.equal(normalUi.get(), null);
+  assert.equal(normalEffects.seen.refresh, 0);
+  assert.deepEqual(normalEffects.seen.shown, []);
+
+  console.log('[lexicon-ui 9] confirmFail=open(no-refresh) edit=one-write close=1',
+    'partialCancel=refresh+hint plainCancel=silent');
 });

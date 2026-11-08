@@ -2327,6 +2327,99 @@ window.__ModuleLoader__.load({
       return body;
     }
 
+    /** 宿主失败原因：error / reason / code 取第一个非空值，与弹窗里显示的文案同源。 */
+    function lexiconFailureReason(result) {
+      for (const value of [result?.error, result?.reason, result?.code]) {
+        const text = String(value ?? '').trim();
+        if (text !== '') return text;
+      }
+      return '操作失败';
+    }
+
+    /** 第二步失败文案：说清「已经确认」与「哪一部分没保存、为什么」。 */
+    function lexiconPartialNotice(reason) {
+      const text = String(reason ?? '').trim();
+      return `已确认但误识别形式未保存：${text === '' ? '操作失败' : text}`;
+    }
+
+    /**
+     * 第二步/重试共用的 edit 请求体：正确写法已由 confirm 保存，这里只补误识别形式，
+     * 不重发 canonical/context（确认弹窗没有上下文，重发会把已有上下文写空）。
+     */
+    function lexiconWrongFormsBody(dialog, entryId) {
+      const forms = (Array.isArray(dialog?.wrongForms) ? dialog.wrongForms : [])
+        .map((form) => String(form ?? '').trim())
+        .filter((form) => form !== '');
+      return { action: 'lexicon.edit', id: String(entryId ?? ''), wrongForms: forms };
+    }
+
+    /**
+     * 两步保存的调度（Panel 注入 act，测试注入假 act）：只返回结果，不做界面副作用。
+     * confirm 契约不带 wrongForms，删减过的形式要在确认成功后补一次 edit；这一步的结果必须
+     * 返回给调用方，不能 await 完就丢掉。
+     */
+    async function lexiconSaveSteps({ dialog, speakerId, act }) {
+      if (dialog === null || dialog === undefined) return { stage: 'skipped' };
+      const body = lexiconSaveBody(dialog, speakerId);
+      const first = await act(body, body.action === 'lexicon.edit' ? 'lexicon-edit' : 'lexicon-confirm');
+      if (first?.ok !== true) return { stage: 'failed', error: lexiconFailureReason(first) };
+      const kept = Array.isArray(dialog.wrongForms) ? dialog.wrongForms.length : 0;
+      const observed = Array.isArray(dialog.observed) ? dialog.observed.length : kept;
+      if (dialog.mode !== 'confirm' || kept === observed) return { stage: 'done' };
+      const entryId = String(first.entry?.id ?? dialog.id ?? '').trim();
+      const second = await act(lexiconWrongFormsBody(dialog, entryId), 'lexicon-edit');
+      if (second?.ok !== true) {
+        return { stage: 'partial', entryId, notice: lexiconPartialNotice(lexiconFailureReason(second)) };
+      }
+      return { stage: 'done' };
+    }
+
+    /** 重试只补第二步：只发 lexicon.edit，绝不重复 confirm。 */
+    async function lexiconRetryStep({ dialog, act }) {
+      const entryId = String(dialog?.retryId ?? '').trim();
+      if (entryId === '') return { stage: 'skipped' };
+      const result = await act(lexiconWrongFormsBody(dialog, entryId), 'lexicon-edit');
+      if (result?.ok !== true) {
+        return { stage: 'partial', entryId, notice: lexiconPartialNotice(lexiconFailureReason(result)) };
+      }
+      return { stage: 'done' };
+    }
+
+    /**
+     * 结果落到弹窗：只有全部成功才关闭；部分成功保留内容 + 重试入口并照常刷新列表
+     * （confirm 已生效）；第一步失败只显示错误，不刷新、不关闭。
+     */
+    async function settleLexiconSave({ dialog, outcome, setDialog, loadLexicon, show }) {
+      const stage = outcome?.stage ?? 'skipped';
+      if (stage === 'skipped') return;
+      if (stage === 'failed') {
+        setDialog((current) => (current === null ? current : { ...current, error: outcome.error }));
+        return;
+      }
+      if (stage === 'partial') {
+        setDialog((current) => (current === null ? current : {
+          ...current, retryId: outcome.entryId, notice: outcome.notice, error: '',
+        }));
+        await loadLexicon();
+        return;
+      }
+      setDialog(null);
+      await loadLexicon();
+      if (typeof show === 'function') {
+        show(dialog?.mode === 'edit' ? '词库已更新' : `已确认「${dialog?.canonical || dialog?.text}」`);
+      }
+    }
+
+    /** 关闭弹窗：部分成功时刷新列表并保留提示，不假装完整成功。 */
+    async function closeLexiconDialogState({ dialog, setDialog, loadLexicon, show }) {
+      setDialog(null);
+      if (String(dialog?.retryId ?? '') === '') return;
+      await loadLexicon();
+      if (typeof show === 'function') {
+        show(`已确认「${dialog?.canonical || dialog?.text}」，误识别形式未保存`);
+      }
+    }
+
     function lexiconSection(h, { data, busy, dialog, pending, speakerId }, handlers) {
       const loading = data === null || data === undefined || data.loading === true;
       // `entries` 是个人词库：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
@@ -2423,8 +2516,16 @@ window.__ModuleLoader__.load({
       const forms = Array.isArray(dialog?.wrongForms) ? dialog.wrongForms : [];
       const canonical = String(dialog?.canonical ?? '');
       const context = dialog?.context ?? { before: '', after: '' };
+      // 第一步（confirm）已生效、第二步（补存误识别形式）失败：保留内容，换成重试入口。
+      const notice = String(dialog?.notice ?? '');
+      const retryId = String(dialog?.retryId ?? '');
+      const partial = notice !== '' && !editing;
       const saveBlocked = stopped || canonical.trim() === '' || (!editing && selfId === '');
-      const dialogNode = h('div', { 'data-lexicon-dialog': editing ? 'edit' : 'confirm', style: styles.overlay },
+      const dialogNode = h('div', {
+        'data-lexicon-dialog': editing ? 'edit' : 'confirm',
+        'data-lexicon-partial': partial ? '1' : undefined,
+        style: styles.overlay,
+      },
         h('div', { style: styles.dialog },
           h('div', { style: styles.title }, editing
             ? `编辑「${canonical || String(dialog?.text ?? '')}」`
@@ -2438,7 +2539,9 @@ window.__ModuleLoader__.load({
               style: styles.input,
               value: canonical,
               placeholder: '例如：向晚',
-              disabled: stopped,
+              // 部分成功时正确写法已经随 confirm 保存，这里只剩误识别形式待补存。
+              disabled: stopped || partial,
+              title: partial ? '正确写法已随确认保存；重试只补存误识别形式' : '',
               onChange: (event) => handlers.changeDialog({ canonical: event.target.value }),
             })),
           h('div', { style: styles.field },
@@ -2480,17 +2583,28 @@ window.__ModuleLoader__.load({
           String(dialog?.error ?? '') === ''
             ? null
             : h('div', { style: { ...styles.hint, color: DANGER } }, String(dialog?.error ?? '')),
+          partial
+            ? h('div', { 'data-lexicon-notice': '1', style: { ...styles.hint, color: DANGER } }, notice)
+            : null,
           h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 } },
-            h('button', {
-              style: { ...styles.btnPrimary, ...(saveBlocked ? styles.off : {}) },
-              disabled: saveBlocked,
-              onClick: () => void handlers.saveDialog(dialog, selfId),
-            }, editing ? '保存修改' : '确认'),
+            partial
+              ? h('button', {
+                  'data-lexicon-retry': '1',
+                  style: { ...styles.btnPrimary, ...(stopped || retryId === '' ? styles.off : {}) },
+                  disabled: stopped || retryId === '',
+                  title: '只重试保存误识别形式，不会重复确认',
+                  onClick: () => void handlers.retrySave(dialog),
+                }, '重试保存')
+              : h('button', {
+                  style: { ...styles.btnPrimary, ...(saveBlocked ? styles.off : {}) },
+                  disabled: saveBlocked,
+                  onClick: () => void handlers.saveDialog(dialog, selfId),
+                }, editing ? '保存修改' : '确认'),
             h('button', {
               style: { ...styles.btn, ...(stopped ? styles.off : {}) },
               disabled: stopped,
-              onClick: () => handlers.closeDialog(),
-            }, '取消')),
+              onClick: () => void handlers.closeDialog(dialog),
+            }, partial ? '关闭' : '取消')),
         ));
 
       return h('div', { style: styles.field },
@@ -2790,7 +2904,9 @@ window.__ModuleLoader__.load({
         setLexiconDialog(lexiconDialogOf(entry, 'edit'));
       }, []);
 
-      const closeLexiconDialog = useCallback(() => setLexiconDialog(null), []);
+      const closeLexiconDialog = useCallback(async (dialog) => {
+        await closeLexiconDialogState({ dialog, setDialog: setLexiconDialog, loadLexicon, show });
+      }, [loadLexicon, show]);
 
       const changeLexiconDialog = useCallback((patch) => {
         setLexiconDialog((current) => (current === null ? current : { ...current, ...patch, error: '' }));
@@ -2807,27 +2923,22 @@ window.__ModuleLoader__.load({
 
       /**
        * 弹窗保存：确认走 lexicon.confirm（speakerId 由宿主状态传入），编辑走 lexicon.edit。
-       * confirm 契约不带 wrongForms，弹窗里删减过的形式在确认成功后补一次 edit；
-       * 失败时把宿主原因留在弹窗里，不关闭，也不把脏数据当成功。
+       * confirm 契约不带 wrongForms，弹窗里删减过的形式在确认成功后补一次 edit；两步的结果都
+       * 落到界面上：只有都成功才关闭，第二步失败时保留弹窗并给出重试，绝不吞掉。
        */
       const saveLexiconDialog = useCallback(async (dialog, speakerId) => {
-        if (dialog === null || dialog === undefined) return;
-        const body = lexiconSaveBody(dialog, speakerId);
-        const result = await act(body, body.action === 'lexicon.edit' ? 'lexicon-edit' : 'lexicon-confirm');
-        if (result?.ok !== true) {
-          setLexiconDialog((current) => (current === null
-            ? current
-            : { ...current, error: String(result?.error ?? result?.reason ?? result?.code ?? '操作失败') }));
-          return;
-        }
-        const kept = Array.isArray(dialog.wrongForms) ? dialog.wrongForms.length : 0;
-        const observed = Array.isArray(dialog.observed) ? dialog.observed.length : kept;
-        if (dialog.mode === 'confirm' && kept !== observed && result.entry?.id !== undefined) {
-          await act({ action: 'lexicon.edit', id: String(result.entry.id), wrongForms: dialog.wrongForms }, 'lexicon-edit');
-        }
-        setLexiconDialog(null);
-        await loadLexicon();
-        show(dialog.mode === 'edit' ? '词库已更新' : `已确认「${dialog.canonical || dialog.text}」`);
+        const outcome = await lexiconSaveSteps({ dialog, speakerId, act });
+        await settleLexiconSave({
+          dialog, outcome, setDialog: setLexiconDialog, loadLexicon, show,
+        });
+      }, [act, loadLexicon, show]);
+
+      /** 重试只补一次 lexicon.edit（不再 confirm）：成功关闭刷新，失败继续留在弹窗。 */
+      const retryLexiconSave = useCallback(async (dialog) => {
+        const outcome = await lexiconRetryStep({ dialog, act });
+        await settleLexiconSave({
+          dialog, outcome, setDialog: setLexiconDialog, loadLexicon, show,
+        });
       }, [act, loadLexicon, show]);
 
       const writeLexiconEntry = useCallback(async (body, tag) => {
@@ -3655,10 +3766,11 @@ window.__ModuleLoader__.load({
             refresh: () => void loadLexicon(),
             openConfirm: openLexiconConfirm,
             openEdit: openLexiconEdit,
-            closeDialog: closeLexiconDialog,
+            closeDialog: (dialog) => void closeLexiconDialog(dialog),
             changeDialog: changeLexiconDialog,
             removeWrongForm: removeLexiconWrongForm,
             saveDialog: (dialog, speakerId) => void saveLexiconDialog(dialog, speakerId),
+            retrySave: (dialog) => void retryLexiconSave(dialog),
             askIgnore: (id) => setLexiconPending({ kind: 'ignore', id: String(id) }),
             ignore: (id) => void ignoreLexicon(id),
             askRemove: (id) => setLexiconPending({ kind: 'remove', id: String(id) }),
