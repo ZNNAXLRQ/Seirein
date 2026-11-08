@@ -30,6 +30,7 @@
 | head-turn / head-tilt | 相对自然姿态转头／侧倾；方向由上下文和可用空间决定 |
 | head-lower / head-lift | 相对自然姿态低头／抬头；方向符号由模型适配决定 |
 | head-center | 头部朝当前自然基线收敛，不是数值归零 |
+| head-center-lite | 仅 headX 朝当前自然基线收敛；不写 headZ，不是随机转头或数值归零 |
 | nod / double-nod | 单次点头／两次点头，双次第二拍能量递减 |
 | shake | 否定摇头，仅明确否定事件可选 |
 | gaze-side / gaze-up / gaze-down | 从当前眼神平滑向相应方向移动，不推断外界对象 |
@@ -77,6 +78,15 @@
 眨眼和呼吸与已有基础生命层互斥所有权，不能两个层各自随机写。
 候选输出仍需控制器检查通道占用、旧代次、速度/加速度限制和最终优先级。
 queryPresets 没有承担这些运行时职责，不能把查询返回当成可直接下发的帧。
+
+### 无 headZ/无目标的中性开口候选
+
+新增 `answer-nod`（仅 headY，开口节奏而非赞同）、`answer-turn`（仅 headX，自然换姿态而非看向对象）、
+`answer-center-lite`（仅 headX，回自然水平基线）。每类四种节奏，不依赖注视目标、声源方向或 headZ。
+三类仍只接受 speaking + answer-start，不为修时序而放宽到 waiting/listening/idle。
+必须绑定首段正文真实播放开始，不能由候音或后续音频块重复触发；过期不在 speechEnd 补做。
+执行适配器需识别新增操作 `head-center-lite`；不认识时明确跳过并记录原因，不能回退到需要 headZ 的 head-center。
+这些条目仅补能力覆盖，不修复事件暂存/释放时序。库内不增加幅度下限或直接发送参数。
 
 ## 设置页建议与持久化
 

@@ -6,6 +6,7 @@
 export const OPERATIONS = Object.freeze({
   'head-turn': ['headX'], 'head-lower': ['headY'], 'head-lift': ['headY'],
   'head-tilt': ['headZ'], 'head-center': ['headX', 'headZ'],
+  'head-center-lite': ['headX'],
   'nod': ['headY'], 'double-nod': ['headY'], 'shake': ['headX'],
   'gaze-side': ['gazeX'], 'gaze-down': ['gazeY'], 'gaze-up': ['gazeY'],
   'gaze-target': ['gazeX', 'gazeY'], 'gaze-center': ['gazeX', 'gazeY'],
@@ -95,6 +96,11 @@ const rows = [
   ['welcome-nod', '迎接时点头致意', 'greeting', 'speaking', 'greet', 'greeting', 'elegant,composed', 'nod'],
   ['farewell-nod', '告别时点头致意', 'farewell', 'speaking', 'farewell', 'farewell', 'gentle,elegant', 'nod'],
   ['farewell-tilt', '告别时偏头停留', 'farewell', 'speaking', 'farewell', 'farewell', 'playful,warm', 'head-tilt'],
+  // Append only: preserve existing display ordinals as well as stable recipe ids.
+  // A speech beat is not agreement. Never route this neutral nod through affirmation semantics.
+  ['answer-nod', '开口节奏点头（不表示赞同）', 'speech-beat', 'speaking', 'answer-start', 'neutral', 'common,earnest', 'nod'],
+  ['answer-turn', '开口时自然转头（不指向对象）', 'posture', 'speaking', 'answer-start', 'neutral', 'warm,lively', 'head-turn'],
+  ['answer-center-lite', '开口时水平回归自然姿态', 'settle', 'speaking', 'answer-start', 'neutral', 'composed,rational', 'head-center-lite'],
 ];
 
 const split = text => text.split(',');
