@@ -475,7 +475,11 @@ export async function prepareMemoryInjection({
       query: text,
       terms: Array.isArray(recallMeta.terms) ? recallMeta.terms : [],
     });
-  const contextLayers = composed.layerStats ?? null;
+  // `total` is the rendered block length (heading/footer/notes included), so the debug row can
+  // report the characters actually placed in the request, not only the content-line estimate.
+  const contextLayers = composed.layerStats === null || composed.layerStats === undefined
+    ? null
+    : { ...composed.layerStats, total: composed.text.length };
   const hits = fixedRows.length + matchedRows.length + archived.length;
   // P-52 wiring: a candidate may move to `delivered` only if this block actually rendered its
   // row; the long-term subset is decided by the existing manual-lane rule, never by delivery.
@@ -540,11 +544,16 @@ export async function prepareMemoryInjection({
 
   if (composed.text.length === 0) {
     // A miss still tells the model that a search happened and found nothing. It is a status line,
-    // not a hit: `injected` stays false and no id is ever reinforced.
+    // not a hit: `injected` stays false and no id is ever reinforced. A lane that allocated no
+    // memory room must stay empty: the status row is memory content too, so it may not bypass the
+    // total budget (e.g. `totalChars: 0`).
+    const memoryRoom = layering
+      ? Math.max(0, Math.floor(Number(layerBudgets.memory) || 0))
+      : Number.POSITIVE_INFINITY;
     const completeness = sources.active === 'timeout' || sources.archive === 'timeout'
       ? 'timeout'
       : archiveTruncated ? 'budget-truncated' : 'complete';
-    const statusText = composeMemoryStatus({ sources, range, timeZone: tz, complete: completeness });
+    const statusText = memoryRoom === 0 ? '' : composeMemoryStatus({ sources, range, timeZone: tz, complete: completeness });
     const recallPayload = {
       ...meta, hits, injected: false, status: true, completeness,
       injectedChars: 0, requestedChars: composed.requestedChars, records: 0,
@@ -558,7 +567,7 @@ export async function prepareMemoryInjection({
       return {
         text: '', injected: false, reason: 'timeout', sources, archiveReason, hits, completeness: 'timeout',
         injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-        contextLayers: composed.layerStats ?? null,
+        contextLayers,
       };
     }
     observeRecall(recallPayload);
@@ -569,7 +578,7 @@ export async function prepareMemoryInjection({
       text: statusText, injected: false, reason: 'no-hit', status: true, sources, archiveReason, hits,
       completeness,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-      contextLayers: composed.layerStats ?? null,
+      contextLayers,
     };
   }
 
@@ -601,7 +610,7 @@ export async function prepareMemoryInjection({
       return {
         text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
         injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-        contextLayers: composed.layerStats ?? null,
+        contextLayers,
       };
     }
   }
@@ -628,7 +637,7 @@ export async function prepareMemoryInjection({
     return {
       text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-      contextLayers: composed.layerStats ?? null,
+      contextLayers,
     };
   }
   if (!(await emitWithinBudget('memory.recall', recallPayload)) || now() > deadline) {
@@ -640,7 +649,7 @@ export async function prepareMemoryInjection({
     return {
       text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-      contextLayers: composed.layerStats ?? null,
+      contextLayers,
     };
   }
   observeRecall(recallPayload);
@@ -658,7 +667,7 @@ export async function prepareMemoryInjection({
     injectedIds: composed.injectedIds,
     matchedIds: composed.matchedIds,
     persistIds,
-    contextLayers: composed.layerStats ?? null,
+    contextLayers,
   };
 }
 
@@ -716,22 +725,15 @@ export function createMemoryPreStep({
    * the preparation budget, and it carries counts only (never any body text). `configured` says
    * whether this round's per-layer caps came from `contextBudgets` or from the built-in defaults.
    */
-  const emitContextBudget = (sessionId, turn, lane, budget, prepared) => {
+  const emitContextBudget = (sessionId, turn, lane, budget, prepared, measured, plan) => {
     try {
-      let measured = {};
-      if (typeof measureLayers === 'function') {
-        try {
-          measured = measureLayers({ sessionId, turn, lane, budget }) ?? {};
-        } catch {
-          measured = {};
-        }
-      }
       const payload = {
         ...buildContextBudgetPayload({
           lane,
           budget,
           measured,
           memoryLayers: prepared?.contextLayers ?? null,
+          plan,
         }),
         source: budget.configured === true ? 'config' : 'default',
         sessionId,
@@ -831,14 +833,31 @@ export function createMemoryPreStep({
     // legacy single block cap when `contextBudgets` is configured; defaults stay advisory.
     const lane = laneOf(sessionId);
     const budget = resolveContextBudget(readContextBudgets(), lane);
+    // The prompt assembled before this pre-step has already allocated the whole lane. Read that
+    // one plan (or measure it here when no prompt service rendered) so memory may only spend what
+    // the plan reserved for it: the total budget covers prompt + injected memory, not two caps.
+    let measured = {};
+    let layerPlan = null;
+    if (typeof measureLayers === 'function') {
+      try {
+        measured = measureLayers({ sessionId, turn, lane, budget, agent }) ?? {};
+        layerPlan = measured?.plan ?? null;
+      } catch {
+        measured = {};
+        layerPlan = null;
+      }
+    }
+    const memoryAllowance = layerPlan !== null && Number.isFinite(layerPlan?.layers?.memory?.chars)
+      ? Math.max(0, Math.floor(layerPlan.layers.memory.chars))
+      : null;
     const layerBudgets = budget.configured === true
       ? {
         // Fixed memories are protected: their cap is the legacy whole-block cap (1200), never the
         // configured `fixed` quota, so a tight fixed quota can never let a relevance hit push a
-        // standing constraint out. Only `memory` is narrowed from configuration.
+        // standing constraint out. Only `memory` is narrowed here by the lane total plan.
         fixed: MEMORY_INJECTION_DEFAULTS.maxChars,
-        memory: budget.memory,
-        totalChars: MEMORY_INJECTION_DEFAULTS.maxChars + budget.memory,
+        memory: memoryAllowance ?? budget.memory,
+        totalChars: MEMORY_INJECTION_DEFAULTS.maxChars + (memoryAllowance ?? budget.memory),
       }
       : null;
     let result;
@@ -876,7 +895,7 @@ export function createMemoryPreStep({
     if (aborted()) return decision;
     // P-59: one `context.budget` row for the round that actually prepared (a miss included), so
     // the P-46 timeline and P-52 candidate/delivered rows can be reconciled with what was placed.
-    emitContextBudget(sessionId, turn, lane, budget, result);
+    emitContextBudget(sessionId, turn, lane, budget, result, measured, layerPlan);
     if (result.text.length === 0) return decision;
     const injected = memoryInjectionMessage(result.text);
     // The message is only in a decision the host may still drop or replace. Candidate delivery

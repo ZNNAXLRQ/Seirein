@@ -514,8 +514,10 @@ test('7. 宿主接线：voice/typed 各写一行 context.budget，字段完整�
   store.close();
   const host = mountHost(root, {
     contextBudgets: {
-      voice: { persona: 100, fixed: 100, memory: 160, recent: 90, ephemeral: 20, totalChars: 370 },
-      typed: { persona: 100, fixed: 100, memory: 320, recent: 320, ephemeral: 20, totalChars: 700 },
+      // Totals cover the protected persona (persona + its functional constraints) plus the
+      // configured allocatable layers, so the memory quotas below are what binds each lane.
+      voice: { persona: 100, fixed: 100, memory: 160, recent: 90, ephemeral: 20, totalChars: 6_000 },
+      typed: { persona: 100, fixed: 100, memory: 320, recent: 320, ephemeral: 20, totalChars: 7_000 },
     },
   });
   try {

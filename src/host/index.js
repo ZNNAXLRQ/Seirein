@@ -485,7 +485,7 @@ export { ACK_FALLBACK_LINE, createAckLane } from './speech/ack-lane.js';
 import { createTypedVoiceRelay, hasToolCallBlocks } from './speech/typed-reply.js';
 export { createTypedVoiceRelay } from './speech/typed-reply.js';
 import { createMemoryTurnLedger, isSubagentAgent, createMemoryPreStep } from './memory/pre-step.js';
-import { resolveContextBudget, trimLayerText } from './memory/context-layers.js';
+import { assembleLayerPlan, resolveContextBudget } from './memory/context-layers.js';
 export {
   createMemoryTurnLedger,
   isSubagentAgent,
@@ -2274,28 +2274,132 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * P-59: cap ONE observation layer to the lane's per-layer quota before it joins the request.
-   * Trimming is whole-line (oldest lines go for recent, tail lines for ephemeral), never a slice
-   * of the final prompt. Persona/fixed do not pass through here: they are protected.
+   * P-59: ONE lane plan per prompt assembly.
+   *
+   * The prompt sections (environment facts, nonverbal cue, dialogue observation) and the memory
+   * pre-step used to trim independently, so a lane total could not hold and the debug row could
+   * describe a different allocation than the one rendered. `assembleLayerPlan` now allocates the
+   * lane once: protected persona/fixed first, then the memory reservation, then the temporary
+   * observations share the remaining ephemeral quota. Every section reads its exact block from
+   * this plan, and the pre-step caps the injected memory block at the same reservation.
    */
-  const budgetObservationText = (layer, context, text) => {
-    const value = typeof text === 'string' ? text : '';
-    if (value.length === 0) return '';
+  const contextPlans = new WeakMap();
+  const planKeyOf = (context) => {
     try {
-      const budget = resolveContextBudget(
-        config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null,
-        contextLaneOf(context),
-      );
-      const trimmed = trimLayerText({
-        text: value,
-        keep: layer === 'recent' ? 'tail' : 'head',
-        headingLines: layer === 'recent' ? 1 : 0,
-        layer,
-      }, budget[layer]);
-      return trimmed.text;
+      const agent = context?.agent;
+      if (agent !== null && typeof agent === 'object') return agent;
     } catch {
-      return value;
+      /* an unreadable identity falls back to no cache */
     }
+    return null;
+  };
+  const planContextLayers = (context, laneOverride = null) => {
+    const lane = laneOverride ?? contextLaneOf(context);
+    const inScope = inWorkspaceScope(context);
+    let companion = false;
+    try {
+      companion = inScope && isCompanionAgent(context?.agent);
+    } catch {
+      companion = false;
+    }
+    let profileText = '';
+    try {
+      const section = maintainProfile().promptSection();
+      profileText = section.text.length > 0 ? `${PROFILE_PROMPT_TITLE}\n${section.text}` : '';
+    } catch {
+      profileText = '';
+    }
+    const personaText = inScope
+      ? [
+        persona.render(),
+        profileText,
+        MEMORY_CONVENTION,
+        HEARING_CONVENTION,
+        renderLanguageConvention(),
+        VOICE_OUTPUT_CONVENTION,
+        EXPRESSION_CONVENTION,
+        SUMMARY_CONVENTION,
+        features.enabled('memory') ? MEMORY_USAGE : '',
+        TASK_DISPATCH,
+        TOOL_SELECTION,
+        features.enabled('ambient') ? AMBIENT_CONVENTION : '',
+      ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n')
+      : '';
+    const fixedText = inScope ? renderResources() : '';
+    // The dialogue observation and the nonverbal cue are companion-only (the same gate the prompt
+    // providers use); a typed session carries the shared environment facts only.
+    const recentText = inScope && companion && lane === 'voice' && features.enabled('hearing')
+      ? dialogueSummary.render()
+      : '';
+    const ephemeralBlocks = [];
+    if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
+    if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
+    return assembleLayerPlan({
+      lane,
+      budget: resolveContextBudget(
+        config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null,
+        lane,
+      ),
+      reserveMemory: true,
+      layers: {
+        persona: { items: [personaText], separator: '\n\n' },
+        fixed: { items: [fixedText], separator: '\n' },
+        recent: { text: recentText, headingLines: 1, keep: 'tail' },
+        ephemeralBlocks,
+      },
+    });
+  };
+  /** Start a new assembly: the persona section is the first one the prompt service renders. */
+  const computeContextPlan = (context) => {
+    try {
+      return planContextLayers(context);
+    } catch {
+      return null;
+    }
+  };
+  const beginContextPlan = (context) => {
+    const plan = computeContextPlan(context);
+    const key = planKeyOf(context);
+    if (plan !== null && key !== null) contextPlans.set(key, plan);
+    return plan;
+  };
+  /**
+   * Read this assembly's plan. A cached plan only exists after `beginContextPlan` (the persona
+   * section), which is what real assembly always renders first. A host double that renders ONE
+   * observation section directly therefore gets a fresh plan on every render instead of a stale
+   * one from the previous turn.
+   */
+  const readContextPlan = (context) => {
+    const key = planKeyOf(context);
+    if (key !== null) {
+      const cached = contextPlans.get(key);
+      if (cached !== undefined) return cached;
+    }
+    return computeContextPlan(context);
+  };
+  const planTemporary = (context, name, fallback) => {
+    const plan = readContextPlan(context);
+    if (plan === null || plan.temporary === null || plan.temporary === undefined) {
+      return typeof fallback === 'function' ? fallback() : fallback;
+    }
+    return plan.temporary[name] ?? '';
+  };
+  const planRecent = (context, fallback) => {
+    const plan = readContextPlan(context);
+    return plan === null ? (typeof fallback === 'function' ? fallback() : fallback) : (plan.blocks?.recent ?? '');
+  };
+  /**
+   * The protected fixed block. A started plan has already rendered it once, so the resources
+   * section reuses that exact text instead of reading and (on overflow) reporting a second time.
+   * A direct section render with no assembly still falls back to the ordinary renderer.
+   */
+  const planFixed = (context) => {
+    const key = planKeyOf(context);
+    if (key !== null) {
+      const cached = contextPlans.get(key);
+      if (cached !== undefined) return cached.blocks?.fixed ?? '';
+    }
+    return renderResources();
   };
 
   // ---- VTube Studio -------------------------------------------------------
@@ -10464,12 +10568,37 @@ export function apply(ctx, config) {
   /**
    * P-59: what this plugin PREPARED for one turn, per layer, for the `context.budget` debug row.
    *
-   * The memory block is measured by the memory pre-step itself (`result.contextLayers`); this
-   * callback supplies the layers owned by the prompt/observation assembly: persona + its
-   * functional constraints, the resident fixed-memory section, the recent dialogue observation and
-   * the temporary perception block. No model is called and no buffer is drained: `render()` reads.
+   * A prompt assembly has already allocated the lane; that exact plan is reused here so the debug
+   * row and the rendered request can never describe two different trims. When no prompt service
+   * rendered (a direct pre-step mount), the same allocator is run against the current raw layers.
+   * The memory block is composed by the pre-step itself (`result.contextLayers`) and is reported
+   * from its actual text, capped at this plan's memory reservation.
    */
-  function measureContextLayers({ lane = 'typed' } = {}) {
+  function measureContextLayers({ lane = 'typed', agent = null, budget = null } = {}) {
+    const resolved = budget ?? resolveContextBudget(
+      config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null,
+      lane,
+    );
+    const key = agent !== null && typeof agent === 'object' ? agent : null;
+    if (key !== null) {
+      const cached = contextPlans.get(key);
+      const sameBudget = cached !== undefined && cached.lane === lane
+        && ['persona', 'fixed', 'memory', 'recent', 'ephemeral', 'totalChars']
+          .every((name) => cached.budget?.[name] === resolved?.[name]);
+      if (sameBudget) return { plan: cached };
+    }
+    const context = key === null ? undefined : { agent: key };
+    let plan = null;
+    try {
+      plan = planContextLayers(context, lane);
+    } catch {
+      plan = null;
+    }
+    if (plan !== null) {
+      if (key !== null) contextPlans.set(key, plan);
+      return { plan };
+    }
+    // Fallback for a mount without a renderable prompt: raw text, trimmed by the builder.
     const personaText = [
       persona.render(),
       MEMORY_CONVENTION,
@@ -10481,15 +10610,11 @@ export function apply(ctx, config) {
       TASK_DISPATCH,
       TOOL_SELECTION,
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
-    // The dialogue observation and the nonverbal cue are companion-only (the same gate the prompt
-    // providers use); a typed session carries the shared environment facts only.
     const recentText = lane === 'voice' && features.enabled('hearing') ? dialogueContext.render() : '';
     const ephemeralText = [
       lane === 'voice' ? nonverbalCue.render() : '',
       renderEnvironment(),
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
-    // The event builder trims recent/ephemeral with the same layer rule the prompt uses, so the
-    // reported chars/dropped describe the text actually placed in this lane's request.
     return {
       persona: personaText,
       fixed: renderResources(),
@@ -10652,7 +10777,11 @@ export function apply(ctx, config) {
       registerSection({
         name: 'assistant:persona',
         order: 100,
-        text: scopedText(() => persona.render()),
+        // The persona section is rendered first, so it starts the one lane plan for this assembly.
+        text: scopedText((context) => {
+          beginContextPlan(context);
+          return persona.render();
+        }),
       }),
     );
     // Environment facts right after the persona: shared machine state (no companion gate). order
@@ -10661,7 +10790,7 @@ export function apply(ctx, config) {
       registerSection({
         name: 'assistant:environment',
         order: 102,
-        text: scopedText((context) => budgetObservationText('ephemeral', context, renderEnvironment())),
+        text: scopedText((context) => planTemporary(context, 'environment', renderEnvironment)),
       }),
     );
     // Nonverbal cue, right after the persona: a temporary observation for THIS step only.
@@ -10671,7 +10800,7 @@ export function apply(ctx, config) {
       registerContext({
         name: 'assistant:nonverbal',
         order: 105,
-        text: companionObservation(scopedText((context) => budgetObservationText('ephemeral', context, nonverbalCue.render()))),
+        text: companionObservation(scopedText((context) => planTemporary(context, 'nonverbal', nonverbalCue.render))),
       }),
     );
     // Continuous dialogue: an independent observation block, never a user message. The body is
@@ -10681,8 +10810,8 @@ export function apply(ctx, config) {
       registerContext({
         name: 'assistant:dialogue',
         order: DIALOGUE_INJECTION_ORDER,
-        text: companionObservation(scopedText((context) => budgetObservationText(
-          'recent', context, features.enabled('hearing') ? dialogueSummary.render() : '',
+        text: companionObservation(scopedText((context) => planRecent(
+          context, () => (features.enabled('hearing') ? dialogueSummary.render() : ''),
         ))),
         status: () => {
           const snapshot = dialogueContext.snapshot();
@@ -10810,7 +10939,7 @@ export function apply(ctx, config) {
       registerSection({
         name: 'assistant:resources',
         order: 9000,
-        text: scopedText(() => renderResources()),
+        text: scopedText((context) => planFixed(context)),
       }, true),
     );
   };

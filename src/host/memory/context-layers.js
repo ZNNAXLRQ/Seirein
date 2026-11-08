@@ -105,16 +105,22 @@ export function resolveContextBudget(config, lane) {
   return budget;
 }
 
-/** One per-layer input as `{heading, items, separator, keep}`; a bare string is one item. */
+/**
+ * One per-layer input as `{heading, items, separator, keep, text, headingLines}`; a bare string is
+ * one item. `text` is the already-joined form (recent/observation blocks): it is trimmed by line so
+ * `headingLines` can protect a leading header exactly like the old one-layer helper.
+ */
 function normalizeLayer(value) {
-  if (typeof value === 'string') return { heading: '', items: value.length > 0 ? [value] : [], separator: '\n', keep: 'head' };
-  if (Array.isArray(value)) return { heading: '', items: value, separator: '\n', keep: 'head' };
-  if (value === null || typeof value !== 'object') return { heading: '', items: [], separator: '\n', keep: 'head' };
+  if (typeof value === 'string') return { heading: '', items: value.length > 0 ? [value] : [], separator: '\n', keep: 'head', text: undefined, headingLines: 0 };
+  if (Array.isArray(value)) return { heading: '', items: value, separator: '\n', keep: 'head', text: undefined, headingLines: 0 };
+  if (value === null || typeof value !== 'object') return { heading: '', items: [], separator: '\n', keep: 'head', text: undefined, headingLines: 0 };
   return {
     heading: typeof value.heading === 'string' ? value.heading : '',
     items: Array.isArray(value.items) ? value.items : [],
     separator: typeof value.separator === 'string' ? value.separator : '\n',
     keep: value.keep === 'tail' ? 'tail' : 'head',
+    text: typeof value.text === 'string' ? value.text : undefined,
+    headingLines: Math.max(0, Math.floor(Number(value.headingLines) || 0)),
   };
 }
 
@@ -201,6 +207,53 @@ export function trimLayerText(input = {}, allowedChars = 0) {
   return { text, chars: text.length, items: kept.length, dropped, dropReasons, budget: allowed };
 }
 
+/**
+ * Trim an ORDERED list of temporary blocks against ONE shared allowance.
+ *
+ * Voice/typed render several independent observation sections (environment facts, nonverbal cue,
+ * …); they may not each spend the full `ephemeral` quota. They share it here,
+ * in rendering order: each block is trimmed whole-line against what the previous blocks left, and
+ * every block (including the empty ones) is returned under its stable `name`, so the section
+ * callbacks place exactly the text this allocation measured.
+ *
+ * @param {Array<{name?: string, text?: string, heading?: string, items?: Array, separator?: string,
+ *                keep?: 'head'|'tail', headingLines?: number}>} blocks
+ * @param {number} allowedChars
+ * @returns {{blocks: Record<string, string>, chars: number, items: number, dropped: number,
+ *            dropReasons: Record<string, number>, budget: number}}
+ */
+export function trimTemporaryBlocks(blocks = [], allowedChars = 0) {
+  const allowed = Math.max(0, Math.floor(Number(allowedChars) || 0));
+  let remaining = allowed;
+  const out = {};
+  const dropReasons = {};
+  let chars = 0;
+  let items = 0;
+  let dropped = 0;
+  const list = Array.isArray(blocks) ? blocks : [];
+  for (const [index, block] of list.entries()) {
+    const name = typeof block?.name === 'string' && block.name.length > 0 ? block.name : `block${index}`;
+    const trimmed = trimLayerText({
+      text: typeof block?.text === 'string' ? block.text : undefined,
+      heading: block?.heading,
+      items: block?.items,
+      separator: block?.separator,
+      keep: block?.keep,
+      headingLines: block?.headingLines,
+      layer: 'ephemeral',
+    }, remaining);
+    out[name] = trimmed.text;
+    chars += trimmed.chars;
+    items += trimmed.items;
+    dropped += trimmed.dropped;
+    for (const [reason, count] of Object.entries(trimmed.dropReasons)) {
+      dropReasons[reason] = (dropReasons[reason] ?? 0) + count;
+    }
+    remaining = Math.max(0, remaining - trimmed.chars);
+  }
+  return { blocks: out, chars, items, dropped, dropReasons, budget: allowed };
+}
+
 /** Normalize `trimLayerText` / a prepared layer stat into the four observable fields. */
 function normalizeStat(stat) {
   if (stat === null || stat === undefined || typeof stat !== 'object') return { ...EMPTY_STAT, dropReasons: {} };
@@ -242,15 +295,25 @@ function layerCount(text, separator = '\n') {
  * get `min(quota, remaining)`. A layer that cannot use its full allowance leaves the remainder
  * to the next layer; dropped items are reported per layer with a reason.
  *
- * @param {{lane?: string, layers?: object, budget?: object|null}} options
+ * Voice/typed prepare their memory block in a different event than the prompt sections, so they
+ * pass `reserveMemory: true`: the memory layer only RESERVES min(quota, remaining), and recent /
+ * ephemeral may spend only what is left after that reservation. The pre-step then caps the actual
+ * injected memory block at that reservation, so one allocation covers both events.
+ *
+ * `layers.ephemeralBlocks` is an ordered list of temporary sections (environment facts, nonverbal
+ * cue, …). They share the ONE ephemeral allowance (see `trimTemporaryBlocks`); `plan.temporary`
+ * maps each block name to the exact text it may render.
+ *
+ * @param {{lane?: string, layers?: object, budget?: object|null, reserveMemory?: boolean}} options
  * @returns {{lane: string, budget: object, totalChars: number, totalBudget: number,
  *            truncated: boolean, protectedOverflow: boolean, text: string,
- *            blocks: Record<string, string>, layers: Record<string, object>}}
+ *            blocks: Record<string, string>, temporary: Record<string, string>|null,
+ *            layers: Record<string, object>}}
  */
-export function assembleLayerPlan({ lane = 'typed', layers = {}, budget = null } = {}) {
+export function assembleLayerPlan({ lane = 'typed', layers = {}, budget = null, reserveMemory = false } = {}) {
   const normalizedLane = normalizeContextLane(lane);
   const resolved = budget ?? resolveContextBudget(null, normalizedLane);
-  const plan = { lane: normalizedLane, budget: resolved, blocks: {}, layers: {} };
+  const plan = { lane: normalizedLane, budget: resolved, blocks: {}, layers: {}, temporary: null };
   let total = 0;
 
   // Protected layers: rendered whole, never trimmed.
@@ -276,11 +339,44 @@ export function assembleLayerPlan({ lane = 'typed', layers = {}, budget = null }
     const layer = normalizeLayer(layers?.[name]);
     const quota = nonNegative(resolved?.[name], 0);
     const allowed = Math.min(quota, remaining);
+    if (name === 'memory' && reserveMemory === true) {
+      // The real memory text is composed by the pre-step; this event only reserves its room. It
+      // is not a rendered block, so it must never be counted as injected text.
+      plan.blocks.memory = '';
+      plan.layers.memory = {
+        chars: allowed,
+        items: 0,
+        dropped: 0,
+        dropReasons: {},
+        budget: quota,
+        reserved: true,
+      };
+      remaining = Math.max(0, remaining - allowed);
+      continue;
+    }
+    if (name === 'ephemeral' && Array.isArray(layers?.ephemeralBlocks)) {
+      // Every temporary observation block draws from this one allowance, in rendering order.
+      const shared = trimTemporaryBlocks(layers.ephemeralBlocks, allowed);
+      plan.temporary = shared.blocks;
+      plan.blocks.ephemeral = Object.values(shared.blocks).filter((text) => text.length > 0).join('\n\n');
+      plan.layers.ephemeral = {
+        chars: shared.chars,
+        items: shared.items,
+        dropped: shared.dropped,
+        dropReasons: shared.dropReasons,
+        budget: quota,
+      };
+      remaining = Math.max(0, remaining - shared.chars);
+      total += shared.chars;
+      continue;
+    }
     const trimmed = trimLayerText({
+      text: layer.text,
       heading: layer.heading,
       items: layer.items,
       separator: layer.separator,
       keep: layer.keep,
+      headingLines: layer.headingLines,
       layer: name,
     }, allowed);
     plan.blocks[name] = trimmed.text;
@@ -299,7 +395,10 @@ export function assembleLayerPlan({ lane = 'typed', layers = {}, budget = null }
   plan.text = blocks.join('\n\n');
   plan.totalChars = plan.text.length;
   plan.totalBudget = nonNegative(resolved?.totalChars, 0);
-  plan.protectedOverflow = plan.layers.persona.overBudget === true || plan.layers.fixed.overBudget === true;
+  const protectedChars = plan.layers.persona.chars + plan.layers.fixed.chars;
+  plan.protectedOverflow = plan.layers.persona.overBudget === true
+    || plan.layers.fixed.overBudget === true
+    || protectedChars > plan.totalBudget;
   plan.truncated = CONTEXT_LAYER_NAMES.some((name) => plan.layers[name].dropped > 0);
   return plan;
 }
@@ -308,15 +407,51 @@ export function assembleLayerPlan({ lane = 'typed', layers = {}, budget = null }
  * The one debug payload of a lane round: `context.budget`.
  *
  * It never carries body text — only per-layer counts plus the lane totals. `memoryLayers` is
- * what the memory preparation actually rendered (fixed/memory); `measured` is what the other
- * layers currently hold (raw text). Recent/ephemeral are trimmed here so the numbers describe
- * the same text the request will carry.
+ * what the memory preparation actually rendered (fixed/memory). When the prompt path passes the
+ * `plan` it rendered, the payload is read straight from that plan (one allocation, no second
+ * trimming); otherwise `measured` raw text is trimmed here as a fallback for a pre-step that ran
+ * without a prompt assembly.
  *
- * @param {{lane?: string, budget?: object|null, measured?: object, memoryLayers?: object|null}} options
+ * @param {{lane?: string, budget?: object|null, measured?: object, memoryLayers?: object|null,
+ *          plan?: object|null}} options
  */
-export function buildContextBudgetPayload({ lane = 'typed', budget = null, measured = {}, memoryLayers = null } = {}) {
+export function buildContextBudgetPayload({
+  lane = 'typed', budget = null, measured = {}, memoryLayers = null, plan = null,
+} = {}) {
   const normalizedLane = normalizeContextLane(lane);
   const resolved = budget ?? resolveContextBudget(null, normalizedLane);
+  const empty = () => ({ chars: 0, items: 0, dropped: 0, dropReasons: {} });
+  if (plan !== null && plan !== undefined && plan.layers !== null && typeof plan.layers === 'object') {
+    const persona = normalizeStat(plan.layers.persona);
+    // Fixed is protected but has two sources: the resident resource section and C2's fixed rows.
+    const fixed = mergeStats(plan.layers.fixed, memoryLayers?.fixed);
+    // A reserved prompt layer is not injected text: only what the pre-step actually composed counts.
+    const memory = memoryLayers !== null && memoryLayers !== undefined
+      ? {
+        ...normalizeStat(memoryLayers.memory),
+        // `total` is the whole rendered block (frame included); fall back to content lines when an
+        // older/other composer did not provide it.
+        chars: Number.isFinite(Number(memoryLayers.total)) && Number(memoryLayers.total) >= 0
+          ? Math.floor(Number(memoryLayers.total))
+          : normalizeStat(memoryLayers.memory).chars,
+      }
+      : empty();
+    const recent = normalizeStat(plan.layers.recent);
+    const ephemeral = normalizeStat(plan.layers.ephemeral);
+    const layers = { persona, fixed, memory, recent, ephemeral };
+    const totalBudget = nonNegative(resolved?.totalChars, 0);
+    return {
+      lane: normalizedLane,
+      layers,
+      totalChars: CONTEXT_LAYER_NAMES.reduce((sum, name) => sum + layers[name].chars, 0),
+      truncated: plan.truncated === true
+        || CONTEXT_LAYER_NAMES.some((name) => layers[name].dropped > 0),
+      totalBudget,
+      protectedOverflow: plan.protectedOverflow === true
+        || fixed.chars > nonNegative(resolved?.fixed, 0)
+        || persona.chars + fixed.chars > totalBudget,
+    };
+  }
   const measuredText = (name) => {
     const value = measured?.[name];
     if (typeof value === 'string') return value;
