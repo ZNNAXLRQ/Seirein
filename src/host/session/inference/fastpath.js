@@ -16,8 +16,16 @@ import { basename, join, resolve } from 'node:path';
 // The speech cap is shared with every other speaking lane (`voice.speechMaxChars`, 1200 by
 // default), so the fast path cannot speak past what the rest of the assistant may speak.
 import { DEFAULT_SPEECH_MAX_CHARS, resolveSpeechBudget } from '../../speech/speech-text.js';
+import {
+  assembleLayerPlan,
+  contextLayerStats,
+  resolveContextBudget,
+} from '../../memory/context-layers.js';
 
-const CONTEXT_MAX_CHARS = 6000;
+// P-59: the joined prompt is no longer sliced by a single constant. The cap is a per-layer
+// budget plan (defaults in `DEFAULT_CONTEXT_BUDGETS.fastpath`, 6000 chars total): persona/fixed
+// are protected, and memory/recent/ephemeral are trimmed whole-line inside their own layer. A
+// deployment narrows it with `contextBudgets.fastpath`.
 // One "turn" is one persisted user/assistant line. Keep this many, and feed all of them
 // to the prompt (stored size === prompt window).
 const MAX_HISTORY_TURNS = 8;
@@ -397,6 +405,32 @@ function abortError() {
   const error = new Error('aborted');
   error.name = 'AbortError';
   return error;
+}
+
+/**
+ * P-59: split `memory.brief()`'s block at its own relevance heading. The fixed/landmark part is
+ * the protected fixed layer; the rest is the relevance (memory) layer. The two halves are pasted
+ * back verbatim, so the request text is unchanged — only the budget that admits each half differs.
+ */
+const MEMORY_MATCHED_HEADING = '\n## 相关记忆（与本次话题相关，按匹配度排序）';
+
+function splitBriefText(text) {
+  const source = typeof text === 'string' ? text : '';
+  const at = source.indexOf(MEMORY_MATCHED_HEADING);
+  if (at < 0) return { fixed: source.trim(), memory: '' };
+  return {
+    fixed: source.slice(0, at).trim(),
+    memory: source.slice(at + 1).trim(),
+  };
+}
+
+/** Layer items from one rendered block: the first `## …` line is its kept heading. */
+function blockLayer(text, { keep = 'head' } = {}) {
+  const source = typeof text === 'string' ? text.trim() : '';
+  if (source.length === 0) return { heading: '', items: [], separator: '\n', keep };
+  const lines = source.split('\n');
+  const heading = /^#{1,6}\s/u.test(lines[0]) ? lines.shift() : '';
+  return { heading, items: lines, separator: '\n', keep };
 }
 
 // A waiting block is one or more generated sentences, kept in order. `lang` is the script bucket
@@ -893,38 +927,68 @@ export class FastPath {
    * its own: a named domain never reads ungrouped lines and ungrouped never reads a named one, so
    * one workspace's dialogue cannot pollute another's request.
    */
-  systemPrompt(utterance, { domain } = {}) {
+  systemPrompt(utterance, { domain, lane = 'fastpath' } = {}) {
     const domains = domain === undefined
       ? [resolveTurnDomain({ config: this.config, workspace: this.currentWorkspace() }).domain]
       : promptDomainScope(domain);
     const personaText = typeof this.persona?.read === 'function' ? this.persona.read('agent') : '';
     const profile = typeof this.persona?.read === 'function' ? this.persona.read('user') : '';
-    let memoryText = '';
+    let brief = null;
     try {
       if (this.memory !== null && this.memory !== undefined) {
-        memoryText = this.memory.brief({ query: utterance, fixedBudget: 400, matchBudget: 500, limit: 4 }).text;
+        brief = this.memory.brief({ query: utterance, fixedBudget: 400, matchBudget: 500, limit: 4 });
       }
     } catch {
-      memoryText = '';
+      brief = null;
     }
+    const memoryParts = splitBriefText(brief?.text ?? '');
     // Only rows of this scope may enter the prompt: the window is the stored cap, the block is the
     // subset whose stored domain is inside the same allow set (legacy/missing = ungrouped).
     const window = this.history.slice(-MAX_HISTORY_TURNS);
     const scoped = window.filter((turn) => domains.includes(normalizeTurnDomain(turn.domain)));
-    const history = scoped
-      .map((turn) => `${turn.role === 'user' ? '用户' : '你'}：${turn.text}`)
-      .join('\n');
+    const history = scoped.map((turn) => `${turn.role === 'user' ? '用户' : '你'}：${turn.text}`);
     this.emitContextScope({ domains, rowsIncluded: scoped.length, rowsExcluded: window.length - scoped.length });
-    const text = [
+    const personaBlocks = [
       '你是运行在用户 Windows 电脑上的伴生助手。用中文回答，口语化、简短直接；第一句不超过 15 个字；没有工具，不要假装能操作电脑。',
       personaText.trim().length > 0 ? `## 人设\n${personaText.trim()}` : '',
       profile.trim().length > 0 ? `## 用户画像\n${profile.trim()}` : '',
-      memoryText.trim().length > 0 ? `## 相关记忆\n${memoryText.trim()}` : '',
-      history.length > 0 ? `## 最近对话\n${history}` : '',
-    ]
-      .filter((part) => part.length > 0)
-      .join('\n\n');
-    return text.length > CONTEXT_MAX_CHARS ? `${text.slice(0, CONTEXT_MAX_CHARS)}…` : text;
+    ].filter((part) => part.length > 0);
+    const plan = assembleLayerPlan({
+      lane,
+      budget: resolveContextBudget(
+        this.config?.contextBudgets ? { contextBudgets: this.config.contextBudgets } : null,
+        lane === 'fastpath' ? 'fastpath' : lane,
+      ),
+      layers: {
+        // Protected: persona and its functional constraints are never trimmed.
+        persona: { items: personaBlocks, separator: '\n\n' },
+        fixed: {
+          heading: memoryParts.fixed.length > 0 || memoryParts.memory.length > 0 ? '## 相关记忆' : '',
+          items: memoryParts.fixed.length > 0 ? [memoryParts.fixed] : [],
+          separator: '\n',
+        },
+        memory: blockLayer(memoryParts.memory),
+        recent: {
+          heading: history.length > 0 ? '## 最近对话' : '',
+          items: history,
+          separator: '\n',
+          keep: 'tail',
+        },
+        ephemeral: { items: [], separator: '\n' },
+      },
+    });
+    // P-59: one debug row per fast-path prompt. Counts only — no utterance, persona, memory or
+    // dialogue text ever enters the event.
+    this.emitQuiet('context.budget', {
+      level: 'debug',
+      lane: plan.lane,
+      layers: contextLayerStats(plan),
+      totalChars: plan.totalChars,
+      truncated: plan.truncated,
+      totalBudget: plan.totalBudget,
+      protectedOverflow: plan.protectedOverflow,
+    });
+    return plan.text;
   }
 
   /**

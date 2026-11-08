@@ -41,6 +41,7 @@ export {
   createVoiceSessionRecovery,
   isVoiceSessionId,
 } from './session/compaction/voice-compaction.js';
+import { isVoiceSessionId } from './session/compaction/voice-compaction.js';
 import {
   PROFILE_STATUS_ENTRY_LIMIT,
   profileAutoMaintainEnabled,
@@ -478,12 +479,20 @@ export { ACK_FALLBACK_LINE, createAckLane } from './speech/ack-lane.js';
 import { createTypedVoiceRelay, hasToolCallBlocks } from './speech/typed-reply.js';
 export { createTypedVoiceRelay } from './speech/typed-reply.js';
 import { createMemoryTurnLedger, isSubagentAgent, createMemoryPreStep } from './memory/pre-step.js';
+import { resolveContextBudget, trimLayerText } from './memory/context-layers.js';
 export {
   createMemoryTurnLedger,
   isSubagentAgent,
   prepareMemoryInjection,
   createMemoryPreStep,
 } from './memory/pre-step.js';
+export {
+  assembleLayerPlan,
+  buildContextBudgetPayload,
+  DEFAULT_CONTEXT_BUDGETS,
+  resolveContextBudget,
+  trimLayerText,
+} from './memory/context-layers.js';
 import { createAutoMemoryRecorder } from './memory/auto-recorder.js';
 export { createAutoMemoryRecorder } from './memory/auto-recorder.js';
 import {
@@ -2227,6 +2236,46 @@ export function apply(ctx, config) {
   const scopedText = (text) => (context) => {
     if (!inWorkspaceScope(context)) return '';
     return typeof text === 'function' ? text(context) : text;
+  };
+  /**
+   * P-59: the lane of one prompt render. The dated companion session is the voice entry; every
+   * other session (GUI typing, resumed, etc.) is the typed entry. Identity is read per render and
+   * an unreadable identity falls back to typed instead of throwing into assembly.
+   */
+  const contextLaneOf = (context) => {
+    try {
+      const agent = context?.agent;
+      const id = typeof agent?.id === 'string' && agent.id.length > 0
+        ? agent.id
+        : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
+      return isVoiceSessionId(id) ? 'voice' : 'typed';
+    } catch {
+      return 'typed';
+    }
+  };
+  /**
+   * P-59: cap ONE observation layer to the lane's per-layer quota before it joins the request.
+   * Trimming is whole-line (oldest lines go for recent, tail lines for ephemeral), never a slice
+   * of the final prompt. Persona/fixed do not pass through here: they are protected.
+   */
+  const budgetObservationText = (layer, context, text) => {
+    const value = typeof text === 'string' ? text : '';
+    if (value.length === 0) return '';
+    try {
+      const budget = resolveContextBudget(
+        config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null,
+        contextLaneOf(context),
+      );
+      const trimmed = trimLayerText({
+        text: value,
+        keep: layer === 'recent' ? 'tail' : 'head',
+        headingLines: layer === 'recent' ? 1 : 0,
+        layer,
+      }, budget[layer]);
+      return trimmed.text;
+    } catch {
+      return value;
+    }
   };
 
   // ---- VTube Studio -------------------------------------------------------
@@ -6045,6 +6094,12 @@ export function apply(ctx, config) {
     featureEnabled: () => features.enabled('memory'),
     displayChars: () => autoMemorySettings().maxChars,
     ledger: memoryTurnLedger,
+    // P-59: the voice session is the dated companion session; every other in-scope session is
+    // the typed entry. Per-layer budgets are opt-in through `contextBudgets`, so a deployment
+    // without them keeps the legacy single-block cap unchanged.
+    contextBudgets: () => (config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null),
+    laneForSession: (sessionId) => (isVoiceSessionId(sessionId) ? 'voice' : 'typed'),
+    measureLayers: (info) => measureContextLayers(info),
     // Observation only: remember what the pre-step recall actually reported for this turn.
     onRecall: (payload) => {
       const recallSessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : '';
@@ -10355,6 +10410,43 @@ export function apply(ctx, config) {
   });
   ctx.effect(() => () => dialogueSummary.stop());
 
+  /**
+   * P-59: what this plugin PREPARED for one turn, per layer, for the `context.budget` debug row.
+   *
+   * The memory block is measured by the memory pre-step itself (`result.contextLayers`); this
+   * callback supplies the layers owned by the prompt/observation assembly: persona + its
+   * functional constraints, the resident fixed-memory section, the recent dialogue observation and
+   * the temporary perception block. No model is called and no buffer is drained: `render()` reads.
+   */
+  function measureContextLayers({ lane = 'typed' } = {}) {
+    const personaText = [
+      persona.render(),
+      MEMORY_CONVENTION,
+      HEARING_CONVENTION,
+      renderLanguageConvention(),
+      VOICE_OUTPUT_CONVENTION,
+      EXPRESSION_CONVENTION,
+      SUMMARY_CONVENTION,
+      TASK_DISPATCH,
+      TOOL_SELECTION,
+    ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
+    // The dialogue observation and the nonverbal cue are companion-only (the same gate the prompt
+    // providers use); a typed session carries the shared environment facts only.
+    const recentText = lane === 'voice' && features.enabled('hearing') ? dialogueContext.render() : '';
+    const ephemeralText = [
+      lane === 'voice' ? nonverbalCue.render() : '',
+      renderEnvironment(),
+    ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
+    // The event builder trims recent/ephemeral with the same layer rule the prompt uses, so the
+    // reported chars/dropped describe the text actually placed in this lane's request.
+    return {
+      persona: personaText,
+      fixed: renderResources(),
+      recent: recentText,
+      ephemeral: ephemeralText,
+    };
+  }
+
   // ---- prompt stability ------------------------------------------------------
   // The DeepSeek route sets `systemPromptUpdate: 'in-history'`: a changed section text appends a
   // COMPLETE system-prompt copy to the history (for prefix caching) and the old copy stays billed
@@ -10518,7 +10610,7 @@ export function apply(ctx, config) {
       registerSection({
         name: 'assistant:environment',
         order: 102,
-        text: scopedText(renderEnvironment),
+        text: scopedText((context) => budgetObservationText('ephemeral', context, renderEnvironment())),
       }),
     );
     // Nonverbal cue, right after the persona: a temporary observation for THIS step only.
@@ -10528,7 +10620,7 @@ export function apply(ctx, config) {
       registerContext({
         name: 'assistant:nonverbal',
         order: 105,
-        text: companionObservation(scopedText(() => nonverbalCue.render())),
+        text: companionObservation(scopedText((context) => budgetObservationText('ephemeral', context, nonverbalCue.render()))),
       }),
     );
     // Continuous dialogue: an independent observation block, never a user message. The body is
@@ -10538,7 +10630,9 @@ export function apply(ctx, config) {
       registerContext({
         name: 'assistant:dialogue',
         order: DIALOGUE_INJECTION_ORDER,
-        text: companionObservation(scopedText(() => (features.enabled('hearing') ? dialogueSummary.render() : ''))),
+        text: companionObservation(scopedText((context) => budgetObservationText(
+          'recent', context, features.enabled('hearing') ? dialogueSummary.render() : '',
+        ))),
         status: () => {
           const snapshot = dialogueContext.snapshot();
           const stats = snapshot?.stats !== null && typeof snapshot?.stats === 'object' ? snapshot.stats : {};

@@ -5,6 +5,7 @@ import { C2_DEFAULT_TIME_ZONE } from '../shared/time.js';
 import { MEMORY_INJECTION_DEFAULTS } from './memory-injection.js';
 import { candidatePersistsLongTerm } from './memory-injection.js';
 import { composeInjectionBlock } from './memory-injection.js';
+import { composeLayeredInjectionBlock } from './memory-injection.js';
 import { composeMemoryStatus } from './memory-injection.js';
 import { detectArchiveRange } from '../shared/time.js';
 import { displayMessageText } from './store.js';
@@ -15,6 +16,8 @@ import { memoryQueryText } from '../shared/text.js';
 import { MEMORY_ITEM_CANDIDATE_EVENT, MEMORY_ITEM_DELIVERED_EVENT, composeMemoryItemMarkers } from './markers.js';
 import { resolveC2TimeZone } from '../shared/time.js';
 import { tokenizeQuery } from './store.js';
+import { buildContextBudgetPayload } from './context-layers.js';
+import { resolveContextBudget } from './context-layers.js';
 import { PRE_STEP_TIMEOUT } from '../speech/typed-reply.js';
 
 /**
@@ -261,7 +264,8 @@ export function isSubagentAgent(agent) {
  * @param {{memory: object, log?: object, sessionId?: string, turn?: number, query?: string,
  *          inScope?: boolean, enabled?: boolean, subagent?: boolean, budgetMs?: number,
  *          now?: () => number, isAborted?: () => boolean, limits?: object,
- *          displayChars?: number, timeZone?: string, fuzzyDays?: number}} options
+ *          displayChars?: number, timeZone?: string, fuzzyDays?: number,
+ *          layerBudgets?: {fixed?: number, memory?: number, totalChars?: number}|null}} options
  */
 export async function prepareMemoryInjection({
   memory,
@@ -281,6 +285,7 @@ export async function prepareMemoryInjection({
   fuzzyDays = C2_DEFAULT_FUZZY_DAYS,
   ledger = null,
   onRecall = null,
+  layerBudgets = null,
 } = {}) {
   const caps = {
     ...MEMORY_INJECTION_DEFAULTS,
@@ -290,6 +295,7 @@ export async function prepareMemoryInjection({
   const skipped = (reason) => ({
     text: '', injected: false, reason, sources, archiveReason: null,
     hits: 0, injectedChars: 0, requestedChars: 0, injectedIds: [], matchedIds: [], persistIds: [],
+    contextLayers: null,
   });
   const text = typeof query === 'string' ? query.trim() : '';
   if (enabled !== true) return skipped('disabled');
@@ -442,15 +448,34 @@ export async function prepareMemoryInjection({
   const notes = [];
   if (sources.active === 'timeout') notes.push('活跃记忆库检索超时，本轮只含已完成的部分');
   if (sources.archive === 'timeout') notes.push('归档检索超时，本轮只含已完成的部分');
-  const composed = composeInjectionBlock({
-    fixed: fixedRows,
-    matched: [...matchedRows, ...archived],
-    notes,
-    limits: caps,
-    timeZone: tz,
-    query: text,
-    terms: Array.isArray(recallMeta.terms) ? recallMeta.terms : [],
-  });
+  const layering = layerBudgets !== null && typeof layerBudgets === 'object';
+  const composed = layering
+    ? composeLayeredInjectionBlock({
+      fixed: fixedRows,
+      matched: [...matchedRows, ...archived],
+      notes,
+      limits: {
+        ...caps,
+        maxChars: Number.isFinite(Number(layerBudgets.totalChars))
+          ? Math.max(0, Math.floor(Number(layerBudgets.totalChars)))
+          : caps.maxChars,
+      },
+      fixedBudget: layerBudgets.fixed ?? caps.maxChars,
+      memoryBudget: layerBudgets.memory ?? caps.maxChars,
+      timeZone: tz,
+      query: text,
+      terms: Array.isArray(recallMeta.terms) ? recallMeta.terms : [],
+    })
+    : composeInjectionBlock({
+      fixed: fixedRows,
+      matched: [...matchedRows, ...archived],
+      notes,
+      limits: caps,
+      timeZone: tz,
+      query: text,
+      terms: Array.isArray(recallMeta.terms) ? recallMeta.terms : [],
+    });
+  const contextLayers = composed.layerStats ?? null;
   const hits = fixedRows.length + matchedRows.length + archived.length;
   // P-52 wiring: a candidate may move to `delivered` only if this block actually rendered its
   // row; the long-term subset is decided by the existing manual-lane rule, never by delivery.
@@ -533,6 +558,7 @@ export async function prepareMemoryInjection({
       return {
         text: '', injected: false, reason: 'timeout', sources, archiveReason, hits, completeness: 'timeout',
         injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+        contextLayers: composed.layerStats ?? null,
       };
     }
     observeRecall(recallPayload);
@@ -543,6 +569,7 @@ export async function prepareMemoryInjection({
       text: statusText, injected: false, reason: 'no-hit', status: true, sources, archiveReason, hits,
       completeness,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+      contextLayers: composed.layerStats ?? null,
     };
   }
 
@@ -574,6 +601,7 @@ export async function prepareMemoryInjection({
       return {
         text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
         injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+        contextLayers: composed.layerStats ?? null,
       };
     }
   }
@@ -600,6 +628,7 @@ export async function prepareMemoryInjection({
     return {
       text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+      contextLayers: composed.layerStats ?? null,
     };
   }
   if (!(await emitWithinBudget('memory.recall', recallPayload)) || now() > deadline) {
@@ -611,6 +640,7 @@ export async function prepareMemoryInjection({
     return {
       text: '', injected: false, reason: 'timeout', sources, archiveReason, hits,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+      contextLayers: composed.layerStats ?? null,
     };
   }
   observeRecall(recallPayload);
@@ -628,6 +658,7 @@ export async function prepareMemoryInjection({
     injectedIds: composed.injectedIds,
     matchedIds: composed.matchedIds,
     persistIds,
+    contextLayers: composed.layerStats ?? null,
   };
 }
 
@@ -649,6 +680,10 @@ export function createMemoryPreStep({
   displayChars = AUTO_MEMORY_DEFAULTS.maxChars,
   ledger = null,
   onRecall = null,
+  contextBudgets = () => null,
+  laneForSession = () => 'typed',
+  measureLayers = null,
+  onContextBudget = null,
 } = {}) {
   const seen = new Map();
   const instances = new WeakMap();
@@ -659,6 +694,64 @@ export function createMemoryPreStep({
       return value !== null && typeof value === 'object' ? value : {};
     } catch {
       return {};
+    }
+  };
+  const readContextBudgets = () => {
+    try {
+      const value = typeof contextBudgets === 'function' ? contextBudgets() : contextBudgets;
+      return value !== null && typeof value === 'object' ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  const laneOf = (sessionId) => {
+    try {
+      return laneForSession(sessionId) === 'voice' ? 'voice' : 'typed';
+    } catch {
+      return 'typed';
+    }
+  };
+  /**
+   * P-59: one debug row per prepared turn. It is fire-and-forget so observation can never extend
+   * the preparation budget, and it carries counts only (never any body text). `configured` says
+   * whether this round's per-layer caps came from `contextBudgets` or from the built-in defaults.
+   */
+  const emitContextBudget = (sessionId, turn, lane, budget, prepared) => {
+    try {
+      let measured = {};
+      if (typeof measureLayers === 'function') {
+        try {
+          measured = measureLayers({ sessionId, turn, lane, budget }) ?? {};
+        } catch {
+          measured = {};
+        }
+      }
+      const payload = {
+        ...buildContextBudgetPayload({
+          lane,
+          budget,
+          measured,
+          memoryLayers: prepared?.contextLayers ?? null,
+        }),
+        source: budget.configured === true ? 'config' : 'default',
+        sessionId,
+        turn,
+      };
+      if (typeof onContextBudget === 'function') {
+        try {
+          onContextBudget(payload);
+        } catch {
+          /* an observer must never break preparation */
+        }
+      }
+      if (typeof log?.emit === 'function') {
+        const pending = log.emit('context.budget', { level: 'debug', ...payload });
+        if (pending !== null && pending !== undefined && typeof pending.catch === 'function') {
+          pending.catch(() => {});
+        }
+      }
+    } catch {
+      /* diagnostics are best-effort */
     }
   };
   const configuredBudget = () => {
@@ -733,6 +826,21 @@ export function createMemoryPreStep({
     const key = `${sessionId}\u0000${turn}\u0000${instanceOf(agent)}`;
     if (seen.has(key)) return decision;
     seen.set(key, { sessionId, turn });
+    // P-59: the lane is decided per session, never per text: the dated companion session is the
+    // voice entry, every other in-scope session is the typed entry. Per-layer caps only replace the
+    // legacy single block cap when `contextBudgets` is configured; defaults stay advisory.
+    const lane = laneOf(sessionId);
+    const budget = resolveContextBudget(readContextBudgets(), lane);
+    const layerBudgets = budget.configured === true
+      ? {
+        // Fixed memories are protected: their cap is the legacy whole-block cap (1200), never the
+        // configured `fixed` quota, so a tight fixed quota can never let a relevance hit push a
+        // standing constraint out. Only `memory` is narrowed from configuration.
+        fixed: MEMORY_INJECTION_DEFAULTS.maxChars,
+        memory: budget.memory,
+        totalChars: MEMORY_INJECTION_DEFAULTS.maxChars + budget.memory,
+      }
+      : null;
     let result;
     try {
       result = await prepareMemoryInjection({
@@ -750,6 +858,7 @@ export function createMemoryPreStep({
         fuzzyDays: configuredFuzzyDays(),
         ledger,
         onRecall,
+        layerBudgets,
       });
     } catch (error) {
       seen.delete(key); // a failed preparation must not poison a retry
@@ -765,6 +874,9 @@ export function createMemoryPreStep({
       return decision;
     }
     if (aborted()) return decision;
+    // P-59: one `context.budget` row for the round that actually prepared (a miss included), so
+    // the P-46 timeline and P-52 candidate/delivered rows can be reconciled with what was placed.
+    emitContextBudget(sessionId, turn, lane, budget, result);
     if (result.text.length === 0) return decision;
     const injected = memoryInjectionMessage(result.text);
     // The message is only in a decision the host may still drop or replace. Candidate delivery

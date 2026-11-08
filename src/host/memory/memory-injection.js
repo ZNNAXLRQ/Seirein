@@ -267,8 +267,28 @@ export function composeInjectionBlock({
   // Every delivered unresolved row keeps its marker; the count is what proves the block still
   // discloses them after the budget had its say.
   const unresolvedRows = chosen.filter((item) => item.mark.length > 0).length;
+  // P-59: the same decision, split per layer, so `context.budget` can report what each layer
+  // actually carried (and what the shared budget dropped) without re-reading the block.
+  const layerStats = {
+    fixed: { chars: 0, items: 0, dropped: 0, dropReasons: {} },
+    memory: { chars: 0, items: 0, dropped: 0, dropReasons: {} },
+  };
+  for (const item of chosen) {
+    const layer = item.fixed === true ? layerStats.fixed : layerStats.memory;
+    layer.chars += item.line.length + 1;
+    layer.items += 1;
+  }
+  for (const item of skipped) {
+    const layer = item.kind === 'fixed' ? layerStats.fixed : layerStats.memory;
+    layer.dropped += 1;
+    layer.dropReasons[item.reason] = (layer.dropReasons[item.reason] ?? 0) + 1;
+  }
   return {
     text,
+    // Content lines only (no heading/footer/notes), in budget order. A layered composition can
+    // re-join them without re-parsing the rendered block.
+    lines: chosen.map((item) => item.line),
+    layerStats,
     injectedChars: text.length,
     requestedChars: candidates.length === 0 ? 0 : requestedChars,
     requestedRecords: candidates.length,
@@ -286,6 +306,109 @@ export function composeInjectionBlock({
     skipped,
     skippedByChars: skipped.length,
     // P-52: the prepared set with its charged width, in budget order (candidate ∪ delivered).
+    prepared,
+  };
+}
+
+// ---- P-59: layered composition -------------------------------------------
+
+/** Content lines of one composed block, i.e. its rendered block without heading/footer/notes. */
+function composedContent(block) {
+  return Array.isArray(block?.lines) ? block.lines : [];
+}
+
+/**
+ * Compose the per-turn block under SEPARATE fixed and memory layer caps.
+ *
+ * The rendered text is byte-for-byte the same shape as `composeInjectionBlock` (one heading, the
+ * fixed rows, the relevance rows, notes, one footer); the difference is only HOW the cap is
+ * spent: fixed rows are charged to `fixedBudget`, relevance rows to `memoryBudget`, and the
+ * remaining total (`limits.maxChars`) still caps the merged block. A fixed row therefore cannot
+ * be displaced by a relevance hit, and a relevance hit cannot raise the fixed layer's cap.
+ *
+ * With the legacy defaults (`fixedBudget = memoryBudget = limits.maxChars`) the allocation is
+ * identical to `composeInjectionBlock`'s single pass, so callers that do not opt into per-layer
+ * budgets keep the old output exactly.
+ *
+ * @param {{fixed?: object[], matched?: object[], notes?: string[], limits?: object,
+ *          fixedBudget?: number|null, memoryBudget?: number|null,
+ *          timeZone?: string, query?: string, terms?: string[]}} options
+ */
+export function composeLayeredInjectionBlock({
+  fixed = [],
+  matched = [],
+  notes = [],
+  limits = MEMORY_INJECTION_DEFAULTS,
+  fixedBudget = null,
+  memoryBudget = null,
+  timeZone = C2_DEFAULT_TIME_ZONE,
+  query = '',
+  terms = [],
+} = {}) {
+  const requestedMax = Math.max(0, Math.floor(Number(limits?.maxChars) || 0));
+  const totalCap = Math.min(MEMORY_INJECTION_DEFAULTS.maxChars, requestedMax);
+  const fixedCap = fixedBudget === null || fixedBudget === undefined
+    ? totalCap
+    : Math.min(totalCap, Math.max(0, Math.floor(Number(fixedBudget) || 0)));
+  const fixedBlock = composeInjectionBlock({
+    fixed,
+    matched: [],
+    notes,
+    limits: { ...limits, maxChars: fixedCap },
+    timeZone,
+    query,
+    terms,
+  });
+  const fixedContent = composedContent(fixedBlock);
+  const fixedChars = fixedContent.join('\n').length;
+  // The merged block inserts one newline between the fixed body and the memory body.
+  const memoryRoom = Math.max(0, totalCap - fixedChars - (fixedChars > 0 ? 1 : 0));
+  const memoryCap = memoryBudget === null || memoryBudget === undefined
+    ? memoryRoom
+    : Math.min(memoryRoom, Math.max(0, Math.floor(Number(memoryBudget) || 0)));
+  const memoryBlock = composeInjectionBlock({
+    fixed: [],
+    matched,
+    notes,
+    limits: { ...limits, maxChars: memoryCap },
+    timeZone,
+    query,
+    terms,
+  });
+  const memoryContent = composedContent(memoryBlock);
+  const noteLines = (Array.isArray(notes) ? notes : [])
+    .filter((note) => typeof note === 'string' && note.trim().length > 0)
+    .map((note) => `- 注：${note.trim()}`);
+  const content = [...fixedContent, ...memoryContent];
+  const text = content.length === 0
+    ? ''
+    : [MEMORY_INJECTION_HEADING, ...content, ...noteLines, MEMORY_INJECTION_FOOTER].join('\n');
+  const prepared = [...fixedBlock.prepared, ...memoryBlock.prepared];
+  const skipped = [...fixedBlock.skipped, ...memoryBlock.skipped];
+  const frame = [MEMORY_INJECTION_HEADING, ...noteLines, MEMORY_INJECTION_FOOTER].join('\n');
+  const layerStats = {
+    fixed: { ...fixedBlock.layerStats.fixed, dropReasons: { ...fixedBlock.layerStats.fixed.dropReasons } },
+    memory: { ...memoryBlock.layerStats.memory, dropReasons: { ...memoryBlock.layerStats.memory.dropReasons } },
+  };
+  const injectedKinds = { hit: 0, link: 0, pair: 0, neighbor: 0, upcoming: 0 };
+  for (const [kind, count] of Object.entries(memoryBlock.injectedKinds)) {
+    if (Object.hasOwn(injectedKinds, kind)) injectedKinds[kind] += count;
+  }
+  return {
+    text,
+    lines: content,
+    layerStats,
+    injectedChars: text.length,
+    requestedChars: prepared.length === 0 ? 0 : frame.length + prepared.reduce((sum, item) => sum + item.chars, 0),
+    requestedRecords: prepared.length,
+    injectedRecords: content.length,
+    injectedIds: [...fixedBlock.injectedIds, ...memoryBlock.injectedIds],
+    matchedIds: memoryBlock.matchedIds,
+    overflow: skipped.length > 0,
+    injectedKinds,
+    unresolvedRows: fixedBlock.unresolvedRows + memoryBlock.unresolvedRows,
+    skipped,
+    skippedByChars: skipped.length,
     prepared,
   };
 }
