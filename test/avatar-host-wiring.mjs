@@ -5,8 +5,9 @@
  *   1. the mouth is written ONLY through the runtime (one intent → one transport frame; the old
  *      `client.setMouth()` path is gone);
  *   2. an unmapped mouth channel is skipped and recorded as `avatar.channel.skipped {channel}`;
- *   3. the light idle-action pool is on by default; an action the model does not expose is skipped
- *      and recorded, never guessed as an expression (emotions stay intent-only);
+ *   3. preset execution is on by default, so the legacy light idle-action pool is NOT sampled; with
+ *      an explicit `presetExecution:false` the light pool is on, and an action the model does not
+ *      expose is skipped and recorded, never guessed as an expression (emotions stay intent-only);
  *   4. disabling the avatar component disposes the runtime (its tick stops; status reports it);
  *   5. the unified 30 Hz controller writes by default (`motion.source:'controller'`), an explicit
  *      `avatarMotionWrites:false` keeps the legacy 4 Hz path, and the first connect builds the
@@ -423,19 +424,57 @@ test('mouth is written only through the runtime (no legacy setMouth path remains
   assert.equal(/client\.setMouth\(/u.test(code), false, 'no client.setMouth() call remains');
   assert.equal((code.match(/client\.injectInputs\(/gu) ?? []).length, 1, 'one injectInputs call site (the runtime transport)');
 
-  // Idle actions: on by default, and the adapted "sway" hotkey really fires.
-  const idled = await waitFor(async () => (await host.status()).live2d?.runtime?.idleActions?.emitted >= 1, 4000);
-  assert.equal(idled, true, 'the lightweight idle action pool is enabled by default');
-  const fired = await waitFor(() => fake.triggeredHotkeys.length >= 1, 4000);
-  assert.equal(fired, true, 'an adapted idle hotkey is triggered');
-  assert.deepEqual(fake.triggeredExpressions, [], 'idle actions never trigger expressions (no random emotion)');
+  // Preset execution is the default action writer: the host still CONFIGURES the legacy pool
+  // (`idleActions.enabled:true`, below) but the preset boundary replaces its sampler. The
+  // observable equivalent of `motion.presets.enabled` is therefore: the pool is present yet emits
+  // nothing, no legacy hotkey is driven, and no expression is invented.
+  await sleep(600);
+  const presetIdle = (await host.status()).live2d.runtime.idleActions;
+  assert.equal(presetIdle.enabled, true, 'the legacy pool is still configured, not silently deleted');
+  assert.equal(presetIdle.emitted, 0,
+    'the legacy idle action pool emits nothing while preset execution owns the boundaries');
+  assert.deepEqual(fake.triggeredHotkeys, [], 'the legacy idle hotkey path is not driven in preset mode');
+  assert.deepEqual(fake.triggeredExpressions, [], 'preset mode never invents an emotion expression');
+  const legacyIdleEvents = (await host.events()).filter((event) => event.type === 'avatar.idleAction');
+  assert.deepEqual(legacyIdleEvents, [], 'no discrete idle action is queued in preset mode');
 
   const final = await host.status();
-  assert.deepEqual(final.live2d.runtime.idleActions.pool, ['sway'], 'the pool narrows to the adapted hotkey');
+  assert.deepEqual(final.live2d.runtime.idleActions.pool, ['sway'],
+    'the host still publishes the adapted pool, but preset mode does not sample it');
   console.log(
     `[avatar] mouthFrames=1 runtimeWrites=${status.live2d.runtime.mouth.writes} mouthInput=${status.live2d.runtime.mouthInput}`
     + ` idleSource=${idleStatus.live2d.runtime.idleSource} controllerFrames=${idleStatus.live2d.runtime.motion.controllerFrames}`
-    + ` idlePool=${final.live2d.runtime.idleActions.pool.join(',')} idleEmitted=${final.live2d.runtime.idleActions.emitted}`
+    + ` preset=true legacyIdlePool=${final.live2d.runtime.idleActions.pool.join(',')}`
+    + ` legacyIdleEmitted=${final.live2d.runtime.idleActions.emitted}`
+    + ` hotkeys=${fake.triggeredHotkeys.length} expressions=${fake.triggeredExpressions.length}`,
+  );
+});
+
+test('显式 presetExecution:false → 轻量待机动作池仍按旧契约触发适配热键', async (t) => {
+  const fake = await createFakeVts({
+    defaultParameters: [MOUTH_INPUT, HEAD_INPUT],
+    modelParams: [{ name: 'ParamMouthOpenY' }, { name: 'ParamAngleX' }],
+    hotkeys: [{ hotkeyID: 'hk-sway', name: 'sway' }],
+  });
+  const host = await startHost(fake, { avatarIdleActionIntervalMs: 20, presetExecution: false });
+  t.after(async () => {
+    host.dispose();
+    await fake.close();
+  });
+
+  assert.equal((await host.callRoute('/assistant/action', { body: { action: 'live2d.connect' } })).ok, true);
+  assert.equal(await waitDiscovered(host), true);
+
+  const idled = await waitFor(async () => (await host.status()).live2d?.runtime?.idleActions?.emitted >= 1, 4000);
+  assert.equal(idled, true, 'the lightweight idle action pool is enabled when preset execution is off');
+  assert.equal(await waitFor(() => fake.triggeredHotkeys.length >= 1, 4000), true,
+    'an adapted idle hotkey is triggered on the legacy path');
+  assert.deepEqual(fake.triggeredExpressions, [], 'legacy idle actions never trigger expressions');
+  const final = await host.status();
+  assert.deepEqual(final.live2d.runtime.idleActions.pool, ['sway'], 'the pool narrows to the adapted hotkey');
+  console.log(
+    `[idle-legacy] presetExecution=false emitted=${final.live2d.runtime.idleActions.emitted}`
+    + ` pool=${final.live2d.runtime.idleActions.pool.join(',')}`
     + ` hotkeys=${fake.triggeredHotkeys.length} expressions=${fake.triggeredExpressions.length}`,
   );
 });
@@ -465,22 +504,57 @@ test('an unmapped mouth channel is skipped and recorded instead of writing', asy
 
   const events = await host.events();
   const skippedMouth = events.filter((event) => event.type === 'avatar.channel.skipped'
-    && event.payload?.channel === 'mouth');
-  assert.ok(skippedMouth.length >= 1, 'avatar.channel.skipped {channel:"mouth"} is recorded');
+    && event.payload?.channel === 'mouth' && event.payload?.reason === 'unmapped');
+  assert.ok(skippedMouth.length >= 1,
+    'avatar.channel.skipped {channel:"mouth",reason:"unmapped"} is recorded');
   assert.equal((await host.status()).live2d.runtime.mouth.unmapped >= 1, true, 'the runtime counted the unmapped write');
 
-  // This model exposes none of the light idle names: each action is skipped (recorded), and no
+  // Preset execution is the default action writer: the legacy light idle pool is configured but
+  // not sampled at all, so the old "unadapted idle action skipped" stream must not appear, and no
   // expression is invented as a fallback.
-  const idled = await waitFor(async () => {
-    const list = await host.events();
-    return list.some((event) => event.type === 'avatar.channel.skipped'
-      && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel));
-  }, 5000);
-  assert.equal(idled, true, 'an unadapted idle action is skipped and recorded');
+  await sleep(600);
+  const presetMode = (await host.status()).live2d.runtime.idleActions;
+  assert.equal(presetMode.enabled, true, 'the legacy pool is still configured, not silently deleted');
+  assert.equal(presetMode.emitted, 0,
+    'the legacy idle action pool emits nothing while preset execution owns the boundaries');
+  const idleSkips = (await host.events()).filter((event) => event.type === 'avatar.channel.skipped'
+    && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel));
+  assert.deepEqual(idleSkips, [], 'preset mode records no legacy idle-action skip');
   assert.deepEqual(fake.triggeredExpressions, [], 'no emotional expression is triggered');
   console.log(
     `[avatar] unmapped mouth frames=0 skippedMouthEvents=${skippedMouth.length}`
-    + ` skippedIdleEvents=${events.filter((event) => event.type === 'avatar.channel.skipped').length}`
+    + ` presetModeIdleEmits=${presetMode.emitted} skippedIdleEvents=${idleSkips.length}`
+    + ` expressions=${fake.triggeredExpressions.length}`,
+  );
+});
+
+test('显式 presetExecution:false → 未适配的轻量待机动作被跳过并记录', async (t) => {
+  const fake = await createFakeVts({
+    defaultParameters: [HEAD_INPUT],
+    hotkeys: [{ hotkeyID: 'hk-idle', name: 'Idle' }],
+  });
+  const host = await startHost(fake, { avatarIdleActionIntervalMs: 20, presetExecution: false });
+  t.after(async () => {
+    host.dispose();
+    await fake.close();
+  });
+
+  assert.equal((await host.callRoute('/assistant/action', { body: { action: 'live2d.connect' } })).ok, true);
+  assert.equal(await waitDiscovered(host), true);
+
+  const skipped = await waitFor(async () => (await host.events()).some((event) => (
+    event.type === 'avatar.channel.skipped'
+    && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel)
+    && event.payload?.reason === 'idle-action-unmapped'
+  )), 5000);
+  assert.equal(skipped, true, 'an unadapted idle action is skipped and recorded on the legacy path');
+  assert.deepEqual(fake.triggeredExpressions, [], 'no emotional expression is triggered');
+  const final = await host.status();
+  assert.ok(final.live2d.runtime.idleActions.emitted >= 1, 'the legacy pool really sampled an action');
+  console.log(
+    `[idle-legacy] presetExecution=false emitted=${final.live2d.runtime.idleActions.emitted}`
+    + ` skippedIdleEvents=${(await host.events()).filter((event) => event.type === 'avatar.channel.skipped'
+      && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel)).length}`
     + ` expressions=${fake.triggeredExpressions.length}`,
   );
 });
@@ -499,12 +573,16 @@ test('disabling the avatar component disposes the runtime', async (t) => {
   assert.equal(connectedStatus.live2d.runtime.connected, true);
   assert.equal(connectedStatus.live2d.runtime.disposed, false);
   // Only the mouth input is discovered here: there is no head/eye/gaze mapping, so the runtime
-  // writes no idle frames and reports the hotkey fallback instead of pretending to be an engine.
-  const fallbackRecorded = await waitFor(async () => (await host.events()).some((event) => (
-    event.type === 'avatar.channel.skipped'
-    && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel)
-  )), 5000);
-  assert.equal(fallbackRecorded, true, 'the hotkey fallback records its skipped actions');
+  // writes no idle frames. Preset execution is the default action writer, so the legacy hotkey
+  // fallback is configured but not sampled at all — that keeps the disposal assertions below
+  // unambiguous.
+  await sleep(600);
+  const presetIdle = (await host.status()).live2d.runtime.idleActions;
+  assert.equal(presetIdle.enabled, true, 'the legacy pool is still configured, not silently deleted');
+  assert.equal(presetIdle.emitted, 0, 'the legacy idle action pool emits nothing in preset mode');
+  const legacyIdleSkips = (await host.events()).filter((event) => event.type === 'avatar.channel.skipped'
+    && ['sway', 'tilt', 'glance', 'nod'].includes(event.payload?.channel));
+  assert.deepEqual(legacyIdleSkips, [], 'preset mode records no legacy idle-action skip');
   assert.ok(['hotkey', 'none'].includes(connectedStatus.live2d.runtime.idleSource), 'no parameter engine without a mapping');
   assert.deepEqual(connectedStatus.live2d.runtime.idleParams.mapped, []);
   assert.equal(connectedStatus.live2d.runtime.idleParams.writes, 0);
