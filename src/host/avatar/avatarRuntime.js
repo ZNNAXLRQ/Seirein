@@ -1192,6 +1192,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     const snap = inner.snapshot();
     const entries = motionEntries(frame.pose, frame.at, snap);
+    reportPresetTransport(entries, snap, {
+      valueOf: (channel) => frame.pose[channel],
+      speaking: mouthActiveForIdle(frame.at, snap),
+      writtenInputs: new Set(entries.map((entry) => entry.input)),
+    });
     if (entries.length === 0) return;
     // The token records which frame generation this RESULT belongs to; sendId owns the gate and
     // seq proves whether a completion is newer than one already applied.
@@ -2413,6 +2418,65 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     return written;
   }
 
+  /** Channels the active preset trajectories asked the ONE writer to flush this frame. */
+  function presetRequestedChannels(snap) {
+    const channels = [];
+    for (const item of snap?.motion?.presets?.active ?? []) {
+      for (const channel of item.channels ?? []) {
+        if (!channels.includes(channel)) channels.push(channel);
+      }
+    }
+    return channels;
+  }
+
+  /**
+   * Why a requested preset channel did not become a transport row. The sender owns this verdict:
+   * an unmapped/unverified binding, a mouth-owned input, or the one-writer-per-input rule.
+   */
+  function transportSkipReason(channel, { valueOf, speaking = false, writtenInputs = null }) {
+    const idleOwned = IDLE_WRITE_CHANNELS.includes(channel);
+    const intentOwned = INTENT_WRITE_CHANNELS.includes(channel);
+    if (!idleOwned && !intentOwned) return 'not-in-write-set';
+    if (!Number.isFinite(valueOf(channel))) return 'no-frame-value';
+    const row = idleOwned ? idleParamMap.find((item) => item.channel === channel) : undefined;
+    const binding = intentOwned ? channelState.bindings.get(channel) : undefined;
+    const inputName = idleOwned ? (row?.inputName ?? '') : (binding?.inputName ?? '');
+    if (idleOwned) {
+      if (inputName === '') return channelState.unverified.includes(channel) ? 'unverified' : 'unmapped';
+    } else if (binding?.verified !== true) {
+      return binding === undefined ? 'unmapped' : 'unverified';
+    }
+    if (speaking && isMouthOwnedInput(inputName)) return 'mouth-owned';
+    if (writtenInputs !== null && inputName !== '' && writtenInputs.has(inputName)) return 'shared-input';
+    return 'not-written';
+  }
+
+  /**
+   * Report what the ONE writer really built to the preset executor. `committed` evidence comes
+   * from these rows only — never from the computed pose — and a requested channel that was
+   * skipped is reported with the sender's reason instead.
+   */
+  function reportPresetTransport(entries, snap, { valueOf, speaking = false, writtenInputs = null } = {}) {
+    const requested = presetRequestedChannels(snap);
+    if (requested.length === 0) return;
+    const written = [];
+    const writtenChannels = new Set();
+    for (const entry of entries) {
+      if (typeof entry?.channel !== 'string') continue;
+      writtenChannels.add(entry.channel);
+      written.push({ channel: entry.channel, value: entry.value });
+    }
+    const skipped = [];
+    for (const channel of requested) {
+      if (writtenChannels.has(channel)) continue;
+      skipped.push({
+        channel,
+        reason: transportSkipReason(channel, { valueOf, speaking, writtenInputs }),
+      });
+    }
+    inner.notePresetTransport({ written, skipped });
+  }
+
   function recordIdleEvent(type, data = {}) {
     idleEvents.push({ type, at: clockNow(), ...data });
     while (idleEvents.length > 20) idleEvents.shift();
@@ -3419,6 +3483,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       entries.push(breath);
       writtenInputs.add(breath.input);
     }
+    // Preset evidence is taken from the rows this flush really built, never from the pose: a
+    // skipped channel is reported with the reason and cannot masquerade as committed.
+    reportPresetTransport(entries, snap, {
+      valueOf: (channel) => frame.get(channel),
+      speaking,
+      writtenInputs,
+    });
     if (entries.length === 0) return;
     lastIdleFrameAt = at;
     if (idleFloor.target !== null) {

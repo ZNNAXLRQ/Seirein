@@ -4,6 +4,7 @@ import {
   ARBITRATION,
   BREATH,
   CHANNELS,
+  IDLE_WRITE_CHANNELS,
   LIMITS,
   SPRING_AXES,
   TIMING,
@@ -581,7 +582,10 @@ function clonePresetTrace(trace) {
         ...sample,
         channels: { ...(sample.channels ?? {}) },
       })),
+      /** The controller's own pose (never a commit) and the rows the sender really built. */
+      computed: { ...(trace.output?.computed ?? {}) },
       committed: { ...(trace.output?.committed ?? {}) },
+      skippedByTransport: { ...(trace.output?.skippedByTransport ?? {}) },
       reason: trace.output?.reason ?? '',
     },
     visible: { ...(trace.visible ?? {}) },
@@ -1831,7 +1835,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         channels: [],
         droppedChannels: [],
         samples: [],
+        /** Controller-computed pose only; it is NEVER copied into `committed`. */
+        computed: {},
+        /** Payload rows that really entered the ONE transport writer (sender acknowledgement). */
         committed: {},
+        /** Requested channels the sender refused, with its reason (e.g. `shared-input`). */
+        skippedByTransport: {},
         peak: 0,
         reason: '',
       },
@@ -2144,10 +2153,33 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return trace;
   }
 
+  /**
+   * Keep a finished preset's channels in the ONE write set until the pose is back at its idle
+   * baseline. This reuses the expression release window (settle → settled or one forced 0). Only
+   * channels the idle frame does NOT already own are released: head/eye are always written, while
+   * gaze/brow would otherwise freeze at their last value on the VTS input. Body/breath are never
+   * part of a trajectory (VTS-native), so they are never released either.
+   */
+  function markPresetRelease(item, atMs) {
+    if (item.written.size === 0) return;
+    for (const channel of item.channels) {
+      if (IDLE_WRITE_CHANNELS.includes(channel)) continue;
+      if (state.releases.has(channel)) continue;
+      const owned = state.presets.active.some((other) => other !== item && other.channels.includes(channel))
+        || state.expressions.some((other) => other.channels.includes(channel))
+        || state.intents.some((other) => other.channels.includes(channel));
+      if (owned) continue;
+      state.releases.set(channel, { kind: `preset:${item.presetId}`, atMs, frames: 0, last: null });
+    }
+  }
+
   function removePresetItem(item, now, { interrupted = false } = {}) {
     const index = state.presets.active.indexOf(item);
     if (index >= 0) state.presets.active.splice(index, 1);
     item.done = true;
+    // The trajectory stopped contributing, but its last value is still on the input: hand the
+    // channels to the release window so the pose returns smoothly instead of sticking there.
+    markPresetRelease(item, now);
     return finishPresetTrace(item, now, { interrupted });
   }
 
@@ -2225,6 +2257,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     while (state.presets.active.length > 2) {
       const evicted = state.presets.active.shift();
       evicted.done = true;
+      markPresetRelease(evicted, at);
       finishPresetTrace(evicted, at, { interrupted: true });
     }
     handOffReleases(item.channels);
@@ -2342,15 +2375,55 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return { adds, gaze, eye, active: state.presets.active.length };
   }
 
-  /** Evidence only: remember the literal pose values the writer produced for preset channels. */
-  function notePresetCommitted(pose, now) {
+  /**
+   * Evidence only: record the pose the controller COMPUTED for the active preset channels. This is
+   * deliberately not `committed` — only the transport sender may report a commit (see
+   * `notePresetTransport`), so a computed value can never be mistaken for a sent one.
+   */
+  function notePresetComputed(pose) {
     for (const item of state.presets.active) {
-      if (now < item.startedAt) continue;
       for (const channel of item.channels) {
         if (!Number.isFinite(pose[channel])) continue;
-        item.trace.output.committed[channel] = pose[channel];
+        item.trace.output.computed[channel] = pose[channel];
       }
     }
+  }
+
+  /**
+   * Sender acknowledgement for the ONE transport write path. `written` lists the rows the sender
+   * really built (`{channel, value}`, value = the payload it received); `skipped` lists requested
+   * channels it refused (`{channel, reason}`). A channel counts as committed only here, never from
+   * the computed pose. A transient skip is kept as evidence even if a later frame writes it.
+   */
+  function notePresetTransport({ written = [], skipped = [] } = {}) {
+    if (state.presets.active.length === 0) return 0;
+    const values = new Map();
+    for (const entry of written) {
+      if (entry !== null && typeof entry === 'object' && typeof entry.channel === 'string') {
+        values.set(entry.channel, entry.value);
+      }
+    }
+    const reasons = new Map();
+    for (const entry of skipped) {
+      if (entry !== null && typeof entry === 'object' && typeof entry.channel === 'string') {
+        reasons.set(entry.channel, String(entry.reason ?? 'skipped'));
+      }
+    }
+    let committed = 0;
+    for (const item of state.presets.active) {
+      const output = item.trace.output;
+      for (const channel of item.channels) {
+        if (values.has(channel)) {
+          const value = values.get(channel);
+          if (!Number.isFinite(value)) continue;
+          output.committed[channel] = value;
+          committed += 1;
+        } else if (reasons.has(channel)) {
+          output.skippedByTransport[channel] = reasons.get(channel);
+        }
+      }
+    }
+    return committed;
   }
 
   /** Low-frequency autonomous idle boundary. Never samples a sentence gap without playback. */
@@ -2461,6 +2534,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       /** The live three-layer trace while a preset is still executing (null when idle). */
       currentTrace: state.presets.active.length === 0
         ? null : clonePresetTrace(state.presets.active[state.presets.active.length - 1].trace),
+      /** Channels still being written by the release window after a preset ended/cancelled. */
+      releasing: [...state.releases]
+        .filter(([, entry]) => String(entry.kind).startsWith('preset:'))
+        .map(([channel, entry]) => ({
+          channel, kind: entry.kind, atMs: entry.atMs, frames: entry.frames,
+        })),
       recent: state.presets.recent.map((trace) => clonePresetTrace(trace)),
     };
   }
@@ -3009,6 +3088,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         });
       }
     }
+    // Motion presets ride the SAME write set as explicit intents: the executor computes their
+    // trajectory on the one pose, so while a trajectory is active its channels must be flushable.
+    // Without this the preset is computed (and used to be reported as committed) but never sent.
+    for (const item of state.presets.active) {
+      if (now < item.startedAt) continue;
+      if (item.cancelledAt !== null && now - item.cancelledAt >= Math.max(1, item.cancelFadeMs)) continue;
+      for (const channel of item.channels) set.add(channel);
+    }
     return [...set];
   }
 
@@ -3498,7 +3585,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     composed.headZ = clampHeadRoll(composed.headZ);
     const pose = applyDynamics(composed, frame, dt);
     publish(pose);
-    notePresetCommitted(pose, now);
+    notePresetComputed(pose);
     stepIdleActions(frame, dt, now);
     state.counters.computed += 1;
     return pose;
@@ -4032,6 +4119,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
      * write of a timed-out release.
      */
     settleReleaseWrite: (channel, value) => settleReleaseWrite(channel, value),
+    /** Sender acknowledgement: the rows it really built / the channels it refused, with reasons. */
+    notePresetTransport: (report) => notePresetTransport(report),
     /** Item 4: decay the posture amplitude to the base over 2–4 s (conversation end). */
     relax,
     cancelIntent,

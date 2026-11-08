@@ -78,8 +78,10 @@ test('1. 复合预设保留编舞结构：按操作顺序写入各自通道与�
   assert.ok(turn.phases.includes('active'));
   assert.ok(turn.phases.includes('hold'));
   assert.ok(turn.phases.includes('exit'));
-  assert.ok(Math.abs(trace.output.committed.headX ?? 0) > 0);
-  assert.ok(Math.abs(trace.output.committed.headZ ?? 0) > 0);
+  assert.ok(Math.abs(trace.output.computed.headX ?? 0) > 0);
+  assert.ok(Math.abs(trace.output.computed.headZ ?? 0) > 0);
+  // No transport is attached to this pure controller, so nothing can be committed.
+  assert.deepEqual(trace.output.committed, {});
   assert.equal(trace.output.reason, 'completed');
 });
 
