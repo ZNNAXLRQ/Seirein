@@ -191,6 +191,7 @@ export const CONTINUATION_PROBE_MS = 1200;
  *          asrDecodeTimeoutMs?: number, asrDecodeTimeoutMaxMs?: number,
  *          asrQueueLimit?: number, asrQueueBytesLimit?: number,
  *          isVoicePlaying?: () => boolean, playingText?: () => string,
+ *          minRmsDb?: number|(() => number), lowEvidenceGate?: boolean|(() => boolean),
  *          echoFilter?: boolean,
  *          dialogueContext?: object|null, dialogueFactory?: () => object|null, now?: Function}} options
  */
@@ -230,6 +231,12 @@ export function startHearing({
    * the next tick; invalid values keep the shipping 500 ms.
    */
   resumeGraceMs = DEFAULT_GROUP_RESUME_GRACE_MS,
+  /**
+   * Silence floor in dB (default -50): anything quieter is silence. A number is fixed for the
+   * session; a **function is the live value** and is re-read at every judgment (frame and
+   * utterance), so a settings change applies to the running capture instead of waiting for a
+   * restart. A throwing getter falls back to the value resolved at session start.
+   */
   minRmsDb = -50,
   onUpdate,
   /**
@@ -279,7 +286,9 @@ export function startHearing({
    * delivery is never changed. When `true`, a candidate (real VAD ratio exactly 0 + empty streaming
    * text + non-empty offline text + silence endpoint, minus the protected-short-answer whitelist)
    * is withheld and `hearing.low-evidence.dropped` is written. Enabling it is the only way this
-   * verdict can touch delivery; the host maps its own setting here later.
+   * verdict can touch delivery. A boolean fixes the switch for the session; a **function is the
+   * live value** (`voice.lowEvidenceGate` in settings), re-read for every final so a change applies
+   * to the next utterance. A throwing getter falls back to the startup value (off).
    */
   lowEvidenceGate = false,
   /**
@@ -1192,8 +1201,66 @@ export function startHearing({
    * is often only 300 ms. Above this floor the text decides whether the utterance was speech.
    */
   const MIN_AUDIO_MS = 150;
-  /** Below this the segment is silence; SenseVoice likes to invent text for silence. */
-  const MIN_RMS_DB = Number.isFinite(minRmsDb) ? minRmsDb : -50;
+  /**
+   * The silence floor in dB. `minRmsDb` is either a number (fixed) or a getter (live setting); the
+   * value is resolved at session start so a later throw has an honest fallback, and every judgment
+   * reads `currentMinRmsDb()` below — the floor is never cached as a startup constant.
+   */
+  const STARTUP_MIN_RMS_DB = (() => {
+    if (typeof minRmsDb === 'function') {
+      try {
+        const read = Number(minRmsDb());
+        if (Number.isFinite(read)) return read;
+      } catch {
+        /* a throwing getter at session start keeps the documented default */
+      }
+      return -50;
+    }
+    return Number.isFinite(minRmsDb) ? minRmsDb : -50;
+  })();
+  /** Last resolved floor: the change detector of `hearing.threshold.updated`, never a gate value. */
+  let reportedMinRmsDb = STARTUP_MIN_RMS_DB;
+  /**
+   * Resolve the floor *now*: 3 judgment sites (two frame-level, one utterance-level) call this
+   * instead of reading a startup constant, so `asrMinRmsDb` changed in settings takes effect on
+   * the next chunk. A throwing getter or a non-finite reading falls back to the startup value and
+   * capture continues; a real change writes one debug `hearing.threshold.updated { from, to }`.
+   */
+  const currentMinRmsDb = () => {
+    let value = STARTUP_MIN_RMS_DB;
+    if (typeof minRmsDb === 'function') {
+      try {
+        const read = Number(minRmsDb());
+        if (Number.isFinite(read)) value = read;
+      } catch {
+        value = STARTUP_MIN_RMS_DB;
+      }
+    }
+    if (value !== reportedMinRmsDb) {
+      const from = reportedMinRmsDb;
+      reportedMinRmsDb = value;
+      try {
+        onEvent?.('hearing.threshold.updated', { level: 'debug', from, to: value });
+      } catch {
+        /* an event sink must never break capture */
+      }
+    }
+    return value;
+  };
+  /**
+   * Low-evidence gate switch, resolved per final. A boolean is the session value; a getter is the
+   * live `voice.lowEvidenceGate` setting, and a throw falls back to the startup value (off), so a
+   * broken settings read can never start withholding speech.
+   */
+  const STARTUP_LOW_EVIDENCE_GATE = lowEvidenceGate === true;
+  const lowEvidenceGateNow = () => {
+    if (typeof lowEvidenceGate !== 'function') return lowEvidenceGate === true;
+    try {
+      return lowEvidenceGate() === true;
+    } catch {
+      return STARTUP_LOW_EVIDENCE_GATE;
+    }
+  };
   /** Resolved commit buffer: invalid/negative config falls back to the shipping 300 ms. */
   const GROUP_COMMIT_MS = Number.isFinite(Number(asrGroupCommitMs)) && Number(asrGroupCommitMs) >= 0
     ? Math.min(Number(asrGroupCommitMs), 5_000)
@@ -1262,12 +1329,15 @@ export function startHearing({
    * never reaches the probe point.
    */
   const noteEndpointProbeAudio = (samples) => {
+    // Resolved once per chunk: the same floor for every frame, and a live setting takes effect on
+    // the next chunk instead of at the next session.
+    const minRmsDbNow = currentMinRmsDb();
     for (let offset = 0; offset < samples.length; offset += GROUP_FRAME_SAMPLES) {
       const frame = samples.subarray(offset, Math.min(samples.length, offset + GROUP_FRAME_SAMPLES));
       let frameSquares = 0;
       for (const sample of frame) frameSquares += sample * sample;
       const voiced = frameSquares > 0
-        && 20 * Math.log10(Math.sqrt(frameSquares / frame.length)) >= MIN_RMS_DB;
+        && 20 * Math.log10(Math.sqrt(frameSquares / frame.length)) >= minRmsDbNow;
       const frameMs = (frame.length * 1000) / 16000;
       if (voiced) {
         if (!probeSeenSpeech) {
@@ -1437,8 +1507,9 @@ export function startHearing({
         vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
       })
       : null;
-    // Low evidence is judged on the final snapshot's evidence chain. `lowEvidenceGate` defaults to
-    // false, so this verdict is recorded by the shadow below and never touches delivery.
+    // Low evidence is judged on the final snapshot's evidence chain. The switch is resolved here,
+    // per final: it defaults to false (shadow only), so with no getter this verdict never touches
+    // delivery, and with one a settings change applies from the next utterance.
     const lowEvidence = lowEvidenceVerdict({
       text: outcome.text,
       vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
@@ -1447,7 +1518,7 @@ export function startHearing({
       endpointReason: snapshot.endpointReason,
       durationMs: snapshot.durationMs,
     });
-    const lowDrop = candidate && lowEvidenceGate === true && lowEvidence.lowEvidence === true;
+    const lowDrop = candidate && lowEvidenceGateNow() && lowEvidence.lowEvidence === true;
     // The verdict is final here. The shadow row is written *after* it and is never read back by it.
     const delivered = candidate && echo?.drop !== true && !lowDrop;
     noteNoiseShadow(snapshot, outcome, delivered);
@@ -2001,12 +2072,15 @@ export function startHearing({
     // chunk, so a short blip inside one large chunk cannot pose as sustained speech. Only a run
     // that stays above the existing floor for `GROUP_RESUME_MIN_VOICE_MS` confirms a resume.
     if (activeGroup !== null && (activeGroup.state === 'buffering' || activeGroup.resumeTimer !== null)) {
+      // Same live floor as the probe above: the group's resume evidence must use the value the
+      // user sees in settings, not the one this session started with.
+      const minRmsDbNow = currentMinRmsDb();
       for (let offset = 0; offset < samples.length; offset += GROUP_FRAME_SAMPLES) {
         const frame = samples.subarray(offset, Math.min(samples.length, offset + GROUP_FRAME_SAMPLES));
         let frameSquares = 0;
         for (const sample of frame) frameSquares += sample * sample;
         const voiced = frameSquares > 0
-          && 20 * Math.log10(Math.sqrt(frameSquares / frame.length)) >= MIN_RMS_DB;
+          && 20 * Math.log10(Math.sqrt(frameSquares / frame.length)) >= minRmsDbNow;
         noteGroupAudio(activeGroup, voiced ? (frame.length * 1000) / 16000 : 0);
       }
     }
@@ -2088,7 +2162,9 @@ export function startHearing({
         }
         utteranceRms = Math.sqrt(sumSquares / utteranceSamples);
       }
-      const loudEnough = utteranceRms > 0 && 20 * Math.log10(utteranceRms) >= MIN_RMS_DB;
+      // The floor is resolved at the judgment itself: a settings change applies to this utterance
+      // even when it arrived while the audio was already being captured.
+      const loudEnough = utteranceRms > 0 && 20 * Math.log10(utteranceRms) >= currentMinRmsDb();
       // Energy VAD over the buffered audio, for the shadow row only: null when there is no audio to
       // measure, and an energy measurement — not a voice/speech classifier.
       const voiced = voicedMetrics(utterance, { sampleRate: 16000 });

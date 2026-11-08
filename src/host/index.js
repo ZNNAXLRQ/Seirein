@@ -12426,7 +12426,11 @@ export function apply(ctx, config) {
           endpointProbe: config?.voice?.endpointProbe !== false,
           endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
           gainDb: Number(config?.asrGainDb ?? 0),
-          minRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
+          // Live floor: `hearing.threshold` mutates `runtime.asrMinRmsDb`, so the running capture
+          // must read it at each judgment — a getter, not a startup number.
+          minRmsDb: () => Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
+          // Low-evidence gate: `voice.lowEvidenceGate` in settings.json, default off (shadow only).
+          lowEvidenceGate: () => readSettings()?.voice?.lowEvidenceGate === true,
           streamThreads: tuning.streamThreads,
           finalThreads: tuning.finalThreads,
           decodeCapSec: tuning.decodeCapSec,
@@ -12661,7 +12665,8 @@ export function apply(ctx, config) {
           endpointProbe: config?.voice?.endpointProbe !== false,
           endpointProbeMs: Number(config?.voice?.endpointProbeMs) > 0 ? Number(config.voice.endpointProbeMs) : undefined,
           gainDb: Number(config?.asrGainDb ?? 0),
-          minRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
+          // Same live floor on the loopback lane: both sessions read the one `asrMinRmsDb` setting.
+          minRmsDb: () => Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
           streamThreads: tuning.streamThreads,
           finalThreads: tuning.finalThreads,
           decodeCapSec: tuning.decodeCapSec,
