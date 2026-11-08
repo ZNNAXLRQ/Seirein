@@ -162,7 +162,7 @@ Seirein 是 DSH 的**插件**，不是独立软件。装好 DSH Desktop 后，�
 
 适合：不想装 git、希望以后能重复装同一个版本的人。
 
-1. 打开 <https://github.com/ZNNAXLRQ/Seirein/releases>（`TODO(确认已经发布 Release 与附件名)`）。
+1. 打开 <https://github.com/ZNNAXLRQ/Seirein/releases>。
 2. 下载名字类似 `local-dsh-assistant-0.99.0.tgz` 的文件。
 3. 把它放到一个**以后不会移动、不会删除**的文件夹。DSH 会记住这个文件的路径；以后移动或删掉它，重装/更新可能失败。
 4. 在 DSH 侧栏点 **插件** → **添加插件**。
@@ -292,7 +292,12 @@ Seirein 是 DSH 的**插件**，不是独立软件。装好 DSH Desktop 后，�
 
 **作用：** 麦克风 / 回环采集、截图、故事板、音频转码；如果同目录有 `ffplay.exe`，也用它播放语音。
 
-**下载：** <https://ffmpeg.org/download.html> → 选 Windows 构建 → 下载压缩包并解压。建议选带 `ffplay.exe` 的构建；Windows 构建的具体推荐来源 `TODO(确认推荐构建)`。
+**下载（任一即可）：**
+- BtbN 的 Windows 构建（推荐，bin 较新）：<https://github.com/BtbN/FFmpeg-Builds/releases> → 选 `win64-gpl` 压缩包 → 解压。
+- gyan.dev 的 Windows 构建：<https://www.gyan.dev/ffmpeg/builds/> → 选 `full`（确保含 `ddagrab` 桌面采集）。
+- 包管理器：`winget install Gyan.FFmpeg`。
+
+**验证：** `ffmpeg -version` 正常输出；`ffmpeg -filters | findstr ddagrab` 能看到 `ddagrab`（视觉桌面采集需要）；`ffmpeg -list_devices true -f dshow -i dummy` 能看到麦克风/回环设备。
 
 **放到哪里（三选一）：**
 
@@ -1179,261 +1184,244 @@ tokens.txt
 
 ### 3.1 总体框架
 
+Seirein 是 DSH 的 **bundle 插件**：`cordis.patch.yml` 在加载期插入一行 `dsh-assistant`，插件入口 `src/host/index.js` 在 Host（Node 模式子进程）里装配服务、工具、事件与 HTTP；设置页 `client.js` 跑在浏览器里，通过 DSH 的 Web 服务与 Host 通信。两者不共享进程，也不互相 import。
+
 ```text
 DSH Host（Node 模式子进程）
-└─ @local/dsh-assistant（src/host/index.js）
-   ├─ cordis.patch.yml  → 插入 dsh-assistant 插件行（id / name / config）
-   ├─ FeatureStore      → data/features.json（8 个组件开关）
-   ├─ 服务层            → hearing / speech / memory / vision / avatar / subtitle / session / profile
-   ├─ 工具面            → ctx.tools.register × 24（定义在 index.js，执行在 runtime/tools.js）
-   ├─ 事件接缝          → ctx.on('session/event') / ctx.on('agent/pre-step') / ctx.on('agent/created')
+└─ @local/dsh-assistant（src/host/index.js，唯一入口）
+   ├─ cordis.patch.yml  → 插入 dsh-assistant 插件行（id / name / config 默认值）
+   ├─ FeatureStore      → data/features.json（8 个组件开关，带启停钩子）
+   ├─ 服务层            → hearing / speech / memory / vision / avatar / subtitle / session / profile / platform
+   ├─ 工具面            → ctx.tools.register × 24（定义在 index.js，execute 在 runtime/tools.js）
+   ├─ 事件接缝          → session/event、agent/pre-step、tools/execute；agent/created 由压缩模块订阅
    ├─ HTTP              → /assistant/status、/assistant/action、/assistant/shot
-   ├─ 客户端            → package.json dsh.client → client.js（settings.plugins.tab + settings.section）
+   ├─ 客户端            → client.js（package.json 的 dsh.client → settings.plugins.tab + settings.section）
    └─ 外部进程 / 服务    → ffmpeg / ffplay、PowerShell + WPF、VTS WebSocket、OBS WebSocket、GPT-SoVITS HTTP、Edge TTS
 ```
 
 | 接入面 | 实现方式 | 说明 |
 | --- | --- | --- |
-| 工具注册 | `ctx.tools.register` | 工具定义与 description / schema 在 `index.js`，execute 在 `runtime/tools.js` |
-| 会话事件 | `ctx.on('session/event', …)` | 观察回答、工具、turn、stream，驱动语音与记忆；不修改宿主事件 |
-| 请求前上下文 | `ctx.on('agent/pre-step', …)` | 记忆、日切摘要注入；只追加，不改宿主的决定 |
-| Agent 生命周期 | `ctx.on('agent/created', …)` | 给语音会话挂压缩 preset；兼容新建、恢复、重载扫描 |
-| HTTP | `ctx.webServer.register({ kind: 'exact', … })` | 状态、动作、截图缓存三个端点 |
-| 客户端 | `dsh.client` + slots | `client.js` 注册 `settings.plugins.tab` 与 `settings.section`，面板通过 HTTP 读写 |
-| 组件开关 | `FeatureStore` | `data/features.json`；启用 / 关闭有生命周期钩子，不是单纯的 UI 状态 |
-| 生命周期 | `ctx.effect` | 采集、播放、字幕、WebSocket、子进程、计时器都挂在 effect/disposer 上 |
+| 插件装载 | `cordis.patch.yml` 的 `insert` | 一行 `dsh-assistant` 与默认 config；组件开关不在这里 |
+| 工具注册 | `ctx.tools.register` | 名称 / description / parameters / schema / render 在 `index.js`，execute 在 `runtime/tools.js` |
+| 会话事件 | `ctx.on('session/event', …)` | 观察回答、工具、turn、stream，驱动语音、记忆与动作；不修改宿主事件 |
+| 请求前上下文 | `ctx.on('agent/pre-step', …)` | 记忆注入、日切摘要、视觉预取、识别残片提示；只追加，不改宿主的决定 |
+| Agent 生命周期 | `ctx.on('agent/created', …)` | 由 `session/compaction/voice-compaction.js` 订阅：给当天语音会话挂压缩 preset |
+| 工具执行 | `ctx.on('tools/execute', …)` | 只给宿主的 `session_search` 加一层超时预算，不改工具语义 |
+| HTTP | `ctx.inject(['webServer'], …)` + `webServer.register({ kind: 'exact' })` | 状态、动作、截图缓存三个端点，路径精确匹配 |
+| 客户端 | `package.json` 的 `dsh.client` + `ctx.slots` | `client.js` 注册 `settings.plugins.tab` 与 `settings.section`，面板通过 HTTP 读写 |
+| 组件开关 | `FeatureStore` | `data/features.json`；启用 / 关闭有生命周期钩子，不是纯 UI 状态 |
+| 生命周期 | `ctx.effect` | 采集、播放、字幕、WebSocket、子进程、计时器都挂在 effect / disposer 上 |
 | 外部服务 | 直接 HTTP / WebSocket / 子进程 | 不依赖 Harness 包；失败时降级或报错，不静默 |
 
-> 设计文档 `docs/DESIGN.md` 里画的「事件总线（L2）」是概念层。当前实现没有独立消息总线：宿主事件用 `ctx.on` 订阅，插件自己的观测写 `data/events.jsonl`（`{id, ts, type, corr_id, payload}`）。
+这里**没有独立的消息总线**：宿主事件一律用 `ctx.on` 订阅，插件自己的观测写 `data/events.jsonl`（每行 `{id, ts, type, corr_id, payload}`，10 MB × 5 轮转）。代价是所有跨模块通知都得顺着具体订阅点找，读代码时不能假设有一个统一事件中心。
 
-### 3.2 项目结构详细说明
+### 3.2 项目结构
 
 ```text
 Seirein/
-├─ client.js                 Web 设置页（必须在仓库根）
+├─ client.js                 Web 设置页（必须在仓库根，DSH 缓存这个入口）
 ├─ cordis.patch.yml          bundle 插入行与默认配置
 ├─ package.json              main / exports / files / engines / dsh
 ├─ locale/                   zh.json / en.json（界面元数据）
 ├─ src/host/
 │  ├─ index.js               唯一入口：装配服务、工具、事件、HTTP、生命周期
-│  ├─ avatar/                形象与动作
-│  ├─ hearing/               听觉
+│  ├─ avatar/                形象与动作（presets/、spout-layer/）
+│  ├─ hearing/               听觉（interaction/）
 │  ├─ memory/                记忆与固定记忆
 │  ├─ platform/              Windows / 热键 / 模型下载
 │  ├─ profile/               人设与画像
-│  ├─ runtime/               组件、依赖、HTTP、诊断、关闭
-│  ├─ session/               投递、推理、上下文、压缩
-│  ├─ shared/                纯函数
+│  ├─ runtime/               组件、依赖、HTTP、设置、诊断、关闭、数据根
+│  ├─ session/               compaction / conversation / delivery / events / inference / timeline
+│  ├─ shared/                纯文本与时间函数
 │  ├─ speech/                语音输出
 │  ├─ subtitle/              字幕
 │  └─ vision/                视觉
-├─ test/                     node:test 回归（200+ 个 .mjs）
+├─ test/                     node:test 回归
 ├─ scripts/                  test-batch.mjs / baseline-snapshot.mjs
-├─ tools/                    开发探针（不进发布包）
-└─ docs/                     本地设计、计划、报告（.gitignore）
+└─ tools/                    开发探针（不进发布包）
 ```
 
-#### `src/host/avatar/` — 形象与动作
+入口只有 `src/host/index.js`：它只做装配（创建服务、注册工具 / 事件 / HTTP、跨域接线、生命周期），业务规则都在功能目录里；`test/module-layout.mjs` 断言 host 根目录只有这一个文件。
 
-| 文件 | 职责 / 思路 |
+| 模块 | 职责 |
 | --- | --- |
-| `vts.js` | VTube Studio WebSocket 客户端：认证、token、热键、表情、参数、模型移动、重连 |
-| `avatarRuntime.js` | 行为运行时门面：连接 epoch、已验证通道、**唯一参数写者**、传输与生命周期 |
-| `motion-controller.js` / `style.js` / `dynamics.js` / `mixer.js` / `motion-primitives.js` | 行为状态机、人设风格、帧数学与通道仲裁；低频决策、高频插值 |
-| `presets/` | 动作预设库：`recipes.js`（编舞与 `requires`）、`styles.js`（16 种风格标签）、`catalog.js`（编舞 × 节奏变体）、`index.js` 查询入口 |
-| `preset-selector.js` | 预设硬过滤 + 家族/变体打分；只输出候选，不直接写参数 |
-| `avatarLayer.js` / `transparent.ps1` | WPF 透明置顶层：`PrintWindow` + 洋红键控镜像 VTS 窗口 |
-| `spoutLayer.js` / `spout-layer/` | 实验性 Spout 显示进程（独立 Electron / CommonJS 边界）；只有阶段 0 经真机验收 |
-| `layer-controls.js` | WPF / Spout 单所有者切换、编辑几何校验 |
+| `avatar/` | VTS WebSocket 客户端（认证、热键、表情、参数）、行为运行时与唯一参数写者、动作预设库与选择器、WPF 透明层、Spout 实验层 |
+| `hearing/` | 麦克风与环境音采集（ffmpeg dshow → 16 kHz PCM）、ASR worker 与主线程解耦、VAD 与端点、终稿门禁（回声 / 低证据影子）、声纹影子、连续台词缓冲、通话模式、音频保留 |
+| `memory/` | 分域情节记忆（SQLite + FTS5）、固定记忆 vault（DPAPI 加密）、自动记录、召回 / 纠正 / 归档 / 容量衰退、请求前注入与分层预算 |
+| `vision/` | 三种观察状态（桌面 / OBS 场景 / 隐私锁）、截图与故事板、单帧与故事板两种产物、黑帧拒绝、鼠标注意目标、回合内视觉预取 |
+| `subtitle/` | 独立 PowerShell/WPF 叠加层与文件协议、区域 / 气泡几何、Windows 字体枚举、分页 |
+| `speech/` | 统一语音出口：Edge / GPT-SoVITS 合成、串行队列与取消、语音 / 字幕双流翻译、口语版单元流、逐句说话人、候音、播放账本与单播放席位、个人语言库、打字回合播报 |
+| `platform/` | 全局热键（`koffi` 轮询 Win32）、硬件探测与 ASR 线程推导、模型下载（URL + 大小 + sha256）、窗口矩形与移动 |
+| `runtime/` | 组件注册表与开关、外部依赖引用计数、工具 execute、HTTP 路由与设置动作、受控诊断、关闭编排、数据根解析与迁移 |
+| `session/` | 投递与结果绑定、闲聊快路 / 轻量模型通道、请求前上下文、连续台词与待回应组、日切摘要、压缩 preset、逐轮时间线 |
+| `profile/` | 人设与用户画像的读写与预算、画像库分类 / 评分 / 整理后台工作流、初始参考人设问卷 |
+| `shared/` | 纯文本与时间函数（句界、注入消息识别、语音预算、日切、时区），不持有状态 |
+| `client.js` | 设置页单面板：状态卡片与全部设置动作，走 HTTP 读写；另有一条 1500 ms 的日切桥轮询 |
 
-关键点：动作数据（`presets/`）是只读源码；用户覆盖写 `<root>/data/motion-presets.json`。预设不携带 VTS 参数名，也不允许第二个参数写者。
+几条结构约定：
 
-#### `src/host/hearing/` — 听觉
+- 子目录按职责再分：`session/{compaction,conversation,delivery,events,inference,timeline}`、`runtime/{http,settings,diagnostics}`、`avatar/{presets,spout-layer}`、`hearing/interaction`。
+- 发布清单以 `package.json.files` 为准：`client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、`Seirein.ico`、`Seirein.png`；新增运行资源必须放进这些路径。
+- 只有纯文本 / 时间函数进 `shared/`，跨域生命周期进 `runtime/`，不要为了方便 import 把业务模块塞进 `runtime/`。
 
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `hearing.js` | 采集会话编排：设备 → ffmpeg dshow → 16 kHz 单声道 PCM → 流式识别 + 精识别终稿；端点、投递、低证据影子、打断判定都在这里汇合 |
-| `asr-worker.js` / `worker-client.js` | ASR worker 生命周期、模型加载、线程/解码上限；主线程不阻塞 |
-| `vad.js` | Silero VAD（缺模型时降级能量判定），端点规则与语音比例 |
-| `audio-evidence.js` | 声学观测：噪声影子、`wouldDrop` 证据、低证据判定、麦克风复核；**只记录，默认不拦截投递** |
-| `devices.js` / `transcript.js` | 设备枚举（回环识别）、ASR 标签拆分、重叠拼接、截断语义 |
-| `speakerVoice.js` | CAM++ 声纹模板：登记、匹配、`match/unsure/no-match`；只做影子，不参与路由 |
-| `ambient.js` / `capture-autostart.js` | 环境音来源分类、自启动与有限重试、手动切换 |
-| `dialogue-capture.js` | 连续台词缓冲：跨设备共用一个 Host 级缓冲，供摘要与注入 |
-| `interaction/callMode.js` / `callNames.js` | 通话模式：只有被称呼的句子才进入；称呼的新增 / 删除 / 启停 |
-| `audio-retention.js` | 可选诊断音频：只保留可疑语句的 16 kHz PCM，FIFO 限额，隐私时不写 |
+### 3.3 总体设计思路
 
-#### `src/host/memory/` — 记忆
+下面先给一条完整链路，再按「这套设计要解决什么问题」拆开。只讲已经实现、而且能在代码或测试里核对的做法；未实现或默认关闭的会单独标明。
 
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `store.js` | 单个 `memory.db`，domain 是列不是分库；FTS5 trigram 子串检索，短查询降级 LIKE；容量驱动的 30/60/90% 衰退与归档；版本、纠正、链接、归档表 |
-| `query.js` | 查询解释（时间范围、角色、意图）、检索词、排序与摘要片段 |
-| `pre-step.js` | `agent/pre-step` 的唯一注入通道：按轮记账、子代理排除、预算与事件 |
-| `memory-injection.js` | 注入块格式、预算裁剪、交付行、状态文本 |
-| `auto-recorder.js` | 消息级自动记忆：用户与助手消息都可在消息边界入库，不占热路径 |
-| `resources.js` | 固定记忆 vault：键 / 标签 / 类型，凭据用 Windows DPAPI 加密；每轮注入正文或索引 |
-| `memory-normalize.js` / `dedup-candidates.js` | 文本规范化、候选去重 |
-
-记忆分层要分清：`fixed` 是用户显式写入、每轮注入；`persona` 是人设 / 画像、每轮注入；`importance` 只影响自动记忆排序与衰退，不再让记录常驻；`pinned` 机制已删除。
-
-#### `src/host/vision/` — 视觉
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `vision.js` | 三模式状态机：`watch`（桌面）/ `scene`（OBS）/ `privacy`（采集锁）；agent 可进隐私、不可出 |
-| `sight.js` | 截图与故事板：桌面 ddagrab（gdigrab 兜底）、OBS 虚拟摄像头、超限缩放、观测时效（默认 30 s）、可取消 |
-| `obs.js` | OBS WebSocket v5：握手、场景列表、场景切换 |
-| `black-frame.js` | 虚拟摄像头黑帧 / 未就绪判断：在交付前按像素判断，不拿黑图冒充「看到的画面」 |
-| `attention-source.js` | 鼠标位置作为注意目标；没读到就是 `verified:false`，不编造目标 |
-
-#### `src/host/speech/` — 语音输出
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `tts.js` | Edge TTS（`msedge-tts`）与 GPT-SoVITS HTTP；串行合成队列、取消、超时、参考音频探测、失败回落 Edge、ffplay 流式播放 |
-| `translate.js` | 语音 / 字幕双流翻译、逐句完整性校验、缓存、超时；`prepareSpeech` 与 `prepareCaption` 分开 |
-| `spokenPipeline.js` / `reply-speaker.js` / `spoken-dedupe.js` | 口语版单元流、逐句说话人、预取深度、轮次所有权、相似度去重 |
-| `speech-text.js` / `format.js` | Markdown 一次解析 → 语音 lane / 字幕 lane；句界预算；不把推理、工具参数、隐藏标签读出来 |
-| `chunk-capabilities.js` | 逗号 / 首块切分能力探测（P-65 / P-148），缺失时退回整句 |
-| `ack-speech.js` / `ack-lane.js` / `ack-warmup.js` | 候音：草稿、预热池、固定兜底；每轮最多一句；正文就绪即让位 |
-| `speech-ledger.js` | 语音账本：接纳、顺序、播放归属、取消与完成；等待 / 取消是独立动作 |
-| `typed-reply.js` | 打字回合的语音播报：与自动语音共用同一条出口 |
-| `lexicon-*.js` | 个人语言库：候选 → 用户确认 → 生效；没确认不写词 |
-| `events.js` / `settings-actions.js` | 语音事件观察与设置动作 |
-
-#### `src/host/subtitle/` — 字幕
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `subtitle.js` | 字幕驱动：与独立 PowerShell/WPF 进程用文件协议通信（`state.json` 原子写、`selection.json` 回传） |
-| `overlay.ps1` | 透明置顶、点击穿透的 WPF 叠加层；自动缩字号、分页、拖选区域 |
-| `geometry.js` / `subtitle-fonts.js` | 区域校验、统一形象几何、Windows 字体枚举与缓存 |
-| `settings-actions.js` | 选择区域、字体 / 字号 / 颜色模式、预览、隐藏 |
-
-气泡模式锚定统一形象几何（WPF / Spout / 编辑中的 VTS 共用），不是旧文档里的「锚 VTS 左上角」。
-
-#### `src/host/platform/` — 平台适配
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `hotkeys.js` | `koffi` 轮询 `GetAsyncKeyState`，支持组合键、numpad、按住/释放语义；保存前校验与裁剪 |
-| `hardware.js` | 探测 CPU / 内存，推导 ASR 线程数与解码上限 |
-| `modelDownload.js` | 固定 URL + 字节数 + sha256 的下载器：Silero VAD、CAM++ 声纹；原子替换、镜像/重试、单任务共享 |
-| `windows.js` / `window-move.ps1` | 窗口矩形、虚拟屏幕、DPI 感知的移动与置顶 |
-
-#### `src/host/runtime/` — 运行时
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `features.js` | 组件注册表与开关；状态写 `features.json`，钩子失败保留 `lastHookError` |
-| `dependency-registry.js` | 外部依赖引用计数、串行启停、进程所有权；不关闭用户自己启动的程序 |
-| `tools.js` | 24 个工具的 execute：参数解析、调用服务、返回结构；定义仍在 `index.js` |
-| `http/routes.js` / `status.js` / `actions.js` / `request.js` | 三个端点、状态投影、精确动作分派、JSON body 限流 |
-| `settings/system-actions.js` | 选文件、自启动、热键、组件开关、诊断查询 |
-| `diagnostics/query.js` | 受控只读诊断：固定探针 + 字段白名单 + 行数/时间/字节上限；不吐原始事件行 |
-| `diagnostics/shutdown-resources.js` | 关闭期资源快照（只观测） |
-| `shutdown.js` | 关闭预算、逐个 stop、子进程确认 |
-| `root.js` | 数据根解析、`instance.json`、旧目录一次性迁移 |
-| `event-log.js` | JSONL 事件日志，10 MB × 5 轮转 |
-
-#### `src/host/profile/` — 人设与画像
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `persona.js` | `persona.md` / `user.md` 读写与预算截断；文件是实现细节，用户通过对话或设置页维护 |
-| `profileStore.js` | 画像库表（与 `memory.db` 同连接，但不计入记忆容量）；分类、条目、版本、导入 |
-| `profileRank.js` | 评分与预算编译：哪些条目进入提示词、顺序与截断 |
-| `profileMaintain.js` + `maintain-config.js` / `maintain-busy.js` / `model-response.js` / `prompt-splitting.js` | 后台整理工作流：空闲、7 天、忙判定、草案/试用/采用 |
-| `classification.js` / `compose.js` / `tone.js` / `evidence.js` | 分类、合成、语气修复、证据记录 |
-| `persona-quiz.js` | 初始参考人设问卷：生成、试用、编辑、采用 / 丢弃 |
-| `profile-actions.js` / `settings-actions.js` | 设置页与工具共享的动作实现 |
-
-#### `src/host/session/` — 会话
-
-| 文件 | 职责 / 思路 |
-| --- | --- |
-| `delivery/dispatch.js` | 会话事件适配、结果等待、busy 判定、流式帧过滤、`voice.latency` 字段与未观测 `null` |
-| `inference/fastpath.js` | 闲聊快路：直连 DSH LLM、上下文包、历史落盘、域分组 |
-| `inference/lightweight.js` | 轻量通道：口语版、摘要、语气修复等辅助任务，有截止时间 |
-| `conversation/pre-step.js` | 用户请求前的上下文装配（与记忆 C2 协作） |
-| `conversation/dialogueContext.js` / `dialogue-summary.js` | 连续台词缓冲与滚动摘要；摘要只读启动，不阻塞请求 |
-| `conversation/responseGroup.js` | 待回应组：连续发言、版本、待传达要点、显式取消 |
-| `conversation/rollover-digest.js` | 日切摘要：在目标会话首个请求注入一次，不新开回合 |
-| `compaction/voice-compaction.js` | `seirein-voice` 压缩 preset 的注册、挂载、近限告警、手动恢复 |
-| `events/voice-context.js` | 会话事件观察：turn、deliveryMessageId、已播句子 |
-| `settings-actions.js` | 客户端握手、日切、作用域、快路历史等动作 |
-
-#### `src/host/shared/`
-
-只有纯文本与时间函数：`text.js`（句子拆分、注入消息识别、语音预算、口语版规范化）、`time.js`（日切、时区、日期范围）。不持状态、不导入宿主入口。
-
-#### 根目录与配套
-
-| 路径 | 职责 |
-| --- | --- |
-| `client.js` | 单个 Panel：状态、组件、听觉、语种、语音合成、环境声音、记忆、固定记忆、人设画像、形象、动作预设、字幕、视觉、热键、诊断等卡片；每 1500 ms 轮询一次日切桥 |
-| `package.json` | `main` / `exports` / `files` / `engines` / `dsh.bundle` / `dsh.client` |
-| `cordis.patch.yml` | 插件行插入与默认配置 |
-| `test/` | node:test 回归，按文件名前缀分组 |
-| `scripts/test-batch.mjs` | 分批回归执行器（避免整批并行停滞） |
-| `scripts/baseline-snapshot.mjs` | 构建 / 模型 / 协议 / TTS 基线快照与对比 |
-| `tools/` | 探针与辅助脚本，不进 npm 包 |
-| `locale/*.json` | 插件元数据（标题 / 描述） |
-
-### 3.3 工作总流程：一次语音交互
+#### 3.3.1 一次语音交互的主链路
 
 ```text
 热键 / 设置页开麦
-  → capture-autostart 启动采集（ffmpeg dshow，16 kHz 单声道）
-  → 流式 ASR（部分结果）+ VAD / 端点
-  → 终稿（SenseVoice）+ 噪声 / 低证据影子（只记录）
-  → noteBargeInFinal：正在播报时，只有通过校验的成句 final 才能打断
-  → 投递：当天 seirein-YYYY-MM-DD 会话（<root>/workspace）
-  → agent/pre-step：人设 / 画像 / 固定记忆 / 环境事实 / 相关记忆 / 日切摘要
+  → 采集：ffmpeg dshow，16 kHz 单声道 PCM
+  → 流式识别（partial）+ VAD / 端点
+  → 终稿（SenseVoice）+ 噪声 / 低证据影子（默认只记录）
+  → 打断判定：播放中只有通过校验的成句 final 才能停播
+  → 投递：当天 seirein-YYYY-MM-DD 会话（<root>/workspace）；上一个回合没结束就拒绝，不排队
+  → 请求上下文：人设 / 画像 / 固定记忆 / 环境事实（system section）+ 相关记忆 / 连续台词 / 日切摘要（agent/pre-step 追加）
+  → 候音：投递后 3000 ms 仍未出声，先说一句等待语；正文音频就绪即让位
   → Agent 循环（工具调用、会话结果）
   → 正文完成 → 口语版决策（短答原样 / 长答一次改写 / 失败回落全文）
-  → 语音语言翻译 + 字幕语言翻译（两条流，可复用缓存）
-  → TTS 合成（Edge / GPT-SoVITS，逗号块 / 预取）→ ffplay 播放
+  → 语音语言 + 字幕语言两条翻译流
+  → TTS 合成（Edge / GPT-SoVITS，分块与预取）→ 单播放席位 → ffplay
   → 字幕叠加 + 口型 / 动作 + 记忆写入
 ```
 
-按阶段拆分：
-
-| 阶段 | 入口 | 实现要点 | 观测 |
-| --- | --- | --- | --- |
-| 采集 | `startListening` / `ambient.start` | 设备名 → ffmpeg dshow；回环端点只允许环境音；采集失败有有限重试 | `hearing.*`、`ambient.source` |
-| 端点 / 识别 | `hearing.js` + `asr-worker.js` | 流式 + 精识别双通道；端点用 VAD 比例与尾静音规则；短答白名单 | `hearing.noise.shadow`、`hearing.low-evidence.*` |
-| 投递 | `prepareVoiceTurn` / `deliverVoiceRequest` | 先取会话所有权再建流水线；上一个回合未完成时**拒绝**并说「上一条还在处理…」，不排队 | `voice.delivery.busy`、`voice.injected` |
-| 上下文 | `agent/pre-step` | 记忆、固定记忆、画像、环境事实、连续台词；只追加，不改宿主决定 | `memory.recall`、`resource.inject.truncated` |
-| 生成 | Agent / 快路 | 快路可绕过 agent（默认关）；轻量通道只做辅助任务 | `voice.reply`、`voice.latency` |
-| 口语版 | `decideSpokenVersion` | 短答（≤60 字且 ≤2 句）或用户要求全文 → 原样；否则一次轻量改写；失败回落全文；待传达要点单独合并 | `voice.spoken.version` |
-| 翻译 | `prepareSpeech` / `prepareCaption` | 语音语种与字幕语种独立；逐句完整性校验；缓存命中不重复请求 | `voice.translate` |
-| 合成 / 播放 | `reply-speaker` + `tts.js` | 一句一个说话人；预取 1–3；首块可切；单播放所有权；取消后不启动旧块 | `voice.first-sentence`、`voice.tts.request`、`voice.prefetch` |
-| 字幕 / 形象 | `subtitle.js` + `avatarRuntime` | 字幕与音频同一句；口型跟播放边界；动作在句间 / 首句触发 | `subtitle.*`、`avatar.*` |
-| 记忆 | `auto-recorder` | 消息边界自动记录；召回反馈只对真正注入的行生效 | `memory.auto`、`memory.recall` |
-
 并行的旁路：
 
-- **文字回合播报**：用户在 GUI 里打字时，回合结束仍可走同一条语音出口；与语音回合共享预算与播放账本。
-- **视觉旁路**：`assistant_see` / `assistant_watch` 只在被调用时取图；普通闲聊不会自动附图。P-48 的「请求前视觉准备」尚未接线。
-- **动作旁路**：动作运行时在播放 / 句间事件上选预设；它不阻塞文本与音频，只写已验证参数通道。
-- **压缩旁路**：压缩在 `agent/pre-step` / 空闲时进行；不打断正在播放的句子；不可用是可见降级。
-- **环境音旁路**：环境音只进上下文，不触发回复，也不占用麦克风的投递所有权。
+- **视觉**：只有视觉工具被调用、或本轮话里明确要求看时才取图；普通闲聊不会自动附图。回合内的预取见 3.3.2。
+- **动作**：由播放、句间、回答起始等事件驱动，独立于文本与音频，只写当前模型验证过的通道。
+- **记忆**：消息边界自动记录（不占热路径）；召回只通过 `agent/pre-step` 注入。
+- **压缩**：由语音会话挂载的 preset 在宿主侧触发，不打断正在播放的句子；不可用是可见降级。
+- **环境音**：只进上下文，不触发回复，也不占语音投递的所有权。
+- **打字回合**：GUI 里打字的回合结束后仍走同一个语音出口与同一本账本。
 
-### 3.4 关键设计取舍
+#### 3.3.2 关键问题与解决方式
+
+**上下文溢出：复用 DSH 原生压缩，不自己滚会话。**
+
+语音会话挂一个只含压缩能力的 `seirein-voice` preset（`compaction-basic` / `command-compact` / `tool-result-pruner` 三行，`compaction` 与 `toolResultPruner` 各自 isolate），由插件在挂载时自己注册——新机器不需要手写 profile patch，也不会打开宿主全局压缩。
+
+同 ID 的 preset 已经存在时先核对内容：只允许压缩行，夹带 `tools` / `persona` / `permissions` 等任何一项都判为 `conflict`，既不覆盖也不挂载。注册失败不是静默的：`status` 给出 `enabled:false` 与原因。压力到窗口的 80% 时置 `near-limit`，并写一条节流过的 `voice.compaction.near-limit`；压缩后仍在 80% 以上、或什么都没释放，只标记 `stillNearLimit` 并给建议。
+
+**边界**：不自动换会话、不自动新建会话、也不反复压缩；已运行的 Agent 需要重启或手动执行 `voice.session.recover`；没有 token meter 时窗口按 128k 估算。
+
+**动态观察注入：按步快照，不写历史。**
+
+变化中的观察（非语言线索、连续台词）不写成 system section，而是通过 `systemPrompt.context` 发布：宿主在**内容变化时**追加一份带来源的用户角色快照（相同内容不重复追加）；旧快照仍留在历史里，等自动压缩回收，所以“过期/清空”只影响当前渲染，不会删除历史消息。非语言线索本身是实验开关，默认关。
+
+隔离是严格的：这些观察只渲染给当天那一个 `seirein-YYYY-MM-DD` 会话；其它会话、子代理、读不到身份的 agent 一律渲染空串。
+
+过期在读取时计算：非语言线索 5 分钟有效、连续台词按时间与字符裁剪，过期或没内容就渲染空，不创建计时器。
+
+渲染有硬上限：连续台词一次最多 3600 字符（给宿主的 3700 字符快照预算留头），超了从最旧处省略并写「已省略 N 字符」；再按层配额收一次（`ephemeral` / `recent`）。
+
+环境事实是单独的 section `assistant:environment`（排在人设之后）：带来源与观察时间，所有会话共享，不随步骤变化。
+
+**边界**：快照每一步都会重放，模型侧仍要读；观察是尽力而为，音频事件没产生就没有对应的 cue。
+
+**回答重复、复述正文：按需求组织的口语版。**
+
+口语版不是「把正文压短」，而是一次按需求重新组织：所有入口共用同一条指令（`SPOKEN_VERSION_GUIDE`），在同一次改写请求里完成五步——识别本次需求 → 选取要说的信息 → 保留所选结论的必要条件 → 按人设重新组织口头表达 → 检查清晰度与冗余。不做额外的分析调用。
+
+必须保留的是会改变结论的内容：否定、适用条件、关键数字、时间、风险与不确定性；用户一次问了多个问题就逐项回应。
+
+长度是结果不是目标：没有固定压缩比，字数只是软性的防铺陈约束；用户本轮明确要求详细、完整列举或全部朗读时，按正文完整度表达。
+
+短答（≤60 字且 ≤2 句）直接原样播；长答最多一次轻量改写；改写失败回落完整正文，不截断成摘要。
+
+**边界**：只改写一次，不会为了更短再跑一轮；模型不遵守时仍有输出形状的硬约束（一段口语、无标题与列表符号）。
+
+**回声与误识别：只在高置信时丢。**
+
+真正会丢输入的噪声规则只有高置信回放回声：必须在播放、必须和「真正送进 TTS 的语音文本」连续匹配、去掉标点后整句仍等于回声、且没有任何额外内容。多出任何一个字（否定、纠正、停止指令）都会让它通过，不会剪掉用户的话。填充词与同一句的重复投递也会被拒，但那是去重，不是噪声判定。
+
+参考文本只取语音语言那一版，不拿另一语种的字幕比对——那只会制造假回声。
+
+低证据（播放中的短文本、VAD 比例过低、离线静音幻觉）只计算 `wouldDrop` 并写影子，默认不拦截投递；`voice.lowEvidenceGate` 打开后才真正生效。
+
+声纹（CAM++）同样只是影子：登记、打分、`match/unsure/no-match`，不参与路由，也不参与投递决策。
+
+**边界**：静音幻觉默认仍会投递；声纹阈值没按本机校准，不能当「只认主人」用。
+
+**动作生硬：预设库、单写者、起始接替。**
+
+动作来自只读预设库：`recipes.js` 写符号编舞与 `requires`，`catalog.js` 展开成稳定 ID 的节奏变体。选择器只做硬过滤（状态、事件、语义、能力、禁用、隐私）和打分，输出候选，不直接写参数。
+
+只有一个参数写者：`avatarRuntime` 拥有连接代次与已验证通道，控制器在同一帧里复核通道占用、旧代次、速度 / 加速度与最终优先级；预设不携带模型参数名。
+
+回答起始接替：回答第一块音频真正开始时，还停着的思考 / 倾听类预设可以在短窗口内被接替（通道集合必须可拆分）；接不了就丢弃这个开场动作（`takeover-unavailable`），而不是拖到 `speechEnd` 再补一个过时的动作。
+
+通道不退化：只用当前模型验证过的语义通道；未映射 / 未验证的通道在状态与设置页明确标注（`unmapped` / `unverified`），不假装可用，也不降级成热键。
+
+**边界**：能力过滤会让可用动作变少；身体与呼吸不归预设执行器写（保留 VTS 自己的动画所有权），需要这两个通道的条目会被直接过滤。
+
+**事件日志被刷屏：源侧聚合、读取侧白名单。**
+
+日志在源侧聚合：同类事件不逐条写，而是按窗口合并——端点静音每 10 条留 1 条、被跳过的投递折叠成一条 `asr.delivery.order.summary`、外部会话的跳过按窗口合成一行；窗口由下一条同类事件或会话结束惰性冲刷，不为日志建计时器。
+
+读取侧是白名单：诊断只认固定探针，逐字段投影（`voice.latency`、`noise.shadow`、`turn.timeline`、`pipeline.timeline`、`hotkeys`、`memory.stats`、`spout`），不返回原始事件行，也会剥离凭据形状的字符串。
+
+保留窗口靠轮转：10 MB × 5 代，够排查最近一段时间，但不是审计日志。
+
+**边界**：诊断默认关闭，需要在 `settings.json` 打开 `diagnostics.enabled`（或 config `diagnosticsEnabled`）；被轮转掉的旧记录找不回来。
+
+**延迟说不清：单轮时间线加席位归因。**
+
+每一轮写一条 `voice.turn.timeline`：把 `turn/start`、`step/start`、`assistant/message`、`tool/call`、`tool/result`、`turn/end` 归约成模型轮次、工具区间并集、首字 / 首音边界与残差（`residualMs = 总时长 - 各阶段`）。工具并集不把并行调用相加，另给 `toolMsSum`；观测不到的值写 `null`，不写 0。
+
+首音之前拆成四段独立时钟：翻译、合成、席位 / 排队等待、真正出声；`speech.seat.wait` 记录等待时长、队列深度与所属会话 / 回合，用来区分「模型慢」还是「没轮到播」。
+
+诊断探针 `turn.timeline` 与 `pipeline.timeline` 只读，默认不返回阶段数组，需要时再显式带上限展开。
+
+**边界**：残差可能为负（它是信息，不是错误）；时间线是单轮的，不跨轮串联。
+
+**上下文预算：分层配额，受保护层不裁。**
+
+提示词按五层记账：`persona`、`fixed`、`memory`、`recent`、`ephemeral`。`persona` 与 `fixed` 受保护，永远整段渲染；只裁后三层，而且按整条 / 整行裁剪，不切断半条记录。
+
+三个入口各自配额：语音会话（`voice`）、打字会话（`typed`）、闲聊快路（`fastpath`）；快路保留原来的 6000 字符总包络。默认值刻意宽松，只用来兜住病态长度，可以用 config 的 `contextBudgets` 收窄。
+
+每层丢了多少都单独计数，报告里只有数字与层名，不带正文。
+
+**边界**：默认配额不是「省 token」策略；总配额压得很小时，persona + fixed 仍然完整。
+
+**视觉预取：同一回合只采一次。**
+
+`agent/pre-step` 每一步都会为该回合开一个视觉作用域；只有用户本轮的话确实在要求看（关键词判定）时，才会在第一次模型请求之前预取一次。
+
+同一回合里的所有视觉读取（`assistant_see`、`assistant_watch take`）先问这个通道：同回合、同来源 / 场景、30 秒内才复用；来源或场景变了、回合变了、隐私锁了，都是 miss。
+
+迟到的结果按 `(sessionId, turn, epoch)` 认领：新回合开始后旧采集落地会被丢弃（`vision.pre-request.stale`），不会覆盖新回合的帧；失败也只清自己的条目。
+
+单帧和故事板是两种产物：`assistant_see` 要单帧，`assistant_watch` 要打包的时间序列，类型不同就算 miss，不能互相冒充。
+
+**边界**：这是优化，失败 fail-open；关键词判定偏窄，漏判时退回工具采集，多一次工具往返。
+
+**会话恢复：重装配再压缩。**
+
+`voice.session.recover` 是唯一能手动重建已存在语音会话的动作：保留同一个 session id，通过 `agentLoop.resume` 在 setup 里重新挂上压缩 preset，再调用一次 preset 自己的 `compactNow()` 后返回。
+
+它不新开会话、不写用户消息、不删历史、不排程、不轮询；失败原样报告，不重试。
+
+只接受 `seirein-YYYY-MM-DD` 形态的会话；还有活着的 Agent 占着它时拒绝，并提示先重启 DSH。
+
+**边界**：恢复后如果压力仍在 80% 以上，只给「新会话 / 手动压缩」的建议，不会替你执行。
+
+#### 3.3.3 取舍与边界
 
 | 取舍 | 做法 | 原因 | 代价 |
 | --- | --- | --- | --- |
-| 统一语音出口 | 自动回答、`assistant_say`、候音、打字播报都走 `speech-ledger` + 一个播放所有权 | 避免双播、抢麦、字幕与口型错位 | 所有播报串行，长队列会等 |
-| 候音草稿优先 | 到点先看本轮草稿（文本 + 音频），再看预热池，最后固定兜底；不等待慢草稿 | 等待语不能拖住正文，也不能说一句空泛的话 | 草稿经常来不及，最终常用兜底 |
-| 上下文走 runtime-context | 环境事实 / 非语言线索 / 连续台词走 `systemPrompt.context` 的按步快照；人设 / 画像 / 固定记忆走 section | 变化的观测不反复写进系统提示；历史不被污染 | 快照每步重放，模型侧仍要读 |
+| 统一语音出口 | 自动回答、`assistant_say`、候音、打字播报都走同一本播放账本与一个播放席位 | 避免双播、抢麦、字幕与口型错位 | 所有播报串行，长队列要等 |
+| 忙时拒投递 | 上一个回合没结束时拒绝新语音，并说明「上一条还在处理」 | 排队会把旧请求的答案说成新请求的 | 用户需要再说一次 |
+| 上下文观察走快照 | 非语言线索 / 连续台词走 `systemPrompt.context`（内容变化才追加）；环境事实走独立 section；人设 / 画像 / 固定记忆走 section | 观察不会每步改写系统提示；最新快照在上下文中生效 | 旧快照仍留在历史，等自动压缩回收；渲染侧只展示当前有效内容 |
 | 记忆只在 `agent/pre-step` 注入 | 用户原话原样投递，记忆作为额外上下文追加 | 避免「拼在用户消息里」导致原话被改写、重复召回 | 注入时机受宿主 pre-step 预算约束 |
-| 压缩 preset 随插件走 | 插件注册 `seirein-voice`（只含 compaction 三件套），挂到当天语音会话 | 新机器不需要手写 profile patch；不打开宿主全局压缩 | preset 冲突 / 未装配时降级；需重启或恢复 |
-| 动作单一写者 | `avatarRuntime` 是唯一参数写者；预设只给候选 | 防止两个循环抢同一参数、抖动、旧代次复活 | 预设必须经过能力过滤，可用动作变少 |
-| 隐私只锁视觉 | `privacy` 停采集 / 拒截图 / 取消在途；不动麦克风、不切 OBS | 用户要的是「别看我」，不是「别听我」；OBS 场景由用户控制 | 语音仍在工作，用户需自己静音 |
+| 压缩 preset 随插件走 | 插件注册 `seirein-voice`（只含压缩三件套），挂到当天语音会话 | 新机器不需要手写 profile patch；不打开宿主全局压缩 | 冲突 / 未装配时降级；需重启或恢复 |
+| 动作单一写者 | `avatarRuntime` 是唯一参数写者，预设只给候选 | 防止两个循环抢同一参数、抖动、旧代次复活 | 预设要过能力过滤，可用动作变少 |
+| 隐私只锁视觉 | `privacy` 停采集、拒截图、取消在途，不动麦克风、不切 OBS | 用户要的是「别看我」，不是「别听我」；OBS 场景由用户控制 | 语音仍在工作，需要自己静音 |
+| Windows 专属实现 | 麦克风 / DPAPI / WPF / 字体 / 窗口几何都直接依赖 Windows 能力 | 这些能力在 Host 的 Node 子进程里没有 Electron 等价物 | 非 Windows 环境语音、视觉、字幕不可用 |
 | 未观测写 `null` | 延迟字段、记忆命中、首音声道等没测到就是 `null` | 不把缺失当 0，避免统计被拉低 | 报表要处理空值 |
 | 失败不静默 | GPT-SoVITS 失败回落 Edge；压缩失败报 `enabled:false + reason`；黑帧拒绝交付 | 宁可降级也要可见 | 状态更复杂，需要读原因 |
+| 不自动滚动会话 | 压缩只告警与建议，恢复只接受显式动作 | 换会话、删历史都是不可逆决定，应由用户做 | 长会话需要用户自己处理 |
 
 ---
 
@@ -1483,10 +1471,9 @@ npm pack --dry-run --json
 
 - **`src/host/index.js` 只做装配**：创建服务、注册工具 / 事件 / HTTP、跨域接线、生命周期。业务逻辑放功能目录；`test/module-layout.mjs` 会断言 host 根只有一个入口。
 - **领域模块不反向 import 入口**：功能模块不得 `import '../index.js'`；依赖通过参数或 getter 注入，避免循环依赖。只有同时被两个以上功能域使用的纯文本 / 时间函数才放 `shared/`。
-- **领域模块尽量纯**：解析、计算、状态机不直接启动设备、进程或模型；有外部副作用的服务由宿主创建并通过参数注入，模块导入本身不产生副作用（见 `docs/host-modules.md`）。
+- **领域模块尽量纯**：解析、计算、状态机不直接启动设备、进程或模型；有外部副作用的服务由宿主创建并通过参数注入，模块导入本身不产生副作用。
 - **跨域生命周期放 `runtime/`**：依赖引用计数、关闭顺序、HTTP、诊断。不要为「方便 import」把业务模块塞进 `runtime/`。
 - **presets 只读**：`avatar/presets/` 是版本控制的数据与查询模块；用户覆盖写 `data/motion-presets.json`，不写回源码。预设不携带模型参数名，不创建第二套参数写者。
-- **`docs/` 不入库**：`PLAN.md`、`WORKLOG.md`、`DESIGN.md`、`reports/**` 都在 `.gitignore`；计划与报告放 `docs/`，不放仓库根。
 - **`test/` 必须上传**：测试是提交的一部分；新增行为要有对应 `test/*.mjs`，真机脚本在文件头标 `// @live` 或加入 `scripts/test-batch.mjs` 的 `LIVE_FILES`。
 - **发布清单**：`package.json.files` 是 `client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、`Seirein.ico`、`Seirein.png`；`exports` 暴露入口、`client`、`locale` 与 `icon`。新增运行资源要放进这些路径，不能只留在仓库根。
 - **客户端入口固定在根 `client.js`**；`CLIENT_VERSION` 与 `package.json.version` / `PLUGIN_VERSION` 一起升。
@@ -1539,14 +1526,14 @@ npm pack --dry-run --json
 
 ### 4.4 已知限制与待办方向
 
-以下条目来自 `docs/PLAN.md`（本地文档，不入库）；不要把它们当成已完成。
+以下条目是已知限制与待办方向；标着「未实现 / 未启用」的，不要当成已完成的功能。
 
 | 项 | 现状 | 影响 / 方向 |
 | --- | --- | --- |
-| P-46 逐轮时间线 | `stageMs` / `asrMs` 已改为未观测 `null`，`translateMs` / `translateCached` 已投影；工具开始/结束、模型往返、`ttsQueueMs`、`residualMs` 与逐轮串联**未完成** | 还无法完整回答「时间花在模型、工具还是合成」 |
-| P-48 视觉准备复用请求前通道 | 尚未接线；视觉仍靠工具触发 | 「看看这个」类请求多一次工具往返，首字之前拿不到图 |
+| P-46 逐轮时间线 | 已实现：每轮一条 `voice.turn.timeline`（模型轮次、工具区间并集、首字 / 首音边界、残差 `residualMs`），并作为附加字段并入 `voice.latency`；诊断探针 `turn.timeline` / `pipeline.timeline` 默认不返回阶段数组 | 时间线是单轮的，不跨轮串联 |
+| P-48 视觉准备复用请求前通道 | 已实现：`agent/pre-step` 开回合作用域，只有「要看」类请求预取一次；同回合复用受 30 s 与来源 / 场景约束，迟到结果丢弃；单帧与故事板分开 | 是否「要看」由关键词判定，漏判时退回工具采集（多一次工具往返） |
 | P-50 关键等待路径 | 只做了观测底座（`a327a47` 等），**优化开发未开始** | 等待位置靠日志逐轮拼，缺统一时间链 |
-| P-59 分层上下文预算 | 未实现；快路仍是整体字符上限 | 人设 / 固定约束 / 记忆 / 近期会话 / 感知没有各自配额 |
+| P-59 分层上下文预算 | 已实现：`persona` / `fixed` 受保护，`memory` / `recent` / `ephemeral` 按 `voice` / `typed` / `fastpath` 三个入口各自配额裁剪，并报告每层丢弃量 | 默认配额宽松，只防病态长度，不是省 token 策略 |
 | P-89 宿主协议门槛 | 有实时正文增量，但**没有**「已进入最终答复阶段」的协议保证，也没有可等待的正文入口 | 不能宣称 token 级首句流式；A2 用「缓冲到 step 提交」实现 |
 | P-65 句内流式 | B 档（逗号切块）已实现、待审查；C 档（句内流式）未做，需先核实 GPT-SoVITS 能否增量输出 | 长句首音仍受整块合成影响 |
 | 低证据门禁 | `lowEvidenceVerdict` 已有完整判定，但 `voice.lowEvidenceGate` **默认关**，只写影子 | 静音幻觉仍会投递；开启前需要更多真实设备证据 |
@@ -1568,7 +1555,7 @@ npm pack --dry-run --json
 | `data/status.json` | 直接读文件 | 启动时写入的状态快照，便于外部工具检查 |
 | `data/events.jsonl` | JSONL，10 MB × 5 轮转 | `{id, ts, type, corr_id, payload}`；语音链路优先看 `voice.*`、`hearing.*`、`memory.recall` |
 | 设置页「诊断（客户端）」 | 打开插件页 → 诊断卡片 | 卡片本身只读一次 `/assistant/status`，可复制诊断报告；不单独加轮询 |
-| `diagnostics.query` | `{"action":"diagnostics.query","probe":"voice.latency","limit":20}` | 受控探针：`voice.latency` / `noise.shadow` / `hotkeys` / `memory.stats` / `spout`；默认关闭，需 `settings.json` 的 `diagnostics.enabled` 或 config `diagnosticsEnabled` |
+| `diagnostics.query` | `{"action":"diagnostics.query","probe":"voice.latency","limit":20}` | 受控探针：`voice.latency` / `noise.shadow` / `turn.timeline` / `pipeline.timeline` / `hotkeys` / `memory.stats` / `spout`；默认关闭，需 `settings.json` 的 `diagnostics.enabled` 或 config `diagnosticsEnabled` |
 | 音频保留 | `voice.audioRetention` + `audio.retention.list` | 只保留可疑语句的 16 kHz WAV，存 `<root>/cache/retention/`；默认关，隐私时不写 |
 | `tools/` 探针 | `node tools/api-smoke.mjs http://127.0.0.1:<GUI端口>`、`tools/memory-debug.mjs`、`tools/tts-probe.mjs`、`tools/vts-probe.mjs`、`tools/asr-probe.mjs`、`tools/obs-seed.mjs`、`tools/subtitle-probe.mjs` | 开发探针，不进发布包 |
 | `scripts/baseline-snapshot.mjs` | 见 §4.1 | 构建 / 模型 / 协议 / TTS 基线与对比 |
@@ -1586,15 +1573,3 @@ Invoke-RestMethod "$base/assistant/action" -Method Post -ContentType 'applicatio
 Invoke-RestMethod "$base/assistant/action" -Method Post -ContentType 'application/json' `
   -Body '{"action":"audio.retention.list"}' | ConvertTo-Json -Depth 6
 ```
-
----
-
-### 延伸阅读（本地文档，`docs/` 不入库）
-
-- [宿主模块边界](docs/host-modules.md)：目录、职责、依赖方向、入口保留职责。
-- [计划（单一权威）](docs/PLAN.md)：P 编号、状态、待办与已知问题。
-- [设计文档](docs/DESIGN.md)：目标、事件、对话链路、记忆与配置的历史设计口径（部分内容已被实现更新，读时以代码为准）。
-- [环境与前置验证](docs/ENVIRONMENT.md)：宿主实测、安装坑、分批回归说明。
-- [执行记录](docs/WORKLOG.md)：按提交分组的实现流水。
-- [声纹登记与语言库设计](docs/speaker-enrollment-design.md)。
-- [C2 请求前上下文设计](docs/c2-pre-request-context-design.md)。
