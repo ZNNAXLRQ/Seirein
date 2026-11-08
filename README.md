@@ -149,26 +149,16 @@ DSH 的插件安装框（侧栏 **插件** → **添加插件**）接受四种 s
 
 | 方式 | 用户操作 | 适用 | 备注 |
 | --- | --- | --- | --- |
-| **已发布包名** | 输入 `包名@版本` → 安装 → 立即启用 | 已发布到 npm / 插件市场 | 需要维护者先发布；见 2.2.1 |
+| **已发布包名** | 输入 `包名@版本` → 安装 → 立即启用 | 已发布到 npm / 插件市场 | 当前**不提供 npm 发布**，普通用户请用压缩包或 Git 地址 |
 | **压缩包 `.tgz`** | 下载 Release 里的 `*.tgz` → 安装框填该文件 **Host 绝对路径** | 尚未发布、但想“下载即装” | 不需要克隆；首次安装需允许 `koffi` / `msedge-tts` 的安装脚本；更新要先卸载再装（profile 记 `file:` 路径，移动文件会失效） |
 | **Git 地址（推荐）** | 输入仓库 URL（`https://…/Seirein.git`） | 仓库公开可访问 | DSH 会自行拉取；需要 git 可用与网络；私有仓库常因禁用凭据提示而失败 |
 | **本地目录** | 填仓库绝对路径 | 开发者 / 本机已克隆 | 需要仓库在磁盘上，见下方“开发者安装” |
 
-> 当前仓库已公开发布在 GitHub，可用 **Git 地址** 安装；但远端默认分支可能落后于本地，正式推荐前应先 push 并打 tag。尚未发布到 npm，“包名”方式要等发布。
-> `package.json` 里的 `"private": true` 只是 npm 发布保护，不影响 Git 安装，发布前去掉即可；
-> 维护者打包与发布步骤见下方 2.2.1。
-
-##### 2.2.1 维护者发布（普通用户可安装的前提）
-
-1. 打包：`pnpm pack` 生成 `*.tgz`（注意：改名后文件名会跟着变）（`package.json.files` 已包含 `client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、图标）。
-2. 验证：在一个干净的 DSH profile 里用 tarball 安装一次，确认组合包出现、可启用、状态正常。
-3. 发布到 npm：改名时必须同步三处 —— `package.json.name`、`client.js` 的模块 `id`、`cordis.patch.yml` 的 `name`；再补 `repository`、去掉 `"private": true`，然后 `pnpm publish --access public`。
-   或把 tarball 传到 GitHub Release 页面（不需要改 `private`，但用户需手动下载并允许依赖脚本）。
-4. 之后普通用户即可用「包名」或「压缩包」安装，无需接触仓库与 pnpm。
+> 当前仓库已公开发布在 GitHub，`main` 已同步到最新代码，可用 **Git 地址** 或 **压缩包** 安装；不提供 npm 发布。
 
 #### 面向开发者：本地仓库安装
 
-1. 插件页 **添加插件** → 填仓库 **本地绝对路径**（例如 `D:\Programs\Others\Seirein`）→ 安装 → **立即启用**。
+1. 插件页 **添加插件** → 填仓库 **本地绝对路径** → 安装 → **立即启用**。
    首次以本地目录安装时，DSH 会把它保存为 `link:<仓库目录>` 依赖。
 2. 开发中的更新：Host 代码改动 → `remove_bundle` → `install_bundle`（target 与安装 spec 相同）；
    只改 `client.js` → 刷新页面；首次安装或组合包/服务/preset 变化后需要重启。
@@ -213,11 +203,11 @@ pnpm install
 #### 安装后确认
 
 - 打开 DSH 侧栏 → **插件**，确认 **Seirein** 组合包已出现且启用。
-- 首次使用先选「存放位置」；数据根默认是 `%LOCALAPPDATA%\Seirein`，旧目录 `%LOCALAPPDATA%\dsh-assistant` 会做一次可恢复的复制迁移。
+- 首次使用先选「存放位置」；数据根默认是 `%LOCALAPPDATA%\Seirein`。
 - `GET /assistant/status` 的 `version` 应为 `0.99.0`；工具面是 24 个（`node test/smoke.mjs` 会断言）。
 - 插件会写 `<root>/data/status.json`，可用来快速判断加载是否成功。
 
-#### `cordis.patch.yml` 配置项
+#### `cordis.patch.yml` 配置项（普通用户可跳过阅读）
 
 仓库自带配置如下（键名与默认值均来自文件）：
 
@@ -227,7 +217,7 @@ pnpm install
 | `enabled` | `true` | 当前入口未读取，保留为声明字段 |
 | `defaultDomain` | `chat` | 记忆默认域 |
 | `obsPort` | `4455` | OBS WebSocket 端口 |
-| `obsPassword` | `null` | OBS WebSocket 密码；没开认证就留空 |
+| `obsPassword` | `null` | OBS WebSocket 密码；没开认证就留空，建议关闭认证 |
 | `privacyScene` | `隐私` | 兼容 / 展示字段。当前隐私模式是**采集锁**，不会切 OBS 场景 |
 | `ttsPlayback` | `true` | 自动播报开关 |
 | `asrMergeWindowMs` | `600` | 连续语音合并窗口（代码内兜底默认是 1200，文件里的值优先） |
@@ -235,7 +225,7 @@ pnpm install
 | `autoMemory.enabled` | `true` | 自动记忆总开关 |
 | `autoMemory.minChars` / `maxChars` | `1` / `400` | 自动记录的文本长度范围 |
 | `autoMemory.includeReply` | `true` | 是否把助手回复也纳入自动记忆 |
-| `subtitle.enabled` | `false` | 当前入口未读取这个块；字幕默认值在代码与设置页，见下方说明 |
+| `subtitle.enabled` | `false`（文件默认值；当前入口未读取这个块） | 字幕实际默认开启，以设置页/启动 reconcile 为准 |
 | `subtitle.font` / `sizeMax` / `colorMode` | `Microsoft YaHei UI` / `32` / `auto` | 同上，以设置页实际值为准 |
 | `hotkeys.mic` / `hotkeys.vision` | `Ctrl+Alt+M` / `Ctrl+Alt+V` | 全局热键；`layerEdit`、`ambient` 可另配 |
 
@@ -257,7 +247,7 @@ pnpm install
 | `voice.speechMaxChars` | 语音预算，默认 1200；`0` 表示不截 |
 | `voice.prefetchDepth` | 句间预取深度，`1–3`，默认 `2` |
 | `voice.ackDelayMs` | 候音等待，`500–15000`，默认 `3000` |
-| `voice.speakerShadow` | 声纹影子开关，默认关；开启后触发模型下载 |
+| `voice.speakerShadow` | 声纹影子开关，默认关；开启后触发模型下载。**只对麦克风生效**；回环（视频/音乐/助手播音）默认不跑影子，避免把混合声音认成当前用户；回环诊断影子是可选开关，且不登记、不更新模板、不参与词库/记忆归属/投递/打断 |
 | `voice.audioRetention`（仅 `settings.json`） | 诊断音频保留开关，默认关；这一项没有插件 config 兜底 |
 | `diagnostics` / `diagnosticsEnabled` | 受控诊断通道开关，默认关 |
 | 视觉采集：`visionWidth` / `visionHeight` / `visionFps` / `visionMaxAttachmentBytes` | 截图尺寸、帧率与附件上限 |
@@ -282,7 +272,7 @@ pnpm install
 | ASR 模型 | 模型目录 | `asrModelDir` / `asrFinalModelDir` | 默认找 `<root>/models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23` 与 `<root>/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`；缺失时 `hearing.start` 直接失败 |
 | 声纹（可选） | 听觉 → 声纹影子 | `voice.speakerShadow` | 默认关；开启后按需下载 CAM++ 模型，只给麦克风通道打分，**不参与投递** |
 | 环境声音（可选） | 环境声音 | `ambient.start` / `ambient.autoListen` | 需要回环端点（Stereo Mix / VB-CABLE / VoiceMeeter 等）；不触发回复 |
-| 字幕（可选） | 字幕 | `subtitle.config` / `subtitle.select` | 默认关闭；区域或气泡模式，字体与字号上限可调 |
+| 字幕 | 字幕 | `subtitle.config` / `subtitle.select` | **默认开启**；区域或气泡模式，字体与字号上限可调；未选区域时不显示 |
 | 热键 | 全局快捷键 | `hotkey.set` / `hotkey.reset` | 默认四项见 §1.3；`koffi` 轮询 `GetAsyncKeyState` |
 
 ### 2.4 可选插件与官方渠道
