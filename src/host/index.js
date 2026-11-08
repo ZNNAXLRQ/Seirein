@@ -13883,13 +13883,30 @@ export function apply(ctx, config) {
   // ---- speaker-voice shadow (host wiring; observation only) ------------------
   // The runtime setting wins over plugin config and both default to OFF. The shadow scores an
   // already-DELIVERED utterance and records a verdict: nothing here filters, reorders, rewrites or
-  // memorises a transcript, and a failed/missing model only leaves the shadow inactive. Only the
-  // microphone lane is wired: a loopback hears media (often the assistant's own voice), not the user.
+  // memorises a transcript, and a failed/missing model only leaves the shadow inactive. The
+  // microphone lane is wired by default; the loopback diagnostic has its own opt-in switch below.
   const SPEAKER_STATUS_EVENT_MS = 5_000;
   const speakerShadowEnabled = () => {
     const saved = readSettings().voice?.speakerShadow;
     return saved !== undefined ? saved === true : config?.voice?.speakerShadow === true;
   };
+  /**
+   * Loopback diagnostic shadow (`voice.speakerShadowLoopback`, **default OFF**). Its own switch:
+   * the ambient/loopback lane scores media only when asked, so the microphone lane's
+   * `voice.speakerShadow` and every existing default stay untouched. Rows are counted per source and
+   * never cached for attribution (see `noteSpeakerLoopbackEvent`).
+   */
+  const speakerShadowLoopbackEnabled = () => {
+    const saved = readSettings().voice?.speakerShadowLoopback;
+    return saved !== undefined ? saved === true : config?.voice?.speakerShadowLoopback === true;
+  };
+  /** An explicit OFF is reported once per mount; the default (unset) writes nothing. */
+  const speakerShadowLoopbackExplicitOff = () => {
+    const saved = readSettings().voice?.speakerShadowLoopback;
+    const value = saved !== undefined ? saved : config?.voice?.speakerShadowLoopback;
+    return value === false;
+  };
+  let speakerLoopbackDisabledReported = false;
   /** The exact file hearing would load: the pinned model next to `<root>/models`. */
   const speakerModelPath = () => {
     const paths = hearingPaths();
@@ -13902,18 +13919,39 @@ export function apply(ctx, config) {
   // `speaker.status.shadow` contract: exactly the three observable verdicts (a `no-speakers` row
   // says the library is empty, so it is not a judgement and is counted separately above).
   const speakerShadowCounts = { match: 0, mismatch: 0, unsure: 0 };
+  // The loopback diagnostic counts on its own: a video/music voice must never look like a
+  // microphone verdict in `speaker.status`, and vice versa.
+  const speakerLoopbackCounts = { match: 0, mismatch: 0, unsure: 0 };
   let speakerLastShadow = null;
   let speakerDownloading = false;
   let speakerStatusAt = 0;
   const speakerModelState = () => (speakerDownloading
     ? 'downloading'
     : (existsSync(speakerModelPath()) ? 'ready' : 'missing'));
-  const speakerStatus = () => ({
-    enabled: speakerShadowEnabled(),
-    model: speakerModelState(),
-    lastShadow: speakerLastShadow,
-    ...speakerCounts,
-  });
+  /** Per-source counts, present only once the loopback diagnostic is in play (default shape stays). */
+  const speakerBySource = () => {
+    const loopbackRows = speakerLoopbackCounts.match
+      + speakerLoopbackCounts.mismatch
+      + speakerLoopbackCounts.unsure;
+    if (!speakerShadowLoopbackEnabled() && loopbackRows === 0) return null;
+    return {
+      mic: { ...speakerShadowCounts },
+      loopback: { ...speakerLoopbackCounts },
+    };
+  };
+  const speakerStatus = () => {
+    const status = {
+      enabled: speakerShadowEnabled(),
+      model: speakerModelState(),
+      lastShadow: speakerLastShadow,
+      ...speakerCounts,
+    };
+    // Additive: the default-off status keeps its exact old shape. The existing counters above stay
+    // microphone-only; `bySource` is the only field that separates the two lanes.
+    const bySource = speakerBySource();
+    if (bySource !== null) status.bySource = bySource;
+    return status;
+  };
   /** `speaker.status` is throttled: the counts change per utterance, the event must not spam. */
   const emitSpeakerStatus = (force = false) => {
     const at = Date.now();
@@ -14044,15 +14082,36 @@ export function apply(ctx, config) {
     if (type === 'speaker.model.failed' || type === 'speaker.model.ready') emitSpeakerStatus(true);
   };
   /**
+   * Loopback diagnostic rows: counted per source and never cached. They cannot enter
+   * `speakerShadowByUtterance` / `speakerAttributionWritten`, so no lexicon candidate or new memory
+   * record can be attributed to a video/music voice; `lastShadow` stays the microphone's. Nothing in
+   * delivery, barge-in, mute or refusal reads these counters.
+   */
+  const noteSpeakerLoopbackEvent = (type, payload) => {
+    if (type !== 'speaker.shadow') return;
+    const decision = String(payload?.decision ?? '');
+    if (decision === 'match' || decision === 'mismatch' || decision === 'unsure') {
+      speakerLoopbackCounts[decision] += 1;
+    }
+    emitSpeakerStatus(false);
+  };
+  /**
    * `speaker.status.shadow` projection: observation data only. `at` is an ISO instant (the card
    * shows it as text); it never feeds a gate, a delivery or an identity decision.
    */
-  const speakerShadowSummary = () => ({
-    lastShadow: speakerLastShadow === null
-      ? null
-      : { ...speakerLastShadow, at: new Date(speakerLastShadow.at).toISOString() },
-    counts: { ...speakerShadowCounts },
-  });
+  const speakerShadowSummary = () => {
+    const counts = { ...speakerShadowCounts };
+    const bySource = speakerBySource();
+    // `speaker.status.shadow` returns `counts`; the split rides inside it so the read-only action
+    // exposes the same per-source numbers as `speaker.status` without a second contract.
+    if (bySource !== null) counts.bySource = bySource;
+    return {
+      lastShadow: speakerLastShadow === null
+        ? null
+        : { ...speakerLastShadow, at: new Date(speakerLastShadow.at).toISOString() },
+      counts,
+    };
+  };
   /** T1: the pinned speaker model, fetched on demand. Never awaited by capture or delivery. */
   const startSpeakerDownload = () => {
     try {
@@ -14550,6 +14609,11 @@ export function apply(ctx, config) {
           streamThreads: tuning.streamThreads,
           finalThreads: tuning.finalThreads,
           decodeCapSec: tuning.decodeCapSec,
+          // Loopback diagnostic shadow (default OFF, its own switch): research-only scoring of the
+          // media lane. `<root>` is the same read-only library the microphone lane scores against.
+          ...(speakerShadowLoopbackEnabled()
+            ? { speakerShadow: true, speakerLibraryRoot: root }
+            : {}),
           // The loopback lane feeds the same continuous dialogue (boundaries separate the sources).
           dialogueContext,
           // Echo evidence for the high-confidence filter, exactly like the microphone lane: the
@@ -14565,6 +14629,8 @@ export function apply(ctx, config) {
           onEvent: (type, payload) => {
             // The same one buffer: a loopback final can make a summary due too.
             if (type === 'hearing.dialogue.appended') dialogueSummary.maybeSummarize();
+            // Diagnostic only: separate counters, no attribution cache, no mic status pollution.
+            noteSpeakerLoopbackEvent(type, payload);
             void log.emit(type, payload).catch(() => {});
           },
           onUpdate: (event) => {
@@ -14659,6 +14725,12 @@ export function apply(ctx, config) {
       dialogueSummary.acquire('loopback');
       await log.emit(source.event.type, source.event.payload);
       await log.emit('ambient.start', { device, source: source.source });
+      // Default (unset) writes no row; an explicit OFF is reported once so the missing diagnostic
+      // shadow is explainable instead of silently absent.
+      if (speakerShadowLoopbackExplicitOff() && !speakerLoopbackDisabledReported) {
+        speakerLoopbackDisabledReported = true;
+        await log.emit('speaker.loopback.shadow.disabled', { reason: 'setting-off' });
+      }
       return { ok: true, device, source: source.source, error: '' };
     } catch (error) {
       ambient = null;
