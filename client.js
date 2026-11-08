@@ -2631,6 +2631,408 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ---- 声纹登记（客户端） -------------------------------------------------------------
+    // 只按宿主契约读写：speaker.enroll.list / .confirm / .reject / .remove + speaker.status.shadow。
+    // 一次挂载读一次，之后只有「刷新」再读：没有定时器、不自动确认、不自动拒绝；影子判定只展示，
+    // 不参与拒收、打断或投递。接口缺失、超时、畸形字段都只变成一行提示，不向渲染抛出。
+    const SPEAKER_ENROLL_READ_TIMEOUT_MS = 4000;
+    const SPEAKER_ENROLL_MIN_TOTAL_MS = 3000;
+    const SPEAKER_ENROLL_STATUS_TEXT = Object.freeze({
+      pending: '待确认',
+      confirmed: '已确认',
+      rejected: '已拒绝',
+    });
+    const SPEAKER_ENROLL_DECISION_TEXT = Object.freeze({
+      match: '匹配',
+      mismatch: '不匹配',
+      unsure: '不确定',
+      'no-speakers': '无声纹',
+    });
+    const SPEAKER_ENROLL_CLASS_TEXT = Object.freeze({
+      self: '本人',
+      other: '他人',
+      'unknown-identity': '身份未知',
+    });
+    const SPEAKER_ENROLL_QUALITY_TEXT = Object.freeze({
+      ok: '清晰',
+      short: '太短',
+      quiet: '太轻',
+      noisy: '噪声',
+    });
+    const SPEAKER_ENROLL_MISSING_RE = /not implemented|unknown action|unsupported|未实现|不支持/iu;
+    const SPEAKER_ENROLL_RECORD_HINT =
+      '需要宿主支持录制；现在请先在语音页说 3 句话（3–5 秒）自动收集样本，再点「刷新」。';
+    const SPEAKER_ENROLL_CONFIRM_NOTICE =
+      '已确认：之后只用于词库与新增记忆归属，不用于拒收/打断。';
+
+    /** 只接受普通对象；数组 / null / 原始值一律当作「没有结果」。 */
+    const speakerEnrollObject = (value) => (
+      value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null
+    );
+
+    const speakerEnrollText = (...values) => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+      }
+      return '';
+    };
+
+    const speakerEnrollNumber = (...values) => {
+      for (const value of values) {
+        if (value === null || value === undefined || value === '') continue;
+        const number = Number(value);
+        if (Number.isFinite(number)) return number;
+      }
+      return null;
+    };
+
+    /** 样本数：契约是数字；宿主误传数组时按长度算，其它畸形值按 0。 */
+    const speakerEnrollSamples = (value, fallback) => {
+      const source = value === null || value === undefined ? fallback : value;
+      if (Array.isArray(source)) return source.length;
+      const number = speakerEnrollNumber(source);
+      return number === null || number < 0 ? 0 : Math.round(number);
+    };
+
+    /** 总时长：优先 totalDurationMs；缺失时退回样本数组里各条 durationMs 之和。 */
+    const speakerEnrollTotalMs = (entry) => {
+      const direct = speakerEnrollNumber(entry?.totalDurationMs, entry?.durationMs);
+      if (direct !== null) return Math.max(0, Math.round(direct));
+      const samples = Array.isArray(entry?.samples) ? entry.samples : [];
+      const sum = samples.reduce((total, item) => total + (speakerEnrollNumber(item?.durationMs) ?? 0), 0);
+      return Math.max(0, Math.round(sum));
+    };
+
+    const speakerEnrollDurationText = (ms) => `${(Math.max(0, Number(ms) || 0) / 1000).toFixed(1)} 秒`;
+
+    /** 受控词表里的中文名；键不在词表里时原样显示（不猜测含义）。 */
+    const speakerEnrollLabel = (table, key, fallback = '') => (
+      typeof key === 'string' && Object.hasOwn(table, key) ? table[key] : (key || fallback)
+    );
+
+    /** 一条登记记录：字段缺失或畸形都降级为默认值，渲染永远拿得到同样的字段。 */
+    function speakerEnrollEntryOf(value, index) {
+      const entry = speakerEnrollObject(value);
+      if (entry === null) return null;
+      const speakerId = speakerEnrollText(entry.speakerId, entry.id);
+      if (speakerId === '') return null;
+      const status = speakerEnrollText(entry.status).toLowerCase();
+      const totalDurationMs = speakerEnrollTotalMs(entry);
+      return {
+        key: `${speakerId}#${index}`,
+        speakerId,
+        label: speakerEnrollText(entry.label),
+        status,
+        statusText: speakerEnrollLabel(SPEAKER_ENROLL_STATUS_TEXT, status, '未知状态'),
+        samples: speakerEnrollSamples(entry.samples, entry.sampleCount),
+        totalDurationMs,
+        confirmedAt: speakerEnrollText(entry.confirmedAt),
+        confirmable: totalDurationMs >= SPEAKER_ENROLL_MIN_TOTAL_MS,
+      };
+    }
+
+    /** 卡片的主条目：优先本人已确认，其次任一已确认，再其次待确认，最后第一行。 */
+    function speakerEnrollPrimary(entries, selfId) {
+      const confirmedSelf = entries.find(
+        (entry) => entry.status === 'confirmed' && selfId !== '' && entry.speakerId === selfId,
+      );
+      return confirmedSelf
+        ?? entries.find((entry) => entry.status === 'confirmed')
+        ?? entries.find((entry) => entry.status === 'pending')
+        ?? entries[0]
+        ?? null;
+    }
+
+    /** 最近一条影子判定：decision 缺失视为「暂无样本」，其余字段全部可选。 */
+    function speakerEnrollLastShadowOf(value) {
+      const shadow = speakerEnrollObject(value);
+      if (shadow === null) return null;
+      const decision = speakerEnrollText(shadow.decision);
+      if (decision === '') return null;
+      const classKey = speakerEnrollText(shadow.class);
+      const qualityKey = speakerEnrollText(shadow.quality);
+      return {
+        decision,
+        decisionText: speakerEnrollLabel(SPEAKER_ENROLL_DECISION_TEXT, decision),
+        class: classKey,
+        classText: classKey === '' ? '' : speakerEnrollLabel(SPEAKER_ENROLL_CLASS_TEXT, classKey),
+        quality: qualityKey,
+        qualityText: qualityKey === '' ? '' : speakerEnrollLabel(SPEAKER_ENROLL_QUALITY_TEXT, qualityKey),
+        score: speakerEnrollNumber(shadow.score),
+        speakerId: speakerEnrollText(shadow.speakerId),
+        at: speakerEnrollText(shadow.at),
+      };
+    }
+
+    /** 三类计数：缺字段 / 负数 / 非数字都按 0；兼容旧宿主用的 matches 字段名。 */
+    function speakerEnrollCountsOf(value) {
+      const counts = speakerEnrollObject(value) ?? {};
+      const count = (...keys) => {
+        for (const key of keys) {
+          const number = speakerEnrollNumber(counts[key]);
+          if (number !== null) return number < 0 ? 0 : Math.round(number);
+        }
+        return 0;
+      };
+      return {
+        match: count('match', 'matches'),
+        mismatch: count('mismatch'),
+        unsure: count('unsure'),
+      };
+    }
+
+    /** 接口不存在（或返回受控的「未实现」）时换成一句用户能看懂的提示。 */
+    const speakerEnrollMissingText = (text) => (
+      SPEAKER_ENROLL_MISSING_RE.test(text) ? '需要宿主支持声纹登记（宿主还没有实现这些动作）' : text
+    );
+
+    /**
+     * 读取结果 → 卡片视图。`data` 是 Panel 的 { list, shadow, loading, error, at }；一处坏字段
+     * 只影响它自己那一行，整块失败显示「不可用」。
+     */
+    function speakerEnrollView(data) {
+      const list = speakerEnrollObject(data?.list);
+      const shadow = speakerEnrollObject(data?.shadow);
+      const available = list !== null && list.ok === true;
+      const entries = (Array.isArray(list?.entries) ? list.entries : [])
+        .map((value, index) => speakerEnrollEntryOf(value, index))
+        .filter((entry) => entry !== null);
+      const selfId = speakerEnrollText(list?.selfId);
+      const primary = available ? speakerEnrollPrimary(entries, selfId) : null;
+      const listError = speakerEnrollText(list?.error, list?.reason, data?.error);
+      return {
+        available,
+        loading: data === null || data === undefined || data.loading === true,
+        error: listError === '' ? '' : speakerEnrollMissingText(listError),
+        at: speakerEnrollNumber(data?.at) ?? 0,
+        selfId,
+        entries,
+        primary,
+        empty: available && entries.length === 0,
+        stateText: available ? (primary === null ? '未登记' : primary.statusText) : '不可用',
+        shadow: {
+          available: shadow !== null && shadow.ok === true,
+          error: speakerEnrollText(shadow?.error, shadow?.reason),
+          last: speakerEnrollLastShadowOf(shadow?.lastShadow),
+          counts: speakerEnrollCountsOf(shadow?.counts),
+        },
+      };
+    }
+
+    /** 确认按钮为什么不能点：'' 表示可点。只看样本时长和状态，不做任何身份推断。 */
+    function speakerEnrollConfirmReason(entry) {
+      if (entry === null) return '还没有可确认的条目';
+      if (entry.status === 'confirmed') return '已确认，不用重复确认';
+      if (entry.status === 'rejected') return '已拒绝的条目不能再确认';
+      if (entry.totalDurationMs < SPEAKER_ENROLL_MIN_TOTAL_MS) {
+        return `样本不足 3 秒（已 ${speakerEnrollDurationText(entry.totalDurationMs)}）`;
+      }
+      return '';
+    }
+
+    /** 一次显式动作的结果文案；成功确认固定说明只用于词库与新增记忆归属。 */
+    function speakerEnrollOutcome(op, result) {
+      if (result?.ok === true) {
+        if (op === 'confirm') return { ok: true, message: SPEAKER_ENROLL_CONFIRM_NOTICE };
+        if (op === 'reject') return { ok: true, message: '已拒绝该条目：不参与任何判定。' };
+        return { ok: true, message: '已删除该条目。' };
+      }
+      const reason = speakerEnrollText(result?.reason, result?.error, result?.code);
+      if (reason === 'insufficient-samples') return { ok: false, message: '样本不足 3 秒，暂时不能确认' };
+      if (reason === '') return { ok: false, message: '操作失败' };
+      const missing = speakerEnrollMissingText(reason);
+      return { ok: false, message: missing === reason ? `操作失败：${reason}` : missing };
+    }
+
+    /** 报告里只保留像 id 的值：路径 / 空白一律打码，标签文本与样本 id 根本不进报告。 */
+    const speakerEnrollReportId = (value) => {
+      const text = speakerEnrollText(value);
+      if (text === '') return '';
+      return /[\\/\s]|^[A-Za-z]:/u.test(text) ? '<redacted>' : text;
+    };
+
+    /** 复制用的脱敏报告：只有状态、计数和分数，没有标签文本、样本 id、路径或任何转写。 */
+    function speakerEnrollReportOf(data) {
+      const view = speakerEnrollView(data);
+      const last = view.shadow.last;
+      return JSON.stringify({
+        schema: 1,
+        kind: 'speaker-enrollment',
+        selfId: speakerEnrollReportId(view.selfId),
+        entries: view.entries.map((entry) => ({
+          speakerId: speakerEnrollReportId(entry.speakerId),
+          status: entry.status === '' ? 'unknown' : entry.status,
+          samples: entry.samples,
+          totalDurationMs: entry.totalDurationMs,
+          confirmed: entry.confirmedAt !== '',
+        })),
+        shadow: {
+          last: last === null ? null : {
+            decision: speakerEnrollReportId(last.decision),
+            class: speakerEnrollReportId(last.class),
+            quality: speakerEnrollReportId(last.quality),
+            score: last.score,
+            speakerId: speakerEnrollReportId(last.speakerId),
+            at: speakerEnrollReportId(last.at),
+          },
+          counts: view.shadow.counts,
+        },
+      }, null, 2);
+    }
+
+    /** 一次读取两个只读动作（list + shadow）；超时 / 异常都收成 {ok:false}，不向渲染抛出。 */
+    async function speakerEnrollRead(fetchImpl, timeoutMs = SPEAKER_ENROLL_READ_TIMEOUT_MS) {
+      if (typeof fetchImpl !== 'function') {
+        return { list: null, shadow: null, error: '当前环境没有 fetch' };
+      }
+      const post = async (body) => {
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetchImpl('/assistant/action', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+            body: JSON.stringify(body),
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
+          const result = await response.json();
+          return speakerEnrollObject(result) ?? { ok: false, error: '返回不是对象' };
+        } catch (cause) {
+          const aborted = cause !== null && typeof cause === 'object' && cause.name === 'AbortError';
+          return {
+            ok: false,
+            error: aborted ? '请求超时' : (cause && cause.message ? cause.message : String(cause)),
+          };
+        } finally {
+          if (timer !== null) clearTimeout(timer);
+        }
+      };
+      const [list, shadow] = await Promise.all([
+        post({ action: 'speaker.enroll.list' }),
+        post({ action: 'speaker.status.shadow' }),
+      ]);
+      return { list, shadow, error: '' };
+    }
+
+    /**
+     * 设置页「声纹」卡片：登记状态 + 显式确认/拒绝/删除 + 影子观测。
+     * 卡片本身不发请求也不自动改状态：只有按钮才会写，刷新只由用户点。
+     */
+    function speakerEnrollSection(h, props) {
+      const view = speakerEnrollView(props?.data);
+      const locked = props?.busy === true;
+      const last = view.shadow.last;
+      const row = (label, value, danger = false) => h('div', { style: styles.row },
+        h('span', { style: styles.label }, label),
+        h('span', { style: danger ? { ...styles.value, color: DANGER } : styles.value }, value));
+      const primary = view.primary;
+      const sampleText = primary === null
+        ? '—'
+        : `${primary.samples} 条 · ${speakerEnrollDurationText(primary.totalDurationMs)}`
+          + (primary.confirmable ? '' : '（不足 3 秒，不能确认）');
+      const entryRow = (entry) => {
+        const reason = speakerEnrollConfirmReason(entry);
+        return h('div', { key: entry.key, style: { marginTop: 8 } },
+          h('div', { style: styles.row },
+            h('span', { style: styles.value },
+              `${entry.label === '' ? entry.speakerId : `${entry.label}（${entry.speakerId}）`}`
+              + ` · ${entry.statusText}`),
+            h('span', { style: { display: 'flex', gap: 8 } },
+              h('button', {
+                style: { ...styles.btnPrimary, ...(locked || reason !== '' ? styles.off : {}) },
+                disabled: locked || reason !== '',
+                title: reason,
+                onClick: () => props?.onConfirm?.(entry.speakerId),
+              }, '确认'),
+              h('button', {
+                style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                disabled: locked,
+                onClick: () => props?.onReject?.(entry.speakerId),
+              }, '拒绝'),
+              h('button', {
+                style: { ...styles.btnDanger, ...(locked ? styles.off : {}) },
+                disabled: locked,
+                onClick: () => props?.onRemove?.(entry.speakerId),
+              }, '删除条目'))),
+          h('div', { style: styles.hint },
+            `样本 ${entry.samples} 条 · ${speakerEnrollDurationText(entry.totalDurationMs)}`
+            + (entry.confirmedAt === '' ? '' : ` · 确认于 ${entry.confirmedAt}`)
+            + (reason === '' ? '' : ` · ${reason}`)));
+      };
+      const lastText = last === null
+        ? '暂无样本'
+        : [
+            last.decisionText === last.decision
+              ? last.decision
+              : `${last.decisionText}（${last.decision}）`,
+            last.classText === '' ? '' : `${last.classText}（${last.class}）`,
+            last.qualityText === '' ? '' : `${last.qualityText}（${last.quality}）`,
+            last.score === null ? '' : `分数 ${last.score.toFixed(2)}`,
+          ].filter((part) => part !== '').join(' · ');
+      const counts = view.shadow.counts;
+      const countsText = view.shadow.available
+        ? `匹配 ${counts.match} · 不匹配 ${counts.mismatch} · 不确定 ${counts.unsure}`
+        : '不可用';
+      return h('div', { style: styles.card, 'data-seirein-speaker-enroll': 'client' },
+        h('div', { style: styles.title }, '声纹'),
+        h('div', { style: styles.hint },
+          '先登记本人声纹，影子只观测：不自动确认、不自动拒绝，判定不参与拒收、打断或投递。'),
+        h('div', { style: styles.row },
+          h('button', {
+            style: { ...styles.btn, ...(locked || view.loading ? styles.off : {}) },
+            disabled: locked || view.loading,
+            onClick: () => props?.onRefresh?.(),
+          }, view.loading ? '读取中…' : '刷新'),
+          h('button', {
+            style: { ...styles.btn, ...(locked ? styles.off : {}) },
+            disabled: locked,
+            onClick: () => props?.onCopy?.(),
+          }, '复制声纹报告')),
+        view.error === ''
+          ? null
+          : h('div', { style: { ...styles.hint, color: DANGER } }, `声纹读取失败：${view.error}`),
+        view.loading ? h('div', { style: styles.hint }, '正在读取声纹登记…') : null,
+        view.at > 0 && !view.loading
+          ? h('div', { style: styles.mono },
+              `上次读取：${new Date(view.at).toLocaleTimeString('zh-CN', { hour12: false })}`)
+          : null,
+        h('div', { style: { marginTop: 10 } },
+          h('div', { style: { ...styles.label, fontWeight: 600 } }, '登记状态'),
+          row('本人 speakerId', view.available ? (view.selfId === '' ? '未登记' : view.selfId) : '不可用'),
+          row('状态', view.stateText),
+          row('样本', sampleText),
+          row('确认时间', primary === null || primary.confirmedAt === '' ? '—' : primary.confirmedAt)),
+        view.available
+          ? h('div', { style: { marginTop: 10 } },
+              h('div', { style: { ...styles.label, fontWeight: 600 } }, `条目（${view.entries.length}）`),
+              view.empty
+                ? h('div', { style: styles.hint },
+                    '还没有登记条目：点下面的「登记我的声纹」，或在语音页说 3 句话自动收集。')
+                : view.entries.map(entryRow))
+          : null,
+        h('div', { style: { ...styles.row, marginTop: 10 } },
+          h('span', { style: styles.value }, '登记我的声纹（对着麦克风说 3–5 秒）'),
+          h('button', {
+            style: { ...styles.btnPrimary, ...(locked ? styles.off : {}) },
+            disabled: locked,
+            onClick: () => props?.onRecord?.(),
+          }, '登记我的声纹')),
+        h('div', { style: styles.hint }, SPEAKER_ENROLL_RECORD_HINT),
+        h('div', { style: { marginTop: 10 } },
+          h('div', { style: { ...styles.label, fontWeight: 600 } }, '影子观测（只记录）'),
+          row('最近一条', lastText),
+          row('三类计数', countsText),
+          view.shadow.available
+            ? null
+            : h('div', { style: styles.hint },
+                view.shadow.error === ''
+                  ? '影子状态不可用：需要宿主支持 speaker.status.shadow。'
+                  : `影子状态不可用：${view.shadow.error}（需要宿主支持 speaker.status.shadow）`)),
+        props?.notice
+          ? h('div', { style: { ...styles.hint, color: '#2b8a3e' } }, String(props.notice))
+          : null);
+    }
+
     // ---- P-111 客户端诊断 ---------------------------------------------------------------
     // 只读 /assistant/status：设置页打开时读一次，之后只由「刷新」再读。这里没有任何定时器，
     // 不新增轮询；所有字段都按可选处理，宿主暂时没有的字段在面板里显示「不可用」。
@@ -3696,6 +4098,10 @@ window.__ModuleLoader__.load({
       const [lexiconPending, setLexiconPending] = useState(null);
       // 客户端诊断：打开设置页时读一次 /assistant/status；之后只由「刷新」再读，不新增轮询。
       const [diagnostics, setDiagnostics] = useState(null);
+
+      // 声纹登记：一次读取的结果 + 最近一次显式动作的提示（不自动确认、不自动拒绝）。
+      const [speakerEnroll, setSpeakerEnroll] = useState(null);
+      const [speakerEnrollNotice, setSpeakerEnrollNotice] = useState('');
       // 存放位置：当前 root 只读来自 status；保存只写设置，需重启 DSH 生效（不自动重启/迁移）。
       const [rootDialog, setRootDialog] = useState(null);
       const [rootNotice, setRootNotice] = useState(null);
@@ -3803,6 +4209,62 @@ window.__ModuleLoader__.load({
         );
         show(result.ok ? '诊断报告已复制' : `复制失败：${result.error}`);
       }, [diagnostics, lastRestart, show]);
+
+      // ---- 声纹登记（客户端）handlers -----------------------------------------------------
+      // 一次挂载读一次 list + shadow；之后只有「刷新」或一次显式动作成功后再读。没有定时器。
+      const loadSpeakerEnroll = useCallback(async () => {
+        setSpeakerEnroll((current) => ({
+          list: current?.list ?? null,
+          shadow: current?.shadow ?? null,
+          loading: true,
+          error: '',
+          at: current?.at ?? 0,
+        }));
+        const read = await speakerEnrollRead(fetch);
+        setSpeakerEnroll({
+          list: read.list,
+          shadow: read.shadow,
+          loading: false,
+          error: read.error,
+          at: Date.now(),
+        });
+      }, []);
+
+      /** 确认 / 拒绝 / 删除都是一次点击一次请求：不重试，也不顺手改别的条目。 */
+      const runSpeakerEnroll = useCallback(async (op, speakerId) => {
+        const body = op === 'confirm'
+          ? { action: 'speaker.enroll.confirm', speakerId }
+          : op === 'reject'
+            ? { action: 'speaker.enroll.reject', speakerId }
+            : { action: 'speaker.enroll.remove', speakerId };
+        const result = await act(body, `speaker-enroll-${op}`);
+        const outcome = speakerEnrollOutcome(op, result);
+        setSpeakerEnrollNotice(outcome.message);
+        if (outcome.ok) await loadSpeakerEnroll();
+        return result;
+      }, [act, loadSpeakerEnroll]);
+
+      /** 契约里还没有录制动作：不假装开始录音，直接说明先自动收集。 */
+      const startSpeakerEnroll = useCallback(() => {
+        setSpeakerEnrollNotice(SPEAKER_ENROLL_RECORD_HINT);
+        show(SPEAKER_ENROLL_RECORD_HINT);
+      }, [show]);
+
+      /** 只复制脱敏后的状态摘要：没有标签文本、样本 id、路径或转写。 */
+      const copySpeakerEnroll = useCallback(async () => {
+        const text = speakerEnrollReportOf(speakerEnroll);
+        const target = typeof navigator === 'undefined' ? null : navigator.clipboard;
+        if (target === null || typeof target?.writeText !== 'function') {
+          show('复制失败：剪贴板不可用');
+          return;
+        }
+        try {
+          await target.writeText(text);
+          show('声纹报告已复制（已脱敏，不含路径与文本）');
+        } catch (cause) {
+          show(`复制失败：${cause && cause.message ? cause.message : String(cause)}`);
+        }
+      }, [speakerEnroll, show]);
 
       // ---- 存放位置 / 恢复语音会话 handlers ------------------------------------------------
       // 一次点击一次请求：这两个动作没有定时器、没有重试、没有自动重启或数据迁移。
@@ -4278,6 +4740,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         void loadDiagnostics();
       }, [loadDiagnostics]);
+
+      // 声纹登记同样只在挂载时读一次；确认/拒绝/删除/手动刷新之后由处理器再读，不跟 3 秒轮询。
+      useEffect(() => {
+        void loadSpeakerEnroll();
+      }, [loadSpeakerEnroll]);
 
       // A queued round is finished by the host later: the 3 s status poll is what releases the
       // silent button, so the card can never stay on 「已排队…」 after the queue drained.
@@ -4920,6 +5387,18 @@ window.__ModuleLoader__.load({
             cancelWrite: () => setLexiconPending(null),
           }),
         ),
+
+        speakerEnrollSection(h, {
+          data: speakerEnroll,
+          busy: busy !== '',
+          notice: speakerEnrollNotice,
+          onRefresh: () => void loadSpeakerEnroll(),
+          onRecord: startSpeakerEnroll,
+          onConfirm: (speakerId) => void runSpeakerEnroll('confirm', speakerId),
+          onReject: (speakerId) => void runSpeakerEnroll('reject', speakerId),
+          onRemove: (speakerId) => void runSpeakerEnroll('remove', speakerId),
+          onCopy: () => void copySpeakerEnroll(),
+        }),
 
         (() => {
           // 语种：语音与字幕分开配置，来源是 /assistant/status 的 langs。
