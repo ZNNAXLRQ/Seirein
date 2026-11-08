@@ -63,6 +63,23 @@ const EXPLICIT_CANCEL = /^\s*(?:停(?:一下|下来|停)?|别说了|不要说了
  */
 const TOPIC_SWITCH = /(?:换个话题|换一个话题|换个题目|说点别的|说个别的|另一个话题|新的话题|换个问题)/u;
 
+/**
+ * A new instruction, never a continuation, even 2 s after the previous segment. These are the
+ * operators that change what the user is asking for (switch/return/open/close/start/stop); the
+ * marker is matched anywhere, because "补充一下，打开 OBS 看看" is still a new instruction.
+ */
+const NEW_INSTRUCTION = /(?:切(?:回|到|换(?:到|成)?)|回到|返回|打开|关闭|关掉|启动|停止|开启|重启|进入|退出)/u;
+
+/**
+ * Openers that may continue the same expression. A candidate must ALSO arrive inside the window and
+ * the group must still own unvoiced content — a backlog alone is never sufficient. A bare "再" is
+ * not accepted (it precedes many new instructions); the additive forms below are.
+ */
+const CONTINUATION_OPENER = /^\s*(?:还有|补充|再补充|另外|对了|再加|加上|顺便|此外|以及|然后|继续|接着|完整(?:再)?(?:读|念|说|讲)|再读|再念|再讲|再说|再来)/u;
+
+/** An explicit request to resume content that is waiting unplayed ("继续/接着播"). */
+const EXPLICIT_RESUME = /^\s*(?:继续|接着|往下)/u;
+
 /** Parse one user input for an explicit cancel. `remainder` is the content after the opener. */
 export function isExplicitCancelInput(text) {
   const source = String(text ?? '');
@@ -81,6 +98,21 @@ export function isExplicitCancelInput(text) {
 /** Is this user input an explicit request to change the subject? */
 export function isTopicSwitchInput(text) {
   return TOPIC_SWITCH.test(String(text ?? ''));
+}
+
+/** Is this user input a new instruction (switch/return/open/close/start/stop), never a continuation? */
+export function isNewInstructionInput(text) {
+  return NEW_INSTRUCTION.test(String(text ?? ''));
+}
+
+/** Is this user input phrased as a continuation of the same expression? */
+export function isContinuationInput(text) {
+  return CONTINUATION_OPENER.test(String(text ?? ''));
+}
+
+/** Is this user input an explicit "continue / keep speaking" request for waiting content? */
+export function isExplicitResumeInput(text) {
+  return EXPLICIT_RESUME.test(String(text ?? ''));
 }
 
 const SENTENCE_TERMINATORS = new Set(['。', '！', '？', '!', '?', '；', ';', '\n']);
@@ -299,6 +331,10 @@ function groupView(group, extra = {}) {
     turns: Array.isArray(group.turns) ? group.turns.length : 0,
     played: Array.isArray(group.played) ? group.played.length : 0,
     pending: Array.isArray(group.pendingSentences) ? group.pendingSentences.length : 0,
+    /** Answer text done but voice not finished; never inherited by a different group. */
+    speechPending: group.speechPending === null || group.speechPending === undefined
+      ? 0
+      : group.speechPending.sentences.length,
     ...extra,
   };
 }
@@ -359,6 +395,9 @@ export function createResponseGroupStore({
 
   const expireGroup = (group, at, reason = 'ttl') => {
     if (TERMINAL_STATES.has(group.state)) return false;
+    // An expired expression may still hold generated-but-unvoiced text: keep it as speechPending,
+    // never silently drop it into "unanswered".
+    markSpeechPending(group, at, reason);
     group.state = 'expired';
     group.reason = reason;
     group.updatedAt = at;
@@ -377,6 +416,9 @@ export function createResponseGroupStore({
 
   const abandonGroup = (group, at, reason, extra = {}) => {
     if (TERMINAL_STATES.has(group.state)) return false;
+    // Leaving the group is not a cancel: text that was already answered but never voiced stays
+    // available as `speechPending` (explicit resume only), and is never mixed into a new group.
+    markSpeechPending(group, at, reason);
     group.state = 'abandoned';
     group.reason = reason;
     group.updatedAt = at;
@@ -475,6 +517,84 @@ export function createResponseGroupStore({
     return false;
   };
 
+  /**
+   * The part of a group whose TEXT answer is already produced but whose voice never finished.
+   * This is deliberately a separate set from `pendingSentences` (which may also cover an answer
+   * that was never generated at all): it is retained for an explicit resume, never merged into a
+   * different group and never played automatically.
+   */
+  const pendingSpeechOf = (group) => {
+    const answer = group.currentAnswer ?? null;
+    const rows = [];
+    const seen = new Set();
+    const played = playedKeySet(group);
+    const push = (sentence) => {
+      const key = sentenceKey(sentence);
+      if (key.length === 0 || seen.has(key) || played.has(key)) return;
+      seen.add(key);
+      rows.push(String(sentence));
+    };
+    for (const sentence of group.pendingSentences ?? []) push(sentence);
+    if (answer !== null) {
+      for (const sentence of unspokenSentencesOf(answer, { maxSentences: pendingLimit })) push(sentence);
+      // A sentence that STARTED but never completed still leaves an unvoiced tail. Its id is not
+      // in `completedSentenceIds`, so it belongs to speechPending even when it is no longer
+      // "unspoken" by wording. (The id is the split index the speaker was given.)
+      const sourceSentences = splitSpeechSentences(answerSource(answer));
+      const completed = new Set((answer.completedSentenceIds ?? []).filter((id) => Number.isInteger(id)));
+      for (let index = 0; index < sourceSentences.length; index += 1) {
+        if (!completed.has(index)) push(sourceSentences[index]);
+      }
+    }
+    if (rows.length === 0) return null;
+    const bounded = rows.slice(-pendingLimit);
+    return { sentences: bounded, chars: bounded.join('').length };
+  };
+
+  /**
+   * Mark "answer text done, speech incomplete" without clearing anything: the content stays on the
+   * old group as `speechPending`, and only an explicit resume request may restore it. The event is
+   * `voice.response.group.speech-pending`; it is never emitted for an unanswered (empty) answer.
+   */
+  const markSpeechPending = (group, at, reason) => {
+    if (group === null || group === undefined) return false;
+    const pending = pendingSpeechOf(group);
+    if (pending === null) return false;
+    const prior = group.speechPending;
+    // A repeated mark with the same content is not a second event (late output may call this again).
+    if (prior !== null && prior !== undefined && prior.version === group.answerVersion
+      && prior.chars === pending.chars && prior.sentences.length === pending.sentences.length) {
+      return false;
+    }
+    group.speechPending = {
+      sentences: pending.sentences,
+      chars: pending.chars,
+      at,
+      reason: String(reason ?? ''),
+      version: group.answerVersion,
+    };
+    publish('voice.response.group.speech-pending', {
+      groupId: group.id,
+      sessionId: group.sessionId,
+      sentences: pending.sentences.length,
+      chars: pending.chars,
+      answerVersion: group.answerVersion,
+      reason: String(reason ?? ''),
+    });
+    return true;
+  };
+
+  /** The newest group of this session that still has unplayed, already-generated answer text. */
+  const newestSpeechPending = (sessionId) => {
+    let found = null;
+    for (const group of groups.values()) {
+      if (group.sessionId !== sessionId) continue;
+      if (group.speechPending === null || group.speechPending === undefined) continue;
+      found = group;
+    }
+    return found;
+  };
+
   const decide = (group, text, at) => {
     if (TERMINAL_STATES.has(group.state)) return { continuation: false, reason: `prior-${group.state}` };
     if (at >= group.expiresAt) {
@@ -487,10 +607,12 @@ export function createResponseGroupStore({
     const lastSegment = group.segments[group.segments.length - 1] ?? null;
     const gapMs = Math.max(0, at - (Number(lastSegment?.at) || group.createdAt));
     if (gapMs > gapLimit) return { continuation: false, reason: 'prior-idle', gapMs };
-    if (isTopicSwitchInput(text)) {
-      if (hasPending(group)) return { continuation: false, reason: 'topic-switch' };
-      return { continuation: false, reason: 'topic-switch-idle' };
-    }
+    // A new instruction or an explicit subject change ALWAYS opens a new group, even 2 s later.
+    if (isTopicSwitchInput(text)) return { continuation: false, reason: 'topic-switch' };
+    if (isNewInstructionInput(text)) return { continuation: false, reason: 'new-instruction' };
+    // Inside the window the input must still be phrased as a continuation. A separate request
+    // ("新回答" / "明天天气怎么样") is never merged just because this group still has a backlog.
+    if (!isContinuationInput(text)) return { continuation: false, reason: 'not-continuation' };
     if (group.generation >= segmentLimit) return { continuation: false, reason: 'segment-limit' };
     if (group.state === 'done') return { continuation: false, reason: 'prior-complete' };
     if (PENDING_STATES.has(group.state) || hasPending(group)) {
@@ -521,6 +643,11 @@ export function createResponseGroupStore({
       played: [],
       /** Generated-but-unvoiced sentences carried across answer versions (bounded). */
       pendingSentences: [],
+      /**
+       * Answer text done but voice not finished. It is never inherited by another group and is
+       * only restored by an explicit "继续/接着播". Null while the group is live.
+       */
+      speechPending: null,
       cancelReason: '',
       // Cached copies for the bounded continuation context (the message itself is never stored).
       lastUserInput: String(text ?? ''),
@@ -537,55 +664,92 @@ export function createResponseGroupStore({
   };
 
   /**
+   * Open the next answer version of a group. Used by both a genuine continuation and an explicit
+   * resume of `speechPending`; the only difference is the source of the covered sentences.
+   */
+  const continueGroup = (group, text, at, reason) => {
+    const prior = group.currentAnswer;
+    const resuming = group.speechPending !== null && group.speechPending !== undefined;
+    if (resuming) {
+      // Explicit resume: restore exactly what was waiting, in transcript order, never a played
+      // sentence. This is the ONLY path that turns speechPending back into pending coverage.
+      const played = playedKeySet(group);
+      const seen = new Set();
+      const restored = [];
+      for (const sentence of group.speechPending.sentences) {
+        const key = sentenceKey(sentence);
+        if (key.length === 0 || played.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        restored.push(sentence);
+      }
+      group.pendingSentences = restored.slice(-pendingLimit);
+      group.speechPending = null;
+      // A resumed group may already be past its original lifetime; give this new version its own.
+      group.expiresAt = at + lifetime;
+    }
+    // The superseded version's generated-but-unvoiced sentences become the group's pending
+    // coverage; its playback coverage is already in `played`.
+    rememberPending(group, answerSource(prior));
+    prior.updatedAt = at;
+    const version = group.answerVersion + 1;
+    const answer = createAnswer(version, { at });
+    answer.inheritedVersion = prior.version;
+    group.priorAnswer = prior;
+    group.currentAnswer = answer;
+    group.answerVersion = version;
+    group.generation += 1;
+    group.state = 'generating';
+    group.reason = reason;
+    group.updatedAt = at;
+    group.segments.push({ text: String(text ?? ''), at, generation: group.generation, messageId: '', turn: null });
+    group.lastUserInput = String(text ?? '');
+    const priorUnspoken = unspokenSentencesOf(prior, { maxSentences: pendingLimit });
+    publish('voice.response.group.continued', {
+      ...groupView(group),
+      priorVersion: prior.version,
+      priorState: prior.state,
+      playedSentences: (prior.playedSentences ?? []).length,
+      unplayedSentences: Math.max(priorUnspoken.length, group.pendingSentences.length),
+      newChars: String(text ?? '').length,
+    });
+    return {
+      group,
+      generation: group.generation,
+      answerVersion: version,
+      continuation: true,
+      priorVersion: prior.version,
+      reason,
+    };
+  };
+
+  /**
    * Register one delivered segment: either continue the session's open group or open a new one.
    * @returns {{group: object, generation: number, answerVersion: number, continuation: boolean,
    *            priorVersion: number, reason: string, gapMs?: number}}
    */
   const beginInput = ({ sessionId, text, speakerId = '', at = now() } = {}) => {
     sweep(at);
+    // B: "继续/接着播" is the only request that restores speech that was already answered but
+    // never voiced. Without it the content stays speechPending and a new group never sees it.
+    if (isExplicitResumeInput(text)) {
+      const pending = newestSpeechPending(sessionId);
+      if (pending !== null) return continueGroup(pending, text, at, 'resume-pending');
+    }
     const current = newestFor(sessionId);
     let decision = { continuation: false, reason: 'new' };
     if (current !== null) {
       decision = decide(current, text, at);
       if (decision.continuation === true) {
-        const prior = current.currentAnswer;
-        // The superseded version's generated-but-unvoiced sentences become the group's pending
-        // coverage; its playback coverage is already in `played`.
-        rememberPending(current, answerSource(prior));
-        prior.updatedAt = at;
-        const version = current.answerVersion + 1;
-        const answer = createAnswer(version, { at });
-        answer.inheritedVersion = prior.version;
-        current.priorAnswer = prior;
-        current.currentAnswer = answer;
-        current.answerVersion = version;
-        current.generation += 1;
-        current.state = 'generating';
-        current.reason = decision.reason;
-        current.updatedAt = at;
-        current.segments.push({ text: String(text ?? ''), at, generation: current.generation, messageId: '', turn: null });
-        current.lastUserInput = String(text ?? '');
-        const priorUnspoken = unspokenSentencesOf(prior, { maxSentences: pendingLimit });
-        publish('voice.response.group.continued', {
-          ...groupView(current),
-          priorVersion: prior.version,
-          priorState: prior.state,
-          playedSentences: (prior.playedSentences ?? []).length,
-          unplayedSentences: Math.max(priorUnspoken.length, current.pendingSentences.length),
-          newChars: String(text ?? '').length,
-        });
-        return {
-          group: current,
-          generation: current.generation,
-          answerVersion: version,
-          continuation: true,
-          priorVersion: prior.version,
-          reason: decision.reason,
-        };
+        // A same-group continuation is already an explicit continuation decision; it may keep
+        // the unvoiced remainder of the previous version.
+        return continueGroup(current, text, at, decision.reason);
       }
+      // Any non-continuation path retires the old group. Its answered-but-unvoiced content is
+      // kept as speechPending (not merged, not auto-played) before the group becomes terminal.
       if (decision.reason === 'prior-idle') {
         abandonGroup(current, at, 'prior-idle', { gapMs: decision.gapMs });
-      } else if (decision.reason === 'topic-switch' || decision.reason === 'segment-limit') {
+      } else if (decision.reason === 'topic-switch' || decision.reason === 'new-instruction'
+        || decision.reason === 'not-continuation' || decision.reason === 'segment-limit') {
         abandonGroup(current, at, decision.reason);
       }
     }
@@ -605,6 +769,8 @@ export function createResponseGroupStore({
     if (current === null) return 'new';
     if (decision.reason === 'topic-switch') return 'topic-switch';
     if (decision.reason === 'segment-limit') return 'segment-limit';
+    if (decision.reason === 'new-instruction') return 'new-instruction';
+    if (decision.reason === 'not-continuation') return 'not-continuation';
     return decision.reason;
   };
 
@@ -645,6 +811,16 @@ export function createResponseGroupStore({
     && group.currentAnswer.state !== 'failed'
   );
 
+  /**
+   * A retired group can still receive its own turn's late body/plan. Keep that content on the old
+   * group as speechPending (joinable by an explicit resume); it never moves into a newer group.
+   */
+  const refreshRetiredSpeechPending = (group) => {
+    if (group === null || group === undefined) return;
+    if (group.state !== 'abandoned' && group.state !== 'expired') return;
+    markSpeechPending(group, now(), group.speechPending?.reason || 'late-result');
+  };
+
   /** Store the committed body once the agent turn succeeded (it still enters memory normally). */
   const noteAnswerBody = ({ group, version, turn = null, text = '' } = {}) => {
     const answer = findAnswer(group, version);
@@ -659,6 +835,7 @@ export function createResponseGroupStore({
     if (!isCurrentAnswer(group, version) && String(answer.planText ?? '').trim().length === 0) {
       rememberPending(group, answer.body);
     }
+    refreshRetiredSpeechPending(group);
     publish('voice.response.group.body', {
       ...groupView(group),
       version,
@@ -682,6 +859,7 @@ export function createResponseGroupStore({
     // A superseded version that decides its plan late still contributes its unvoiced sentences;
     // the current version's plan is handled by adjustSpeech (condensed share, exact coverage).
     if (!isCurrentAnswer(group, version)) rememberPending(group, answer.planText);
+    refreshRetiredSpeechPending(group);
     if (isCurrentAnswer(group, version)) {
       group.state = group.state === 'playing' ? 'playing' : 'ready';
       publish('voice.response.group.ready', {
@@ -748,6 +926,9 @@ export function createResponseGroupStore({
   const notePlaybackStart = ({
     group, version, sentenceId = null, chunkIndex = 0, chunkCount = 1, text = '', chars = 0,
   } = {}) => {
+    // A terminal group never revives: a late block from a superseded version must not turn an
+    // abandoned/expired group back into `playing` (nor steal the new group's coverage).
+    if (group === null || group === undefined || TERMINAL_STATES.has(group.state)) return;
     const answer = findAnswer(group, version);
     if (answer === null) return;
     const at = now();
@@ -800,6 +981,7 @@ export function createResponseGroupStore({
   const notePlaybackEnd = ({
     group, version, sentenceId = null, chunkIndex = 0, chunkCount = 1, status = 'completed', text = '',
   } = {}) => {
+    if (group === null || group === undefined || TERMINAL_STATES.has(group.state)) return;
     const answer = findAnswer(group, version);
     if (answer === null) return;
     const at = now();
@@ -1035,6 +1217,12 @@ export function createResponseGroupStore({
         turns: [...group.turns],
         messageIds: [...group.messageIds],
         played: [...group.played],
+        speechPending: group.speechPending === null || group.speechPending === undefined ? null : {
+          sentences: [...group.speechPending.sentences],
+          chars: group.speechPending.chars,
+          version: group.speechPending.version,
+          reason: group.speechPending.reason,
+        },
         currentAnswer: group.currentAnswer === null ? null : {
           version: group.currentAnswer.version,
           state: group.currentAnswer.state,

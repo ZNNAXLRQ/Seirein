@@ -14,6 +14,20 @@ export const VOICE_PREFETCH_DEPTH_MIN = 1;
 
 export const VOICE_PREFETCH_DEPTH_MAX = 3;
 
+/**
+ * Read-only lifecycle diagnostic for one reply speaker. Transition-only (a repeated state is
+ * collapsed) and throttled, so a long clip cannot flood the event log. `ageMs` is measured from the
+ * speaker's `startedAt`, which is what distinguishes "still translating/synthesizing" from "queued"
+ * and "really playing". `speechId` is the host ledger id as soon as the play seam reports it; before
+ * the first clip it is this speaker's own stable id.
+ */
+export const SPEECH_LIFECYCLE_EVENT = 'voice.speech.lifecycle';
+
+/** Minimum gap before the same state may be reported again (a phase transition always reports). */
+export const SPEECH_LIFECYCLE_MIN_MS = 1_000;
+
+/** One speaker id per invocation (module-local; diagnostics only, never a ledger identity). */
+let replySpeakerSequence = 0;
 
 /** Clamp the configurable `voice.prefetchDepth`; a missing/invalid value keeps the default 2. */
 export function resolveVoicePrefetchDepth(value, fallback = DEFAULT_VOICE_PREFETCH_DEPTH) {
@@ -170,8 +184,76 @@ export function createReplySpeaker({
 } = {}) {
   const controller = new AbortController();
   const lane = signal === undefined || signal === null ? controller.signal : AbortSignal.any([signal, controller.signal]);
-  // A5: one resolved budget for the streamed queue *and* the whole-reply fallback, so neither path
-  // can speak more than the subtitle shows. `Infinity`/0 means "speak it all".
+  // ---- C: lifecycle + explicit release -----------------------------------
+  // One clip may be replaced/cancelled while its player never settles. The speaker must still let
+  // go of its active ownership, otherwise the response group stays "playing" for minutes.
+  replySpeakerSequence += 1;
+  const speakerId = `reply-speaker-${replySpeakerSequence}`;
+  let active = true;
+  let lifecycleSpeechId = '';
+  let lifecycleState = '';
+  let lifecycleAt = 0;
+  const lifecycleStartedAt = Number.isFinite(Number(startedAt)) && Number(startedAt) > 0
+    ? Number(startedAt)
+    : now();
+  /** The host's ledger speech id rides on the play session; keep it once it is observable. */
+  const noteLifecycleSpeechId = (session) => {
+    const id = session?.owner?.speechId;
+    if (typeof id === 'string' && id.length > 0) lifecycleSpeechId = id;
+  };
+  /** Terminal lifecycle states are reported once; the others may re-report after the throttle. */
+  const LIFECYCLE_FINAL = new Set(['finished', 'failed', 'cancelled', 'released']);
+  /** Transition-only, throttled `voice.speech.lifecycle {speechId, state, ageMs, reason}`. */
+  const emitLifecycle = (state, reason = '', extra = {}) => {
+    if (typeof onEvent !== 'function') return;
+    // Once the speaker released its ownership, later cleanup must not reopen the lifecycle stream
+    // (the release row is the last one a consumer may rely on).
+    if (!active) return;
+    const at = now();
+    if (state === lifecycleState
+      && (LIFECYCLE_FINAL.has(state) || at - lifecycleAt < SPEECH_LIFECYCLE_MIN_MS)) return;
+    lifecycleState = state;
+    lifecycleAt = at;
+    try {
+      onEvent({
+        type: SPEECH_LIFECYCLE_EVENT,
+        // Stable across every phase of this speaker, so early (pre-play) rows join later ones.
+        speakerId,
+        // The host ledger id once the play seam reports it; before that the speaker id is used.
+        speechId: lifecycleSpeechId.length > 0 ? lifecycleSpeechId : speakerId,
+        state,
+        ageMs: Math.max(0, at - lifecycleStartedAt),
+        reason: String(reason ?? ''),
+        ...extra,
+      });
+    } catch {
+      /* observation cannot break playback */
+    }
+  };
+  const releaseActive = (reason) => {
+    if (!active) return;
+    emitLifecycle('released', reason);
+    // The release row is written first; from here no later cleanup may claim the speaker is alive.
+    active = false;
+  };
+  const abortReason = () => (
+    lane.reason instanceof Error ? lane.reason : new DOMException('Reply speech cancelled', 'AbortError')
+  );
+  /**
+   * Resolve/reject with the lane: a cancelled or superseded version must not keep `run()` (and
+   * therefore `finish()`) waiting on a player/synthesis promise that may never settle.
+   */
+  const abortable = (promise) => {
+    if (lane.aborted) return Promise.reject(abortReason());
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(abortReason());
+      lane.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve(promise).then(
+        (value) => { lane.removeEventListener('abort', onAbort); resolve(value); },
+        (error) => { lane.removeEventListener('abort', onAbort); reject(error); },
+      );
+    });
+  };
   const speechBudget = resolveBudget({ maxChars });
   let remaining = speechBudget.unbounded ? Infinity : speechBudget.maxChars;
   const stats = {
@@ -274,7 +356,12 @@ export function createReplySpeaker({
     if (lane.aborted) throw lane.reason ?? new DOMException('Reply speech cancelled', 'AbortError');
     const synthAt = now();
     if (stats.firstSynthStartedAt === 0) stats.firstSynthStartedAt = synthAt;
-    const audio = await synthesizeSentence({ text: item.text, sentenceId: item.seq, signal: lane });
+    if (lifecycleState === '' || lifecycleState === 'queued') {
+      emitLifecycle('synthesizing', 'first-sentence');
+    }
+    // The seam must observe cancellation too: a provider that ignores its signal may otherwise
+    // pin the run (and `finish`) long after this version was replaced.
+    const audio = await abortable(synthesizeSentence({ text: item.text, sentenceId: item.seq, signal: lane }));
     if (lane.aborted) throw lane.reason ?? new DOMException('Reply speech cancelled', 'AbortError');
     // Only the first sentence's stage payload is reported; prefetched later clips are not measured.
     if (item.seq === 0) {
@@ -332,7 +419,9 @@ export function createReplySpeaker({
   const discardAhead = async () => {
     const pending = ahead.splice(0);
     for (const task of pending) {
-      const settled = await task;
+      // A cancelled/replaced version must release even if a synthesis seam ignores its signal;
+      // waiting for it forever is exactly what kept the group "playing" for minutes.
+      const settled = await abortable(task).catch(() => null);
       if (settled?.value) await discardAudio(settled.value.audio);
     }
     if (pending.length > 0) notifyPrefetch();
@@ -361,7 +450,7 @@ export function createReplySpeaker({
         const blocks = Array.isArray(entry.audio?.chunkTexts) && entry.audio.chunkTexts.length > 1
           ? entry.audio.chunkTexts
           : null;
-        const summary = await (chunkPlayer ?? speakSingleBlock)({
+        const summary = await abortable((chunkPlayer ?? speakSingleBlock)({
           chunks: blocks ?? [entry.item.text],
           sentenceId: entry.item.seq,
           first: entry.audio,
@@ -387,6 +476,9 @@ export function createReplySpeaker({
           onStart: ({ started, index }) => {
             const audioAt = Number(started?.audioStartedAt) || 0;
             entry.played = audioAt > 0;
+            // C: the ledger speech id (owner of the single playback session) makes the lifecycle
+            // row joinable with speech.* without the speaker ever owning playback state.
+            noteLifecycleSpeechId(started?.session);
             // Observation only: keep the first block's player session; the player-ready anchor is
             // read at finish(), after the transport had time to report its process readiness.
             if (entry.item.seq === 0 && index === 0 && started?.session !== undefined) {
@@ -394,6 +486,10 @@ export function createReplySpeaker({
             }
             if (audioAt > 0) {
               playedAny = true;
+              emitLifecycle('playing', 'audio-started', {
+                sentenceId: entry.item.seq,
+                chunkIndex: index,
+              });
               // Gap A: `firstPlayStartedAt` is written once (the first sentence's first block);
               // the last block has its own stamp, so a three-sentence reply reports 1000 and
               // 6000, not 6000 twice.
@@ -409,7 +505,7 @@ export function createReplySpeaker({
               }
             }
           },
-        });
+        }));
         // One skipped sentence counts once, however many blocks it had.
         if (summary.skipped > 0) stats.skipped += 1;
         // Counted once the player really finished the clip (not at accept/synthesis/start); a
@@ -431,6 +527,7 @@ export function createReplySpeaker({
       // this queue too, instead of playing its next sentence over the newer reply.
       if (error?.code === 'REPLY_SUPERSEDED') cancelled = true;
       else if (!lane.aborted) failure ??= error;
+      emitLifecycle(cancelled || lane.aborted ? 'cancelled' : 'failed', String(error?.code ?? error?.message ?? ''));
       release(null);
       controller.abort();
     } finally {
@@ -439,6 +536,10 @@ export function createReplySpeaker({
       release(null);
       await discardAhead();
       if (current !== null && current.played !== true) await discardAudio(current.audio);
+      // C: the run is over (finished, cancelled or failed) — the speaker owns nothing from here.
+      // `finish()` awaits this promise, so releasing here is what prevents a stuck "still playing".
+      emitLifecycle(cancelled ? 'cancelled' : (failure !== null ? 'failed' : 'finished'), 'run-settled');
+      releaseActive(cancelled ? 'cancelled' : (failure !== null ? 'failed' : 'finished'));
     }
   };
   const start = () => {
@@ -465,6 +566,7 @@ export function createReplySpeaker({
     stats.spokenChars += chars;
     if (stats.firstQueuedAt === 0) stats.firstQueuedAt = now();
     const item = { seq: stats.sentences, text };
+    if (stats.sentences === 0) emitLifecycle('queued', 'first-sentence');
     stats.sentences += 1;
     const waiter = waiters.shift();
     if (waiter !== undefined) {
@@ -553,6 +655,8 @@ export function createReplySpeaker({
       // reply after the user interrupted. A failure that aborted the lane still falls back below.
       stats.cancelled = true;
       reportBudget();
+      // finish() is the caller's end callback: it must release even when no run ever started.
+      releaseActive('cancelled');
       return stats;
     }
     if (failure !== null) stats.error = String(failure?.message ?? failure);
@@ -573,7 +677,10 @@ export function createReplySpeaker({
         if (limited.text.length > 0) {
           stats.fallback = true;
           try {
-            const spoken = await speakWhole(limited.text);
+            // The fallback is the same voice outlet: a replaced version must not keep `finish`
+            // waiting on a clip whose lane was already aborted.
+            const spoken = await abortable(speakWhole(limited.text));
+            noteLifecycleSpeechId(spoken?.session);
             const audioAt = Number(spoken?.audioStartedAt) || 0;
             if (audioAt > 0) {
               if (stats.firstPlayStartedAt === 0) stats.firstPlayStartedAt = audioAt;
@@ -592,7 +699,11 @@ export function createReplySpeaker({
       // Replaying from the top would repeat text the user already heard; report the partial tail.
       stats.partial = true;
     }
+    // A lane aborted during the fallback is still a cancellation, never a finished answer.
+    if (!stats.cancelled && lane.aborted && failure === null) stats.cancelled = true;
     reportBudget();
+    if (running === null) emitLifecycle('finished', 'no-clip');
+    releaseActive(cancelled || lane.aborted ? 'cancelled' : (failure !== null ? 'failed' : 'finished'));
     return stats;
   };
 
@@ -603,7 +714,11 @@ export function createReplySpeaker({
     buffer = '';
     queue = [];
     release(null);
+    emitLifecycle('cancelled', String(reason ?? 'cancel'));
     controller.abort(new DOMException(String(reason), 'AbortError'));
+    // The version was replaced or stopped: it owns no active playback from this instant, even if
+    // its player/run promise settles later. This is what keeps a superseded version inactive.
+    releaseActive(`cancel:${String(reason ?? 'cancel')}`);
     return true;
   };
 
@@ -615,6 +730,10 @@ export function createReplySpeaker({
     stats,
     signal: lane,
     hasPlayed: () => playedAny,
+    /** True while this speaker may still own the voice outlet (false after finish/cancel). */
+    isActive: () => active,
+    /** Stable diagnostic id; the ledger `speechId` is used once the play seam reports one. */
+    speakerId,
   };
 }
 

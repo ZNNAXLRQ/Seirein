@@ -23,6 +23,11 @@
  *  13. store: twenty seconds exceeds the default 15 s window
  *  14. store: a configured 30 s window continues at 20 s and stops just past it
  *  15. store: a topic switch inside the window still does not merge
+ *  16. store: an explicit continuation ("还有/补充") 2 s later still merges
+ *  17. store: a new instruction ("切回屏幕模式"/"打开 OBS") 2 s later opens a new group
+ *  18. store: answer text done + speech incomplete becomes speechPending (never into a new group)
+ *  19. store: "接着播/继续" is the only path that restores speechPending content
+ *  20. store: a superseded group's late body/plan/playback is never mixed into the new group
  *
  * Run: node --test test/response-group.mjs
  */
@@ -554,7 +559,7 @@ test('2. a segment after the body but before voice playback revokes the old audi
   await synthEntered.promise;
   assert.equal(app.players().length, 0, 'the old version had not reached the player yet');
 
-  app.say('新增内容');
+  app.say('补充内容');
   await app.waitForEvent('voice.response.group.continued');
   synthGate.resolve();
   await waitUntil(() => app.preStep(2) !== null, 'the unified turn started');
@@ -1068,5 +1073,174 @@ test('15. a topic switch inside the window does not merge and still names the sw
   assert.equal(events.filter((event) => event.type === 'voice.response.group.continued').length, 0);
   t.diagnostic(
     `gap=3000ms reason=${second.reason} old=${row.payload.groupId}/retained true newPending=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 16. An explicit continuation two seconds later still merges
+// ---------------------------------------------------------------------------
+
+test('16. an explicit continuation ("还有/补充") two seconds later still merges', (t) => {
+  const { store, clock, events } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-cont' });
+
+  clock.t += 2_000; // inside the window AND phrased as a continuation
+  const second = store.beginInput({ sessionId: 's-cont', text: '还有，再补充一句', at: clock.t });
+
+  assert.equal(second.continuation, true, 'a genuine continuation inside the window merges');
+  assert.equal(second.reason, 'continue-playing');
+  assert.equal(second.group.id, first.group.id);
+  assert.equal(second.generation, 2);
+  assert.equal(second.answerVersion, 2);
+  const continued = events.find((event) => event.type === 'voice.response.group.continued');
+  assert.equal(continued.payload.generation, 2);
+  assert.equal(continued.payload.priorVersion, 1);
+  assert.equal(continued.payload.playedSentences, 1, 'the already-played sentence is still known');
+  // The continuation speaks the old unvoiced sentence, then the new plan.
+  const adjusted = store.adjustSpeech({ group: first.group, version: 2, text: '新增回答。' });
+  assert.equal(adjusted.text, '旧回答第二句。新增回答。');
+  t.diagnostic(`gap=2000ms reason=${second.reason} gen=${second.generation} speech=${adjusted.text}`);
+});
+
+// ---------------------------------------------------------------------------
+// 17. A new instruction two seconds later opens a new group (window is not sufficient)
+// ---------------------------------------------------------------------------
+
+test('17. a new instruction two seconds later opens a new group even with a backlog', (t) => {
+  const rows = [];
+  for (const input of ['切回屏幕模式', '打开 OBS 看看']) {
+    const { store, clock, events, abandoned } = groupStore();
+    const first = openPlayingGroup(store, clock, { sessionId: `s-instr-${rows.length}` });
+    clock.t += 2_000; // deliberately inside the 15 s window
+    const second = store.beginInput({ sessionId: `s-instr-${rows.length}`, text: input, at: clock.t });
+
+    assert.equal(second.continuation, false, `${input} is a new instruction, never a continuation`);
+    assert.equal(second.reason, 'new-instruction');
+    assert.notEqual(second.group.id, first.group.id, 'a new group is created');
+    const row = abandoned();
+    assert.equal(row.payload.groupId, first.group.id);
+    assert.equal(row.payload.reason, 'new-instruction');
+    assert.equal(store.get(first.group.id).pendingSentences.length, 1, 'old unvoiced content is retained');
+    assert.equal(store.get(second.group.id).pendingSentences.length, 0, 'nothing is inherited');
+    assert.equal(events.filter((event) => event.type === 'voice.response.group.continued').length, 0);
+    rows.push(`${input}:${second.reason}/${row.payload.reason}`);
+  }
+  t.diagnostic(`2s instructions -> ${rows.join(' | ')} (window alone never merges)`);
+});
+
+// ---------------------------------------------------------------------------
+// 18. Text done + speech incomplete is speechPending, never inherited
+// ---------------------------------------------------------------------------
+
+test('18. answer text done but speech incomplete becomes speechPending and never enters a new group', (t) => {
+  const { store, clock, events } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-pending' });
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-pending', text: '切回屏幕模式', at: clock.t });
+  assert.equal(second.continuation, false);
+
+  const pending = events.find((event) => event.type === 'voice.response.group.speech-pending');
+  assert.ok(pending !== undefined, 'the unanswered-speech state is reported');
+  assert.equal(pending.payload.groupId, first.group.id);
+  assert.equal(pending.payload.sentences, 1);
+  assert.equal(pending.payload.chars, '旧回答第二句。'.length);
+  assert.equal(pending.payload.answerVersion, 1);
+
+  const old = store.get(first.group.id);
+  assert.equal(old.state, 'abandoned', 'the old group is retired, not revived');
+  assert.deepEqual(old.speechPending.sentences, ['旧回答第二句。'], 'the answered text is kept as speechPending');
+  assert.equal(old.speechPending.reason, 'new-instruction');
+
+  // The new group owns only its own input and spoken plan.
+  const snapshot = store.snapshot(second.group.id);
+  assert.deepEqual(snapshot.segments.map((segment) => segment.text), ['切回屏幕模式']);
+  assert.equal(snapshot.pending, 0);
+  assert.equal(snapshot.speechPending, null);
+  assert.equal(store.get(second.group.id).priorAnswer, null);
+  const context = composeResponseGroupContext({ group: second.group, newInput: '切回屏幕模式' });
+  assert.ok(!context.includes('旧回答'), 'the old answer is not in the new group\'s context');
+  const adjusted = store.adjustSpeech({ group: second.group, version: 1, text: '屏幕模式的新回答。' });
+  assert.equal(adjusted.text, '屏幕模式的新回答。', 'the old speech is not prepended to the new group');
+  assert.equal(adjusted.unplayedPrior.length, 0);
+  t.diagnostic(
+    `old=${first.group.id} speechPending=${pending.payload.sentences}句/${pending.payload.chars}字 `
+    + `new=${second.group.id} inherited=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 19. "接着播/继续" restores speechPending; nothing else does
+// ---------------------------------------------------------------------------
+
+test('19. only an explicit "接着播/继续" restores speechPending content', (t) => {
+  const { store, clock, events } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-resume' });
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-resume', text: '切回屏幕模式', at: clock.t });
+  assert.equal(second.continuation, false, 'a new instruction does not resume the old content');
+
+  // An ordinary, unrelated request while speechPending exists must not restore it either.
+  clock.t += 2_000;
+  const third = store.beginInput({ sessionId: 's-resume', text: '明天天气怎么样', at: clock.t });
+  assert.equal(third.continuation, false, 'a normal new question does not resume pending speech');
+  assert.notEqual(third.group.id, first.group.id);
+  assert.deepEqual(store.get(first.group.id).speechPending.sentences, ['旧回答第二句。'], 'still waiting');
+
+  // Only the explicit request restores it, and the restored version precedes the new answer.
+  clock.t += 2_000;
+  const resumed = store.beginInput({ sessionId: 's-resume', text: '接着播，继续', at: clock.t });
+  assert.equal(resumed.continuation, true);
+  assert.equal(resumed.reason, 'resume-pending');
+  assert.equal(resumed.group.id, first.group.id, 'the old group is the one resumed');
+  assert.equal(resumed.generation, 2);
+  assert.equal(resumed.priorVersion, 1);
+  assert.equal(store.get(first.group.id).speechPending, null, 'resuming clears the pending marker');
+  assert.equal(events.filter((event) => event.type === 'voice.response.group.continued').length, 1);
+  const adjusted = store.adjustSpeech({ group: first.group, version: 2, text: '补充回答。' });
+  assert.equal(adjusted.text, '旧回答第二句。补充回答。', 'the unplayed old sentence is restored first');
+  assert.deepEqual(store.get(third.group.id).speechPending, null, 'other groups are untouched');
+  t.diagnostic(
+    `newInstruction=${second.reason} normal=${third.reason} resume=${resumed.reason} `
+    + `restored=${adjusted.text}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 20. A superseded group's late result never mixes into the new group
+// ---------------------------------------------------------------------------
+
+test('20. a superseded group\'s late body/plan/playback never mixes into the new group', (t) => {
+  const { store, clock } = groupStore();
+  const first = openPlayingGroup(store, clock, { sessionId: 's-late' });
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-late', text: '切回屏幕模式', at: clock.t });
+  assert.equal(second.continuation, false);
+
+  // The old turn's result arrives after its group was retired.
+  store.noteAnswerBody({
+    group: first.group, version: 1, turn: 1, text: '迟到的旧正文。',
+  });
+  store.noteAnswerPlan({
+    group: first.group, version: 1, turn: 1, text: '迟到的旧口语。', feedText: '迟到的旧正文。',
+  });
+  store.notePlaybackStart({
+    group: first.group, version: 1, sentenceId: 9, text: '迟到的旧句。',
+  });
+
+  assert.equal(store.get(first.group.id).state, 'abandoned', 'the old group is not revived by late output');
+  assert.equal(store.isCurrentAnswer(first.group, 1), false, 'the old version may never open a speaker');
+  const snapshot = store.snapshot(second.group.id);
+  assert.deepEqual(snapshot.segments.map((segment) => segment.text), ['切回屏幕模式']);
+  assert.equal(snapshot.pending, 0);
+  assert.equal(snapshot.played.length, 0, 'the old late playback never counts for the new group');
+  assert.equal(store.get(second.group.id).priorAnswer, null);
+  assert.deepEqual(store.get(second.group.id).pendingSentences, []);
+  const context = composeResponseGroupContext({ group: second.group, newInput: '切回屏幕模式' });
+  assert.ok(!context.includes('迟到'), 'the new group never sees the late result');
+  t.diagnostic(
+    `old=${first.group.id}/abandoned lateBody=kept new=${second.group.id} mixed=0 stolen=0`,
   );
 });
