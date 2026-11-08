@@ -32,6 +32,7 @@ import {
   DIALOGUE_IDLE_MS,
   DIALOGUE_REPEAT_WINDOW_MS,
   createDialogueCapture,
+  parseUtteranceId,
   startHearing,
 } from '../src/host/hearing/hearing.js';
 import { createDialogueContext } from '../src/host/session/conversation/dialogueContext.js';
@@ -197,9 +198,11 @@ test('1. 两段最终文本按采集顺序入缓冲；hearing.dialogue.appended 
   const appended = session.ofType('hearing.dialogue.appended');
   assert.equal(appended.length, 2, 'two finals, two appended rows');
   assert.deepEqual(appended.map((event) => event.payload), [
-    { chars: '第一段：门是开着的。'.length, at: 1_000, utteranceId: '1' },
-    { chars: '第二段：里面没有人。'.length, at: 2_000, utteranceId: '2' },
+    { chars: '第一段：门是开着的。'.length, at: 1_000, utteranceId: first.utteranceId },
+    { chars: '第二段：里面没有人。'.length, at: 2_000, utteranceId: second.utteranceId },
   ]);
+  assert.ok(appended.every((event) => parseUtteranceId(event.payload.utteranceId) !== null),
+    'the buffer is keyed by the scoped id');
 
   const view = session.hearing.dialogueSnapshot();
   assert.deepEqual(Object.keys(view).sort(), ['generation', 'needsSummary', 'pendingVersion', 'renderText']);
@@ -376,12 +379,17 @@ test('6. 投递内容与改动前一致：finals 文本、refined、utteranceId 
   const uncaptured = await run(() => null);
 
   assert.deepEqual(captured.map((update) => update.final), script, 'the captured text is exactly the delivered text');
+  // The instance prefix necessarily differs between two launches; the local seq must not.
   assert.deepEqual(
-    captured.map((update) => ({ final: update.final, refined: update.refined, utteranceId: update.utteranceId })),
-    uncaptured.map((update) => ({ final: update.final, refined: update.refined, utteranceId: update.utteranceId })),
+    captured.map((update) => ({
+      final: update.final, refined: update.refined, seq: parseUtteranceId(update.utteranceId).seq,
+    })),
+    uncaptured.map((update) => ({
+      final: update.final, refined: update.refined, seq: parseUtteranceId(update.utteranceId).seq,
+    })),
     'capturing never changes what is delivered',
   );
-  assert.deepEqual(captured.map((update) => update.utteranceId), [1, 2]);
+  assert.deepEqual(captured.map((update) => parseUtteranceId(update.utteranceId).seq), [1, 2]);
   assert.equal(captured[0].refined, true);
 });
 
@@ -478,7 +486,7 @@ test('9. 播放中的回授（宿主判定 drop）→ 不入缓冲、写 hearing
     const gated = session.ofType('hearing.dialogue.gated');
     assert.equal(gated.length, 1, 'the refusal is recorded once');
     assert.deepEqual(gated[0].payload, {
-      level: 'debug', reason: 'playback-echo', utteranceId: '1', source,
+      level: 'debug', reason: 'playback-echo', utteranceId: delivered.utteranceId, source,
     });
     session.hearing.stop();
   };
@@ -589,7 +597,7 @@ test('13. 宿主返回 inactive（组件关闭/停止丢弃）→ 同样不入�
   const gated = session.ofType('hearing.dialogue.gated');
   assert.equal(gated.length, 1, 'the refusal is recorded once');
   assert.deepEqual(gated[0].payload, {
-    level: 'debug', reason: 'inactive', utteranceId: '1', source: 'mic',
+    level: 'debug', reason: 'inactive', utteranceId: delivered.utteranceId, source: 'mic',
   });
   session.hearing.stop();
 });

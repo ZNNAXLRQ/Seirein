@@ -24,6 +24,7 @@ import {
   DEFAULT_GROUP_COMMIT_MS,
   DEFAULT_GROUP_RESUME_GRACE_MS,
   GROUP_RESUME_MIN_VOICE_MS,
+  parseUtteranceId,
   startHearing,
 } from '../src/host/hearing/hearing.js';
 
@@ -186,7 +187,7 @@ test('1. 单片段自然结束：300ms 后投递一次，只发一条 group.comm
   await until(() => session.finals().length === 1, 'the buffered delivery');
   const [final] = session.finals();
   assert.equal(final.final, '第一句', 'the delivery text is unchanged');
-  assert.equal(final.utteranceId, 1);
+  assert.equal(parseUtteranceId(final.utteranceId).seq, 1);
 
   const committed = session.ofType('hearing.group.committed');
   assert.equal(committed.length, 1, 'exactly one commit for one group');

@@ -74,7 +74,7 @@ const {
   nonverbalLaughterTag,
   voiceSessionTarget,
 } = await import('../src/host/index.js');
-const { startHearing } = await import(REAL_HEARING_URL);
+const { parseUtteranceId, startHearing } = await import(REAL_HEARING_URL);
 hooks.deregister();
 
 after(() => {
@@ -471,7 +471,7 @@ test('6. 回环来源不写成“用户笑了”', async (t) => {
   assert.equal(upload.source, 'loopback');
   assert.equal(upload.event, '<|Laughter|>');
   assert.equal(upload.eventClean, 'Laughter');
-  assert.ok(Number.isFinite(upload.utteranceId), 'the audio segment id travels with it');
+  assert.equal(parseUtteranceId(upload.utteranceId).seq, 1, 'the audio segment id travels with it');
 
   const micUpload = await runHearingClip({
     device: '麦克风 (Realtek(R) Audio)',

@@ -31,6 +31,7 @@ import test from 'node:test';
 import {
   echoGate,
   echoMatch,
+  parseUtteranceId,
   startHearing,
 } from '../src/host/hearing/hearing.js';
 
@@ -215,9 +216,10 @@ test('1) 播放中识别出与正在播放文本完全相同 → drop，事件 h
   assert.equal(stats.echoDropped, 1, 'the applied rule counts its decision');
   assert.equal(stats.hallucination, 0, 'an echo is not a hallucination');
   assert.equal(drops.length, 1);
-  assert.deepEqual(drops[0].payload, {
+  const { utteranceId, ...rest } = drops[0].payload;
+  assert.equal(parseUtteranceId(utteranceId).seq, 1);
+  assert.deepEqual(rest, {
     level: 'debug',
-    utteranceId: 1,
     matchedChars: 6,
     playingChars: 6,
     reason: 'playback-echo',
@@ -370,7 +372,9 @@ test('9) 放行场景的投递文本与顺序逐字不变', async () => {
     finalModelDir: '',
     device: 'fake-device',
     recognizer: fakeStreaming({ endpointAtSamples: clip.length / 2, text: '' }),
-    asrWorkerFactory: () => fakeWorker((message) => texts[message.utteranceId === 2 ? 1 : 0]),
+    asrWorkerFactory: () => fakeWorker(
+      (message) => texts[parseUtteranceId(message.utteranceId)?.seq === 2 ? 1 : 0],
+    ),
     spawnProcess: () => child,
     isVoicePlaying: () => state.playing,
     playingText: () => state.text,
@@ -389,7 +393,7 @@ test('9) 放行场景的投递文本与顺序逐字不变', async () => {
 
   const finals = finalsOf(updates);
   assert.deepEqual(finals.map((event) => event.final), [PLAYING, '帮我看看'], 'verbatim, in order');
-  assert.deepEqual(finals.map((event) => event.utteranceId), [1, 2]);
+  assert.deepEqual(finals.map((event) => parseUtteranceId(event.utteranceId).seq), [1, 2]);
   assert.equal(dropsOf(events).length, 0);
   assert.equal(hearing.stats().finals, 2);
   hearing.stop();

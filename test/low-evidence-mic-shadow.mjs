@@ -38,7 +38,7 @@ import {
   micShadowVerdict,
   truncateShadowText,
 } from '../src/host/hearing/audio-evidence.js';
-import { startHearing } from '../src/host/hearing/hearing.js';
+import { parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 
 const SAMPLE_RATE = 16000;
 /** One energy-VAD frame: exactly one 20 ms frame, so the measured ratio is the frame ratio. */
@@ -250,7 +250,7 @@ test('1) mic + vad=0 + 能量 0.31 + 「还有。」：写一条，字段齐全�
   assert.equal(row.rmsDb, -20, 'loud enough to be a real utterance (the real row was -22)');
   assert.equal(row.peakDb, -12, 'a real peak, not a click at the noise floor');
   assert.equal(row.durationMs, clipDurationMs(energyClip(item)), 'the whole clip');
-  assert.equal(row.utteranceId, 1);
+  assert.equal(parseUtteranceId(row.utteranceId).seq, 1);
   assert.equal(row.text, '还有。');
   assert.equal(row.textChars, 3);
   assert.equal(row.whitelisted, false, 'a sentence is not a protected short answer');
@@ -368,11 +368,11 @@ test('6) 不改变投递：同一组三句在 mic / 回环上顺序完全一致'
   assert.equal(loopback.stats.finals, 3);
 
   const rows = micRows(mic.events).map((event) => event.payload);
-  assert.deepEqual(rows.map((row) => row.utteranceId), [1, 2], 'one row per qualifying utterance');
+  assert.deepEqual(rows.map((row) => parseUtteranceId(row.utteranceId).seq), [1, 2], 'one row per qualifying utterance');
   assert.deepEqual(rows.map((row) => row.delivered), [true, true]);
   assert.equal(micRows(loopback.events).length, 0, 'the loopback run logs nothing new');
   // The third clip is the control: it was delivered and wrote no mic row.
-  assert.equal(micRows(mic.events).some((event) => event.payload.utteranceId === 3), false);
+  assert.equal(micRows(mic.events).some((event) => parseUtteranceId(event.payload.utteranceId).seq === 3), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -396,7 +396,7 @@ test('7) 既有 low-evidence 影子/门禁不变；同一 utteranceId 只一条 
   assert.equal(lowDropped(on.events).length, 1);
   const gated = onlyMicRow(on.events);
   assert.equal(gated.delivered, false, 'the shadow row follows the real verdict');
-  assert.equal(gated.utteranceId, 1);
+  assert.equal(parseUtteranceId(gated.utteranceId).seq, 1);
   // Observation only: the new row never withheld anything on its own (counters are the gate's).
   assert.equal(off.stats.lowEvidenceDropped, 0);
 

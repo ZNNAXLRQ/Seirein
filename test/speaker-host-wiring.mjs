@@ -149,6 +149,7 @@ after(() => { delete globalThis.__speakerHostTest; });
 
 const realHearingUrl = `${hearingUrl}?real-speaker-host`;
 let realStartHearing = null;
+let realParseUtteranceId = null;
 
 // ---------------------------------------------------------------------------
 // Host mount
@@ -510,7 +511,9 @@ test('6) 判定不参与投递：宿主侧文本与顺序不变；真实 hearing
   // Real hearing: one fake embedder matching an enrolled voice; the delivered text must be
   // byte-identical to the same clip with the shadow OFF, and `speaker.shadow` exists only in the ON run.
   if (realStartHearing === null) {
-    realStartHearing = (await import(realHearingUrl)).startHearing;
+    const realHearing = await import(realHearingUrl);
+    realStartHearing = realHearing.startHearing;
+    realParseUtteranceId = realHearing.parseUtteranceId;
   }
   const realRoot = await mkdtemp(join(tmpdir(), 'speaker-host-real-'));
   const library = createSpeakerLibrary({ root: realRoot });
@@ -528,12 +531,13 @@ test('6) 判定不参与投递：宿主侧文本与顺序不变；真实 hearing
   });
   const offRun = await clip(false);
   const onRun = await clip(true);
-  // Compare the delivered words/order and the per-utterance ids; `endpointAt` is a wall clock.
+  // Compare the delivered words/order and the per-utterance local seq; `endpointAt` is a wall clock
+  // and the instance prefix necessarily differs between two launches.
   const delivered = (result) => result.updates
     .filter((event) => typeof event.final === 'string')
-    .map((event) => ({ final: event.final, utteranceId: event.utteranceId }));
+    .map((event) => ({ final: event.final, seq: realParseUtteranceId(event.utteranceId).seq }));
   assert.deepEqual(delivered(onRun), delivered(offRun), 'the delivered text and order are byte-identical');
-  assert.deepEqual(delivered(onRun), [{ final: '好', utteranceId: 1 }], 'one unchanged final');
+  assert.deepEqual(delivered(onRun), [{ final: '好', seq: 1 }], 'one unchanged final');
   const shadows = onRun.events.filter((event) => event.type === 'speaker.shadow');
   assert.equal(shadows.length, 1);
   assert.equal(shadows[0].payload.decision, 'match');

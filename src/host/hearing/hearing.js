@@ -193,6 +193,34 @@ const shortHash = (value) => {
 };
 
 /**
+ * Split an utterance id into its capture scope and its local sequence.
+ *
+ * Current ids are `<instanceId>:<seq>` (for example `h3-141s:696`); the instance is
+ * everything before the last `:` and `seq` is a number. Legacy plain-number ids
+ * (`'696'`, and the numeric values older logs still carry) stay readable and report
+ * `instanceId: null` — a reader can tell old data from new instead of guessing.
+ *
+ * @returns {{instanceId: string|null, seq: number}|null} null for anything else.
+ */
+export function parseUtteranceId(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 ? { instanceId: null, seq: value } : null;
+  }
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (text === '') return null;
+  const separator = text.lastIndexOf(':');
+  const seqText = separator < 0 ? text : text.slice(separator + 1);
+  // Digits only: `1.5`, `1e3`, `-1` and an empty tail are not ids.
+  if (!/^\d+$/u.test(seqText)) return null;
+  const seq = Number(seqText);
+  if (!Number.isSafeInteger(seq)) return null;
+  if (separator < 0) return { instanceId: null, seq };
+  const instance = text.slice(0, separator);
+  return instance === '' ? null : { instanceId: instance, seq };
+}
+
+/**
  * Default silence point of the endpoint-continuation probe (shadow, observation only). At this
  * trailing silence the probe freezes a candidate; a resumption before the real endpoint becomes a
  * `hearing.endpoint.continuation` row. The host may override it per capture session.
@@ -210,7 +238,7 @@ export const CONTINUATION_PROBE_MS = 1200;
  *          onUpdate?: (event: {partial?: string, final?: string, refined?: boolean,
  *                              durationMs?: number, truncated?: boolean, joinFallback?: boolean,
  *                              offlineLimited?: boolean, note?: string, event?: string|null,
- *                              eventClean?: string|null, utteranceId?: number,
+ *                              eventClean?: string|null, utteranceId?: string,
  *                              source?: 'mic'|'loopback'|'unknown'}) =>
  *                               void|boolean|{accepted?: boolean, reason?: string},
  *          onEvent?: (type: string, payload: object) => void,
@@ -401,6 +429,12 @@ export function startHearing({
    * an old instance (or an in-flight fragment) is never read as the replacement's.
    */
   const instanceId = `h${(hearingInstanceSeq += 1)}-${shortHash(`${Date.now()}|${device}|${hearingInstanceSeq}`)}`;
+  /**
+   * Outward utterance identity: `<instanceId>:<local seq>`. The local `seq` stays the internal
+   * order/Map key (delivery slots, grouping) because two instances restart at 1; only this
+   * outward form is scoped, so a mic `696` and a loopback `696` can never be read as one.
+   */
+  const utteranceIdOf = (seq) => `${instanceId}:${seq}`;
 
   /**
    * Diagnosis clips are opt-in and off by default. One store per root is shared with the other
@@ -787,7 +821,7 @@ export function startHearing({
       }
       const embedding = embedder.embed(snapshot.speakerSamples);
       if (!(embedding instanceof Float32Array) || embedding.length === 0) {
-        emitSpeakerShadow({ decision: 'unsure', reason: 'no-embedding', utteranceId: snapshot.id });
+        emitSpeakerShadow({ decision: 'unsure', reason: 'no-embedding', utteranceId: snapshot.utteranceId });
         return;
       }
       const startedAt = Date.now();
@@ -798,7 +832,7 @@ export function startHearing({
         score: result.score,
         speakerId: result.speakerId,
         ms,
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
       });
     } catch (error) {
       noteSpeakerDebug('shadow-failed', error);
@@ -1031,7 +1065,7 @@ export function startHearing({
       if (echoCandidates.length > 64) echoCandidates.shift();
       onEvent?.('hearing.echo.candidate', {
         level: 'debug',
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         matched: verdict.match.matched,
         delivered: true,
         reason: verdict.reason,
@@ -1126,7 +1160,7 @@ export function startHearing({
       });
       onEvent?.('hearing.noise.shadow', {
         level: 'debug',
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         // Which capture instance judged this clip, and the floor it actually compared against.
         instanceId,
         effectiveMinRmsDb: Number.isFinite(snapshot.effectiveMinRmsDb) ? snapshot.effectiveMinRmsDb : null,
@@ -1201,7 +1235,7 @@ export function startHearing({
       if (lowEvidenceRows.length > 64) lowEvidenceRows.shift();
       onEvent?.('hearing.low-evidence.shadow', {
         level: 'debug',
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         reason: verdict.reason,
         vadRatio: snapshot.vadSpeechRatio ?? null,
         textChars: [...outcome.text].length,
@@ -1246,7 +1280,7 @@ export function startHearing({
       });
       if (verdict.shadow !== true) return;
       const admission = micShadowLog.admit({
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         at: Date.now(),
         textKey: shadowTextKey(outcome.text),
       });
@@ -1260,7 +1294,7 @@ export function startHearing({
       }
       onEvent?.('hearing.low-evidence.mic-shadow', {
         level: 'debug',
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         durationMs: snapshot.durationMs,
         rmsDb: snapshot.rmsDb,
         peakDb: snapshot.peakDb,
@@ -1300,7 +1334,7 @@ export function startHearing({
         const target = entry?.snapshot ?? entry;
         if (target.retentionSamples === null || target.retentionSamples === undefined) continue;
         void retention.retain({
-          utteranceId: target.id,
+          utteranceId: target.utteranceId ?? utteranceIdOf(target.id),
           samples: target.retentionSamples,
           reason: clip.reason,
           suspects: clip.suspects,
@@ -1379,7 +1413,7 @@ export function startHearing({
       if (vadRows.length > 64) vadRows.shift();
       onEvent?.('hearing.vad.shadow', {
         level: 'debug',
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         device,
         // Which capture this window came from. The two lanes run the same shadow, so without
         // `source` a silent mic row and a silent loopback row would be indistinguishable.
@@ -1588,7 +1622,7 @@ export function startHearing({
         } else if (probeCandidateMs > 0 && !probeContinued) {
           if (probeResumeRunMs === 0) probeResumeSilenceMs = probeSilenceMs;
           probeResumeRunMs += frameMs;
-          if (probeResumeRunMs >= ENDPOINT_PROBE_VOICE_MS) markProbeContinuation(utteranceSeq + 1);
+          if (probeResumeRunMs >= ENDPOINT_PROBE_VOICE_MS) markProbeContinuation(utteranceIdOf(utteranceSeq + 1));
         }
         probeSilenceMs = 0;
       } else if (probeSeenSpeech) {
@@ -1782,7 +1816,7 @@ export function startHearing({
       try {
         onEvent?.('hearing.echo.dropped', {
           level: 'debug',
-          utteranceId: snapshot.id,
+          utteranceId: snapshot.utteranceId,
           matchedChars: echo.match.matchedChars,
           playingChars: echo.match.playingChars,
           reason: echo.reason,
@@ -1801,7 +1835,7 @@ export function startHearing({
       try {
         onEvent?.('hearing.low-evidence.dropped', {
           level: 'debug',
-          utteranceId: snapshot.id,
+          utteranceId: snapshot.utteranceId,
           reason: lowEvidence.reason,
           vadRatio: snapshot.vadSpeechRatio ?? null,
           textChars: [...outcome.text].length,
@@ -1837,7 +1871,7 @@ export function startHearing({
         // use a `Laughter` tag as a timed nonverbal cue; none of it changes the delivered text.
         event: outcome.event ?? null,
         eventClean: outcome.eventClean ?? null,
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         source: inputSource,
       };
       // The join detail describes the joined text, so it only applies when that text is delivered.
@@ -1858,6 +1892,9 @@ export function startHearing({
       }
       observe('hearing.delivery', {
         id: snapshot.id,
+        // Public identity next to the numeric delivery slot: the slot restarts per instance, this
+        // id never does.
+        utteranceId: snapshot.utteranceId,
         text: outcome.text,
         durationMs: snapshot.durationMs,
         rmsDb: snapshot.rmsDb,
@@ -1877,13 +1914,13 @@ export function startHearing({
         dialogue.push({
           text: update.final,
           at: snapshot.endpointAt,
-          utteranceId: String(snapshot.id),
+          utteranceId: snapshot.utteranceId,
           source: dialogue.source,
         });
       } else {
         observe('hearing.dialogue.gated', {
           reason: hostVerdict.reason,
-          utteranceId: String(snapshot.id),
+          utteranceId: snapshot.utteranceId,
           source: dialogue.source,
         });
       }
@@ -2390,7 +2427,7 @@ export function startHearing({
       // Continuation signal #2, streaming: new words after the endpoint (not the offline final).
       if (clean.length > 0) {
         noteGroupContinuation();
-        if (endpointProbeOn && hadPartial) noteEndpointProbePartial(utteranceSeq + 1);
+        if (endpointProbeOn && hadPartial) noteEndpointProbePartial(utteranceIdOf(utteranceSeq + 1));
       }
     }
 
@@ -2442,6 +2479,8 @@ export function startHearing({
       utteranceSeq += 1;
       const snapshot = {
         id: utteranceSeq,
+        /** Outward identity `<instanceId>:<seq>`; every judgment row and delivery carries it. */
+        utteranceId: utteranceIdOf(utteranceSeq),
         /** Stable id of this ASR fragment, carried by the group and endpoint observations. */
         segmentId: `seg-${utteranceSeq}`,
         endpointAt,
@@ -2492,7 +2531,7 @@ export function startHearing({
       // just keeps collecting. `segment` is null only for a noise-only fragment with no open group.
       const segment = beginGroupSegment(snapshot);
       observe('hearing.endpoint.detail', {
-        utteranceId: snapshot.id,
+        utteranceId: snapshot.utteranceId,
         endpointReason: snapshot.endReason,
         audioMs: snapshot.durationMs,
         // The VAD shadow is the one measured trailing silence. Without it the value is null — the
@@ -2506,7 +2545,7 @@ export function startHearing({
       });
       // The endpoint closed this utterance: a frozen probe candidate that never resumed is a
       // no-continuation row; either way the probe state restarts for the next utterance.
-      settleEndpointProbe(snapshot.id, snapshot.endReason);
+      settleEndpointProbe(snapshot.utteranceId, snapshot.endReason);
 
       // A short but audible clip still gets the accurate pass: SenseVoice is exactly what recovers
       // a 300 ms "好" the streaming transducer may render loosely. Duration no longer gates it.
@@ -2557,7 +2596,7 @@ export function startHearing({
           // its tail instead of being cut at the first cap, a short one is still a single decode,
           // and no word is ever split at a cut point.
           pass = syncPass(decodeSegmented(
-            finalRecognizer, merged, SEGMENT_SAMPLES, SEGMENT_OVERLAP_SAMPLES, 16000, { utteranceId: snapshot.id },
+            finalRecognizer, merged, SEGMENT_SAMPLES, SEGMENT_OVERLAP_SAMPLES, 16000, { utteranceId: snapshot.utteranceId },
           ));
         } catch (error) {
           lastError = `final pass failed: ${error?.message ?? error}`;
@@ -2577,7 +2616,7 @@ export function startHearing({
             sampleRate: 16000,
             language: asrWorkerLanguage,
             // Stamped on the request so the thread's per-piece ids and the shadow row agree.
-            utteranceId: snapshot.id,
+            utteranceId: snapshot.utteranceId,
           });
         } catch (error) {
           // Stopped: the session already closed the queue. A request abandoned for any other
@@ -2602,7 +2641,7 @@ export function startHearing({
             if (fallback !== null) {
               try {
                 pass = syncPass(decodeSegmented(
-                  fallback, merged, SEGMENT_SAMPLES, SEGMENT_OVERLAP_SAMPLES, 16000, { utteranceId: snapshot.id },
+                  fallback, merged, SEGMENT_SAMPLES, SEGMENT_OVERLAP_SAMPLES, 16000, { utteranceId: snapshot.utteranceId },
                 ));
               } catch (decodeError) {
                 lastError = `final pass failed: ${decodeError?.message ?? decodeError}`;

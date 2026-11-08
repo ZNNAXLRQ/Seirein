@@ -24,7 +24,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import { lowEvidenceVerdict, startHearing } from '../src/host/hearing/hearing.js';
+import { lowEvidenceVerdict, parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 
 const SAMPLE_RATE = 16000;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -360,7 +360,8 @@ test('7) 事件字段齐全、无 undefined；30 秒内重复只写一条 + supp
     'delivered', 'level', 'reason', 'textChars', 'utteranceId', 'vadRatio',
   ]);
   assert.equal(rows[0].level, 'debug');
-  assert.equal(rows[0].utteranceId, 1);
+  assert.equal(parseUtteranceId(rows[0].utteranceId).seq, 1);
+  assert.equal(parseUtteranceId(rows[0].utteranceId).instanceId, hearing.instanceId);
   assert.equal(rows[0].vadRatio, 0);
   assert.equal(rows[0].textChars, 4);
   assert.equal(rows[0].delivered, true);

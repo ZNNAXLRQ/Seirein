@@ -36,7 +36,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { startHearing } from '../src/host/hearing/hearing.js';
+import { parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 import { createSileroVad, createVadShadow, VAD_WINDOW_SIZE } from '../src/host/hearing/vad.js';
 
 const SAMPLE_RATE = 16000;
@@ -293,7 +293,7 @@ test('1) 假 VAD：影子字段齐全，投递的 finals 与文本完全不变',
 
   const [shadow] = vadShadows(events).map((event) => event.payload);
   assert.ok(shadow, 'exactly one VAD shadow row per utterance');
-  assert.equal(shadow.utteranceId, 1);
+  assert.equal(parseUtteranceId(shadow.utteranceId).seq, 1);
   assert.equal(shadow.device, 'fake-device');
   assert.equal(shadow.durationMs, 600);
   assert.equal(shadow.speechMs, 400, '100–500 ms is the detected speech span');

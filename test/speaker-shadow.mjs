@@ -25,7 +25,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { startHearing } from '../src/host/hearing/hearing.js';
+import { parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 import { createSpeakerLibrary } from '../src/host/hearing/speakerVoice.js';
 
 const run = promisify(execFile);
@@ -269,7 +269,7 @@ test('3) 开启 + 已注册声纹 + 假 embedder：match 含 score/speakerId，�
   assert.equal(shadow.decision, 'match');
   assert.equal(shadow.score, 1, 'the enrolled direction scores 1.0');
   assert.equal(shadow.speakerId, 'alice');
-  assert.equal(shadow.utteranceId, 1);
+  assert.equal(parseUtteranceId(shadow.utteranceId).seq, 1);
   assert.ok(Number.isFinite(shadow.ms) && shadow.ms >= 0, 'the row carries a measured ms');
 
   assert.equal(embedder.built, 1, 'the lazy embedder is built once');

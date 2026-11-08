@@ -36,6 +36,7 @@ import {
   noiseSuspects,
   onFixedCutGrid,
   onlineOfflineAgree,
+  parseUtteranceId,
   shadowTextKey,
   startHearing,
   voicedMetrics,
@@ -207,10 +208,11 @@ test('1) 正常短答「好」：影子行存在、suspect 为空、投递照常
   assert.ok(shadow, 'exactly one shadow row per final judgment');
   assert.deepEqual(shadow.suspect, [], 'a plain short answer raises no suspect');
 
-  // Identity chain: utterance → decode task → per-piece ids → delivery slot.
-  assert.equal(shadow.utteranceId, 1);
+  // Identity chain: utterance → decode task → per-piece ids → delivery slot. The outward id is
+  // scoped to the capture instance; the decode piece id is built from that same scoped id.
+  assert.equal(parseUtteranceId(shadow.utteranceId).seq, 1);
   assert.equal(shadow.decodeTaskId, 1);
-  assert.deepEqual(shadow.segmentIds, ['1:s0']);
+  assert.deepEqual(shadow.segmentIds, [`${shadow.utteranceId}:s0`]);
   assert.equal(shadow.deliveryId, 1);
 
   // Measured evidence, never a guess.

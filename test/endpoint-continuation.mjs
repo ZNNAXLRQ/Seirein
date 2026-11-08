@@ -19,7 +19,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import { CONTINUATION_PROBE_MS, startHearing } from '../src/host/hearing/hearing.js';
+import { CONTINUATION_PROBE_MS, parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 
 const SAMPLE_RATE = 16000;
 const FRAME_SAMPLES = 320; // 20 ms, the probe's measurement frame
@@ -181,7 +181,7 @@ test('1) 静音 1.3s 后续说：一条 continuation，silenceMs≈1200–1300�
     assert.equal(rows.length, 1, 'one continuation row for the resumed utterance');
     assert.equal(noContinuations(events).length, 0, 'a resumed utterance is not a no-continuation');
     const [row] = rows.map((event) => event.payload);
-    assert.equal(row.utteranceId, 1);
+    assert.equal(parseUtteranceId(row.utteranceId).seq, 1);
     assert.equal(row.source, 'mic');
     assert.equal(row.probeMs, CONTINUATION_PROBE_MS, 'the default probe point is reported');
     assert.equal(CONTINUATION_PROBE_MS, 1200, 'the shipped probe default is 1.2 s');
@@ -201,7 +201,7 @@ test('2) 静音到 1.8s 端点：一条 no-continuation，没有 continuation', 
     assert.equal(rows.length, 1, 'the endpoint without a resume is recorded');
     assert.equal(continuations(events).length, 0);
     const [row] = rows.map((event) => event.payload);
-    assert.equal(row.utteranceId, 1);
+    assert.equal(parseUtteranceId(row.utteranceId).seq, 1);
     assert.equal(row.source, 'mic');
     assert.equal(row.silenceMs, 1200, 'silence at the 1200 ms probe point');
     assert.equal(row.level, 'debug');
@@ -262,7 +262,7 @@ test('5) 10s 节流：两次续说只留一条 continuation', async () => {
   try {
     const rows = continuations(events);
     assert.equal(rows.length, 1, 'two continuations inside the 10 s window write one row');
-    assert.equal(rows[0].payload.utteranceId, 1, 'the first occurrence is the one kept');
+    assert.equal(parseUtteranceId(rows[0].payload.utteranceId).seq, 1, 'the first occurrence is the one kept');
     assert.equal(noContinuations(events).length, 0);
     assert.deepEqual(finals().map((event) => event.final), ['一', '二'], 'both utterances still deliver');
   } finally {

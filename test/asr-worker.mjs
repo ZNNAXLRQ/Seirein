@@ -28,6 +28,7 @@ import {
   DEFAULT_ASR_QUEUE_BYTES,
   DEFAULT_ASR_QUEUE_LIMIT,
   MAX_ASR_DECODE_TIMEOUT_MS,
+  parseUtteranceId,
   startHearing,
 } from '../src/host/hearing/hearing.js';
 
@@ -884,7 +885,9 @@ test('p) 默认配置下 10 ms 间隔两段合并为一次投递，证明分组�
       onDecode: (self, message) => {
         setTimeout(() => {
           self.emit('message', {
-            type: 'result', id: message.id, text: `段${message.utteranceId}`, joinFallback: false,
+            type: 'result', id: message.id,
+            text: `段${parseUtteranceId(message.utteranceId)?.seq ?? message.utteranceId}`,
+            joinFallback: false,
           });
         }, 5);
       },

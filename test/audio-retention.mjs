@@ -45,7 +45,7 @@ import {
   retentionVerdictOf,
 } from '../src/host/hearing/audio-retention.js';
 import { createHearingSettingsActions } from '../src/host/hearing/settings-actions.js';
-import { startHearing } from '../src/host/hearing/hearing.js';
+import { parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
 import { cleanupRoot } from './helpers/cleanup.mjs';
 
 const SAMPLE_RATE = RETENTION_SAMPLE_RATE;
@@ -263,7 +263,7 @@ test('2) 开启后：可疑片段写入 1 个 WAV + 1 条完整索引 + retained
   const [item] = listed.items;
   assert.equal(item.reason, 'noise', 'forced-segment + short-latin is the "noise" hypothesis');
   assert.deepEqual(item.suspects, ['short-latin']);
-  assert.equal(item.utteranceId, 1);
+  assert.equal(parseUtteranceId(item.utteranceId).seq, 1);
   assert.equal(item.durationMs, 600);
   assert.ok(item.bytes > 44, 'header + PCM');
   assert.ok(Number.isFinite(item.rmsDb) && item.rmsDb < 0, 'rms is measured, not guessed');
@@ -299,7 +299,7 @@ test('2) 开启后：可疑片段写入 1 个 WAV + 1 条完整索引 + retained
   const retained = ofType(events, 'hearing.audio.retained');
   assert.equal(retained.length, 1);
   assert.deepEqual(retained[0].payload, {
-    utteranceId: 1,
+    utteranceId: item.utteranceId,
     bytes: item.bytes,
     reason: 'noise',
   });
