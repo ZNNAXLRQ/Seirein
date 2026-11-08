@@ -1923,6 +1923,196 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * 「动作预设」区块：家族分组 + 搜索/过滤 + 动作/家族级启停与优先级，放在现有「形象」卡片内。
+     * 纯展示：所有写入都交给 handlers（Panel 里统一 act 到 motion.presets.*）。
+     * 预览按钮在控制器接线前保持禁用并标注「待接线」，不会私自播放动作。
+     */
+    function motionPresetSection(h, { data, query, filters, drafts, busy }, handlers) {
+      if (data === null || data === undefined) {
+        return h('div', { style: { marginTop: 10 } },
+          h('div', { style: styles.label }, '动作预设'),
+          h('div', { style: styles.hint }, '正在读取动作预设…'),
+        );
+      }
+      const items = Array.isArray(data.items) ? data.items : [];
+      const families = Array.isArray(data.families) ? data.families : [];
+      const overrides = data.overrides ?? {};
+      const disabled = new Set(Array.isArray(overrides.disabled) ? overrides.disabled : []);
+      const disabledFamilies = new Set(Array.isArray(overrides.disabledFamilies) ? overrides.disabledFamilies : []);
+      const actionPriority = overrides.actionPriority ?? {};
+      const familyPriority = overrides.familyPriority ?? {};
+      const defaultPriority = Number.isFinite(data.defaultPriority) ? data.defaultPriority : 50;
+      const state = filters ?? {};
+      const q = String(query ?? '').trim().toLowerCase();
+      const matches = (item) => {
+        if (String(state.family ?? '') !== '' && item.family !== state.family) return false;
+        if (String(state.style ?? '') !== '' && !(item.styles ?? []).includes(state.style)) return false;
+        if (state.availability === 'available' && item.available !== true) return false;
+        if (state.availability === 'unavailable' && item.available !== false) return false;
+        if (q.length === 0) return true;
+        return [
+          item.name, item.description, item.family, item.familyLabel, item.recipe, item.variant,
+          ...(item.states ?? []), ...(item.stateLabels ?? []),
+          ...(item.events ?? []), ...(item.eventLabels ?? []),
+          ...(item.styles ?? []), ...(item.styleLabels ?? []),
+        ].map(value => String(value ?? '')).join(' ').toLowerCase().includes(q);
+      };
+      const visible = items.filter(matches);
+      const styleOptions = [...new Map(items.flatMap((item) => (item.styles ?? [])
+        .map((id, index) => [id, (item.styleLabels ?? [])[index] ?? id]))).entries()];
+      const familyOrder = [...new Set([...families.map(family => family.family), ...items.map(item => item.family)])];
+      const groups = familyOrder.map((family) => ({
+        family,
+        label: families.find(entry => entry.family === family)?.label
+          ?? items.find(item => item.family === family)?.familyLabel ?? family,
+        meta: families.find(entry => entry.family === family) ?? null,
+        members: visible.filter(item => item.family === family),
+      })).filter(group => group.members.length > 0);
+
+      const priorityInput = (key, value, body) => h('input', {
+        style: { ...styles.input, width: 72 },
+        type: 'number', min: 0, max: 100, step: 1,
+        title: '0–100，默认 50；只影响概率，不绕过硬约束，100 也不保证选中',
+        value: drafts?.[key] ?? String(value),
+        disabled: busy !== '',
+        onChange: (event) => handlers.setDraft(key, event.target.value),
+        onBlur: async (event) => {
+          const raw = event.target.value;
+          handlers.setDraft(key, null);
+          const number = Number(raw);
+          if (!Number.isFinite(number) || number === value) return;
+          await handlers.override({ ...body, priority: number });
+        },
+        onKeyDown: (event) => { if (event.key === 'Enter' && event.target?.blur) event.target.blur(); },
+      });
+
+      const actionRow = (item) => {
+        const enabled = !disabled.has(item.presetId);
+        const priority = actionPriority[item.presetId] ?? familyPriority[item.family] ?? defaultPriority;
+        return h('div', {
+          key: item.presetId,
+          'data-preset-id': item.presetId,
+          'data-family': item.family,
+          'data-styles': (item.styles ?? []).join(','),
+          'data-available': item.available ? '1' : '0',
+          style: { padding: '6px 0', borderTop: `1px dashed ${BORDER}` },
+        },
+          h('div', { style: styles.row },
+            h('span', { style: styles.label }, item.name),
+            h('span', {
+              style: { ...styles.badge, ...(item.available ? {} : { borderColor: DANGER, color: DANGER }) },
+            }, item.available ? '可用' : '不可用'),
+          ),
+          h('div', { style: styles.hint }, item.description),
+          h('div', { style: styles.hint },
+            `状态：${(item.stateLabels ?? item.states ?? []).join(' / ')} · `
+            + `事件：${(item.eventLabels ?? item.events ?? []).join(' / ')} · `
+            + `风格：${(item.styleLabels ?? item.styles ?? []).join(' / ')}`),
+          item.available ? null : h('div', { style: { ...styles.hint, color: DANGER } }, `不可用原因：${item.reason}`),
+          h('div', { style: styles.row },
+            h('button', {
+              style: styles.btn,
+              disabled: busy !== '',
+              onClick: () => { void handlers.override({ kind: 'action', id: item.presetId, enabled: !enabled }); },
+            }, enabled ? '禁用' : '启用'),
+            priorityInput(`action:${item.presetId}`, priority, { kind: 'action', id: item.presetId }),
+            h('button', {
+              style: styles.btn,
+              disabled: busy !== '',
+              onClick: () => { void handlers.reset({ kind: 'action', id: item.presetId }); },
+            }, '恢复默认'),
+            h('button', {
+              style: { ...styles.btn, ...styles.off },
+              disabled: true,
+              title: '待接线：预览将走正常控制器与安全限制',
+            }, '预览（待接线）'),
+          ),
+        );
+      };
+
+      const familyBlock = (group) => {
+        const familyEnabled = !disabledFamilies.has(group.family);
+        const priority = familyPriority[group.family] ?? group.meta?.priority ?? defaultPriority;
+        return h('div', {
+          key: group.family,
+          'data-family': group.family,
+          style: { marginTop: 12 },
+        },
+          h('div', { style: styles.row },
+            h('span', { style: { ...styles.label, fontWeight: 600 } }, `${group.label}（${group.members.length}）`),
+            h('span', {
+              style: { ...styles.badge, ...(familyEnabled ? {} : { borderColor: DANGER, color: DANGER }) },
+            }, familyEnabled ? '家族启用' : '家族禁用'),
+          ),
+          h('div', { style: styles.row },
+            h('button', {
+              style: styles.btn,
+              disabled: busy !== '',
+              onClick: () => { void handlers.override({ kind: 'family', id: group.family, enabled: !familyEnabled }); },
+            }, familyEnabled ? '禁用家族' : '启用家族'),
+            priorityInput(`family:${group.family}`, priority, { kind: 'family', id: group.family }),
+            h('button', {
+              style: styles.btn,
+              disabled: busy !== '',
+              onClick: () => { void handlers.reset({ kind: 'family', id: group.family }); },
+            }, '恢复该家族默认'),
+          ),
+          group.members.map(actionRow),
+        );
+      };
+
+      const filterSelect = (title, value, options, onChange) => h('select', {
+        style: { ...styles.input, width: 'auto' },
+        title,
+        value,
+        disabled: busy !== '',
+        onChange: (event) => onChange(event.target.value),
+      }, options.map(option => h('option', { key: option.value, value: option.value }, option.label)));
+
+      return h('div', { style: { marginTop: 10 } },
+        h('div', { style: styles.row },
+          h('span', { style: styles.label }, `动作预设（${visible.length} / ${items.length}）`),
+          h('button', { style: styles.btn, disabled: busy !== '', onClick: handlers.refresh }, '刷新'),
+        ),
+        h('div', { style: styles.hint }, '影响概率，不绕过硬约束：优先级 100 也不保证选中。内置动作的“删除”= 本地隐藏/禁用，可恢复。'),
+        h('div', { style: styles.field },
+          h('input', {
+            style: styles.input,
+            type: 'search',
+            placeholder: '搜索名称 / 家族 / 风格 / 状态 / 事件',
+            value: query ?? '',
+            disabled: busy !== '',
+            onChange: (event) => handlers.setQuery(event.target.value),
+          }),
+        ),
+        h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+          filterSelect('按家族过滤', state.family ?? '', [
+            { value: '', label: '全部家族' },
+            ...families.map(family => ({ value: family.family, label: family.label ?? family.family })),
+          ], (value) => handlers.setFilter('family', value)),
+          filterSelect('按风格过滤', state.style ?? '', [
+            { value: '', label: '全部风格' },
+            ...styleOptions.map(([id, label]) => ({ value: id, label })),
+          ], (value) => handlers.setFilter('style', value)),
+          filterSelect('按可用性过滤', state.availability ?? '', [
+            { value: '', label: '全部可用性' },
+            { value: 'available', label: '仅可用' },
+            { value: 'unavailable', label: '仅不可用' },
+          ], (value) => handlers.setFilter('availability', value)),
+          h('button', {
+            style: { ...styles.btnDanger, ...(busy !== '' ? styles.off : {}) },
+            disabled: busy !== '',
+            onClick: () => { void handlers.reset({ all: true }); },
+          }, '全部恢复默认'),
+        ),
+        data.error ? h('div', { style: { ...styles.hint, color: DANGER } }, `读取失败：${data.error}`) : null,
+        h('div', { style: { maxHeight: 520, overflowY: 'auto', marginTop: 4 } },
+          groups.length > 0 ? groups.map(familyBlock) : h('div', { style: styles.hint }, '没有匹配的动作'),
+        ),
+      );
+    }
+
     function Panel() {
       const [status, setStatus] = useState(null);
       const [error, setError] = useState('');
@@ -1973,6 +2163,11 @@ window.__ModuleLoader__.load({
       const [ttsDraft, setTtsDraft] = useState(null);
       // Last 「应用模型」 result of this visit; carries the per-model timings the status omits.
       const [ttsApply, setTtsApply] = useState(null);
+      // 动作预设：列表（含覆盖值与可用性）、搜索/过滤、优先级草稿（key = action:id / family:id）。
+      const [motionPresets, setMotionPresets] = useState(null);
+      const [motionQuery, setMotionQuery] = useState('');
+      const [motionFilters, setMotionFilters] = useState({ family: '', style: '', availability: '' });
+      const [motionDrafts, setMotionDrafts] = useState({});
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
       const [expandedAmbient, setExpandedAmbient] = useState(false);
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
@@ -2028,6 +2223,49 @@ window.__ModuleLoader__.load({
         },
         [load, show],
       );
+
+      // 动作预设列表：只在打开设置页时读一次，覆盖/恢复后再读一次（保持按钮与覆盖值一致）。
+      const loadMotionPresets = useCallback(async () => {
+        try {
+          const response = await fetch('/assistant/action', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+            body: JSON.stringify({ action: 'motion.presets.list' }),
+          });
+          const result = await response.json();
+          if (result?.ok === true) {
+            setMotionPresets({
+              items: Array.isArray(result.items) ? result.items : [],
+              families: Array.isArray(result.families) ? result.families : [],
+              overrides: result.overrides ?? null,
+              defaultPriority: result.defaultPriority ?? 50,
+              error: '',
+            });
+          } else {
+            setMotionPresets({
+              items: [], families: [], overrides: null, defaultPriority: 50,
+              error: String(result?.error ?? '读取失败'),
+            });
+          }
+        } catch (cause) {
+          setMotionPresets({
+            items: [], families: [], overrides: null, defaultPriority: 50,
+            error: cause && cause.message ? cause.message : String(cause),
+          });
+        }
+      }, []);
+
+      const overrideMotionPreset = useCallback(async (body) => {
+        const result = await act({ action: 'motion.presets.override', ...body }, 'motion-presets');
+        if (result?.ok === true) await loadMotionPresets();
+        return result;
+      }, [act, loadMotionPresets]);
+
+      const resetMotionPresets = useCallback(async (body) => {
+        const result = await act({ action: 'motion.presets.reset', ...body }, 'motion-presets');
+        if (result?.ok === true) await loadMotionPresets();
+        return result;
+      }, [act, loadMotionPresets]);
 
       // ---- P-116 问卷弹窗 handlers -----------------------------------------------------------
       // Every async step captures an epoch: closing the dialog (or a newer open) invalidates the
@@ -2193,6 +2431,11 @@ window.__ModuleLoader__.load({
           clearInterval(timer);
         };
       }, [load]);
+
+      // 动作预设不随 3 秒状态轮询：只在挂载时读一次，之后由刷新/覆盖/恢复触发。
+      useEffect(() => {
+        void loadMotionPresets();
+      }, [loadMotionPresets]);
 
       // A queued round is finished by the host later: the 3 s status poll is what releases the
       // silent button, so the card can never stay on 「已排队…」 after the queue drained.
@@ -3708,6 +3951,25 @@ window.__ModuleLoader__.load({
                 stopWpf: () => act({ action: 'transparent.stop' }, 'transparent'),
               });
             })(),
+            motionPresetSection(h, {
+              data: motionPresets,
+              query: motionQuery,
+              filters: motionFilters,
+              drafts: motionDrafts,
+              busy,
+            }, {
+              setQuery: setMotionQuery,
+              setFilter: (key, value) => setMotionFilters((current) => ({ ...current, [key]: value })),
+              setDraft: (key, value) => setMotionDrafts((current) => {
+                const next = { ...current };
+                if (value === null) delete next[key];
+                else next[key] = value;
+                return next;
+              }),
+              override: overrideMotionPreset,
+              reset: resetMotionPresets,
+              refresh: () => { void loadMotionPresets(); },
+            }),
           );
         })(),
 

@@ -458,7 +458,7 @@ import {
   createRuntimeSettingsActions,
 } from './runtime/settings/system-actions.js';
 import { ACTIONS as sessionActions, createSessionSettingsActions } from './session/settings-actions.js';
-import { ACTIONS as avatarActions, createAvatarSettingsActions } from './avatar/settings-actions.js';
+import { ACTIONS as avatarActions, createAvatarSettingsActions, createMotionPresetOverridesStore } from './avatar/settings-actions.js';
 import { ACTIONS as subtitleActions, createSubtitleSettingsActions } from './subtitle/settings-actions.js';
 import { ACTIONS as visionActions, createVisionSettingsActions } from './vision/settings-actions.js';
 import { ACTIONS as profileActions, createProfileSettingsActions } from './profile/settings-actions.js';
@@ -1179,6 +1179,12 @@ export function apply(ctx, config) {
     mkdirSync(join(root, 'data'), { recursive: true });
     writeFileSync(settingsFile, `${JSON.stringify({ ...readSettings(), ...patch }, null, 2)}\n`, 'utf8');
   };
+  // User overrides for the motion preset library: data/, not the source tree, so an upgrade
+  // never drops them. The file is read lazily on every list/override/reset.
+  const motionPresetStore = createMotionPresetOverridesStore({
+    file: join(root, 'data', 'motion-presets.json'),
+    log,
+  });
   /**
    * A5: the one `voice.speechMaxChars` value every speaking lane reads. The runtime setting wins;
    * the plugin config is the fallback; `undefined` keeps `resolveSpeechBudget`'s 1200 default
@@ -13348,6 +13354,8 @@ export function apply(ctx, config) {
   }) },
 { actions: avatarActions, handle: createAvatarSettingsActions({
     get avatarLayerController() { return avatarLayerController; },
+    get avatarCapabilitiesStatus() { return avatarCapabilitiesStatus; },
+    get avatarMotionLockReasons() { return [...avatarMotionLocks]; },
     get discoverAvatarCapabilities() { return discoverAvatarCapabilities; },
     get ensureAvatarLayer() { return ensureAvatarLayer; },
     get ensureComponent() { return ensureComponent; },
@@ -13357,6 +13365,7 @@ export function apply(ctx, config) {
     get layerSwitch() { return layerSwitch; },
     get leaveSpoutEditForStop() { return leaveSpoutEditForStop; },
     get log() { return log; },
+    get motionPresetStore() { return motionPresetStore; },
     get observeAvatarGeometry() { return observeAvatarGeometry; },
     get publishEditGeometry() { return publishEditGeometry; },
     get runtime() { return runtime; },
@@ -13365,6 +13374,7 @@ export function apply(ctx, config) {
     get stopTransparentLayer() { return stopTransparentLayer; },
     get subtitleGeometry() { return subtitleGeometry; },
     get transparentChild() { return transparentChild; },
+    get vision() { return vision; },
     get vts() { return vts; },
     get vtsClient() { return vtsClient; },
     get vtsConnect() { return vtsConnect; },
