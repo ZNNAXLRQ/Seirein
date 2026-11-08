@@ -106,6 +106,7 @@ import {
   shadowTextKey,
   voicedMetrics,
   wouldDropVerdict,
+  echoGate,
   noiseSuspects,
   onlineOfflineAgree,
   ASR_OBSERVE_WINDOW_MS,
@@ -137,6 +138,11 @@ export {
   PROTECTED_SHORT_ANSWERS,
   isProtectedShortAnswer,
   wouldDropVerdict,
+  echoTextKey,
+  echoMatch,
+  echoGate,
+  ECHO_MIN_CHARS,
+  ECHO_MIN_COVERAGE,
   noiseSuspects,
   onlineOfflineAgree,
   ASR_OBSERVE_WINDOW_MS,
@@ -182,7 +188,8 @@ export const CONTINUATION_PROBE_MS = 1200;
  *          asrWorkerLanguage?: string,
  *          asrDecodeTimeoutMs?: number, asrDecodeTimeoutMaxMs?: number,
  *          asrQueueLimit?: number, asrQueueBytesLimit?: number,
- *          isVoicePlaying?: () => boolean,
+ *          isVoicePlaying?: () => boolean, playingText?: () => string,
+ *          echoFilter?: boolean,
  *          dialogueContext?: object|null, dialogueFactory?: () => object|null, now?: Function}} options
  */
 export function startHearing({
@@ -249,6 +256,21 @@ export function startHearing({
    * `playing` are both `false`, never a guess.
    */
   isVoicePlaying = null,
+  /**
+   * The text that is sounding right now, read at the moment a final is judged. Required for the
+   * high-confidence echo filter: without it the input can never match a playing line and every
+   * final is delivered (the playback state alone is not enough — that is how the shadow's old
+   * `playback-echo` guess could mistake an interjection for an echo). A getter throws safely:
+   * the failure is treated as "no playing text", never as capture failure.
+   */
+  playingText = null,
+  /**
+   * High-confidence playback echo filter (**on by default**). It drops a final only when the
+   * player is sounding, the final matches the sounding text (exact/contiguous substring, ≥4 chars,
+   * ≥70% coverage) and the real VAD ratio is low. All other noise reasons (`low-vad-speech`,
+   * `no-text`) remain record-only. `false` turns the whole applied rule off for a regression test.
+   */
+  echoFilter = true,
   /**
    * Round-1 VAD shadow (worker sessions only). `vadModelPath` defaults to a `silero_vad.onnx`
    * next to the ASR models; when the shared `<root>/models` copy is missing it is downloaded on
@@ -785,6 +807,8 @@ export function startHearing({
   let noiseTriggerCount = 0;
   let shortAnswerCount = 0;
   let dropAtBoundaryCount = 0;
+  /** Finals actually withheld by the high-confidence echo rule (the only applied noise rule). */
+  let echoDropped = 0;
   const DELIVER_LATENCY_MAX_SAMPLES = 240;
   const deliverLatencySamples = [];
   const DIAGNOSTICS_SAMPLE_MS = 60_000;
@@ -810,6 +834,7 @@ export function startHearing({
     noiseTriggerCount,
     shortAnswerCount,
     dropAtBoundaryCount,
+    echoDropped,
     deliverLatency: deliverLatencySummary(),
     queueBacklog: queueBacklogNow(),
     queuedBytes: workerClient === null ? 0 : workerClient.status().queuedBytes,
@@ -841,6 +866,7 @@ export function startHearing({
       noiseTriggerCount: summary.noiseTriggerCount,
       shortAnswerCount: summary.shortAnswerCount,
       dropAtBoundaryCount: summary.dropAtBoundaryCount,
+      echoDropped: summary.echoDropped,
       deliverLatencyP50Ms: summary.deliverLatency.p50Ms,
       deliverLatencyP95Ms: summary.deliverLatency.p95Ms,
     });
@@ -852,6 +878,48 @@ export function startHearing({
       return isVoicePlaying() === true;
     } catch {
       return false;
+    }
+  };
+  /**
+   * The line that is sounding right now, from the host's getter (live subtitle, else the playback
+   * session's subtitle). `''` means "nothing to compare against" — an echo cannot be claimed then.
+   */
+  const playingTextNow = () => {
+    if (typeof playingText !== 'function') return '';
+    try {
+      const value = playingText();
+      return typeof value === 'string' ? value : '';
+    } catch {
+      return '';
+    }
+  };
+  /**
+   * Echo candidates already logged. This is a log throttle only: the delivery decision has already
+   * been made when this list is touched, and a suppressed candidate changes nothing about `text`.
+   */
+  const echoCandidates = [];
+  const noteEchoCandidate = (snapshot, verdict) => {
+    if (!asrWorkerRequested) return;
+    try {
+      const at = Date.now();
+      for (let index = echoCandidates.length - 1; index >= 0; index -= 1) {
+        if (at - echoCandidates[index].at >= SHADOW_SUPPRESS_WINDOW_MS) echoCandidates.splice(index, 1);
+      }
+      const key = `${verdict.reason}:${verdict.match.reason}:${verdict.match.matchedChars}:${verdict.match.playingChars}`;
+      if (echoCandidates.some((row) => row.key === key)) return;
+      echoCandidates.push({ at, key });
+      if (echoCandidates.length > 64) echoCandidates.shift();
+      onEvent?.('hearing.echo.candidate', {
+        level: 'debug',
+        utteranceId: snapshot.id,
+        matched: verdict.match.matched,
+        delivered: true,
+        reason: verdict.reason,
+        matchedChars: verdict.match.matchedChars,
+        playingChars: verdict.match.playingChars,
+      });
+    } catch {
+      /* a diagnostic row must never break delivery */
     }
   };
   /**
@@ -1292,9 +1360,42 @@ export function startHearing({
     }
     // Gate 3: punctuation-only output is noise, not an utterance.
     const meaningful = outcome.text.replace(/[\s.,!?;:'"…—、。，！？；：（）()\-]/gu, '');
+    const candidate = audible && loudEnough && meaningful.length > 0;
+    /**
+     * Gate 4 (the only applied noise rule): a **high-confidence playback echo**. The gate combines
+     * the live playback state, the text that is actually sounding and the real VAD ratio, so an
+     * interjection, a protected short answer or an uncertain match always passes through.
+     */
+    const playingNow = voiceSounding();
+    const echo = candidate && echoFilter !== false
+      ? echoGate({
+        text: outcome.text,
+        playingText: playingTextNow(),
+        playing: playingNow,
+        vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
+      })
+      : null;
     // The verdict is final here. The shadow row is written *after* it and is never read back by it.
-    const delivered = audible && loudEnough && meaningful.length > 0;
+    const delivered = candidate && echo?.drop !== true;
     noteNoiseShadow(snapshot, outcome, delivered);
+    if (echo !== null && echo.drop !== true && (echo.match.matched || playingNow)) {
+      noteEchoCandidate(snapshot, echo);
+    }
+    if (echo?.drop === true) {
+      echoDropped += 1;
+      try {
+        onEvent?.('hearing.echo.dropped', {
+          level: 'debug',
+          utteranceId: snapshot.id,
+          matchedChars: echo.match.matchedChars,
+          playingChars: echo.match.playingChars,
+          reason: echo.reason,
+        });
+      } catch {
+        /* an event sink must never break capture */
+      }
+      return false;
+    }
     // The text decides a short utterance, not its duration: "好" at 300 ms is speech, an equally
     // loud click at 300 ms carries no text. `audible` keeps the minimum-valid-audio floor (a click
     // below it is never delivered, even if a decoder invented a character for it).
@@ -2089,6 +2190,7 @@ export function startHearing({
       finals,
       dropped,
       hallucination,
+      echoDropped,
       truncations,
       bufferedSamples: utteranceSamples,
       device,

@@ -12361,6 +12361,10 @@ export function apply(ctx, config) {
           // shadow's `playing`): the host owns the answer, hearing only forwards what it is told.
           // Without this probe both fields stay `false` — never a guess.
           isVoicePlaying: () => ttsIsSpeaking() === true,
+          // What is sounding right now: the high-confidence echo filter compares the final with
+          // this text; the playback state above alone never drops an utterance. Read lazily, so a
+          // worker result settling after the sentence changed is judged against the current line.
+          playingText: () => playback?.subtitle ?? subtitleLive?.text ?? '',
           // Worker telemetry (started/degraded/decode/stopped) reaches events.jsonl; hearing emits
           // counts, timings and reasons only, never audio or transcript text.
           onEvent: (type, payload) => {
@@ -12580,6 +12584,9 @@ export function apply(ctx, config) {
           decodeCapSec: tuning.decodeCapSec,
           // The loopback lane feeds the same continuous dialogue (boundaries separate the sources).
           dialogueContext,
+          // Echo evidence for the high-confidence filter, exactly like the microphone lane: the
+          // final is compared with the line that is sounding at judgment time.
+          playingText: () => playback?.subtitle ?? subtitleLive?.text ?? '',
           // The loopback lane is a second ASR session: the same worker telemetry is logged.
           onEvent: (type, payload) => {
             // The same one buffer: a loopback final can make a summary due too.

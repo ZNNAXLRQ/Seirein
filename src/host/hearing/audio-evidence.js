@@ -229,6 +229,24 @@ export const DROP_SHORT_TEXT_MAX_CHARS = 2;
 
 export const DROP_SHORT_LATIN_MAX_CHARS = 3;
 
+/**
+ * High-confidence playback echo: a real echo repeats at least this many normalized characters.
+ * Shorter input is a short answer/interjection, never an echo — see `ECHO_MIN_CHARS` in `echoMatch`.
+ */
+export const ECHO_MIN_CHARS = 4;
+
+/**
+ * How much of the input must be covered by the playing line. Below this the input contains extra
+ * words the assistant never said (the user and the echo are mixed), so it is delivered, not dropped.
+ */
+export const ECHO_MIN_COVERAGE = 0.7;
+
+/**
+ * Filler syllables ignored when comparing with the playing line. This is a comparison-only
+ * normalization: it never edits the delivered text and never protects a stop word.
+ */
+const ECHO_FILLERS = /[嗯哼啊呃哦噢喔哎唉呀吧呢嘛啦哟诶欸]/gu;
+
 
 /**
  * Answers that must never even become a *candidate*: a real short answer (好/不/停/OK/嗯) and every
@@ -253,6 +271,79 @@ export function isProtectedShortAnswer(text) {
   const tokens = shadowTokens(text);
   return tokens.length > 1 && tokens.every((token) => token === tokens[0])
     && PROTECTED_SHORT_ANSWERS.includes(tokens[0]);
+}
+
+
+/**
+ * Comparison form of a transcript for the echo check: ASR tags, punctuation, symbols, spacing,
+ * case and filler syllables are ignored ("嗯，今天 天气不错啊。" and "今天天气不错" are the same words).
+ * The input text itself is never rewritten; only this comparison key is.
+ */
+export function echoTextKey(text) {
+  return shadowTextKey(text).replace(ECHO_FILLERS, '');
+}
+
+
+/**
+ * Does `text` repeat what is sounding now? Two shapes only, both requiring at least
+ * `ECHO_MIN_CHARS` normalized characters:
+ *  - the whole input equals the playing line, or is one contiguous piece of it;
+ *  - the whole playing line is one contiguous piece of the input (the user may have added words;
+ *    `coverage` then says how much of the input the playing line covers).
+ * Similar wording that is not a contiguous substring ("今天天气很好" vs "今天天气不错") is **not**
+ * an echo: matching is exact/substring only, because an uncertain match must pass through.
+ *
+ * @returns {{matched: boolean, reason: string, matchedChars: number, playingChars: number,
+ *   coverage: number}}
+ */
+export function echoMatch(text, playingText) {
+  const spoken = echoTextKey(text);
+  const playing = echoTextKey(playingText);
+  const inputChars = [...spoken].length;
+  const playingChars = [...playing].length;
+  if (inputChars === 0 || playingChars === 0) {
+    return { matched: false, reason: 'no-text', matchedChars: 0, playingChars, coverage: 0 };
+  }
+  if (inputChars < ECHO_MIN_CHARS) {
+    return { matched: false, reason: 'short-text', matchedChars: 0, playingChars, coverage: 0 };
+  }
+  if (spoken === playing) {
+    return { matched: true, reason: 'exact', matchedChars: inputChars, playingChars, coverage: 1 };
+  }
+  if (playing.includes(spoken)) {
+    return { matched: true, reason: 'input-in-playing', matchedChars: inputChars, playingChars, coverage: 1 };
+  }
+  if (playingChars >= ECHO_MIN_CHARS && spoken.includes(playing)) {
+    const coverage = Math.round((playingChars / inputChars) * 1000) / 1000;
+    return { matched: true, reason: 'playing-in-input', matchedChars: playingChars, playingChars, coverage };
+  }
+  return { matched: false, reason: 'not-similar', matchedChars: 0, playingChars, coverage: 0 };
+}
+
+
+/**
+ * The one applied noise rule: a **high-confidence playback echo** is dropped only when all three
+ * independent conditions hold — the player is sounding, the input matches the sounding line, and
+ * the real VAD measured very little speech. Every other outcome is a pass-through, and the reason
+ * says which condition was missing (recorded as `hearing.echo.candidate`).
+ *
+ * A protected short answer / stop word is checked first and never dropped, even if its text also
+ * matches the playing line exactly. A low VAD ratio without a content match stays `low-vad-speech`
+ * in the shadow row — it is not applied here.
+ */
+export function echoGate(input = {}) {
+  const text = typeof input?.text === 'string' ? input.text : '';
+  if (isProtectedShortAnswer(text)) {
+    return { drop: false, reason: 'whitelisted', match: echoMatch(text, input?.playingText) };
+  }
+  const match = echoMatch(text, input?.playingText);
+  if (!match.matched) return { drop: false, reason: match.reason, match };
+  if (input?.playing !== true) return { drop: false, reason: 'not-playing', match };
+  if (match.coverage < ECHO_MIN_COVERAGE) return { drop: false, reason: 'mixed', match };
+  const ratio = Number.isFinite(input?.vadSpeechRatio) ? Number(input.vadSpeechRatio) : null;
+  if (ratio === null) return { drop: false, reason: 'no-vad', match };
+  if (ratio >= PLAYBACK_ECHO_MAX_RATIO) return { drop: false, reason: 'vad-high', match };
+  return { drop: true, reason: 'playback-echo', match };
 }
 
 
