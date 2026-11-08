@@ -12,6 +12,7 @@ import { injectionRowRank } from './memory-injection.js';
 import { isAssistantMemoryMessage } from '../shared/text.js';
 import { memoryInjectionMessage } from '../shared/text.js';
 import { memoryQueryText } from '../shared/text.js';
+import { MEMORY_ITEM_CANDIDATE_EVENT, MEMORY_ITEM_DELIVERED_EVENT, composeMemoryItemMarkers } from './markers.js';
 import { resolveC2TimeZone } from '../shared/time.js';
 import { tokenizeQuery } from './store.js';
 import { PRE_STEP_TIMEOUT } from '../speech/typed-reply.js';
@@ -486,6 +487,15 @@ export async function prepareMemoryInjection({
       /* an observer must never break the injection */
     }
   };
+  // P-52: one aggregate candidate/delivered line per injection. Debug only: fire-and-forget, so a
+  // marker can never extend the deadline or change what this turn injected. A quiet recall writes
+  // neither line. `memory.recall.records` is the same delivered count these items report.
+  const emitItemMarkers = (block) => {
+    const marks = composeMemoryItemMarkers({ turn, prepared: block.prepared, deliveredIds: block.injectedIds });
+    if (marks.prepared === 0) return;
+    emitLate(MEMORY_ITEM_CANDIDATE_EVENT, { turn: marks.turn, items: marks.candidate });
+    emitLate(MEMORY_ITEM_DELIVERED_EVENT, { turn: marks.turn, items: marks.delivered, adoptRate: marks.adoptRate });
+  };
   const meta = {
     phase: 'pre-step',
     sessionId,
@@ -526,6 +536,9 @@ export async function prepareMemoryInjection({
       };
     }
     observeRecall(recallPayload);
+    // The status block still enters the request, but not one prepared row was adopted: the
+    // candidate line lists them, the delivered line is empty with adoptRate 0.
+    emitItemMarkers(composed);
     return {
       text: statusText, injected: false, reason: 'no-hit', status: true, sources, archiveReason, hits,
       completeness,
@@ -601,6 +614,8 @@ export async function prepareMemoryInjection({
     };
   }
   observeRecall(recallPayload);
+  // P-52: exactly one candidate line and one delivered line for this injection (never per item).
+  emitItemMarkers(composed);
   return {
     text: composed.text,
     injected: true,

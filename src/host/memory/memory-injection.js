@@ -241,6 +241,15 @@ export function composeInjectionBlock({
       reason: 'char-budget',
     });
   }
+  // P-52 marker input (additive, observability only): the prepared set in the exact order and at
+  // the exact width the budget saw, so `composeMemoryItemMarkers` can split it into the rows this
+  // request adopted and the rows it left behind. `chars` is the charged line width (label and
+  // separator included); an undelivered row keeps the width it would have spent.
+  const prepared = candidates.map((item) => ({
+    row: item.row,
+    kind: item.fixed === true ? 'fixed' : (typeof item.row?.kind === 'string' ? item.row.kind : 'hit'),
+    chars: item.line.length + 1,
+  }));
   const text = chosen.length === 0
     ? ''
     : [MEMORY_INJECTION_HEADING, ...chosen.map((item) => item.line), ...noteLines, MEMORY_INJECTION_FOOTER].join('\n');
@@ -276,6 +285,8 @@ export function composeInjectionBlock({
     unresolvedRows,
     skipped,
     skippedByChars: skipped.length,
+    // P-52: the prepared set with its charged width, in budget order (candidate ∪ delivered).
+    prepared,
   };
 }
 
