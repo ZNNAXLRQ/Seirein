@@ -68,10 +68,17 @@ let gptSovitsWarningHook = null;
 let gptSovitsWarmupFailureHook = null;
 /** Observation only: a synthesis that had to wait for a slot reports its measured queue wait. */
 let ttsSlotWaitHook = null;
+/** Observation only: one `voice.tts.request` row per finished synthesis request. */
+let ttsRequestHook = null;
 let edgeSynthesizeOverride = null;
 /** In-flight / completed warm-up for this provider generation; reset by configureTts(). */
 let gptSovitsWarmupInFlight = null;
 let gptSovitsWarmupDone = false;
+/** Cold-start observation: the first N requests of this generation, plus the one after a warm-up. */
+const TTS_COLD_START_REQUESTS = 3;
+let ttsColdStartLimit = TTS_COLD_START_REQUESTS;
+let ttsRequestsSinceStart = 0;
+let ttsColdAfterWarmup = false;
 /** Injected seams: where the audio tools are (host) and how long the clip is (tests). */
 let referenceProbeResolver = null;
 let referenceProbeOverride = null;
@@ -310,6 +317,8 @@ export function configureTts({
   onGptSovitsWarning,
   onGptSovitsWarmupFailed,
   onSlotWait,
+  onTtsRequest,
+  coldStartRequests,
   edgeSynthesize,
   resolveProbe,
   probeReference,
@@ -323,6 +332,12 @@ export function configureTts({
   gptSovitsWarningHook = typeof onGptSovitsWarning === 'function' ? onGptSovitsWarning : null;
   gptSovitsWarmupFailureHook = typeof onGptSovitsWarmupFailed === 'function' ? onGptSovitsWarmupFailed : null;
   ttsSlotWaitHook = typeof onSlotWait === 'function' ? onSlotWait : null;
+  ttsRequestHook = typeof onTtsRequest === 'function' ? onTtsRequest : null;
+  // A fresh provider generation is a fresh service start: cold-start counting begins again.
+  ttsColdStartLimit = Number.isInteger(coldStartRequests) && coldStartRequests >= 0
+    ? coldStartRequests : TTS_COLD_START_REQUESTS;
+  ttsRequestsSinceStart = 0;
+  ttsColdAfterWarmup = false;
   edgeSynthesizeOverride = typeof edgeSynthesize === 'function' ? edgeSynthesize : null;
   referenceProbeResolver = typeof resolveProbe === 'function' ? resolveProbe : null;
   referenceProbeOverride = typeof probeReference === 'function' ? probeReference : null;
@@ -492,6 +507,76 @@ async function notifyHook(hook, payload) {
   }
 }
 
+/** The provider id (`edge-tts`) is recorded as the engine name the log already uses (`edge`). */
+function ttsEngineName(value) {
+  const name = typeof value === 'string' ? value : '';
+  if (name === 'edge-tts') return 'edge';
+  if (name === 'gpt-sovits') return 'gpt-sovits';
+  return name.length > 0 ? name : null;
+}
+
+/**
+ * A stable diagnostic code instead of the provider message: that message may echo the spoken text
+ * (`error.body` from /tts), and this event must never carry text.
+ */
+function ttsErrorCode(error) {
+  if (error?.name === 'AbortError') return 'TTS_ABORTED';
+  const code = typeof error?.code === 'string' ? error.code : '';
+  if (code === 'TTS_AUDIO_LIMIT' || code === 'TTS_QUEUE_FULL' || code === 'TTS_TEXT_LIMIT') return code;
+  if (Number.isInteger(error?.timeoutMs)) return 'TTS_TIMEOUT';
+  if (Number.isInteger(error?.status)) return `TTS_HTTP_${error.status}`;
+  return code.length > 0 ? code : 'TTS_FAILED';
+}
+
+/** The first N requests of this provider generation, or the first one after a successful warm-up. */
+function takeTtsColdStart() {
+  const cold = ttsColdAfterWarmup === true || ttsRequestsSinceStart < ttsColdStartLimit;
+  ttsColdAfterWarmup = false;
+  ttsRequestsSinceStart += 1;
+  return cold;
+}
+
+/**
+ * `voice.tts.request`: one debug row per finished synthesis request.
+ *
+ * Observation only: never awaited (logging cannot delay audio), never throws, and never carries
+ * the spoken text — characters, engine and times only. The queue wait and the provider round trip
+ * stay separate measurements; `totalMs` is their sum, never a re-measurement of the wall clock.
+ * `requestMs` is the clip's synthesis time, except for a streamed request where the provider
+ * round trip ends at the FIRST audio byte (`streamed: true`); the rest of a stream is playback.
+ */
+function reportTtsRequest(request, { slot = null, slotWaitMs = 0, startedAt = 0, requestMs = null,
+  result, error, attempts = [], retryErrorCode = null, streamed = false } = {}) {
+  if (ttsRequestHook === null) return;
+  const wait = Math.max(0, Math.round(Number(slotWaitMs) || 0));
+  const elapsed = requestMs === null
+    ? Math.max(0, Math.round(Date.now() - startedAt))
+    : Math.max(0, Math.round(Number(requestMs) || 0));
+  const seen = Array.isArray(attempts) ? attempts : [];
+  const payload = {
+    level: 'debug',
+    purpose: String(request?.purpose ?? 'speech'),
+    engine: ttsEngineName(result?.provider ?? seen.at(-1)),
+    chars: [...String(request?.text ?? '')].length,
+    slotWaitMs: wait,
+    requestMs: elapsed,
+    totalMs: wait + elapsed,
+    ok: error === undefined,
+    errorCode: error === undefined ? null : ttsErrorCode(error),
+    cached: request?.cached === true,
+    chunkIndex: Number.isInteger(request?.chunkIndex) ? request.chunkIndex : null,
+    sentenceId: Number.isInteger(request?.sentenceId) ? request.sentenceId : null,
+    coldStart: takeTtsColdStart(),
+    retried: seen.length > 1,
+    retries: Math.max(0, seen.length - 1),
+    retryErrorCode: seen.length > 1 ? retryErrorCode : null,
+    queueDepth: Math.max(0, Math.round(Number(slot?.queueDepth) || 0)),
+    priority: Number(request?.priority) || 0,
+    streamed: streamed === true,
+  };
+  void notifyHook(ttsRequestHook, payload);
+}
+
 /** Read sample rate/byte rate straight from the RIFF header — no ffprobe dependency. */
 function wavDurationMs(buffer) {
   try {
@@ -654,7 +739,11 @@ async function runWarmup({ dir, speech, signal, settings, generation }) {
   const lang = TTS_LANGS.has(String(speech ?? '').toLowerCase()) ? String(speech).toLowerCase() : 'ja';
   try {
     const result = await synthesizeGptSovits({ text: WARMUP_TEXT[lang] ?? 'あ', dir, speech: lang, settings, signal });
-    if (providerGeneration === generation) gptSovitsWarmupDone = true;
+    if (providerGeneration === generation) {
+      gptSovitsWarmupDone = true;
+      // The first real request after a successful warm-up is still reported as cold.
+      ttsColdAfterWarmup = true;
+    }
     // The tiny clip only exists to load the model; do not leave it in the cache.
     await rm(result.file, { force: true }).catch(() => {});
     return { ok: true, bytes: result.bytes };
@@ -779,6 +868,9 @@ async function synthesizeEdge({ text, voice, dir, signal, maxBytes = TTS_AUDIO_M
 export function synthesize(options) {
   const request = { ...options, snapshot: options.snapshot ?? captureTtsSnapshot() };
   const purpose = String(request.purpose ?? 'speech');
+  // Observation only: which engines were tried, so the automatic Edge fallback is reported as one
+  // retry instead of being folded into a single opaque duration.
+  const observation = { attempts: [], retryErrorCode: null };
   return synthesisSlots.run(
     async (signal, slot) => {
       const slotWaitMs = Math.max(0, Number(slot?.slotWaitMs) || 0);
@@ -791,7 +883,16 @@ export function synthesize(options) {
           running: slot?.running === true,
         });
       }
-      const result = await synthesizeNow({ ...request, signal });
+      // The clock starts when this request owns the slot, so `requestMs` excludes the queue wait.
+      const startedAt = Date.now();
+      let result;
+      try {
+        result = await synthesizeNow({ ...request, signal, observation });
+      } catch (error) {
+        reportTtsRequest(request, { slot, slotWaitMs, startedAt, error, ...observation });
+        throw error;
+      }
+      reportTtsRequest(request, { slot, slotWaitMs, startedAt, result, ...observation });
       // Returned so the caller can put the wait beside the clip: `voice.latency.ttsSlotWaitMs`.
       return { ...result, slotWaitMs: Math.round(slotWaitMs) };
     },
@@ -800,7 +901,7 @@ export function synthesize(options) {
   );
 }
 
-async function synthesizeNow({ text, voice, lang = 'zh', textLang = '', dir, signal, snapshot, maxBytes = TTS_AUDIO_MAX_BYTES }) {
+async function synthesizeNow({ text, voice, lang = 'zh', textLang = '', dir, signal, snapshot, maxBytes = TTS_AUDIO_MAX_BYTES, observation = null }) {
   checkAbort(signal);
   if (snapshot.weightsEpoch !== weightsEpoch) throw abortError();
   const resolvedVoice = typeof voice === 'string' && voice.trim().length > 0 ? voice : voiceForLanguage(lang);
@@ -830,12 +931,14 @@ async function synthesizeNow({ text, voice, lang = 'zh', textLang = '', dir, sig
     }
   }
   if (gptUsable) {
+    observation?.attempts.push('gpt-sovits');
     try {
       checkAbort(signal);
       return await synthesizeGptSovits({ text, dir, speech: lang, textLang, settings, signal, maxBytes });
     } catch (error) {
       checkAbort(signal);
       if (error?.code === 'TTS_AUDIO_LIMIT') throw error;
+      if (observation !== null && observation.retryErrorCode === null) observation.retryErrorCode = ttsErrorCode(error);
       const payload = { error: error?.message ?? String(error) };
       if (Number.isInteger(error?.status)) payload.status = error.status;
       if (typeof error?.body === 'string') payload.body = error.body;
@@ -846,6 +949,7 @@ async function synthesizeNow({ text, voice, lang = 'zh', textLang = '', dir, sig
     }
   }
   checkAbort(signal);
+  observation?.attempts.push('edge');
   const result = await (edgeSynthesizeOverride ?? synthesizeEdge)({ text, voice: resolvedVoice, dir, signal, maxBytes });
   if (signal?.aborted) {
     if (result?.file) await rm(result.file, { force: true });
@@ -927,11 +1031,11 @@ function startPlayer(command, args, { signal, piped = false, onStart = null } = 
  * @returns {Promise<{file: string, bytes: number, durationMs: number, firstChunkMs: number|null, via: string}>}
  */
 export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', dir, ffplayPath = null, onStart = null,
-  onTransport = null, signal, snapshot = captureTtsSnapshot(), maxBytes = TTS_AUDIO_MAX_BYTES }) {
+  onTransport = null, purpose = 'speech', signal, snapshot = captureTtsSnapshot(), maxBytes = TTS_AUDIO_MAX_BYTES }) {
   checkAbort(signal);
   const resolvedVoice = typeof voice === 'string' && voice.trim().length > 0 ? voice : voiceForLanguage(lang);
   if (snapshot.settings?.enabled === true || !ffplayPath) {
-    const result = await synthesize({ text, voice: resolvedVoice, lang, textLang, dir, signal, snapshot, maxBytes });
+    const result = await synthesize({ text, voice: resolvedVoice, lang, textLang, dir, purpose, signal, snapshot, maxBytes });
     try {
       checkAbort(signal);
     } catch (error) {
@@ -947,11 +1051,18 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
   }
   // Public result settles when the file is complete; playback ownership lasts until child close.
   return new Promise((resolve, reject) => {
+    // Observation only: the inline Edge stream owns a slot directly, so it reports its own request
+    // row (the file path above already reported one through `synthesize()`).
+    const streamRequest = { text, purpose: String(purpose ?? 'speech') };
     // Always acquire synthesis before playback, like the model-application barrier. The legacy
     // pipe path conservatively retains synthesis ownership until player cleanup; sentence-file
     // prefetch below releases synthesis independently and still overlaps with playback.
-    void synthesisSlots.run(async (synthSignal) => {
+    void synthesisSlots.run(async (synthSignal, synthSlot) => {
+      const slotWaitMs = Math.max(0, Number(synthSlot?.slotWaitMs) || 0);
       return playbackSlots.run(async (playSignal) => {
+        // The provider round trip is timed from the instant both seats are owned, so the playback
+        // seat wait never becomes synthesis time (the request row keeps its clocks separate).
+        const requestStartedAt = Date.now();
         let player;
         /** Process-ready instant from the internal spawn hook; 0 until the child's `spawn` fires. */
         let playerReadyAt = 0;
@@ -988,6 +1099,8 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
           }, (error) => controller.abort(error));
           let bytes = 0;
           let firstChunkMs = null;
+          /** Transport arrival of the first audio byte: where a streamed provider round trip ends. */
+          let firstDataAt = 0;
           const startedAt = Date.now();
           const sink = new Writable({ write(chunk, _encoding, callback) {
             bytes += chunk.length;
@@ -997,7 +1110,7 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
               // The first audio DATA handed to the player: transport arrival, not decoded audio and
               // not speaker sound. `firstDataIsAudible` is false without a read-back; the PCM and
               // audible instants are never inferred from it.
-              const firstDataAt = Date.now();
+              firstDataAt = Date.now();
               const spawnAt = Number(player?.spawnAt) || 0;
               try {
                 onStart?.({
@@ -1040,10 +1153,25 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
             if (!fileStream.closed) await new Promise((done) => fileStream.once('close', done));
           }
           checkAbort(streamSignal);
+          // One debug row per streamed request: the provider round trip ends at the first audio
+          // byte; the rest of the pipe runs at playback rate and is not synthesis time.
+          reportTtsRequest(streamRequest, {
+            slot: synthSlot,
+            slotWaitMs,
+            startedAt: requestStartedAt,
+            requestMs: firstDataAt > 0 ? firstDataAt - requestStartedAt : null,
+            result: { provider: 'edge-tts' },
+            attempts: ['edge'],
+            streamed: true,
+          });
           published = true;
           resolve({ file, bytes, durationMs: Math.round((bytes * 8) / BITRATE_KBPS), firstChunkMs, via: 'ffplay-stream', provider: 'edge-tts' });
           await player.done;
         } catch (error) {
+          // A failure after the clip was delivered is a playback failure, not a second request row.
+          if (!published) {
+            reportTtsRequest(streamRequest, { slot: synthSlot, slotWaitMs, startedAt: requestStartedAt, error, attempts: ['edge'], streamed: true });
+          }
           audioStream?.destroy();
           if (player) {
             try { player.child.kill(); } catch { /* already gone */ }
