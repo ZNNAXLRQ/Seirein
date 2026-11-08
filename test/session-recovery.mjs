@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import {
   VOICE_COMPACTION_PRESET,
   VOICE_COMPACTION_PRESET_ID,
+  VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION,
   VOICE_SESSION_AGENT_OWNED_REASON,
   VOICE_SESSION_RECOVER_ACTION,
   createVoiceCompaction,
@@ -50,6 +51,8 @@ function createHost({
   registerError = null,
   resumeError = null,
   compactionError = null,
+  compactionNoop = false,
+  windowTokens = null,
 } = {}) {
   const declared = new Map(Object.entries(definitions));
   let registerCalls = 0;
@@ -71,6 +74,13 @@ function createHost({
     const measure = () => tokenMeter.measure(agent.session).totalTokens;
     const compact = async () => {
       if (compactionError !== null) throw compactionError;
+      if (compactionNoop) {
+        // A compaction that commits but frees nothing: `after === before`.
+        const tokens = measure();
+        agent.session.compactions.push({ shadowed: 0, before: tokens, after: tokens });
+        compactionRuns.push({ before: tokens, after: tokens });
+        return { shadowedSeqs: [], summarySeq: 0 };
+      }
       const messages = agent.session.messages;
       const before = measure();
       const keep = 2; // newest tail stays verbatim
@@ -170,7 +180,7 @@ function createHost({
   const ownerCtx = { get: (name) => services[name], effect: (fn) => fn() };
 
   const getService = (name) => services[name];
-  const engine = createVoiceCompaction({ getService, log });
+  const engine = createVoiceCompaction({ getService, log, windowTokens });
   const recover = createVoiceSessionRecovery({
     getService,
     log,
@@ -215,6 +225,14 @@ test('1. no live agent + preset available: resume once, mount once, compactNow o
   assert.equal(typeof result.after, 'number');
   assert.ok(result.before > result.after, `request tokens drop (${result.before} -> ${result.after})`);
   assert.equal(result.freed, result.before - result.after);
+  assert.equal(result.stillNearLimit, false, 'an effective compaction under 80% is healthy');
+  assert.equal(result.compressionEffective, true);
+  assert.equal(result.recommendation, '');
+  assert.equal(
+    host.events.filter((entry) => entry.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION).length,
+    0,
+    'below the threshold no pressure event is written',
+  );
   assert.equal(host.persisted.has('seirein-2026-11-08'), true, 'history stays under the same id');
   assert.equal(host.persisted.get('seirein-2026-11-08').length, 20, 'the persisted log is not rewritten');
   assert.equal(host.announces.length, 1, 'announce finished before resume resolved');
@@ -306,6 +324,8 @@ test('5. a compaction failure reports ok:false while the mount stays recorded an
   assert.equal(result.code, 'compaction-failed');
   assert.equal(result.mounted, true, 'the preset really mounted; only compaction failed');
   assert.equal(result.compacted, false);
+  assert.equal(result.compressionEffective, false, 'a failed compaction is never reported effective');
+  assert.equal(result.recommendation, 'new-session', 'the user is told the remaining route explicitly');
   assert.equal(typeof result.before, 'number');
   assert.equal(result.after, null);
   assert.equal(result.freed, null);
@@ -318,6 +338,13 @@ test('5. a compaction failure reports ok:false while the mount stays recorded an
   assert.equal(event.payload.ok, false);
   assert.equal(event.payload.mounted, true);
   assert.equal(event.payload.reason, 'compaction-failed');
+  assert.equal(event.payload.compressionEffective, false);
+  assert.equal(event.payload.recommendation, 'new-session');
+  assert.equal(
+    host.events.filter((entry) => entry.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION).length,
+    0,
+    'a failed compaction has a failure line, not a misleading still-near-limit line',
+  );
 });
 
 test('6. the action is manual only: no timer, listener or delivery path can run it', async () => {
@@ -370,4 +397,78 @@ test('7. recovery registers the preset itself, then resumes, mounts and compacts
   assert.ok(registered !== undefined, 'the self-registration is observable');
   assert.equal(registered.payload.source, 'registered');
   console.log(`[7] self-registered: register=1 mount=1 compactNow=1 ${result.before} -> ${result.after}`);
+});
+
+test('8. a compaction that reduces tokens but stays above 80% flags stillNearLimit and one event', async () => {
+  // The fake compaction keeps the newest two messages (817 tokens with the summary); a 400-token
+  // window makes that remaining surface cross the 0.8 threshold on purpose.
+  const host = createHost({ windowTokens: 400 });
+  host.persisted.set('seirein-2026-11-08', history());
+
+  const result = await host.recover({});
+
+  assert.equal(result.ok, true);
+  assert.ok(result.before > result.after, `request tokens drop (${result.before} -> ${result.after})`);
+  assert.ok(result.pressureAfter.ratio >= 0.8, `after ratio ${result.pressureAfter.ratio}`);
+  assert.equal(result.stillNearLimit, true);
+  assert.equal(
+    result.compressionEffective,
+    false,
+    'the token drop is real, but compaction did not leave a healthy context',
+  );
+  assert.equal(result.recommendation, 'new-session', 'pressure is still above the threshold');
+
+  const recoverEvent = host.events.filter((entry) => entry.type === VOICE_SESSION_RECOVER_ACTION).at(-1);
+  assert.equal(recoverEvent.payload.stillNearLimit, true);
+  assert.equal(recoverEvent.payload.compressionEffective, false);
+  assert.equal(recoverEvent.payload.recommendation, 'new-session');
+
+  const events = host.events.filter((entry) => entry.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION);
+  assert.equal(events.length, 1, 'one separate debug line, exactly once');
+  assert.deepEqual(events[0].payload, {
+    sessionId: 'seirein-2026-11-08',
+    before: result.before,
+    after: result.after,
+    ratio: result.pressureAfter.ratio,
+    recommendation: 'new-session',
+  });
+  console.log(`[8] still-near-limit: ${result.before} -> ${result.after} ratio=${result.pressureAfter.ratio} recommendation=${result.recommendation} events=${events.length}`);
+});
+
+test('9. an effective compaction below 80% is healthy: no flags and no event', async () => {
+  const host = createHost(); // default 128k window
+  host.persisted.set('seirein-2026-11-08', history());
+
+  const result = await host.recover({});
+
+  assert.equal(result.ok, true);
+  assert.equal(result.compressionEffective, true);
+  assert.ok(result.pressureAfter.ratio < 0.8, `after ratio ${result.pressureAfter.ratio}`);
+  assert.equal(result.stillNearLimit, false);
+  assert.equal(result.recommendation, '');
+  assert.equal(
+    host.events.filter((entry) => entry.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION).length,
+    0,
+  );
+  console.log(`[9] healthy: ${result.before} -> ${result.after} ratio=${result.pressureAfter.ratio} stillNearLimit=${result.stillNearLimit} events=0`);
+});
+
+test('10. a compaction that frees nothing reports compressionEffective:false (even below the threshold)', async () => {
+  const host = createHost({ compactionNoop: true });
+  host.persisted.set('seirein-2026-11-08', history());
+
+  const result = await host.recover({});
+
+  assert.equal(result.ok, true);
+  assert.equal(result.freed, 0);
+  assert.equal(result.after, result.before, 'the surface is byte-for-byte the same size');
+  assert.equal(result.compressionEffective, false, 'after >= before is not an effective compaction');
+  assert.equal(result.stillNearLimit, true, 'no reduction is flagged even though the ratio is low');
+  assert.equal(result.recommendation, 'manual-compact');
+  const events = host.events.filter((entry) => entry.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.before, result.before);
+  assert.equal(events[0].payload.after, result.after);
+  assert.equal(events[0].payload.recommendation, 'manual-compact');
+  console.log(`[10] no effect: before=${result.before} after=${result.after} ratio=${result.pressureAfter.ratio} compressionEffective=${result.compressionEffective} recommendation=${result.recommendation}`);
 });

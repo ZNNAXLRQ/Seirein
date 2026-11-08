@@ -115,10 +115,12 @@ function createHost({
   return {
     ctx, log, events, declared, bindings, start, agentPresets, getService,
     get registerCalls() { return registerCalls; },
-    hookCount: () => createdListeners.length,
+    hookCount: (type = 'agent/created') => createdListeners.filter((entry) => entry.type === type).length,
     nearLimitCount: () => events.filter((event) => event.type === 'voice.compaction.near-limit').length,
     async announce(agent) {
-      for (const entry of createdListeners.slice()) await entry.handler({ agent, source: 'startup' });
+      for (const entry of createdListeners.filter((item) => item.type === 'agent/created').slice()) {
+        await entry.handler({ agent, source: 'startup' });
+      }
     },
   };
 }

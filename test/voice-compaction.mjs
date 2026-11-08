@@ -29,6 +29,7 @@ import test from 'node:test';
 import {
   VOICE_COMPACTION_PRESET,
   VOICE_COMPACTION_PRESET_ID,
+  VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION,
   assessVoiceCompactionPreset,
   createVoiceCompaction,
   isVoiceSessionId,
@@ -238,7 +239,16 @@ function createHost({
   }
 
   async function announce(agent, source = 'startup') {
-    for (const entry of createdListeners.slice()) await entry.handler({ agent, source });
+    for (const entry of createdListeners.filter((item) => item.type === 'agent/created').slice()) {
+      await entry.handler({ agent, source });
+    }
+  }
+
+  /** Deliver one durable session event to host-level `session/event` listeners (as DSH does). */
+  function sessionEmit(session, event) {
+    for (const entry of createdListeners.filter((item) => item.type === 'session/event').slice()) {
+      entry.handler(session, event);
+    }
   }
 
   async function createAndAnnounce(sessionId, options = {}) {
@@ -289,11 +299,11 @@ function createHost({
     meter, log, events, mounts, liveAgents, services, ctx, agentPresets, declared,
     get registerCalls() { return registerCalls; },
     get mountAttempts() { return mountAttempts; },
-    createAgent, createAndAnnounce, announce, emit,
+    createAgent, createAndAnnounce, announce, emit, sessionEmit,
     listenersFor, commandFor, compactionFor, getService, cleanups,
     listenerCount: (agent, type) => listenersFor(agent, type).length,
     commandCount: (agent, name) => (commandFor(agent, name) === undefined ? 0 : 1),
-    createdCount: () => createdListeners.length,
+    createdCount: () => createdListeners.filter((item) => item.type === 'agent/created').length,
   };
 }
 
@@ -1102,4 +1112,43 @@ test('25. a running Agent is not retro-assembled: registered / mounted / active 
   const failed = host.events.find((event) => event.type === 'voice.compaction.failed');
   assert.equal(failed.payload.reason, 'mount');
   console.log(`[25] status=${status.status} registered=${status.registered} running/mounted/active=${status.running}/${status.mounted}/${status.active} requiresRestart=${status.requiresRestart} enabled=${status.enabled}`);
+});
+
+test('26. an automatic compaction that stays above the threshold writes exactly one event', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({
+    getService: host.getService,
+    log: host.log,
+    windowTokens: 1000, // 900 / 1000 = 0.9 after compaction
+  });
+  helper.attach(host.ctx);
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  agent.session.messages = Array.from({ length: 10 }, () => createMessage('x'.repeat(400))); // 1000 tokens
+
+  // The automatic path encloses the run in an open turn; the close sees the shorter surface.
+  host.sessionEmit(agent.session, { type: 'compaction/start', data: { compactionId: 'auto-1', turn: 'turn-1' } });
+  agent.session.messages = Array.from({ length: 9 }, () => createMessage('x'.repeat(400))); // 900 tokens
+  const end = { type: 'compaction/end', data: { compactionId: 'auto-1', turn: 'turn-1' } };
+  host.sessionEmit(agent.session, end);
+
+  const events = host.events.filter((event) => event.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION);
+  assert.equal(events.length, 1, 'one event per completed automatic compaction');
+  assert.deepEqual(events[0].payload, {
+    sessionId: 'seirein-2026-11-08',
+    before: 1000,
+    after: 900,
+    ratio: 0.9,
+    recommendation: 'new-session',
+  });
+
+  // A repeated close is not a second completion, and the idle/manual path (`turn:null`, which
+  // includes `voice.session.recover`'s `compactNow`) reports itself -- never this observer.
+  host.sessionEmit(agent.session, end);
+  host.sessionEmit(agent.session, { type: 'compaction/start', data: { compactionId: 'manual-1', turn: null } });
+  host.sessionEmit(agent.session, { type: 'compaction/end', data: { compactionId: 'manual-1', turn: null } });
+  assert.equal(
+    host.events.filter((event) => event.type === VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION).length,
+    1,
+  );
+  console.log(`[26] auto: 1000 -> 900 ratio=0.9 recommendation=new-session events=${events.length}; manual/idle adds 0`);
 });

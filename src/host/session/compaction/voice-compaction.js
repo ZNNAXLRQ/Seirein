@@ -29,7 +29,10 @@
  *    `voice.compaction.near-limit` event;
  *  - `detach()` removes only a definition this instance registered (a reused one is preserved);
  *  - registration does not retro-assemble a running Agent: `status` separates `registered` /
- *    `mounted` / `active` and, when they diverge, says restart or `voice.session.recover` is needed.
+ *    `mounted` / `active` and, when they diverge, says restart or `voice.session.recover` is needed;
+ *  - a compaction that leaves pressure at/above `nearLimitRatio` (or frees nothing) is FLAGGED,
+ *    never acted on: the result carries `stillNearLimit` / `compressionEffective` / `recommendation`
+ *    and one `voice.compaction.still-near-limit` trace; no rollover and no new session are started.
  */
 
 /** Preset identity Seirein's voice agent runs. */
@@ -92,6 +95,24 @@ export const VOICE_COMPACTION_NEAR_LIMIT_THROTTLE_MS = 60_000;
 export const VOICE_COMPACTION_DEFAULT_WINDOW_TOKENS = 128_000;
 /** What the operator must do when a live Agent was never assembled. */
 export const VOICE_COMPACTION_RESTART_NOTE = '需重启 DSH 或执行 voice.session.recover 重新装配';
+/**
+ * Written once when a COMPLETED compaction left context pressure at/above the threshold, or freed
+ * nothing. It is a debug trace, not a trigger: nothing rolls the session over on it.
+ */
+export const VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION = 'voice.compaction.still-near-limit';
+/** The user decides; the flag only names the two choices, it never performs either. */
+export const VOICE_COMPACTION_RECOMMENDATIONS = Object.freeze({
+  NEW_SESSION: 'new-session',
+  MANUAL_COMPACT: 'manual-compact',
+});
+/**
+ * The manual next step after a compaction that did not leave a healthy context:
+ * a compaction that freed tokens but is still above the threshold needs a new session + summary;
+ * one that freed nothing should be retried by hand before that decision.
+ */
+const recommendationFor = (effective) => (
+  effective ? VOICE_COMPACTION_RECOMMENDATIONS.NEW_SESSION : VOICE_COMPACTION_RECOMMENDATIONS.MANUAL_COMPACT
+);
 
 /**
  * The package name a declaration row stands for. Only `name` counts; the row `id` is a label and
@@ -237,6 +258,12 @@ export function createVoiceCompaction({
   };
   /** Throttle stamp for `voice.compaction.near-limit`; reset when pressure falls again. */
   let nearLimitEmittedAt = 0;
+  /**
+   * Automatic compactions currently open, keyed by the durable `compactionId`:
+   * `{ sessionId, before, agent }`. Only `turn != null` compactions enter it, so the idle/manual
+   * path (including `voice.session.recover`'s `compactNow()`) can never double-report.
+   */
+  const autoCompactions = new Map();
 
   const note = (type, payload) => {
     try {
@@ -482,6 +509,68 @@ export function createVoiceCompaction({
       note('voice.compaction.near-limit', { presetId, ...pressure });
     }
     return pressure;
+  };
+
+  /** The live voice Agent that owns one session object (undefined outside a live Agent). */
+  const agentForSession = (session) => {
+    for (const agent of liveVoiceAgents()) {
+      if (agent?.session === session) return agent;
+    }
+    return undefined;
+  };
+
+  /**
+   * Observe the AUTO compaction path (never the idle/manual one).
+   *
+   * `compaction-basic` wraps an automatic run in `compaction/start` / `compaction/end` session
+   * events carrying the same `compactionId` and the current turn. An idle compaction (manual
+   * `/compact`, or `voice.session.recover`'s `compactNow()`) carries `turn:null`, so it is ignored
+   * here: the recovery action reports its own result instead of writing a duplicate event.
+   *
+   * The observation is read-only: `before` is measured when the run opens, the new surface is
+   * measured when it closes, and one event says whether pressure is still at/above the threshold.
+   * A failed close (`error` in the end event) is silent here; the engine's own logging owns it.
+   */
+  const onSessionEvent = (session, event) => {
+    try {
+      const type = event?.type;
+      if (type !== 'compaction/start' && type !== 'compaction/end') return;
+      if (!isVoiceSessionId(session?.id)) return;
+      const data = event?.data ?? {};
+      const compactionId = data.compactionId;
+      if (typeof compactionId !== 'string' || compactionId.length === 0) return;
+      if (type === 'compaction/start') {
+        if (data.turn === null || data.turn === undefined) return;
+        const agent = agentForSession(session);
+        if (agent === undefined) return;
+        const before = measureAgentTokens(getService, agent, compactionServiceOf(getService, agent));
+        // Every run is paired, but a bounded map keeps a host that drops a close from leaking.
+        if (autoCompactions.size >= 32) autoCompactions.clear();
+        autoCompactions.set(compactionId, { sessionId: session.id, before, agent });
+        return;
+      }
+      const record = autoCompactions.get(compactionId);
+      if (record === undefined) return;
+      autoCompactions.delete(compactionId);
+      if (data.error !== undefined) return;
+      const after = measureAgentTokens(
+        getService, record.agent, compactionServiceOf(getService, record.agent),
+      );
+      const window = resolveWindowTokens();
+      if (after === null || !Number.isFinite(window) || window <= 0) return;
+      const ratio = Math.round((after / window) * 1000) / 1000;
+      if (ratio < nearLimitRatio) return;
+      const effective = record.before !== null && after < record.before;
+      note(VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION, {
+        sessionId: record.sessionId,
+        before: record.before,
+        after,
+        ratio,
+        recommendation: recommendationFor(effective),
+      });
+    } catch {
+      /* observing a compaction must never break the session append that produced it */
+    }
   };
 
   /** Why automatic compaction is not usable, as the operator-facing reason. */
@@ -747,12 +836,21 @@ export function createVoiceCompaction({
     if (attached) return detach;
     attached = true;
     let off = null;
+    let offSession = null;
     if (typeof ctx.on === 'function') {
       off = ctx.on('agent/created', (payload) => {
         // Serial listener: awaiting keeps the binding before the first step; the ensure() result
         // is always fulfilled, so a missing preset can never fail Agent creation.
         return ensure(payload?.agent);
       });
+      // Read-only observer for the auto-compaction path. A Host context is unscoped, so it
+      // receives every session's `compaction/start`/`compaction/end`; the handler filters by
+      // dated voice session and ignores the idle/manual runs.
+      try {
+        offSession = ctx.on('session/event', onSessionEvent);
+      } catch {
+        offSession = null;
+      }
     }
     // Register as soon as the plugin mounts; if the registry service is not ready yet, the next
     // voice Agent's ensure() retries (an unavailable state is deliberately not latched).
@@ -761,7 +859,10 @@ export function createVoiceCompaction({
       if (!attached) return undefined;
       attached = false;
       if (typeof off === 'function') off();
+      if (typeof offSession === 'function') offSession();
       off = null;
+      offSession = null;
+      autoCompactions.clear();
       return releasePreset();
     };
     if (typeof ctx.effect === 'function') ctx.effect(() => detach);
@@ -797,9 +898,9 @@ export function createVoiceCompaction({
   return {
     presetId, setup, ensure, attach, evidenceOf, ensurePreset,
     presetStatus, status: presetStatus, samplePressure,
-    // The window size the pressure sample uses, so recovery can report a real ratio instead of
-    // guessing one from `before`/`after` alone.
-    resolveWindowTokens,
+    // The threshold and window the pressure sample uses, so recovery reports the same ratio the
+    // status card sees instead of guessing one from `before`/`after` alone.
+    nearLimitRatio, resolveWindowTokens,
   };
 }
 
@@ -841,29 +942,48 @@ export function createVoiceSessionRecovery({
   const engine = compaction ?? createVoiceCompaction({ getService, log, presetId });
   const describe = (error) => (error instanceof Error ? error.message : String(error));
 
-  /** One `voice.session.recover` debug line per attempt; observability never fails the action. */
-  const note = (payload) => {
+  /** Emit one debug line; a log that throws must never hide or fail the action. */
+  const emitLog = (type, payload) => {
     try {
-      const pending = log?.emit?.(VOICE_SESSION_RECOVER_ACTION, {
-        sessionId: payload.sessionId ?? '',
-        ok: payload.ok === true,
-        mounted: payload.mounted === true,
-        before: payload.before ?? null,
-        after: payload.after ?? null,
-        freed: payload.freed ?? null,
-        // Real pressure (tokens/window/ratio) at each point, or null when the meter could not be
-        // read: `before`/`after` alone are absolute counts, not the pressure an operator expects.
-        pressureBefore: payload.pressureBefore ?? null,
-        pressureAfter: payload.pressureAfter ?? null,
-        // The machine code is the stable filter value; success falls back to its own note.
-        reason: typeof payload.code === 'string' && payload.code.length > 0
-          ? payload.code
-          : (payload.reason ?? ''),
-      });
+      const pending = log?.emit?.(type, payload);
       if (pending !== undefined && typeof pending?.catch === 'function') pending.catch(() => {});
     } catch {
-      /* a log that throws must not hide the outcome */
+      /* observability must never break the action */
     }
+  };
+
+  /** One `voice.session.recover` debug line per attempt. */
+  const note = (payload) => {
+    emitLog(VOICE_SESSION_RECOVER_ACTION, {
+      sessionId: payload.sessionId ?? '',
+      ok: payload.ok === true,
+      mounted: payload.mounted === true,
+      before: payload.before ?? null,
+      after: payload.after ?? null,
+      freed: payload.freed ?? null,
+      // Real pressure (tokens/window/ratio) at each point, or null when the meter could not be
+      // read: `before`/`after` alone are absolute counts, not the pressure an operator expects.
+      pressureBefore: payload.pressureBefore ?? null,
+      pressureAfter: payload.pressureAfter ?? null,
+      // `null` means "not measured", never "healthy": a failed recovery must not read as a clean one.
+      stillNearLimit: payload.stillNearLimit ?? null,
+      compressionEffective: payload.compressionEffective ?? null,
+      recommendation: payload.recommendation ?? '',
+      // The machine code is the stable filter value; success falls back to its own note.
+      reason: typeof payload.code === 'string' && payload.code.length > 0
+        ? payload.code
+        : (payload.reason ?? ''),
+    });
+  };
+  /** The separate, once-per-recovery trace (only when the result is still above the threshold). */
+  const noteStillNearLimit = (payload) => {
+    emitLog(VOICE_COMPACTION_STILL_NEAR_LIMIT_ACTION, {
+      sessionId: payload.sessionId ?? '',
+      before: payload.before ?? null,
+      after: payload.after ?? null,
+      ratio: payload.ratio ?? payload.pressureAfter?.ratio ?? null,
+      recommendation: payload.recommendation ?? '',
+    });
   };
   const done = (payload) => {
     note(payload);
@@ -905,6 +1025,11 @@ export function createVoiceSessionRecovery({
     } catch {
       return null;
     }
+  };
+  /** The same threshold the engine's `near-limit` status uses (default 0.8). */
+  const nearLimitRatioOf = () => {
+    const value = Number(engine?.nearLimitRatio);
+    return Number.isFinite(value) && value > 0 ? value : VOICE_COMPACTION_NEAR_LIMIT_RATIO;
   };
 
   /**
@@ -1045,8 +1170,21 @@ export function createVoiceSessionRecovery({
       const after = measureTokens(agent, service);
       const pressureAfter = pressureOf(after, windowTokens);
       const freed = before !== null && after !== null ? before - after : null;
+      // Two independent reasons to warn: the measured pressure is still at/above the threshold, or
+      // this compaction freed nothing at all (`after >= before`). `compressionEffective` answers the
+      // operator's question ("did compaction leave a healthy context?"), so it is false on this
+      // branch even when `before`/`after` prove a token drop; the raw counts keep that fact visible.
+      const aboveThreshold = pressureAfter !== null && pressureAfter.ratio >= nearLimitRatioOf();
+      const noEffect = before !== null && after !== null && after >= before;
+      const measured = pressureAfter !== null;
+      // `null` (not `false`) when the meter or window is unreadable: an unmeasured context must
+      // never be reported as a healthy one.
+      const stillNearLimit = (aboveThreshold || noEffect) ? true : (measured ? false : null);
+      const tokenDrop = before !== null && after !== null && after < before;
+      const compressionEffective = stillNearLimit === true ? false : tokenDrop;
+      const recommendation = stillNearLimit === true ? recommendationFor(tokenDrop) : '';
       const idle = compacted === null || compacted === undefined;
-      return done({
+      const result = {
         ok: true,
         sessionId,
         mounted: true,
@@ -1055,11 +1193,21 @@ export function createVoiceSessionRecovery({
         freed,
         pressureBefore,
         pressureAfter,
+        stillNearLimit,
+        compressionEffective,
+        recommendation,
         compacted: !idle,
         ...(idle ? { reason: 'no-compactable-range' } : {}),
-      });
+      };
+      done(result);
+      // One separate trace per recovery, and only when the result above is not healthy. Nothing
+      // acts on it: no rollover, no new session, no second compaction.
+      if (stillNearLimit) noteStillNearLimit(result);
+      return result;
     } catch (error) {
       // The session is untouched on disk (no deletion, no rewrite) and the attempt is not retried.
+      // A failed compaction cannot be called effective, and the only remaining route is the
+      // user's own decision: start a new session and carry a summary over.
       return fail({
         sessionId,
         mounted: true,
@@ -1068,6 +1216,8 @@ export function createVoiceSessionRecovery({
         code: 'compaction-failed',
         reason: describe(error),
         error: describe(error),
+        compressionEffective: false,
+        recommendation: VOICE_COMPACTION_RECOMMENDATIONS.NEW_SESSION,
       });
     }
   };
