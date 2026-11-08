@@ -472,6 +472,17 @@ export function createReplySpeaker({
     await Promise.all(removals);
   };
 
+  /**
+   * Count one played sentence at most once. A clip that reached the player was heard even when a
+   * barge-in aborts the waiting `run()` before its summary lands; a late/abnormal settle of the
+   * same entry must never count it again.
+   */
+  const countPlayed = (entry) => {
+    if (entry.played !== true || entry.counted === true) return;
+    entry.counted = true;
+    stats.played += 1;
+  };
+
   const run = async () => {
     try {
       // The first sentence is the latency-critical path: it is reserved and synthesized the
@@ -550,12 +561,18 @@ export function createReplySpeaker({
               }
             }
           },
-        }));
+        })).catch((error) => {
+          // A barge-in rejects this await even though the player already confirmed a start: the
+          // clip was heard, so account for it before the run exits.
+          countPlayed(entry);
+          throw error;
+        });
         // One skipped sentence counts once, however many blocks it had.
         if (summary.skipped > 0) stats.skipped += 1;
         // Counted once the player really finished the clip (not at accept/synthesis/start); a
         // clip that only reached the player still counts as heard even if a barge-in cut its tail.
-        if (entry.played === true) stats.played += 1;
+        // `countPlayed` also runs on the abort path above and is a one-shot, so no double count.
+        countPlayed(entry);
         if (lane.aborted) return;
         // Strictly serial playback: the oldest prefetched sentence is awaited in order, so a
         // fast later synthesis never reorders the queue and sentence N+1 cannot play early.
@@ -734,10 +751,8 @@ export function createReplySpeaker({
         }
         if (limited.text.length > 0) {
           stats.fallback = true;
-          try {
-            // The fallback is the same voice outlet: a replaced version must not keep `finish`
-            // waiting on a clip whose lane was already aborted.
-            const spoken = await abortable(speakWhole(limited.text));
+          let fallback = null;
+          const recordFallback = (spoken) => {
             noteLifecycleSpeechId(spoken?.session);
             const audioAt = Number(spoken?.audioStartedAt) || 0;
             if (audioAt > 0) {
@@ -748,7 +763,15 @@ export function createReplySpeaker({
                 stats.firstStartSession = spoken.session ?? null;
               }
             }
+          };
+          try {
+            fallback = Promise.resolve(speakWhole(limited.text));
+            // A run failure already aborted the lane, but the fallback is the only voice left: wait
+            // for it so its real stats are recorded. A live lane still releases finish() on abort;
+            // the aborted clip's stats land when it settles (exactly one settlement records them).
+            recordFallback(lane.aborted ? await fallback : await abortable(fallback));
           } catch (error) {
+            if (fallback !== null) void fallback.then(recordFallback, () => {});
             if (stats.error.length === 0) stats.error = String(error?.message ?? error);
           }
         }

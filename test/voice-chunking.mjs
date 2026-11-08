@@ -144,7 +144,7 @@ test('B) a barge-in stops the sounding block and never starts the queued blocks'
   assert.equal(stats.cancelled, true);
   assert.equal(fx.plays.length, 1, 'block 1 never reaches the player');
   assert.equal(fx.plays[0].chunkIndex, 0);
-  assert.equal(stats.played, 0, 'the stopped block is not counted as completed playback');
+  assert.equal(stats.played, 1, 'the block that reached the player counts as heard once, even when stopped');
 });
 
 // ---------------------------------------------------------------------------
