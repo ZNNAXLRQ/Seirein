@@ -361,8 +361,20 @@ export function createReplySpeaker({
     }
     // The seam must observe cancellation too: a provider that ignores its signal may otherwise
     // pin the run (and `finish`) long after this version was replaced.
-    const audio = await abortable(synthesizeSentence({ text: item.text, sentenceId: item.seq, signal: lane }));
-    if (lane.aborted) throw lane.reason ?? new DOMException('Reply speech cancelled', 'AbortError');
+    const pendingAudio = Promise.resolve(synthesizeSentence({ text: item.text, sentenceId: item.seq, signal: lane }));
+    let audio;
+    try {
+      audio = await abortable(pendingAudio);
+    } catch (error) {
+      // Released before the clip arrived: a provider that ignores its signal may still return it.
+      // It never reached the player, so delete its file whenever that late result finally lands.
+      void pendingAudio.then((lateAudio) => discardAudio(lateAudio), () => {});
+      throw error;
+    }
+    if (lane.aborted) {
+      await discardAudio(audio);
+      throw lane.reason ?? new DOMException('Reply speech cancelled', 'AbortError');
+    }
     // Only the first sentence's stage payload is reported; prefetched later clips are not measured.
     if (item.seq === 0) {
       stats.firstTranslated = audio?.translated === true;
@@ -402,29 +414,62 @@ export function createReplySpeaker({
       notifyPrefetch();
       return { error };
     });
-    ahead.push(task);
+    ahead.push(trackPrefetch(task));
     notifyPrefetch();
     return true;
   };
 
   /**
    * A5: a prefetched clip that never reached the player is still the producer's, so its file is
-   * deleted with the same force-remove rule `tts.js` applies to a rejected slot. Waiting for each
-   * task also guarantees a late synthesis result cannot outlive the invocation and leak its file.
+   * deleted with the same force-remove rule `tts.js` applies to a rejected slot. Deletion never
+   * waits for a synthesizer; a slot's settle hook removes a late result when it lands.
    */
   const discardAudio = async (audio) => {
     const file = typeof audio?.file === 'string' && audio.file.length > 0 ? audio.file : '';
-    if (file.length > 0) await rm(file, { force: true }).catch(() => {});
+    if (file.length === 0) return;
+    try {
+      await rm(file, { force: true });
+    } catch (error) {
+      // Cleanup is diagnostic only: a failed unlink must never fail finish() or the run.
+      try {
+        onEvent?.({
+          type: 'voice.speech.cleanup.failed',
+          level: 'debug',
+          file,
+          error: String(error?.code ?? error?.message ?? error),
+        });
+      } catch {
+        /* observation cannot break playback */
+      }
+    }
+  };
+  /**
+   * A prefetch keeps its cleanup responsibility until the playback loop adopts it. A slot still
+   * `pending` when the speaker stops deletes its file whenever synthesis settles — including a
+   * late result that arrives after `finish()`. `adopted` slots belong to playback, not cleanup.
+   */
+  const trackPrefetch = (task) => {
+    const slot = { task, audio: null, settled: false, state: 'pending' };
+    task.then((outcome) => {
+      slot.settled = true;
+      slot.audio = outcome?.value?.audio ?? null;
+      if (slot.state === 'discarded') void discardAudio(slot.audio);
+    }, () => { slot.settled = true; });
+    return slot;
+  };
+  const discardSlot = async (slot) => {
+    if (slot.state !== 'pending') return;
+    slot.state = 'discarded';
+    // Ready now -> delete now (bounded, local); still synthesizing -> the settle hook deletes it.
+    if (slot.settled) await discardAudio(slot.audio);
   };
   const discardAhead = async () => {
     const pending = ahead.splice(0);
-    for (const task of pending) {
-      // A cancelled/replaced version must release even if a synthesis seam ignores its signal;
-      // waiting for it forever is exactly what kept the group "playing" for minutes.
-      const settled = await abortable(task).catch(() => null);
-      if (settled?.value) await discardAudio(settled.value.audio);
-    }
+    // Never wait for a synthesizer here: a cancelled/replaced version must release immediately.
+    // Each slot owns its late result, so no prefetched file can outlive the speaker.
+    const removals = pending.map((slot) => discardSlot(slot));
     if (pending.length > 0) notifyPrefetch();
+    await Promise.all(removals);
   };
 
   const run = async () => {
@@ -514,10 +559,23 @@ export function createReplySpeaker({
         if (lane.aborted) return;
         // Strictly serial playback: the oldest prefetched sentence is awaited in order, so a
         // fast later synthesis never reorders the queue and sentence N+1 cannot play early.
-        const task = ahead.shift();
-        if (task === undefined) return;
-        const settled = await task;
-        if (settled.error) throw settled.error;
+        const slot = ahead.shift();
+        if (slot === undefined) return;
+        let settled;
+        try {
+          settled = await abortable(slot.task);
+        } catch (error) {
+          // The prefetched clip never reached the player: hand it back to delete-on-settle
+          // cleanup before releasing the run (a late result must still remove its file).
+          await discardSlot(slot);
+          throw error;
+        }
+        if (settled.error) {
+          await discardSlot(slot);
+          throw settled.error;
+        }
+        // Playback adopts this slot now; only unadopted prefetches are ever deleted as spills.
+        slot.state = 'adopted';
         current = settled.value;
         if (current === null) return;
       }
