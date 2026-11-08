@@ -149,19 +149,20 @@ DSH 的插件安装框（侧栏 **插件** → **添加插件**）接受四种 s
 
 | 方式 | 用户操作 | 适用 | 备注 |
 | --- | --- | --- | --- |
-| **已发布包名**（最推荐） | 输入 `包名@版本` → 安装 → 立即启用 | 已发布到 npm / 插件市场 | 需要维护者先发布；见 2.2.1 |
+| **已发布包名** | 输入 `包名@版本` → 安装 → 立即启用 | 已发布到 npm / 插件市场 | 需要维护者先发布；见 2.2.1 |
 | **压缩包 `.tgz`** | 下载 Release 里的 `*.tgz` → 安装框填该文件绝对路径 | 尚未发布、但想“下载即装” | 不需要克隆、不需要手动 `pnpm install` |
-| **Git 地址** | 输入仓库 URL（`https://…/Seirein.git`） | 仓库公开可访问 | DSH 会自行拉取；需要 git 可用与网络；私有仓库常因禁用凭据提示而失败 |
+| **Git 地址（推荐）** | 输入仓库 URL（`https://…/Seirein.git`） | 仓库公开可访问 | DSH 会自行拉取；需要 git 可用与网络；私有仓库常因禁用凭据提示而失败 |
 | **本地目录** | 填仓库绝对路径 | 开发者 / 本机已克隆 | 需要仓库在磁盘上，见下方“开发者安装” |
 
-> 当前仓库 `private: true`、尚未发布，也还没有公开仓库地址：普通用户暂时请用 **压缩包** 或等发布后的 **包名**；
+> 当前仓库已公开发布在 GitHub，普通用户可直接用 **Git 地址** 安装；尚未发布到 npm，所以“包名”方式要等发布。
+> `package.json` 里的 `"private": true` 只是 npm 发布保护，不影响 Git 安装，发布前去掉即可；
 > 维护者打包与发布步骤见下方 2.2.1。
 
 ##### 2.2.1 维护者发布（普通用户可安装的前提）
 
 1. 打包：`pnpm pack` 生成 `dsh-assistant-0.99.0.tgz`（`package.json.files` 已包含 `client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、图标）。
 2. 验证：在一个干净的 DSH profile 里用 tarball 安装一次，确认组合包出现、可启用、状态正常。
-3. 发布：改 `name` 为可发布 scope、去掉 `"private": true`、补 `repository`，再 `npm publish`；或把 tarball 传到 Release 页面。
+3. 发布到 npm：改 `name` 为可发布 scope、去掉 `"private": true`、补 `repository`，再 `npm publish`；或把 tarball 传到 GitHub Release 页面（不需要改 `private`）。
 4. 之后普通用户即可用「包名」或「压缩包」安装，无需接触仓库与 pnpm。
 
 #### 面向开发者：本地仓库安装
