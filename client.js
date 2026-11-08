@@ -3223,6 +3223,414 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ---- 设置页：存放位置 / 恢复语音会话 ------------------------------------------------
+    // 两个都是显式动作：保存只写设置、恢复只手动触发。这里没有定时器、没有自动重试，也没有
+    // 自动重启或数据迁移；接口缺失 / 超时 / 畸形返回都只变成一行提示，不向渲染抛出。
+    const SETTINGS_ACTION_TIMEOUT_MS = 8000;
+    const RECOVER_SESSION_TIMEOUT_MS = 30000;
+
+    /** 只接受普通对象；数组 / null / 原始值一律当作「没有结果」。 */
+    const settingsObject = (value) => (
+      value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null
+    );
+
+    const settingsText = (...values) => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+      }
+      return '';
+    };
+
+    const settingsErrorText = (cause) => (
+      cause instanceof Error ? cause.message : String(cause ?? '未知错误')
+    );
+
+    /** status 里的当前 root（只读）：status.root 优先，其次 config/paths/instance 上的副本。 */
+    function instanceRootOf(status, fallback = '') {
+      const object = settingsObject(status);
+      return settingsText(
+        object?.root,
+        object?.instance?.root,
+        object?.config?.root,
+        object?.paths?.root,
+        fallback,
+      );
+    }
+
+    /** 宿主的 root 是数据目录；选择框存父目录（host 会补 `<parent>\Seirein`）。 */
+    function instanceRootParentOf(root) {
+      const text = settingsText(root);
+      if (text === '') return '';
+      const parent = text.replace(/[\\/]+Seirein[\\/]*$/iu, '');
+      return parent === text ? text : parent;
+    }
+
+    /**
+     * POST /assistant/action 的最小封装：一次请求、一个硬超时，任何失败都只返回
+     * `{ok:false, code, error, timedOut}`，调用方永远不需要 try/catch。
+     */
+    async function runSettingsAction(body, options = {}) {
+      const fetchImpl = options.fetchImpl !== undefined
+        ? options.fetchImpl
+        : (typeof fetch === 'function' ? fetch : null);
+      const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : SETTINGS_ACTION_TIMEOUT_MS;
+      if (typeof fetchImpl !== 'function') {
+        return { ok: false, code: 'FETCH_UNAVAILABLE', error: '服务未就绪（无法连接 DSH）', timedOut: false };
+      }
+      let controller = null;
+      try {
+        controller = typeof AbortController === 'function' ? new AbortController() : null;
+      } catch {
+        controller = null;
+      }
+      const timer = controller === null ? null : setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchImpl('/assistant/action', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify(body ?? {}),
+          ...(controller === null ? {} : { signal: controller.signal }),
+        });
+        if (response === null || response === undefined || response.ok !== true) {
+          const status = Number(response?.status);
+          return {
+            ok: false,
+            code: Number.isFinite(status) ? `HTTP_${status}` : 'NO_RESPONSE',
+            error: Number.isFinite(status) ? `HTTP ${status}` : '没有响应',
+            timedOut: false,
+          };
+        }
+        const result = await response.json();
+        const object = settingsObject(result);
+        if (object === null) {
+          return { ok: false, code: 'BAD_RESPONSE', error: '返回格式异常', timedOut: false };
+        }
+        return object;
+      } catch (cause) {
+        const aborted = cause?.name === 'AbortError' || cause?.code === 'ABORT_ERR';
+        return {
+          ok: false,
+          code: aborted ? 'TIMEOUT' : 'REQUEST_FAILED',
+          error: aborted ? '请求超时' : settingsErrorText(cause),
+          timedOut: aborted,
+        };
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    }
+
+    /** instance.setRoot 的拒绝码 -> 可读原因（码本身仍留在 detail 里）。 */
+    const INSTANCE_ROOT_CODE_TEXT = {
+      EMPTY_ROOT: '请填写存放位置',
+      RELATIVE_ROOT: '请填写绝对路径',
+      NOT_A_DIRECTORY: '所选路径是文件，不是目录',
+      NOT_WRITABLE: '该位置不可写（检查权限或路径）',
+      WRITE_FAILED: '写入设置失败（检查权限）',
+      TIMEOUT: '请求超时，未确认是否保存',
+      FETCH_UNAVAILABLE: '服务未就绪（无法连接 DSH）',
+      NO_RESPONSE: '服务没有响应',
+      BAD_RESPONSE: '返回格式异常',
+      REQUEST_FAILED: '请求失败',
+    };
+
+    const instanceRootCodeText = (code) => INSTANCE_ROOT_CODE_TEXT[code] ?? '';
+
+    /**
+     * 把一次 instance.setRoot 结果投影成卡片提示。restart-required 是正常结果：既可能是
+     * `applied:'restart-required'`，也可能是旧的 `applied:false, reason:'restart-required'`。
+     */
+    function instanceRootOutcome(result, submitted = '') {
+      const object = settingsObject(result);
+      if (object === null) {
+        return {
+          ok: false, danger: true, restartRequired: false, root: '', code: 'NO_RESPONSE',
+          message: '保存失败：没有返回结果', detail: '',
+        };
+      }
+      const code = settingsText(object.code);
+      const reason = settingsText(object.reason);
+      const restartRequired = object.applied === 'restart-required'
+        || reason === 'restart-required'
+        || code === 'restart-required'
+        || object.restartRequired === true;
+      // restart-required 只是「下次启动生效」，不能报成失败；真正的拒绝会带别的错误码。
+      const accepted = object.ok === true
+        || (restartRequired && (code === '' || code === 'restart-required'));
+      if (accepted) {
+        const root = settingsText(object.root, object.dataRoot, object.parent, submitted);
+        const appliedNow = object.applied === true;
+        return {
+          ok: true,
+          danger: false,
+          restartRequired: !appliedNow,
+          root,
+          code: '',
+          message: appliedNow ? '已保存并已生效' : '已保存，需重启 DSH 生效',
+          detail: root === '' ? '' : `存放位置：${root}`,
+        };
+      }
+      const friendly = instanceRootCodeText(code)
+        || instanceRootCodeText(reason)
+        || reason
+        || code
+        || '未知原因';
+      return {
+        ok: false,
+        danger: true,
+        restartRequired: false,
+        root: '',
+        code: code || reason,
+        message: `保存失败：${friendly}`,
+        detail: code === '' ? '' : `原因码：${code}`,
+      };
+    }
+
+    /** 显式保存：空输入不发请求；动作参数固定 `{ action:'instance.setRoot', root }`。 */
+    async function submitInstanceRoot(root, post) {
+      const value = typeof root === 'string' ? root.trim() : '';
+      if (value === '') {
+        return {
+          ok: false, danger: true, restartRequired: false, root: '', code: 'EMPTY_ROOT',
+          message: '请先选择或输入存放位置', detail: '',
+        };
+      }
+      if (typeof post !== 'function') {
+        return instanceRootOutcome({ ok: false, code: 'FETCH_UNAVAILABLE' }, value);
+      }
+      let result;
+      try {
+        result = await post({ action: 'instance.setRoot', root: value });
+      } catch (cause) {
+        result = { ok: false, code: 'REQUEST_FAILED', error: settingsErrorText(cause) };
+      }
+      return instanceRootOutcome(result, value);
+    }
+
+    /** 目录选择器是可选依赖：缺失 / 取消 / 抛错都只返回一行提示，不打断设置页。 */
+    async function pickRootDirectory(uiWorkspace) {
+      if (uiWorkspace === null || uiWorkspace === undefined
+        || typeof uiWorkspace.pickDirectory !== 'function') {
+        return { ok: false, path: '', error: '目录选择器不可用，请手动输入路径' };
+      }
+      try {
+        const picked = await uiWorkspace.pickDirectory();
+        if (typeof picked !== 'string' || picked.trim() === '') return { ok: false, path: '', error: '' };
+        return { ok: true, path: picked.trim(), error: '' };
+      } catch (cause) {
+        return { ok: false, path: '', error: `目录选择失败：${settingsErrorText(cause)}` };
+      }
+    }
+
+    /** voice.session.recover 的受控码 -> 友好文案；未知码回落到宿主 reason。 */
+    const RECOVER_CODE_TEXT = {
+      'agent-owned': '会话仍被占用，请先重启 DSH',
+      'preset-missing': '压缩能力未就绪',
+      'preset-conflict': '压缩预设冲突（见诊断）',
+      'compaction-failed': '压缩失败，历史未删除',
+      'resume-failed': '恢复失败，历史未改动',
+      'mount-failed': '恢复后压缩能力未挂载',
+      'compaction-unavailable': '当前作用域没有压缩能力',
+      'agent-loop-unavailable': '恢复接口不可用（需重启 DSH）',
+      'session-unresolved': '找不到要恢复的语音会话',
+      'not-voice-session': '只能恢复 seirein-YYYY-MM-DD 语音会话',
+      'preset-invalid': '压缩预设定义损坏（见诊断）',
+      'preset-unavailable': '压缩预设读取失败',
+      'preset-registry-unavailable': '找不到压缩预设注册表',
+      TIMEOUT: '恢复超时，未确认结果',
+      FETCH_UNAVAILABLE: '服务未就绪（无法连接 DSH）',
+      NO_RESPONSE: '服务没有响应',
+      BAD_RESPONSE: '返回格式异常',
+      REQUEST_FAILED: '请求失败',
+    };
+
+    const recoverCodeText = (code) => RECOVER_CODE_TEXT[code] ?? '';
+
+    const recoverCount = (value) => (
+      typeof value === 'number' && Number.isFinite(value) ? value : null
+    );
+
+    /** 成功展示 before→after / freed / mounted；失败只展示受控文案 + 原因码。 */
+    function recoverSessionOutcome(result) {
+      const object = settingsObject(result);
+      if (object === null) {
+        return {
+          ok: false, danger: true, code: 'NO_RESPONSE', sessionId: '', mounted: null,
+          before: null, after: null, freed: null, compacted: null,
+          message: recoverCodeText('NO_RESPONSE'), detail: '',
+        };
+      }
+      const code = settingsText(object.code);
+      const sessionId = settingsText(object.sessionId);
+      if (object.ok === true) {
+        const before = recoverCount(object.before);
+        const after = recoverCount(object.after);
+        const freed = recoverCount(object.freed)
+          ?? (before !== null && after !== null ? before - after : null);
+        const mounted = object.mounted === true;
+        const compacted = object.compacted === true;
+        const show = (value) => (value === null ? '—' : String(value));
+        return {
+          ok: true, danger: false, code: '', sessionId, mounted, before, after, freed, compacted,
+          message: `已恢复${sessionId === '' ? '' : ` ${sessionId}`}：`
+            + `${show(before)} → ${show(after)} token，释放 ${show(freed)}`,
+          detail: `preset ${mounted ? '已挂载' : '未挂载'} · `
+            + `${compacted ? '已压缩一次' : '本次没有可压缩范围（历史未改动）'}`,
+        };
+      }
+      const reason = settingsText(object.reason, object.error);
+      const friendly = recoverCodeText(code);
+      return {
+        ok: false,
+        danger: true,
+        code,
+        sessionId,
+        mounted: object.mounted === true,
+        before: recoverCount(object.before),
+        after: null,
+        freed: null,
+        compacted: false,
+        message: friendly !== '' ? friendly : (reason !== '' ? reason : '恢复失败'),
+        detail: code === '' ? '' : `原因码：${code}`,
+      };
+    }
+
+    /** 二次确认之后才调用的唯一入口；没有 sessionId 时由宿主恢复当前的语音会话。 */
+    async function submitVoiceSessionRecover(post, sessionId = '') {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      const body = id === ''
+        ? { action: 'voice.session.recover' }
+        : { action: 'voice.session.recover', sessionId: id };
+      if (typeof post !== 'function') {
+        return recoverSessionOutcome({ ok: false, code: 'FETCH_UNAVAILABLE' });
+      }
+      let result;
+      try {
+        result = await post(body, RECOVER_SESSION_TIMEOUT_MS);
+      } catch (cause) {
+        result = { ok: false, code: 'REQUEST_FAILED', error: settingsErrorText(cause) };
+      }
+      return recoverSessionOutcome(result);
+    }
+
+    /** 存放位置卡片：只读 root + 一个显式按钮；弹窗里可以输入或走目录选择器。 */
+    function instanceRootSection(h, props) {
+      const { status, dialog, notice, busy } = props;
+      const root = instanceRootOf(status, settingsText(props.fallbackRoot));
+      const open = settingsObject(dialog) !== null;
+      const draft = open && typeof dialog.draft === 'string' ? dialog.draft : '';
+      const dialogError = open ? settingsText(dialog.error) : '';
+      const locked = busy === true;
+      const saveDisabled = locked || draft.trim() === '';
+      return h('div', { style: styles.card, 'data-seirein-root': 'instance' },
+        h('div', { style: styles.title }, '存放位置'),
+        h('div', { style: styles.row },
+          h('span', { style: styles.label }, '当前存放位置'),
+          h('span', { style: { ...styles.mono, wordBreak: 'break-all' } }, root === '' ? '不可用' : root)),
+        h('div', { style: styles.row },
+          h('span', { style: styles.value }, '只写入设置，需重启 DSH 生效'),
+          h('button', {
+            style: { ...styles.btnPrimary, ...(locked ? styles.off : {}) },
+            disabled: locked,
+            onClick: () => props.onOpen?.(),
+          }, '选择存放位置')),
+        h('div', { style: styles.hint },
+          '保存后不会自动重启 DSH，也不会自动迁移已有数据；重启后新位置生效，原数据需要自己搬。'),
+        notice === null || notice === undefined
+          ? null
+          : h('div', {
+              style: { ...styles.hint, color: notice.danger === true ? DANGER : '#2b8a3e' },
+            },
+              notice.message,
+              typeof notice.detail === 'string' && notice.detail !== ''
+                ? h('span', { style: styles.mono }, ` · ${notice.detail}`)
+                : null),
+        !open ? null : h('div', {
+          style: styles.overlay,
+          onClick: (event) => { if (event.target === event.currentTarget) props.onCancel?.(); },
+        },
+          h('div', { style: styles.dialog },
+            h('div', { style: styles.title }, '选择存放位置'),
+            h('div', { style: styles.hint },
+              '数据会写到 <所选目录>\\Seirein。保存后需重启 DSH 生效；不会自动重启，也不会迁移已有数据。'),
+            h('div', { style: styles.field },
+              h('span', { style: styles.label }, '目录（绝对路径）'),
+              h('div', { style: { display: 'flex', gap: 8 } },
+                h('input', {
+                  style: styles.input,
+                  value: draft,
+                  placeholder: '例如：D:\\SeireinData',
+                  onChange: (event) => props.onDraft?.(event.target.value),
+                  onKeyDown: (event) => {
+                    if (event.key === 'Enter' && !saveDisabled) props.onSave?.();
+                  },
+                }),
+                h('button', {
+                  style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                  disabled: locked,
+                  onClick: () => props.onPick?.(),
+                }, '浏览…'))),
+            dialogError === ''
+              ? null
+              : h('div', { style: { ...styles.hint, color: DANGER } }, dialogError),
+            h('div', { style: styles.row },
+              h('span', { style: styles.value }, ''),
+              h('span', { style: { display: 'flex', gap: 8 } },
+                h('button', {
+                  style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                  disabled: locked,
+                  onClick: () => props.onCancel?.(),
+                }, '取消'),
+                h('button', {
+                  style: { ...styles.btnPrimary, ...(saveDisabled ? styles.off : {}) },
+                  disabled: saveDisabled,
+                  onClick: () => props.onSave?.(),
+                }, locked ? '保存中…' : '保存'))))));
+    }
+
+    /** 恢复卡片：按钮 -> 二次确认 -> 一次动作；结果只展示，不自动调用、不轮询。 */
+    function recoverSessionSection(h, props) {
+      const { confirm, busy, outcome } = props;
+      const armed = confirm === true;
+      const locked = busy === true;
+      return h('div', { style: styles.card, 'data-seirein-recover': 'voice-session' },
+        h('div', { style: styles.title }, '恢复语音会话（诊断）'),
+        h('div', { style: styles.hint },
+          '手动重装配压缩 preset 并先压缩一次；不会自动调用，也不会轮询。历史不会被删除。'),
+        armed
+          ? h('div', { style: styles.row },
+              h('span', { style: { ...styles.value, color: DANGER } },
+                '将重新恢复当前语音会话并压缩一次，确认吗？'),
+              h('span', { style: { display: 'flex', gap: 8 } },
+                h('button', {
+                  style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                  disabled: locked,
+                  onClick: () => props.onCancel?.(),
+                }, '取消'),
+                h('button', {
+                  style: { ...styles.btnDanger, ...(locked ? styles.off : {}) },
+                  disabled: locked,
+                  onClick: () => props.onConfirm?.(),
+                }, locked ? '恢复中…' : '确认恢复')))
+          : h('div', { style: styles.row },
+              h('span', { style: styles.value }, '只在需要时手动点一次'),
+              h('button', {
+                style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                disabled: locked,
+                onClick: () => props.onAsk?.(),
+              }, '恢复当前语音会话')),
+        outcome === null || outcome === undefined
+          ? null
+          : h('div', {
+              style: { ...styles.hint, color: outcome.danger === true ? DANGER : '#2b8a3e' },
+            },
+              outcome.message,
+              typeof outcome.detail === 'string' && outcome.detail !== ''
+                ? h('span', { style: styles.mono }, ` · ${outcome.detail}`)
+                : null));
+    }
+
     function Panel() {
       const [status, setStatus] = useState(null);
       const [error, setError] = useState('');
@@ -3288,6 +3696,14 @@ window.__ModuleLoader__.load({
       const [lexiconPending, setLexiconPending] = useState(null);
       // 客户端诊断：打开设置页时读一次 /assistant/status；之后只由「刷新」再读，不新增轮询。
       const [diagnostics, setDiagnostics] = useState(null);
+      // 存放位置：当前 root 只读来自 status；保存只写设置，需重启 DSH 生效（不自动重启/迁移）。
+      const [rootDialog, setRootDialog] = useState(null);
+      const [rootNotice, setRootNotice] = useState(null);
+      const [rootBusy, setRootBusy] = useState(false);
+      // 恢复语音会话：按钮 -> 二次确认 -> 一次动作；结果只展示，不轮询、不自动重试。
+      const [recoverConfirm, setRecoverConfirm] = useState(false);
+      const [recoverBusy, setRecoverBusy] = useState(false);
+      const [recoverOutcome, setRecoverOutcome] = useState(null);
       // 阈值保存触发的采集重启结果：状态接口未提供时，用本次设置页最后一次动作结果补齐。
       const [lastRestart, setLastRestart] = useState(null);
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
@@ -3387,6 +3803,87 @@ window.__ModuleLoader__.load({
         );
         show(result.ok ? '诊断报告已复制' : `复制失败：${result.error}`);
       }, [diagnostics, lastRestart, show]);
+
+      // ---- 存放位置 / 恢复语音会话 handlers ------------------------------------------------
+      // 一次点击一次请求：这两个动作没有定时器、没有重试、没有自动重启或数据迁移。
+      const postSettingsAction = useCallback(
+        (body, timeoutMs) => runSettingsAction(body, { timeoutMs }),
+        [],
+      );
+
+      const openRootDialog = useCallback(() => {
+        setRootDialog({ draft: instanceRootParentOf(instanceRootOf(status)), error: '' });
+      }, [status]);
+
+      const closeRootDialog = useCallback(() => {
+        setRootDialog(null);
+      }, []);
+
+      const pickRootIntoDialog = useCallback(async () => {
+        const picked = await pickRootDirectory(window.__seireinCtx?.get?.('uiWorkspace'));
+        if (picked.ok === true) {
+          setRootDialog((current) => (current === null
+            ? current
+            : { ...current, draft: picked.path, error: '' }));
+          return;
+        }
+        if (picked.error !== '') {
+          setRootDialog((current) => (current === null
+            ? current
+            : { ...current, error: picked.error }));
+        }
+      }, []);
+
+      const saveRootDialog = useCallback(async () => {
+        if (rootDialog === null || rootBusy) return;
+        setRootBusy(true);
+        const outcome = await submitInstanceRoot(rootDialog.draft, postSettingsAction);
+        setRootBusy(false);
+        setRootNotice(outcome);
+        if (outcome.ok) {
+          setRootDialog(null);
+          show(outcome.message);
+          return;
+        }
+        setRootDialog((current) => (current === null
+          ? current
+          : { ...current, error: outcome.message }));
+      }, [postSettingsAction, rootBusy, rootDialog, show]);
+
+      /** 首次使用卡片上的「使用默认位置」：同一条显式保存路径，不迁移数据。 */
+      const applyDefaultRoot = useCallback(async () => {
+        const parent = instanceRootParentOf(instanceRootOf(status));
+        if (parent === '') {
+          setRootNotice({
+            ok: false, danger: true, restartRequired: false, root: '', code: 'EMPTY_ROOT',
+            message: '无法推断默认位置', detail: '',
+          });
+          return;
+        }
+        setRootBusy(true);
+        const outcome = await submitInstanceRoot(parent, postSettingsAction);
+        setRootBusy(false);
+        setRootNotice(outcome);
+        if (outcome.ok) show(outcome.message);
+      }, [postSettingsAction, show, status]);
+
+      const askRecoverSession = useCallback(() => {
+        setRecoverOutcome(null);
+        setRecoverConfirm(true);
+      }, []);
+
+      const cancelRecoverSession = useCallback(() => {
+        setRecoverConfirm(false);
+      }, []);
+
+      const confirmRecoverSession = useCallback(async () => {
+        if (recoverBusy) return;
+        setRecoverBusy(true);
+        const outcome = await submitVoiceSessionRecover(postSettingsAction);
+        setRecoverBusy(false);
+        setRecoverConfirm(false);
+        setRecoverOutcome(outcome);
+      }, [postSettingsAction, recoverBusy]);
 
       // 动作预设列表：只在打开设置页时读一次，覆盖/恢复后再读一次（保持按钮与覆盖值一致）。
       const loadMotionPresets = useCallback(async () => {
@@ -4197,57 +4694,41 @@ window.__ModuleLoader__.load({
           ? card(
             '首次使用：请先选择存放位置',
             h('div', { style: styles.hint },
-              `当前数据会写到 ${status.root ?? '默认目录'}。选一个你自己的位置后，记忆、数据和工作区都会放在 <所选目录>\\Seirein 下，且改写根目录时会自动把已有数据带过去。`),
+              `当前数据会写到 ${status.root ?? '默认目录'}。选一个你自己的位置后，数据会放在 <所选目录>\\Seirein 下；保存后需重启 DSH 生效，不会自动重启，也不会自动迁移已有数据。`),
             h('div', { style: styles.row },
               h('button', {
-                style: styles.btnPrimary,
-                disabled: busy !== '',
-                onClick: async () => {
-                  const uiWorkspace = window.__seireinCtx?.get?.('uiWorkspace');
-                  const picked = await uiWorkspace?.pickDirectory?.();
-                  if (!picked) return;
-                  const result = await act({ action: 'instance.setRoot', root: picked }, 'firstRun');
-                  if (result.ok) show('已设定，重启 DSH 生效');
-                },
+                style: { ...styles.btnPrimary, ...(rootBusy ? styles.off : {}) },
+                disabled: rootBusy,
+                onClick: openRootDialog,
               }, '选择存放位置'),
               h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: async () => {
-                  const parent = (status.root ?? '').replace(/[\\/]+Seirein[\\/]*$/iu, '');
-                  if (parent.length === 0) {
-                    show('无法推断默认位置');
-                    return;
-                  }
-                  const result = await act({ action: 'instance.setRoot', root: parent }, 'firstRunDefault');
-                  if (result.ok) show('已使用默认位置');
-                },
+                style: { ...styles.btn, ...(rootBusy ? styles.off : {}) },
+                disabled: rootBusy,
+                onClick: () => void applyDefaultRoot(),
               }, '使用默认位置'),
             ),
           )
           : null,
 
+        instanceRootSection(h, {
+          status,
+          fallbackRoot: status.root ?? '',
+          dialog: rootDialog,
+          notice: rootNotice,
+          busy: rootBusy,
+          onOpen: openRootDialog,
+          onDraft: (value) => setRootDialog((current) => (current === null
+            ? current
+            : { ...current, draft: value, error: '' })),
+          onPick: () => void pickRootIntoDialog(),
+          onCancel: closeRootDialog,
+          onSave: () => void saveRootDialog(),
+        }),
+
         card(
           'Seirein',
           line('客户端 / 服务端', `v${CLIENT_VERSION} / v${status.version}`),
           line('根目录', status.root ?? '—'),
-          h('div', { style: styles.row },
-            h('button', {
-              style: styles.btn,
-              disabled: busy !== '',
-              onClick: async () => {
-                const uiWorkspace = window.__seireinCtx?.get?.('uiWorkspace');
-                if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== 'function') {
-                  show('目录选择器不可用，请手动编辑 instance.json');
-                  return;
-                }
-                const picked = await uiWorkspace.pickDirectory();
-                if (picked === null || picked === undefined || picked === '') return;
-                const result = await act({ action: 'instance.setRoot', root: picked }, 'root');
-                if (result.ok) show('已写入，重启 DSH 后生效');
-              },
-            }, '选择根目录'),
-          ),
           line('运行时长', `${Math.max(1, Math.round(status.uptimeMs / 60000))} 分钟`),
           line('人设与画像', `${status.personaChars} 字符`),
           line('固定记忆', `${resources.length} 条`),
@@ -4260,6 +4741,15 @@ window.__ModuleLoader__.load({
           busy: busy !== '',
           onRefresh: () => void loadDiagnostics(),
           onCopy: () => void copyDiagnostics(),
+        }),
+
+        recoverSessionSection(h, {
+          confirm: recoverConfirm,
+          busy: recoverBusy,
+          outcome: recoverOutcome,
+          onAsk: askRecoverSession,
+          onCancel: cancelRecoverSession,
+          onConfirm: () => void confirmRecoverSession(),
         }),
 
         card(
