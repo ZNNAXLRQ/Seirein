@@ -12051,6 +12051,24 @@ export function apply(ctx, config) {
     speakerStatusAt = at;
     void log.emit('speaker.status', speakerStatus()).catch(() => {});
   };
+  // The host's OWN subscription to the shared speaker-model download. Aborting it only unbinds this
+  // caller: the download layer keeps the task running while hearing (or anyone else) still waits.
+  let speakerDownloadController = null;
+  /**
+   * Leave the host's share of the download. `speakerDownloading` is cleared first so status can
+   * never keep reporting `downloading` after the switch/component/unload has closed it.
+   */
+  const cancelSpeakerDownload = (reason = 'listener-left') => {
+    const controller = speakerDownloadController;
+    if (controller === null) return false;
+    speakerDownloadController = null;
+    if (speakerDownloading) {
+      speakerDownloading = false;
+      emitSpeakerStatus(true);
+    }
+    if (controller.signal.aborted !== true) controller.abort(reason);
+    return true;
+  };
   /** Aggregate what hearing already emitted; this never scores and never touches delivery. */
   const noteSpeakerEvent = (type, payload) => {
     if (type === 'speaker.shadow') {
@@ -12076,25 +12094,43 @@ export function apply(ctx, config) {
       if (speakerDownloading) return;
       const targetPath = speakerModelPath();
       if (!isSharedModelTarget(targetPath) || existsSync(targetPath)) return;
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      speakerDownloadController = controller;
       speakerDownloading = true;
       emitSpeakerStatus(true);
       void ensureSpeakerModel({
         targetPath,
+        signal: controller?.signal,
+        // Per-subscription teardown: `remaining > 0` means this caller only detached (the shared
+        // task continues for hearing); `0` means the layer aborted it and removed its own `.part`.
+        onDetach: (remaining, reason) => {
+          void log.emit(
+            remaining > 0 ? 'speaker.download.detached' : 'speaker.download.cancelled',
+            remaining > 0 ? { remaining } : { reason },
+          ).catch(() => {});
+        },
+        cancelReason: 'listener-left',
         onEvent: (type, payload) => {
           noteSpeakerEvent(type, payload);
           void log.emit(type, payload).catch(() => {});
         },
       }).catch(() => {
-        /* modelDownload already reported `speaker.model.failed`; a missing model is not fatal */
+        /* modelDownload already reported the cancellation/failure; a missing model is not fatal */
       }).finally(() => {
+        if (speakerDownloadController !== controller) return;
+        speakerDownloadController = null;
         speakerDownloading = false;
         emitSpeakerStatus(true);
       });
     } catch {
       // A broken path probe is the shadow's problem, never the capture's.
       speakerDownloading = false;
+      speakerDownloadController = null;
     }
   };
+  // A plugin unload must not keep the subscription alive; a shared download hearing still waits for
+  // is left running by the layer's reference count (see modelDownload `subscribeTask`).
+  ctx.effect(() => () => { cancelSpeakerDownload('unload'); });
 
   // ---- microphone barge-in ----------------------------------------------
   // One partial frame is not evidence that the user spoke: a cough or an ASR hallucination
@@ -13153,8 +13189,11 @@ export function apply(ctx, config) {
   };
 
   const stopComponentResources = async (id, reason) => {
-    if (id === 'hearing') await stopListening();
-    else if (id === 'ambient') await stopAmbient();
+    if (id === 'hearing') {
+      await stopListening();
+      // Closing the hearing component also closes the host's shadow-download subscription.
+      cancelSpeakerDownload('disabled');
+    } else if (id === 'ambient') await stopAmbient();
     else if (id === 'voice') {
       speechLedger.cancelAll('feature-disabled');
       invalidateSpeech();
@@ -13254,7 +13293,7 @@ export function apply(ctx, config) {
     return results;
   };
 
-  const handleUiAction = createSettingsRouter([
+  const dispatchUiAction = createSettingsRouter([
 { actions: hearingActions, handle: createHearingSettingsActions({
     get ambientAutostart() { return ambientAutostart; },
     get callModeNames() { return callModeNames; },
@@ -13421,6 +13460,15 @@ export function apply(ctx, config) {
     get writeSettings() { return writeSettings; }
   }) }
   ]);
+  /**
+   * The hearing actions own the switch; the host owns the download subscription. An explicit OFF
+   * therefore also leaves the host's share here (the shared task keeps running for other callers).
+   */
+  const handleUiAction = async (body) => {
+    const result = await dispatchUiAction(body);
+    if (body?.action === 'voice.speakerShadow' && body.enabled !== true) cancelSpeakerDownload('disabled');
+    return result;
+  };
 
   const registerRoutes = createSettingsRoutes({
     get buildStatus() { return buildStatus; },
@@ -13487,6 +13535,16 @@ export function apply(ctx, config) {
       },
       { name: 'hearing', kind: 'internal', stop: () => stopHearingSession(hearing) },
       { name: 'ambient', kind: 'internal', stop: () => stopHearingSession(ambient) },
+      {
+        name: 'speakerDownload',
+        kind: 'internal',
+        // Unload and a Host shutdown both end the host's download subscription inside the shared
+        // deadline; a task another caller still waits for is left running by the layer's refcount.
+        stop: () => ({
+          confirmed: true,
+          cancelled: cancelSpeakerDownload(shutdown.reason === 'host-shutdown' ? 'shutdown' : 'unload'),
+        }),
+      },
       {
         name: 'speech',
         kind: 'internal',

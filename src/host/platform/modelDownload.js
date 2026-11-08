@@ -35,7 +35,12 @@ export const SPEAKER_MODEL_SHA256 = 'f682b514c05d947ee3fa91cd6ec6c5c7543479a1283
 const inFlight = new Map();
 
 /** Cancellation reasons a caller may name through `signal.reason`. */
-const CANCEL_REASONS = new Set(['stopped', 'shutdown', 'superseded']);
+const CANCEL_REASONS = new Set([
+  'stopped', 'shutdown', 'superseded',
+  // The speaker shadow's own subscription lifecycle: the setting/component closed, the plugin
+  // unloaded, the Host shut down, or a caller simply left without a more specific reason.
+  'disabled', 'unload', 'listener-left',
+]);
 
 /** The reason a caller asked for; anything else falls back to `stopped`. */
 function cancelReasonOf(signal, fallback = 'stopped') {
@@ -140,8 +145,12 @@ async function fetchBuffer(url, { fetchImpl, timeoutMs, signal }) {
   }
 }
 
-/** Bind one caller to a shared task; that caller's abort only unbinds itself. */
-function subscribeTask(task, signal, fallbackReason) {
+/**
+ * Bind one caller to a shared task; that caller's abort only unbinds itself. `onDetach` observes
+ * this caller's own departure with the number of callers still waiting (0 means the download layer
+ * cancels the shared task and removes its own `.part`); it never runs for a normal completion.
+ */
+function subscribeTask(task, signal, fallbackReason, onDetach) {
   return new Promise((resolve, reject) => {
     const entry = {
       signal, fallbackReason, onAbort: null, settled: false, settle: null, resolve, reject,
@@ -162,7 +171,13 @@ function subscribeTask(task, signal, fallbackReason) {
       const reason = cancelReasonOf(signal, entry.fallbackReason);
       entry.settle(reject, cancelledError(reason));
       // The task belongs to every caller: only the last one leaving cancels the download.
-      if (task.subscribers.size === 0) cancelTask(task, reason);
+      const remaining = task.subscribers.size;
+      try {
+        onDetach?.(remaining, reason);
+      } catch {
+        /* an observer must never break the download */
+      }
+      if (remaining === 0) cancelTask(task, reason);
     };
     task.subscribers.add(entry);
     if (signal === null || signal === undefined) return;
@@ -219,10 +234,13 @@ async function finalizeTask(task, outcome) {
  * `<eventPrefix>.ready {path}`, `<eventPrefix>.failed {reason}`, and
  * `<eventPrefix>.cancelled {reason}` for `stopped`/`shutdown`/`superseded` (the default prefix is
  * `vad.model`, so the existing VAD events keep their names; the speaker model passes its own).
+ * `onDetach(remaining, reason)` reports this caller's own departure only (never a completion): it is
+ * the hook a subscriber uses to tell "I left while others still wait" from "the task was cancelled".
  *
  * @param {{targetPath: string, url?: string, mirrors?: string[], bytes: number, sha256: string,
  *          fetchImpl?: Function, retries?: number, timeoutMs?: number, eventPrefix?: string,
- *          signal?: AbortSignal, cancelReason?: 'stopped'|'shutdown'|'superseded',
+ *          signal?: AbortSignal, cancelReason?: 'stopped'|'shutdown'|'superseded'|'disabled'|'unload'|'listener-left',
+ *          onDetach?: (remaining: number, reason: string) => void,
  *          onEvent?: (type: string, payload: object) => void, now?: () => number}} options
  * @returns {Promise<{ok: true, path: string, downloaded: boolean, bytes: number, ms: number}>}
  */
@@ -238,6 +256,7 @@ export function ensureModel({
   eventPrefix = 'vad.model',
   signal = null,
   cancelReason = 'stopped',
+  onDetach,
   onEvent,
   now = Date.now,
 } = {}) {
@@ -252,7 +271,7 @@ export function ensureModel({
   }
   const key = resolve(targetPath);
   const running = inFlight.get(key);
-  if (running !== undefined) return subscribeTask(running, signal, cancelReason);
+  if (running !== undefined) return subscribeTask(running, signal, cancelReason, onDetach);
 
   const definition = { bytes: Number(bytes), sha256 };
   const sources = [...new Set([url, ...(Array.isArray(mirrors) ? mirrors : [])]
@@ -356,14 +375,14 @@ export function ensureModel({
     }
   };
 
-  const promise = subscribeTask(task, signal, cancelReason);
+  const promise = subscribeTask(task, signal, cancelReason, onDetach);
   if (!task.finalized) void runTask().catch(() => {});
   return promise;
 }
 
 /** The pinned Silero VAD download, at the fixed `models/silero_vad.onnx` destination. */
 export function ensureVadModel({
-  targetPath, mirrors, fetchImpl, retries, timeoutMs, signal, cancelReason, onEvent, now,
+  targetPath, mirrors, fetchImpl, retries, timeoutMs, signal, cancelReason, onDetach, onEvent, now,
 } = {}) {
   return ensureModel({
     targetPath,
@@ -376,6 +395,7 @@ export function ensureVadModel({
     timeoutMs,
     signal,
     cancelReason,
+    onDetach,
     onEvent,
     now,
   });
@@ -383,7 +403,7 @@ export function ensureVadModel({
 
 /** The pinned CAM++ speaker-embedding download, at the fixed `models/` destination. */
 export function ensureSpeakerModel({
-  targetPath, mirrors, fetchImpl, retries, timeoutMs, signal, cancelReason, onEvent, now,
+  targetPath, mirrors, fetchImpl, retries, timeoutMs, signal, cancelReason, onDetach, onEvent, now,
 } = {}) {
   return ensureModel({
     targetPath,
@@ -397,6 +417,7 @@ export function ensureSpeakerModel({
     timeoutMs,
     signal,
     cancelReason,
+    onDetach,
     onEvent,
     now,
   });
