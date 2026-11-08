@@ -5,6 +5,11 @@ export const ACTIONS = Object.freeze([
   'hearing.start',
   'hearing.autoListen',
   'voice.speakerShadow',
+  /** Opt-in, short-lived diagnosis clips: the switch is `voice.audioRetention`, off by default. */
+  'voice.audioRetention',
+  'audio.retention.list',
+  'audio.retention.delete',
+  'audio.retention.export',
   'hearing.threshold',
   'hearing.device',
   'hearing.devices.refresh',
@@ -19,6 +24,16 @@ export const ACTIONS = Object.freeze([
 ]);
 
 export function createHearingSettingsActions(services) {
+  /**
+   * The one diagnosis-clip store. The Host owns it (one per plugin root); a live capture session
+   * is the fallback, so the actions keep working even when only the session created the store.
+   */
+  const retentionStore = () => services.retentionStore ?? services.hearing?.retention ?? null;
+  const RETENTION_UNAVAILABLE = Object.freeze({
+    ok: false,
+    code: 'AUDIO_RETENTION_UNAVAILABLE',
+    error: '音频诊断保留尚未接线：需要 Host 提供 retention 存储',
+  });
   const handler = async (body) => {
     switch (body.action) {
       case 'hearing.start': {
@@ -60,6 +75,39 @@ export function createHearingSettingsActions(services) {
           await (0, services.startListening)(device);
         }
         return { ok: true, enabled, model: (0, services.speakerModelState)() };
+      }
+      case 'voice.audioRetention': {
+        // Opt-in diagnosis clips, off by default. The switch is persisted first; a running store
+        // follows it live, so an enabled capture starts keeping suspicious clips without a restart.
+        // Turning it off stops new writes — nothing is deleted behind the user's back.
+        const enabled = body.enabled === true;
+        (0, services.writeSettings)({ voice: { ...(0, services.storedVoice)(), audioRetention: enabled } });
+        const store = retentionStore();
+        store?.setEnabled?.(enabled);
+        await services.log.emit('hearing.audio.retention', { enabled, source: 'settings' });
+        return { ok: true, enabled, limits: store?.limits ?? null, status: store?.status?.() ?? null };
+      }
+      case 'audio.retention.list': {
+        // Entries only: time / utteranceId / rms / vad / text / reason / bytes. Never audio bytes.
+        const store = retentionStore();
+        if (store === null) return RETENTION_UNAVAILABLE;
+        return store.list();
+      }
+      case 'audio.retention.delete': {
+        const store = retentionStore();
+        if (store === null) return RETENTION_UNAVAILABLE;
+        if (body.all === true || body.id === 'all') return store.deleteAll();
+        const id = String(body.id ?? '');
+        if (id === '') return { ok: false, error: '需要 id 或 all=true' };
+        return store.deleteOne(id);
+      }
+      case 'audio.retention.export': {
+        // A file path for the settings page to play; the audio itself never travels in an event.
+        const store = retentionStore();
+        if (store === null) return RETENTION_UNAVAILABLE;
+        const id = String(body.id ?? '');
+        if (id === '') return { ok: false, error: '需要 id' };
+        return store.exportPath(id);
       }
       case 'hearing.threshold': {
         // Noise floor in dB: anything quieter than this counts as silence. Lower = more sensitive.

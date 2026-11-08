@@ -39,6 +39,12 @@ import {
   vadModelTarget,
 } from '../platform/modelDownload.js';
 import { createSpeakerEmbedder, createSpeakerLibrary } from './speakerVoice.js';
+import {
+  openAudioRetention,
+  pcm16FromChunks,
+  pcm16FromFloat32,
+  retentionVerdictOf,
+} from './audio-retention.js';
 import { createDialogueContext } from '../session/conversation/dialogueContext.js';
 
 import { finalModelReady, createFinalRecognizer, createRecognizer } from './models.js';
@@ -357,6 +363,17 @@ export function startHearing({
   dialogueContext = null,
   dialogueFactory = createDialogueContext,
   now = Date.now,
+  /**
+   * Diagnosis clips (`voice.audioRetention`, **off by default**). A boolean/getter is the switch; a
+   * store object is used as-is (tests) and `retentionRoot` builds the shared store for `<root>`.
+   * While off, no audio is kept anywhere. When on, only a *suspicious* final keeps its own PCM
+   * briefly — see `audio-retention.js`. Delivery and recognition never read this.
+   */
+  audioRetention = false,
+  retentionRoot = '',
+  retentionLimits = null,
+  /** Privacy lock probe (`vision.mode === 'privacy'`): a clip is refused at write time. */
+  isPrivacy = null,
   /** Test seams: production never passes these, so the real models and ffmpeg are used. */
   recognizer: recognizerOverride,
   finalRecognizer: finalRecognizerOverride,
@@ -380,6 +397,48 @@ export function startHearing({
    * an old instance (or an in-flight fragment) is never read as the replacement's.
    */
   const instanceId = `h${(hearingInstanceSeq += 1)}-${shortHash(`${Date.now()}|${device}|${hearingInstanceSeq}`)}`;
+
+  /**
+   * Diagnosis clips are opt-in and off by default. One store per root is shared with the other
+   * capture lane, so two sessions can never interleave `index.json`. Nothing is written at start;
+   * `cleanupOnce()` only expires old clips (and creates no directory when nothing was ever kept).
+   */
+  const retention = audioRetention !== null && typeof audioRetention === 'object'
+    && typeof audioRetention.retain === 'function'
+    ? audioRetention
+    : (retentionRoot !== ''
+      ? openAudioRetention({
+        root: retentionRoot,
+        limits: retentionLimits,
+        enabled: typeof audioRetention === 'function' ? audioRetention : () => audioRetention === true,
+        isPrivacy,
+        emit: (type, payload) => {
+          try {
+            onEvent?.(type, payload);
+          } catch {
+            /* a diagnosis row must never break capture */
+          }
+        },
+      })
+      : null);
+  /** The switch, read live: a settings toggle applies without restarting the capture. */
+  const retentionOn = () => retention !== null && retention.isEnabled();
+  const retentionRequested = () => {
+    if (typeof audioRetention !== 'function') return audioRetention === true;
+    try {
+      return audioRetention() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (retention === null && retentionRequested()) {
+    try {
+      onEvent?.('hearing.audio.retention.unavailable', { level: 'debug', reason: 'no-root' });
+    } catch {
+      /* an event sink must never break capture */
+    }
+  }
+  void retention?.cleanupOnce?.();
 
   let lastError = null;
   // Final pass is optional: a missing model just means "use the streaming text".
@@ -1149,6 +1208,49 @@ export function startHearing({
     }
   };
   /**
+   * Diagnosis clips (opt-in, `voice.audioRetention`): queue this final's own PCM when the verdict
+   * names a hypothesis worth listening to. Called *after* the delivery verdict and before the drop
+   * branches, never awaited: the store may write a file, the delivery path is not delayed or changed.
+   * A merged group keeps per-fragment PCM, so each fragment is kept with its own audio.
+   */
+  const noteRetention = (snapshot, outcome, verdict) => {
+    if (retention === null || !retentionOn()) return;
+    try {
+      const clip = retentionVerdictOf({
+        text: outcome.text,
+        durationMs: snapshot.durationMs,
+        endpointReason: snapshot.endpointReason,
+        voicedMs: snapshot.voicedMs,
+        vadSpeechRatio: snapshot.vadSpeechRatio,
+        delivered: verdict.delivered,
+        echo: verdict.echo,
+        lowEvidence: verdict.lowEvidence,
+      });
+      if (clip.reason === '') return;
+      const targets = Array.isArray(snapshot.groupSegments) ? snapshot.groupSegments : [snapshot];
+      for (const entry of targets) {
+        const target = entry?.snapshot ?? entry;
+        if (target.retentionSamples === null || target.retentionSamples === undefined) continue;
+        void retention.retain({
+          utteranceId: target.id,
+          samples: target.retentionSamples,
+          reason: clip.reason,
+          suspects: clip.suspects,
+          rmsDb: target.rmsDb,
+          peakDb: target.peakDb,
+          vadRatio: target.vadSpeechRatio,
+          vadSource: target.vadRatioSource,
+          text: outcome.text,
+          source: inputSource,
+          device,
+        }).catch(() => {});
+        target.retentionSamples = null;
+      }
+    } catch {
+      /* a diagnosis clip must never break delivery */
+    }
+  };
+  /**
    * VAD-shadow rows already written. Like the noise shadow, this list only decides whether a log
    * row is written: `hearing.vad.shadow` is emitted after the utterance's audio window closed and
    * is never read by a delivery path.
@@ -1598,6 +1700,9 @@ export function startHearing({
     const delivered = candidate && echo?.drop !== true && !lowDrop;
     noteNoiseShadow(snapshot, outcome, delivered);
     noteLowEvidence(snapshot, outcome, lowEvidence, delivered);
+    // Diagnosis clip (opt-in): a suspicious final keeps its audio for a short while. The verdict
+    // above is already final; this call never changes it and never waits for the store.
+    noteRetention(snapshot, outcome, { delivered, echo, lowEvidence });
     if (echo !== null && echo.drop !== true && (echo.match.matched || playingNow)) {
       noteEchoCandidate(snapshot, echo);
     }
@@ -2007,7 +2112,10 @@ export function startHearing({
     const entries = group.segments;
     if (entries.length === 1) {
       // A one-fragment group is delivered byte-for-byte like before; only the group tag is added.
-      return { snapshot: { ...entries[0].snapshot, groupSegments: entries }, outcome: entries[0].outcome };
+      return {
+        snapshot: { ...entries[0].snapshot, retentionSamples: null, groupSegments: entries },
+        outcome: entries[0].outcome,
+      };
     }
     const snapshots = entries.map((entry) => entry.snapshot);
     const outcomes = entries.map((entry) => entry.outcome);
@@ -2055,6 +2163,8 @@ export function startHearing({
         vadSpeechRatio: vadSpeechMs === null || durationMs === 0 ? null : vadSpeechMs / durationMs,
         vadRatioSource: last.vadRatioSource ?? null,
         speakerSamples: null,
+        // Each fragment owns (and hands off) its own diagnosis clip; the merged view never does.
+        retentionSamples: null,
         groupSegments: entries,
       },
       outcome: {
@@ -2340,6 +2450,14 @@ export function startHearing({
         }
         if (speakerShadowOn) snapshot.speakerSamples = merged;
       }
+      // Diagnosis clip (opt-in): this utterance's own PCM, converted here so the decoded result
+      // cannot hold the Float32 buffer alive. No file is written yet — only the final's verdict
+      // decides whether `noteRetention` ever hands it to the store.
+      if (retentionOn()) {
+        snapshot.retentionSamples = merged !== null
+          ? pcm16FromFloat32(merged)
+          : pcm16FromChunks(utterance, utteranceSamples);
+      }
 
       // Release the streaming state before the accurate pass: with the worker it runs off-thread,
       // so the next utterance has to be captured immediately (the audio was copied above).
@@ -2434,6 +2552,11 @@ export function startHearing({
     device,
     /** This session's capture-instance id (`hearing.instance.*`, judgment rows, status). */
     instanceId,
+    /**
+     * The shared diagnosis-clip store (null when the switch has no root). The settings actions
+     * reach it through here for `audio.retention.list/delete/export`; it holds no audio in memory.
+     */
+    retention,
     /**
      * The floor this instance resolves *now*, without the change detector: the status card and the
      * evidence rows must be able to read the effective value without inventing an event.
