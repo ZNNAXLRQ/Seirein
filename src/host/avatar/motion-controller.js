@@ -31,11 +31,15 @@ import {
   INTENT_SETTLE_MS,
   INTENT_VARIANTS,
   MOTION_STATUSES,
+  PRESET_EXECUTION,
+  PRESET_NATIVE_CHANNELS,
+  PRESET_OPERATION_CHANNELS,
   SPEECH_HEAD_DAMP,
   STATUS_MODIFIERS,
   STYLE_DIMENSION_APPLICATION,
   intentChannelsFor,
 } from './motion-config.js';
+import { createPresetSelector } from './preset-selector.js';
 import { composeChannels, normalizeGaze } from './mixer.js';
 import { createBlinkState, springParams, stepBlink, stepSpringAxis } from './dynamics.js';
 
@@ -472,6 +476,120 @@ const levelIndex = (elapsedMs, stepMs, length) => {
 };
 
 
+// ---------------------------------------------------------------------------------------------
+// Motion preset execution — symbolic operations, never the four legacy intents
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which preset event a host state uses at an autonomous idle boundary. `speaking` deliberately
+ * has no autonomous draw: `sentence-gap` must follow a REAL playback boundary, so the runtime
+ * calls `preset()` from its clip-start/speech-end path instead of sampling one here.
+ */
+const PRESET_EVENT_BY_STATE = Object.freeze({
+  idle: 'idle',
+  waiting: 'idle',
+  tired: 'idle',
+  listening: 'user-speaking',
+  thinking: 'thinking',
+});
+
+/** Host phase names (motionEvents.js) → preset event vocabulary (presets/catalog.js). */
+const PRESET_EVENT_FOR_PHASE = Object.freeze({
+  'turn-start': 'user-speaking',
+  'user-speaking': 'user-speaking',
+  thinking: 'thinking',
+  'answer-start': 'answer-start',
+  'answer-end': 'answer-end',
+  idle: 'idle',
+  confused: 'confused',
+  conclusion: 'affirm',
+});
+
+/**
+ * One symbolic operation → the trajectory the executor generates. `amount` is in semantic pose
+ * units at persona amplitude 1 (one unit = 30° for head channels); it is scaled by the persona
+ * style and the room left in the chosen direction at execution time. Nothing here is a VTS
+ * parameter name and nothing asserts a visible minimum.
+ */
+const PRESET_OPERATION_PROFILE = Object.freeze({
+  'head-turn': Object.freeze({ kind: 'move', amount: 0.42, sign: 0, active: 'TURN_ACTIVE_MS' }),
+  'head-tilt': Object.freeze({ kind: 'move', amount: 0.34, sign: 0, tilt: true, active: 'TILT_ACTIVE_MS' }),
+  'head-lower': Object.freeze({ kind: 'move', amount: -0.30, sign: -1, active: 'TURN_ACTIVE_MS' }),
+  'head-lift': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, active: 'TURN_ACTIVE_MS' }),
+  'head-center': Object.freeze({ kind: 'center', amount: 0, active: 'TURN_ACTIVE_MS' }),
+  nod: Object.freeze({ kind: 'nod', amount: -0.30, sign: -1, active: 'NOD_ACTIVE_MS' }),
+  'double-nod': Object.freeze({ kind: 'double-nod', amount: -0.30, sign: -1, active: 'DOUBLE_NOD_ACTIVE_MS' }),
+  shake: Object.freeze({ kind: 'shake', amount: 0.32, sign: 0, active: 'SHAKE_ACTIVE_MS' }),
+  'gaze-side': Object.freeze({ kind: 'move', amount: 0.34, sign: 0, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
+  'gaze-up': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
+  'gaze-down': Object.freeze({ kind: 'move', amount: -0.30, sign: -1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
+  'gaze-target': Object.freeze({ kind: 'target', amount: 0, gaze: 'target', active: 'GAZE_ACTIVE_MS' }),
+  'gaze-center': Object.freeze({ kind: 'center', amount: 0, gaze: 'center', active: 'GAZE_ACTIVE_MS' }),
+  blink: Object.freeze({ kind: 'blink', amount: 0.92, sign: 1, active: 'BLINK_ACTIVE_MS' }),
+  'double-blink': Object.freeze({ kind: 'double-blink', amount: 0.92, sign: 1, active: 'DOUBLE_BLINK_ACTIVE_MS' }),
+  'brow-lift': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, active: 'BROW_ACTIVE_MS' }),
+  'brow-knit': Object.freeze({ kind: 'move', amount: -0.28, sign: -1, active: 'BROW_ACTIVE_MS' }),
+  'brow-one': Object.freeze({ kind: 'move', amount: 0.32, sign: 0, browOne: true, active: 'BROW_ACTIVE_MS' }),
+  'body-lean': Object.freeze({ kind: 'native', amount: 0 }),
+  'body-settle': Object.freeze({ kind: 'native', amount: 0 }),
+  'body-tilt': Object.freeze({ kind: 'native', amount: 0 }),
+  'breath-cycle': Object.freeze({ kind: 'native', amount: 0 }),
+});
+
+const PRESET_HEAD_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
+const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
+
+const presetClamp = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
+
+/** True when one operation list contains a head roll (the tilt family, used for style bias). */
+const hasTiltOperation = (preset) => Array.isArray(preset?.operations)
+  && preset.operations.some((operation) => operation === 'head-tilt');
+
+/** Classify a recipe's gaze content for the `gazeHabit` weighting/dwell consumer. */
+const gazeKindOf = (preset) => {
+  const operations = Array.isArray(preset?.operations) ? preset.operations : [];
+  if (operations.includes('gaze-target')) return 'target';
+  if (operations.includes('gaze-center')) return 'center';
+  if (operations.some((operation) => operation === 'gaze-side'
+    || operation === 'gaze-up' || operation === 'gaze-down')) return 'away';
+  return null;
+};
+
+/** Clone one trace into a bounded, caller-safe shape (snapshot / return values). */
+function clonePresetTrace(trace) {
+  if (trace === null || typeof trace !== 'object') return null;
+  return {
+    at: trace.at,
+    selection: {
+      ...trace.selection,
+      reasons: [...(trace.selection?.reasons ?? [])],
+      droppedChannels: [...(trace.selection?.droppedChannels ?? [])],
+      effectiveRequires: [...(trace.selection?.effectiveRequires ?? [])],
+      operations: [...(trace.selection?.operations ?? [])],
+      verifiedChannels: [...(trace.selection?.verifiedChannels ?? [])],
+    },
+    output: {
+      ...trace.output,
+      stages: (trace.output?.stages ?? []).map((stage) => ({
+        ...stage,
+        channels: [...(stage.channels ?? [])],
+        phases: [...(stage.phases ?? [])],
+      })),
+      channels: [...(trace.output?.channels ?? [])],
+      droppedChannels: [...(trace.output?.droppedChannels ?? [])],
+      samples: (trace.output?.samples ?? []).map((sample) => ({
+        ...sample,
+        channels: { ...(sample.channels ?? {}) },
+      })),
+      committed: { ...(trace.output?.committed ?? {}) },
+      reason: trace.output?.reason ?? '',
+    },
+    visible: { ...(trace.visible ?? {}) },
+    interrupt: trace.interrupt === undefined ? null : trace.interrupt,
+  };
+}
+
+
 /**
  * Deterministic text → mouth envelope, one level per `stepMs` slice (100 ms by default).
  *
@@ -717,6 +835,38 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     interrupts: 0,
     lastInterruptReason: '',
     lastError: '',
+    /**
+     * Motion preset execution (presets/README.md). Selection lives in the same low-frequency
+     * controller as the idle posture; the active trajectories below are folded into the ONE 30 Hz
+     * pose through `presetFrame()`, never through the four legacy intents.
+     */
+    presets: {
+      enabled: supplied.presetExecution === true,
+      capabilities: {
+        channels: Array.isArray(supplied.presetChannels) ? [...supplied.presetChannels] : [],
+        targetVerified: supplied.presetTargetVerified === true,
+        directionVerified: supplied.presetDirectionVerified === true,
+      },
+      overrides: null,
+      selector: null,
+      selectorKey: '',
+      active: [],
+      seq: 0,
+      generation: 0,
+      starts: 0,
+      holds: 0,
+      selected: 0,
+      dropped: 0,
+      nextDecisionAt: null,
+      lastSelection: null,
+      lastTrace: null,
+      recent: [],
+      history: [],
+      recentFamilies: [],
+      recentActions: [],
+      lastSign: Object.create(null),
+      random: createSeededRandom(`preset:${cfg.seed === undefined ? 'default' : String(cfg.seed)}`),
+    },
   };
 
   const clockNow = () => {
@@ -1243,6 +1393,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   function stepIdleActions(frame, dt, now) {
+    // With preset execution enabled, the discrete idle pool is replaced by the preset selection
+    // boundary. The legacy action queue must stay empty, otherwise two schedulers would write.
+    if (state.presets.enabled === true) {
+      state.idleAction.accMs = 0;
+      return;
+    }
     const idle = state.idleAction;
     // Only an explicit `flags.idle === false` pauses the scheduler. SPEECH NEVER PAUSES IT: a new
     // sentence must not zero the rhythm, re-sample a candidate or empty the queue (voice = mouth).
@@ -1353,6 +1509,962 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     recordEvent('avatar.state', { status, previous, reason: String(reason ?? '') });
     return { ok: true, changed: true, status, previous };
   }
+
+  // ---- motion preset execution (selection + symbolic trajectory) -------------------------
+  const presetNative = new Set(PRESET_NATIVE_CHANNELS);
+
+  function normalizePresetOverridesValue(raw) {
+    const source = raw !== null && typeof raw === 'object' ? raw : {};
+    const strings = (value) => {
+      const out = [];
+      for (const entry of Array.isArray(value) ? value : []) {
+        if (typeof entry === 'string' && entry.length > 0 && !out.includes(entry)) out.push(entry);
+      }
+      return out;
+    };
+    const priorities = (value) => {
+      const out = {};
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return out;
+      for (const [key, entry] of Object.entries(value)) {
+        const number = Number(entry);
+        if (!Number.isFinite(number)) continue;
+        out[key] = Math.min(100, Math.max(0, Math.round(number)));
+      }
+      return out;
+    };
+    return {
+      disabled: strings(source.disabled),
+      disabledFamilies: strings(source.disabledFamilies),
+      familyPriority: priorities(source.familyPriority),
+      actionPriority: priorities(source.actionPriority),
+    };
+  }
+
+  function presetOverridesValue() {
+    if (state.presets.overrides === null) {
+      state.presets.overrides = normalizePresetOverridesValue(
+        supplied.presetOverrides ?? supplied.motionPresets ?? {},
+      );
+    }
+    return state.presets.overrides;
+  }
+
+  /** Replace the user override set (shape matches `<root>/data/motion-presets.json`). */
+  function setPresetOverrides(raw) {
+    state.presets.overrides = normalizePresetOverridesValue(raw);
+    state.presets.selector = null;
+    state.presets.selectorKey = '';
+    recordEvent('avatar.preset.overrides', {
+      disabled: state.presets.overrides.disabled.length,
+      disabledFamilies: state.presets.overrides.disabledFamilies.length,
+    });
+    return { ok: true, overrides: JSON.parse(JSON.stringify(state.presets.overrides)) };
+  }
+
+  /** Verified channels the preset executor may drive: body/breath stay VTS-native. */
+  function presetCapabilityChannels() {
+    const raw = Array.isArray(state.presets.capabilities.channels)
+      ? state.presets.capabilities.channels : [];
+    return [...new Set(raw.filter((channel) => !presetNative.has(channel)))];
+  }
+
+  /** Host reports the verified channel set and the two target/direction proofs. */
+  function setPresetCapabilities({ channels = null, targetVerified = undefined, directionVerified = undefined } = {}) {
+    if (Array.isArray(channels)) state.presets.capabilities.channels = [...new Set(channels)];
+    if (targetVerified !== undefined) state.presets.capabilities.targetVerified = targetVerified === true;
+    if (directionVerified !== undefined) state.presets.capabilities.directionVerified = directionVerified === true;
+    return { ok: true, capabilities: { ...state.presets.capabilities, channels: [...state.presets.capabilities.channels] } };
+  }
+
+  function setPresetExecution(enabled, { at = undefined } = {}) {
+    state.presets.enabled = enabled === true;
+    if (state.presets.enabled !== true) {
+      clearPresets('preset-disabled', { fadeMs: 0, at });
+      state.presets.nextDecisionAt = null;
+    } else {
+      state.presets.nextDecisionAt = (Number.isFinite(at) ? at : clockNow())
+        + PRESET_EXECUTION.DECISION_MIN_MS;
+    }
+    recordEvent('avatar.preset.enabled', { enabled: state.presets.enabled });
+    return { ok: true, enabled: state.presets.enabled };
+  }
+
+  function presetSelector() {
+    const overrides = presetOverridesValue();
+    const key = JSON.stringify(overrides);
+    if (state.presets.selector === null || state.presets.selectorKey !== key) {
+      state.presets.selector = createPresetSelector({ overrides });
+      state.presets.selectorKey = key;
+    }
+    return state.presets.selector;
+  }
+
+  /** Soft persona tags for the selector: tiltChance / gazeHabit have real, named consumers. */
+  function presetPersona() {
+    const style = state.effective ?? state.style;
+    const tilt = clamp01(finite(style?.tiltChance, DEFAULT_AVATAR_STYLE.tiltChance) / 0.5);
+    const gazeHabit = ['steady', 'wandering', 'direct'].includes(style?.gazeHabit)
+      ? style.gazeHabit : 'steady';
+    const styles = {};
+    const add = (id, weight) => { styles[id] = Math.max(styles[id] ?? 0, clamp01(weight)); };
+    if (tilt > 0.45) {
+      add('playful', tilt);
+      add('curious', tilt * 0.85);
+      add('gentle', tilt * 0.6);
+    } else if (tilt < 0.3) {
+      add('reserved', 1 - tilt * 2);
+      add('composed', (1 - tilt * 2) * 0.9);
+      add('cool', (1 - tilt * 2) * 0.7);
+    }
+    if (gazeHabit === 'wandering') {
+      add('dreamy', 0.9);
+      add('curious', 0.75);
+      add('shy', 0.6);
+    } else if (gazeHabit === 'direct') {
+      add('warm', 0.85);
+      add('earnest', 0.85);
+      add('confident', 0.7);
+      add('composed', 0.6);
+    }
+    return { styles, dimensions: state.dimensions, tiltChance: tilt, gazeHabit };
+  }
+
+  /**
+   * Style → recipe priority. `tiltChance` reweights the head-roll (偏头) recipes and
+   * `gazeHabit` reweights look-at / look-back / look-away recipes; user priorities always win.
+   */
+  function presetSelectionOverrides() {
+    const base = presetOverridesValue();
+    const actionPriority = { ...base.actionPriority };
+    const selector = presetSelector();
+    const tilt = clamp01(finite((state.effective ?? state.style)?.tiltChance, DEFAULT_AVATAR_STYLE.tiltChance) / 0.5);
+    const gazeHabit = (state.effective ?? state.style)?.gazeHabit ?? 'steady';
+    const gazePriority = gazeHabit === 'direct'
+      ? { target: 82, center: 74, away: 24 }
+      : gazeHabit === 'wandering'
+        ? { target: 24, center: 30, away: 82 }
+        : { target: 55, center: 55, away: 55 };
+    const tiltPriority = Math.round(50 + (tilt - 0.5) * 70);
+    const untouched = (preset) => {
+      for (const key of [preset.id, preset.recipeId]) {
+        if (Object.prototype.hasOwnProperty.call(base.actionPriority, key)) return false;
+      }
+      return true;
+    };
+    for (const preset of selector.index.presets) {
+      if (!untouched(preset)) continue;
+      if (hasTiltOperation(preset)) actionPriority[preset.recipeId] = tiltPriority;
+      const gazeKind = gazeKindOf(preset);
+      if (gazeKind !== null) actionPriority[preset.recipeId] = gazePriority[gazeKind];
+    }
+    return {
+      disabled: [...base.disabled],
+      disabledFamilies: [...base.disabledFamilies],
+      familyPriority: { ...base.familyPriority },
+      actionPriority,
+    };
+  }
+
+  /** Normalise one selection request into the selector's context shape. */
+  function presetContext(raw = {}) {
+    const source = raw !== null && typeof raw === 'object' ? raw : {};
+    const stateName = MOTION_STATUSES.includes(source.state) ? source.state : state.status;
+    const event = typeof source.event === 'string' && source.event.length > 0
+      ? source.event
+      : (PRESET_EVENT_BY_STATE[stateName] ?? 'idle');
+    const rawChannels = Array.isArray(source.verifiedChannels)
+      ? source.verifiedChannels
+      : presetCapabilityChannels();
+    const nativeDropped = rawChannels.filter((channel) => presetNative.has(channel));
+    const verifiedChannels = [...new Set(rawChannels.filter((channel) => !presetNative.has(channel)))];
+    const attention = state.motion.attention;
+    const targetVerified = source.targetVerified !== undefined
+      ? source.targetVerified === true
+      : (state.presets.capabilities.targetVerified === true
+        || (attention.verified === true && attention.mode === 'user'));
+    const directionVerified = source.directionVerified !== undefined
+      ? source.directionVerified === true
+      : state.presets.capabilities.directionVerified === true;
+    return {
+      state: stateName,
+      event,
+      intent: source.intent,
+      privacy: source.privacy === true,
+      disposed: source.disposed === true,
+      verifiedChannels,
+      nativeDropped,
+      targetVerified,
+      directionVerified,
+      family: source.family,
+      style: source.style,
+      recipe: source.recipe,
+      persona: source.persona ?? presetPersona(),
+      recent: {
+        families: state.presets.recentFamilies,
+        actions: state.presets.recentActions,
+      },
+      history: state.presets.history,
+      now: Number.isFinite(source.now) ? source.now : (state.lastAt ?? clockNow()),
+      frequencyWindowMs: source.frequencyWindowMs,
+      seed: source.seed,
+      rand: source.rand,
+      overrides: presetSelectionOverrides(),
+    };
+  }
+
+  function holdSelection(reasons) {
+    return {
+      kind: 'hold',
+      presetId: null,
+      family: null,
+      recipe: null,
+      variant: null,
+      score: 0,
+      probability: 0,
+      reasons: ['hold', ...reasons],
+      droppedChannels: [],
+      timing: null,
+      operations: [],
+      requires: [],
+      effectiveRequires: [],
+    };
+  }
+
+  /**
+   * Selection boundary. A missing target never degrades into a guessed gaze; the candidate is
+   * excluded (the selector already hard-filters) and the trace records why the draw held.
+   */
+  function selectPreset(raw = {}) {
+    const context = presetContext(raw);
+    let selection;
+    try {
+      selection = presetSelector().select(context);
+    } catch (error) {
+      selection = holdSelection([`selector-error:${String(error?.message ?? error)}`]);
+    }
+    const reasons = [...selection.reasons];
+    reasons.push(`state:${context.state}`, `event:${context.event}`);
+    if (context.nativeDropped.length > 0) {
+      reasons.push(`native-owned:${[...new Set(context.nativeDropped)].join(',')}`);
+    }
+    if (context.targetVerified !== true) reasons.push('target-unverified');
+    if (context.directionVerified !== true) reasons.push('direction-unverified');
+    // An explicitly requested targeted recipe that held has a concrete reason, not a silent skip.
+    if (selection.kind !== 'preset' && typeof context.recipe === 'string') {
+      const explicitlyTargeted = presetSelector().index.presets.some((preset) => (
+        preset.recipeId === context.recipe && preset.requiresTarget === true
+      ));
+      if (explicitlyTargeted && context.targetVerified !== true) reasons.push('requires-target');
+      const explicitlyDirected = presetSelector().index.presets.some((preset) => (
+        preset.recipeId === context.recipe && preset.requiresDirection === true
+      ));
+      if (explicitlyDirected && context.directionVerified !== true) reasons.push('requires-direction');
+    }
+    const normalized = {
+      ...selection,
+      reasons: [...new Set(reasons)],
+      /** Proof fields the trace can quote without re-reading the runtime. */
+      targetVerified: context.targetVerified === true,
+      directionVerified: context.directionVerified === true,
+      verifiedChannels: [...context.verifiedChannels],
+      context: {
+        state: context.state,
+        event: context.event,
+        targetVerified: context.targetVerified === true,
+        directionVerified: context.directionVerified === true,
+        tiltChance: context.persona?.tiltChance ?? null,
+        gazeHabit: context.persona?.gazeHabit ?? 'steady',
+      },
+    };
+    if (normalized.kind === 'preset') {
+      const chosen = presetSelector().index.byId.get(normalized.presetId);
+      if (chosen !== undefined) {
+        normalized.requiresTarget = chosen.requiresTarget === true;
+        normalized.requiresDirection = chosen.requiresDirection === true;
+        normalized.states = [...chosen.states];
+        normalized.events = [...chosen.events];
+        normalized.semantic = chosen.semantic;
+      }
+    }
+    state.presets.lastSelection = {
+      kind: normalized.kind,
+      presetId: normalized.presetId ?? null,
+      family: normalized.family ?? null,
+      recipe: normalized.recipe ?? null,
+      variant: normalized.variant ?? null,
+      reasons: [...normalized.reasons],
+      droppedChannels: [...(normalized.droppedChannels ?? [])],
+      targetVerified: normalized.targetVerified,
+      directionVerified: normalized.directionVerified,
+    };
+    if (normalized.kind === 'preset') state.presets.selected += 1;
+    else state.presets.holds += 1;
+    return normalized;
+  }
+
+  function presetTraceBase(selection, at) {
+    return {
+      at,
+      selection: {
+        kind: selection.kind,
+        presetId: selection.presetId ?? null,
+        family: selection.family ?? null,
+        recipe: selection.recipe ?? null,
+        variant: selection.variant ?? null,
+        probability: finite(selection.probability, 0),
+        reasons: [...(selection.reasons ?? [])],
+        operations: [...(selection.operations ?? [])],
+        droppedChannels: [...(selection.droppedChannels ?? [])],
+        effectiveRequires: [...(selection.effectiveRequires ?? [])],
+        verifiedChannels: [...(selection.verifiedChannels ?? [])],
+        targetVerified: selection.targetVerified === true,
+        directionVerified: selection.directionVerified === true,
+        requiresTarget: selection.requiresTarget === true,
+        requiresDirection: selection.requiresDirection === true,
+        context: { ...(selection.context ?? {}) },
+      },
+      output: {
+        startedAt: null,
+        endedAt: null,
+        durationMs: 0,
+        stages: [],
+        channels: [],
+        droppedChannels: [],
+        samples: [],
+        committed: {},
+        peak: 0,
+        reason: '',
+      },
+      visible: {
+        verifiable: false,
+        reason: 'render-not-observable',
+        note: '插件只能证明提交到传输层的通道/参数；渲染像素与模型绑定结果不可验证。',
+      },
+      interrupt: null,
+    };
+  }
+
+  function recordPresetHoldTrace(selection, at, reason = 'hold') {
+    const trace = presetTraceBase(selection, at);
+    trace.output.reason = `${reason}:${(selection.reasons ?? []).filter((entry) => entry !== 'hold').join('|') || 'no-candidates'}`;
+    state.presets.lastTrace = clonePresetTrace(trace);
+    state.presets.recent.push(clonePresetTrace(trace));
+    while (state.presets.recent.length > PRESET_EXECUTION.TRACE_LIMIT) state.presets.recent.shift();
+    recordEvent('avatar.preset.trace', {
+      presetId: null,
+      kind: 'hold',
+      reason: trace.output.reason,
+      at,
+    });
+    return trace;
+  }
+
+  function actualPresetPose(channel) {
+    const last = state.lastPose?.[channel];
+    if (Number.isFinite(last)) return last;
+    return finite(state.motion?.axes?.[channel]?.current, 0);
+  }
+
+  function naturalPresetPose(channel) {
+    return finite(state.idle?.[channel], 0);
+  }
+
+  /** Pick a direction from the CURRENT pose: never keep crowding the same limit. */
+  function choosePresetSign(op, profile, channel) {
+    if (profile.sign !== 0) return profile.sign;
+    const random = state.presets.random;
+    const actual = actualPresetPose(channel);
+    const offset = actual - naturalPresetPose(channel);
+    let sign;
+    if (offset > 0.3) sign = -1;
+    else if (offset < -0.3) sign = 1;
+    else sign = random() < 0.5 ? -1 : 1;
+    const last = state.presets.lastSign[channel];
+    if (last !== undefined && last === sign && random() < 0.65) sign = -sign;
+    state.presets.lastSign[channel] = sign;
+    return sign;
+  }
+
+  function presetOperationChannels(op, selection, context) {
+    const required = Array.isArray(selection.effectiveRequires) && selection.effectiveRequires.length > 0
+      ? selection.effectiveRequires
+      : (Array.isArray(selection.requires) ? selection.requires : []);
+    const verified = new Set(Array.isArray(context?.verifiedChannels) ? context.verifiedChannels : []);
+    return (PRESET_OPERATION_CHANNELS[op] ?? []).filter((channel) => (
+      !presetNative.has(channel)
+      && required.includes(channel)
+      && (verified.size === 0 || verified.has(channel))
+    ));
+  }
+
+  function buildPresetTrajectory(selection, context, now) {
+    const timing = selection.timing ?? {};
+    const style = state.effective ?? state.style;
+    const dims = state.dimensions ?? {};
+    const liveliness = clamp01(finite(dims.liveliness, 0));
+    const restraint = clamp01(finite(dims.restraint, 0));
+    const tilt = clamp01(finite(context?.persona?.tiltChance, finite(style?.tiltChance, 0.15) / 0.5));
+    const gazeHabit = context?.persona?.gazeHabit ?? style?.gazeHabit ?? 'steady';
+    const tempo = Math.max(0.2, finite(style?.tempo, 1));
+    const amplitudeScale = (STYLE_DIMENSION_APPLICATION.amplitudeBase
+      + STYLE_DIMENSION_APPLICATION.amplitudeSpan * liveliness)
+      * (1 - STYLE_DIMENSION_APPLICATION.restraintCap * restraint);
+    const unstable = timing.release === 'unhurried';
+    const holdScale = timing.hold === 'lingering' ? PRESET_EXECUTION.HOLD_LINGER_MS : PRESET_EXECUTION.HOLD_MIN_MS;
+    const separated = timing.pacing === 'separated';
+    const stages = [];
+    const droppedOps = [];
+    const nativeOps = [];
+    let cursor = timing.onset === 'pause-before' ? PRESET_EXECUTION.PAUSE_BEFORE_MS / tempo : 0;
+    for (const op of Array.isArray(selection.operations) ? selection.operations : []) {
+      const profile = PRESET_OPERATION_PROFILE[op];
+      if (profile === undefined) { droppedOps.push(op); continue; }
+      if (profile.kind === 'native') { nativeOps.push(op); continue; }
+      const channels = presetOperationChannels(op, selection, context);
+      if (channels.length === 0) { droppedOps.push(op); continue; }
+      const channelAmounts = {};
+      const cancelOffsets = {};
+      const targetOffsets = {};
+      const channel = channels[0];
+      const sign = choosePresetSign(op, profile, channel === 'eyeOpenL' ? 'headY' : channel);
+      const jitter = 0.94 + state.presets.random() * 0.12;
+      const durationJitter = 0.94 + state.presets.random() * 0.12;
+      const activeMs = Math.max(80, (PRESET_EXECUTION[profile.active] ?? PRESET_EXECUTION.BROW_ACTIVE_MS)
+        / tempo * durationJitter);
+      const prepareMs = Math.max(60, PRESET_EXECUTION.PREPARE_MS / tempo);
+      let holdMs = holdScale / tempo;
+      let exitMs = (unstable ? PRESET_EXECUTION.UNHURRIED_EXIT_MS : PRESET_EXECUTION.EXIT_MS) / tempo;
+      if (profile.tilt === true) {
+        holdMs *= 0.8 + 0.6 * tilt;
+        if (tilt > 0.4) exitMs *= 1.12;
+      }
+      if (profile.gaze === 'target') holdMs *= gazeHabit === 'direct' ? 1.35 : gazeHabit === 'wandering' ? 0.65 : 1;
+      else if (profile.gaze === 'away') {
+        holdMs *= gazeHabit === 'wandering' ? 1.6 : gazeHabit === 'direct' ? 0.55 : 1;
+        exitMs *= gazeHabit === 'wandering' ? 1.25 : 1;
+      } else if (profile.gaze === 'center') {
+        exitMs *= gazeHabit === 'direct' ? 0.8 : 1;
+      }
+      for (const target of channels) {
+        const global = Math.max(1e-6, finite(style?.amplitude, DEFAULT_AVATAR_STYLE.amplitude));
+        const channelScale = styleChannelAmplitude(style, target) / global;
+        let amount = profile.amount * global * amplitudeScale * channelScale * jitter;
+        if (profile.tilt === true) amount *= 0.75 + 0.55 * tilt;
+        if (profile.kind === 'center') {
+          cancelOffsets[target] = naturalPresetPose(target) - actualPresetPose(target);
+        } else if (profile.kind === 'target') {
+          const attention = state.motion.attention;
+          const targetValue = attention.mode === 'user' && attention.verified === true
+            ? (target === 'gazeX' ? attention.target.x : attention.target.y)
+            : naturalPresetPose(target);
+          targetOffsets[target] = targetValue - naturalPresetPose(target);
+        } else if (profile.kind === 'blink' || profile.kind === 'double-blink') {
+          // Eye closure is an absolute eye-open value, not an additive pose offset.
+          channelAmounts[target] = clamp01(profile.amount);
+        } else if (profile.browOne === true) {
+          const hasLeft = channels.includes('browL');
+          const hasRight = channels.includes('browR');
+          // A one-sided brow is one-sided by definition: when only one side is verified, THAT side
+          // is the raised one (never the lowered side of an unavailable pair).
+          const raised = hasLeft && hasRight ? (sign >= 0 ? 'browL' : 'browR') : (hasLeft ? 'browL' : 'browR');
+          const lowered = raised === 'browL' ? 'browR' : 'browL';
+          channelAmounts[target] = target === raised ? amount : target === lowered ? -0.3 * amount : amount;
+        } else {
+          const actual = actualPresetPose(target);
+          const room = sign > 0
+            ? 1 - actual - PRESET_EXECUTION.HEADROOM_MARGIN
+            : 1 + actual - PRESET_EXECUTION.HEADROOM_MARGIN;
+          const headroom = Math.max(0.12, Math.min(1, room));
+          channelAmounts[target] = amount * sign * headroom;
+        }
+      }
+      const start = Math.max(0, cursor);
+      const end = start + prepareMs + activeMs + holdMs + exitMs;
+      const stage = {
+        index: stages.length,
+        op,
+        kind: profile.kind,
+        channels,
+        sign,
+        start,
+        prepareMs,
+        activeMs,
+        holdMs,
+        exitMs,
+        end,
+        phase: 'pending',
+        phases: [],
+        firstWriteAt: null,
+        lastWriteAt: null,
+        peak: 0,
+        channelAmounts,
+        cancelOffsets,
+        targetOffsets,
+      };
+      stages.push(stage);
+      const gap = separated ? PRESET_EXECUTION.SEPARATED_GAP_MS / tempo : 0;
+      const overlap = separated ? 0 : exitMs * PRESET_EXECUTION.CONNECTED_OVERLAP_RATIO;
+      cursor = end + gap - overlap;
+    }
+    const durationMs = stages.reduce((max, stage) => Math.max(max, stage.end), 0);
+    return { stages, durationMs, droppedOps, nativeOps, timing, holdScale, gazeHabit, tilt };
+  }
+
+  function presetStageEnvelope(stage, elapsed) {
+    const local = elapsed - stage.start;
+    if (local < 0) return null;
+    if (local < stage.prepareMs) {
+      const u = local / Math.max(1, stage.prepareMs);
+      return { phase: 'prepare', wave: -PRESET_EXECUTION.PREPARE_RATIO * Math.sin(Math.PI * u) };
+    }
+    const activeStart = stage.prepareMs;
+    if (local < activeStart + stage.activeMs) {
+      const p = clamp01((local - activeStart) / Math.max(1, stage.activeMs));
+      if (stage.kind === 'nod') return { phase: 'active', wave: Math.sin(Math.PI * p) };
+      if (stage.kind === 'double-nod') {
+        return {
+          phase: 'active',
+          wave: p < 0.5 ? Math.sin(Math.PI * (p * 2)) : 0.6 * Math.sin(Math.PI * ((p - 0.5) * 2)),
+        };
+      }
+      if (stage.kind === 'shake') return { phase: 'active', wave: Math.sin(Math.PI * 2 * p), signed: true };
+      if (stage.kind === 'double-blink') {
+        return {
+          phase: 'active',
+          wave: p < 0.5 ? Math.sin(Math.PI * (p * 2)) : Math.sin(Math.PI * ((p - 0.5) * 2)),
+        };
+      }
+      if (stage.kind === 'blink') return { phase: 'active', wave: Math.sin(Math.PI * p) };
+      return { phase: 'active', wave: smootherstep(p) };
+    }
+    const holdEnd = activeStart + stage.activeMs + stage.holdMs;
+    if (local < holdEnd) {
+      return { phase: 'hold', wave: (stage.kind === 'nod' || stage.kind === 'double-nod'
+        || stage.kind === 'shake' || stage.kind === 'blink' || stage.kind === 'double-blink') ? 0 : 1 };
+    }
+    if (local < holdEnd + stage.exitMs) {
+      const base = (stage.kind === 'nod' || stage.kind === 'double-nod'
+        || stage.kind === 'shake' || stage.kind === 'blink' || stage.kind === 'double-blink') ? 0 : 1;
+      const u = smootherstep((local - holdEnd) / Math.max(1, stage.exitMs));
+      return { phase: 'exit', wave: base * (1 - u) };
+    }
+    return null;
+  }
+
+  function presetStageValues(stage, wave) {
+    const values = {};
+    if (stage.kind === 'blink' || stage.kind === 'double-blink') {
+      const closure = clamp01(stage.channelAmounts.eyeOpenL ?? 0) * clamp01(Math.max(0, wave));
+      for (const channel of stage.channels) values[channel] = clamp01(1 - closure);
+      return values;
+    }
+    if (stage.kind === 'center') {
+      for (const channel of stage.channels) values[channel] = finite(stage.cancelOffsets[channel], 0) * wave;
+      return values;
+    }
+    if (stage.kind === 'target') {
+      for (const channel of stage.channels) values[channel] = finite(stage.targetOffsets[channel], 0) * wave;
+      return values;
+    }
+    const signed = stage.kind === 'shake' ? wave : Math.max(0, wave);
+    for (const channel of stage.channels) values[channel] = finite(stage.channelAmounts[channel], 0) * signed;
+    return values;
+  }
+
+  function notePresetStage(item, stage, phase, values, now) {
+    const trace = item.trace;
+    if (trace.output.stages.length <= stage.index) {
+      trace.output.stages[stage.index] = {
+        op: stage.op,
+        kind: stage.kind,
+        channels: [...stage.channels],
+        startMs: Math.round(stage.start),
+        activeMs: Math.round(stage.activeMs),
+        holdMs: Math.round(stage.holdMs),
+        exitMs: Math.round(stage.exitMs),
+        phases: [],
+        firstWriteAt: null,
+        lastWriteAt: null,
+        peak: 0,
+      };
+    }
+    const record = trace.output.stages[stage.index];
+    if (stage.phase !== phase) {
+      stage.phase = phase;
+      record.phase = phase;
+      if (!record.phases.includes(phase)) record.phases.push(phase);
+      if (!stage.phases.includes(phase)) stage.phases.push(phase);
+      trace.output.samples.push({
+        at: Math.round(now - item.startedAt),
+        op: stage.op,
+        phase,
+        channels: { ...values },
+      });
+      while (trace.output.samples.length > PRESET_EXECUTION.SAMPLE_LIMIT) trace.output.samples.shift();
+    }
+    let peak = 0;
+    for (const [channel, value] of Object.entries(values)) {
+      if (Math.abs(value) > Math.abs(peak)) peak = value;
+      if (Math.abs(value) > 1e-4) {
+        if (!item.written.has(channel)) item.written.add(channel);
+        if (!trace.output.channels.includes(channel)) trace.output.channels.push(channel);
+        if (record.firstWriteAt === null) {
+          record.firstWriteAt = Math.round(now - item.startedAt);
+          trace.output.samples.push({
+            at: record.firstWriteAt,
+            op: stage.op,
+            phase,
+            channels: { ...values },
+          });
+          while (trace.output.samples.length > PRESET_EXECUTION.SAMPLE_LIMIT) trace.output.samples.shift();
+        }
+        record.lastWriteAt = Math.round(now - item.startedAt);
+      }
+    }
+    if (Math.abs(peak) > Math.abs(record.peak)) record.peak = peak;
+    trace.output.peak = Math.max(trace.output.peak, Math.abs(peak));
+  }
+
+  function finishPresetTrace(item, now, { interrupted = false } = {}) {
+    const trace = item.trace;
+    trace.output.endedAt = now;
+    trace.output.durationMs = Math.max(0, Math.round(now - item.startedAt));
+    trace.output.channels = [...trace.output.channels];
+    trace.output.reason = interrupted ? 'interrupted' : 'completed';
+    state.presets.lastTrace = clonePresetTrace(trace);
+    state.presets.recent.push(clonePresetTrace(trace));
+    while (state.presets.recent.length > PRESET_EXECUTION.TRACE_LIMIT) state.presets.recent.shift();
+    recordEvent('avatar.preset.trace', {
+      presetId: item.presetId,
+      kind: interrupted ? 'interrupted' : 'completed',
+      channels: [...trace.output.channels],
+      peak: trace.output.peak,
+      at: now,
+    });
+    return trace;
+  }
+
+  function removePresetItem(item, now, { interrupted = false } = {}) {
+    const index = state.presets.active.indexOf(item);
+    if (index >= 0) state.presets.active.splice(index, 1);
+    item.done = true;
+    return finishPresetTrace(item, now, { interrupted });
+  }
+
+  /**
+   * Execute one already-selected preset through the ONE controller. The operations keep their
+   * order and channels; a failed capability check is a hold, never a silent partial gesture.
+   */
+  function startPreset(selection, options = {}) {
+    const at = Number.isFinite(options.at) ? options.at : clockNow();
+    const context = selection?.context !== undefined && options.context === undefined
+      ? { ...presetContext({}), ...selection.context }
+      : presetContext(options.context ?? {});
+    // A selection carries the exact verified set / proofs it was drawn with; execution must not
+    // quietly widen it to whatever the runtime happens to know later.
+    if (Array.isArray(selection?.verifiedChannels)) context.verifiedChannels = [...selection.verifiedChannels];
+    if (selection?.targetVerified !== undefined) context.targetVerified = selection.targetVerified === true;
+    if (selection?.directionVerified !== undefined) context.directionVerified = selection.directionVerified === true;
+    if (selection === null || selection === undefined || selection.kind !== 'preset') {
+      const hold = selection ?? holdSelection(['no-selection']);
+      recordPresetHoldTrace({ ...hold, verifiedChannels: context.verifiedChannels }, at, 'hold');
+      return { ok: true, started: false, kind: 'hold', selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
+    }
+    const built = buildPresetTrajectory(selection, context, at);
+    if (built.stages.length === 0) {
+      const reason = built.nativeOps.length > 0 ? 'native-owned' : 'no-executable-operations';
+      const hold = holdSelection([...selection.reasons, reason]);
+      recordPresetHoldTrace({ ...hold, verifiedChannels: context.verifiedChannels }, at, reason);
+      return { ok: true, started: false, kind: 'hold', reason, selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
+    }
+    const trace = presetTraceBase({
+      ...selection,
+      verifiedChannels: context.verifiedChannels,
+      targetVerified: context.targetVerified,
+      directionVerified: context.directionVerified,
+      context: context.presetTraceContext ?? selection.context,
+    }, at);
+    trace.output.startedAt = at;
+    trace.output.stages = built.stages.map((stage) => ({
+      op: stage.op,
+      kind: stage.kind,
+      channels: [...stage.channels],
+      startMs: Math.round(stage.start),
+      activeMs: Math.round(stage.activeMs),
+      holdMs: Math.round(stage.holdMs),
+      exitMs: Math.round(stage.exitMs),
+      phases: [],
+      firstWriteAt: null,
+      lastWriteAt: null,
+      peak: 0,
+    }));
+    trace.output.droppedChannels = [...(selection.droppedChannels ?? [])];
+    trace.output.reason = 'running';
+    if (built.nativeOps.length > 0) trace.output.nativeOwned = [...built.nativeOps];
+    if (built.droppedOps.length > 0) trace.output.skippedOperations = [...built.droppedOps];
+    state.presets.seq += 1;
+    const item = {
+      seq: state.presets.seq,
+      presetId: selection.presetId,
+      family: selection.family,
+      recipe: selection.recipe,
+      variant: selection.variant,
+      operations: [...(selection.operations ?? [])],
+      channels: [...new Set(built.stages.flatMap((stage) => stage.channels))],
+      stages: built.stages,
+      durationMs: built.durationMs,
+      startedAt: at,
+      generation: Number.isInteger(options.generation) ? options.generation : state.presets.generation,
+      cancelledAt: null,
+      cancelFadeMs: 0,
+      done: false,
+      written: new Set(),
+      trace,
+    };
+    state.presets.active.push(item);
+    while (state.presets.active.length > 2) {
+      const evicted = state.presets.active.shift();
+      evicted.done = true;
+      finishPresetTrace(evicted, at, { interrupted: true });
+    }
+    handOffReleases(item.channels);
+    state.presets.starts += 1;
+    state.presets.lastSign = state.presets.lastSign ?? Object.create(null);
+    state.presets.history.push({ id: selection.presetId, at });
+    while (state.presets.history.length > 32) state.presets.history.shift();
+    state.presets.recentFamilies.push(selection.family);
+    while (state.presets.recentFamilies.length > 8) state.presets.recentFamilies.shift();
+    state.presets.recentActions.push(selection.presetId);
+    while (state.presets.recentActions.length > 8) state.presets.recentActions.shift();
+    recordEvent('avatar.preset.start', {
+      presetId: selection.presetId,
+      family: selection.family,
+      recipe: selection.recipe,
+      variant: selection.variant,
+      operations: [...(selection.operations ?? [])],
+      channels: [...item.channels],
+      durationMs: built.durationMs,
+      at,
+    });
+    return {
+      ok: true,
+      started: true,
+      kind: 'preset',
+      presetId: selection.presetId,
+      family: selection.family,
+      recipe: selection.recipe,
+      variant: selection.variant,
+      operations: [...item.operations],
+      channels: [...item.channels],
+      droppedChannels: [...(selection.droppedChannels ?? [])],
+      durationMs: built.durationMs,
+      stages: trace.output.stages,
+      trace: clonePresetTrace(trace),
+    };
+  }
+
+  /** One action boundary: select, then execute. A hold draw writes no preset channel at all. */
+  function preset(context = {}) {
+    const selection = selectPreset(context);
+    if (selection.kind !== 'preset') {
+      const trace = recordPresetHoldTrace(selection, Number.isFinite(context.at) ? context.at : clockNow());
+      return { ok: true, started: false, kind: 'hold', selection, trace: clonePresetTrace(trace) };
+    }
+    return startPreset(selection, {
+      at: Number.isFinite(context.at) ? context.at : clockNow(),
+      generation: context.generation,
+      context,
+    });
+  }
+
+  /**
+   * Fold every active preset into the same additive pose frame the legacy intents use. Returns
+   * additions only; the caller (intentFrame) still owns the single arbitration/compose path.
+   */
+  function presetFrame(now) {
+    const adds = { headX: 0, headY: 0, headZ: 0, browL: 0, browR: 0, bodyX: 0, bodyY: 0, bodyZ: 0 };
+    const gaze = { x: 0, y: 0 };
+    let eye = null;
+    if (state.presets.active.length === 0) return { adds, gaze, eye, active: 0 };
+    for (let index = state.presets.active.length - 1; index >= 0; index -= 1) {
+      const item = state.presets.active[index];
+      const elapsed = now - item.startedAt;
+      if (elapsed < 0) continue;
+      let fade = 1;
+      if (item.cancelledAt !== null) {
+        const cancelElapsed = now - item.cancelledAt;
+        if (cancelElapsed >= Math.max(1, item.cancelFadeMs)) {
+          removePresetItem(item, now, { interrupted: true });
+          continue;
+        }
+        fade = 1 - smootherstep(cancelElapsed / Math.max(1, item.cancelFadeMs));
+      }
+      if (elapsed >= item.durationMs) {
+        removePresetItem(item, now, { interrupted: item.cancelledAt !== null });
+        continue;
+      }
+      let contributed = false;
+      for (const stage of item.stages) {
+        const envelope = presetStageEnvelope(stage, elapsed);
+        if (envelope === null) continue;
+        const values = presetStageValues(stage, envelope.wave);
+        let any = false;
+        for (const [channel, value] of Object.entries(values)) {
+          const scaled = finite(value, 0) * fade;
+          if (!Number.isFinite(scaled)) continue;
+          if (PRESET_HEAD_CHANNELS.includes(channel) || channel === 'bodyX' || channel === 'bodyY' || channel === 'bodyZ') {
+            adds[channel] += scaled;
+          } else if (channel === 'browL' || channel === 'browR') {
+            adds[channel] += scaled;
+          } else if (channel === 'gazeX' || channel === 'gazeY') {
+            gaze[channel === 'gazeX' ? 'x' : 'y'] += scaled;
+          } else if (channel === 'eyeOpenL' || channel === 'eyeOpenR') {
+            if (eye === null) eye = { left: 1, right: 1 };
+            if (channel === 'eyeOpenL') eye.left = Math.min(eye.left, scaled);
+            else eye.right = Math.min(eye.right, scaled);
+          }
+          if (Math.abs(scaled) > 1e-4) any = true;
+        }
+        notePresetStage(item, stage, envelope.phase, values, now);
+        if (any) contributed = true;
+      }
+      if (!contributed && item.cancelledAt === null && elapsed >= item.durationMs) {
+        removePresetItem(item, now, { interrupted: false });
+      }
+    }
+    adds.headX = presetClamp(adds.headX, 0.95);
+    adds.headY = presetClamp(adds.headY, 0.95);
+    adds.headZ = presetClamp(adds.headZ, HEAD_ROLL_CAP);
+    adds.browL = presetClamp(adds.browL, 0.6);
+    adds.browR = presetClamp(adds.browR, 0.6);
+    gaze.x = presetClamp(gaze.x, EXPRESSION_MOTION.MAX_GAZE);
+    gaze.y = presetClamp(gaze.y, EXPRESSION_MOTION.MAX_GAZE);
+    return { adds, gaze, eye, active: state.presets.active.length };
+  }
+
+  /** Evidence only: remember the literal pose values the writer produced for preset channels. */
+  function notePresetCommitted(pose, now) {
+    for (const item of state.presets.active) {
+      if (now < item.startedAt) continue;
+      for (const channel of item.channels) {
+        if (!Number.isFinite(pose[channel])) continue;
+        item.trace.output.committed[channel] = pose[channel];
+      }
+    }
+  }
+
+  /** Low-frequency autonomous idle boundary. Never samples a sentence gap without playback. */
+  function maybeAutoPreset(now) {
+    if (state.presets.enabled !== true) return null;
+    if (state.presets.active.length > 0) return null;
+    if (state.status === 'speaking') return null;
+    if (state.intents.some((item) => item.done !== true)) return null;
+    if (state.presets.nextDecisionAt === null) {
+      state.presets.nextDecisionAt = now + PRESET_EXECUTION.DECISION_MIN_MS
+        + (PRESET_EXECUTION.DECISION_MAX_MS - PRESET_EXECUTION.DECISION_MIN_MS) * state.presets.random();
+      return null;
+    }
+    if (now < state.presets.nextDecisionAt) return null;
+    const result = preset({
+      state: state.status,
+      event: PRESET_EVENT_BY_STATE[state.status] ?? 'idle',
+      at: now,
+      generation: state.presets.generation,
+      seed: Math.floor(state.presets.random() * 0x1_0000_0000),
+    });
+    const wait = PRESET_EXECUTION.DECISION_MIN_MS
+      + (PRESET_EXECUTION.DECISION_MAX_MS - PRESET_EXECUTION.DECISION_MIN_MS) * state.presets.random();
+    state.presets.nextDecisionAt = now + wait + (result.started === true ? result.durationMs : 0);
+    return result;
+  }
+
+  function cancelPreset({ fadeMs = 240, at = undefined, reason = 'cancel' } = {}) {
+    const now = Number.isFinite(at) ? at : clockNow();
+    if (state.presets.active.length === 0) {
+      return { ok: false, reason: 'no-active-preset', cancelled: 0, at: now };
+    }
+    const fade = Math.max(1, Math.min(2000, finite(fadeMs, 240)));
+    let cancelled = 0;
+    for (const item of state.presets.active) {
+      if (item.cancelledAt !== null) continue;
+      item.cancelledAt = now;
+      item.cancelFadeMs = fade;
+      item.trace.interrupt = { reason: String(reason), at: now, fadeMs: fade };
+      cancelled += 1;
+    }
+    if (cancelled > 0) recordEvent('avatar.preset.cancel', { reason: String(reason), fadeMs: fade, count: cancelled });
+    return { ok: cancelled > 0, cancelled, fadeMs: fade, at: now };
+  }
+
+  function clearPresets(reason = 'clear', { fadeMs = 0, at = undefined, throughGeneration = null } = {}) {
+    const now = Number.isFinite(at) ? at : clockNow();
+    const fade = Math.max(0, finite(fadeMs, 0));
+    let removed = 0;
+    let faded = 0;
+    for (let index = state.presets.active.length - 1; index >= 0; index -= 1) {
+      const item = state.presets.active[index];
+      if (throughGeneration !== null && Number.isInteger(item.generation)
+        && item.generation > throughGeneration) continue;
+      if (fade > 0) {
+        if (item.cancelledAt === null) {
+          item.cancelledAt = now;
+          item.cancelFadeMs = fade;
+          item.trace.interrupt = { reason: String(reason), at: now, fadeMs: fade };
+          faded += 1;
+        }
+        continue;
+      }
+      state.presets.active.splice(index, 1);
+      item.done = true;
+      finishPresetTrace(item, now, { interrupted: true });
+      removed += 1;
+    }
+    state.presets.generation += 1;
+    if (removed > 0 || faded > 0) {
+      recordEvent('avatar.preset.cleared', {
+        reason: String(reason), removed, faded, throughGeneration, at: now,
+      });
+    }
+    return { ok: true, removed, faded, at: now };
+  }
+
+  function presetsSnapshot() {
+    return {
+      enabled: state.presets.enabled,
+      starts: state.presets.starts,
+      holds: state.presets.holds,
+      selected: state.presets.selected,
+      dropped: state.presets.dropped,
+      generation: state.presets.generation,
+      capabilities: {
+        channels: presetCapabilityChannels(),
+        nativeOwned: [...PRESET_NATIVE_CHANNELS],
+        targetVerified: state.presets.capabilities.targetVerified,
+        directionVerified: state.presets.capabilities.directionVerified,
+      },
+      overrides: JSON.parse(JSON.stringify(presetOverridesValue())),
+      active: state.presets.active.map((item) => ({
+        presetId: item.presetId,
+        family: item.family,
+        recipe: item.recipe,
+        variant: item.variant,
+        operations: [...item.operations],
+        channels: [...item.channels],
+        startedAt: item.startedAt,
+        durationMs: item.durationMs,
+        remainingMs: Math.max(0, item.durationMs - ((state.lastAt ?? 0) - item.startedAt)),
+        cancelled: item.cancelledAt !== null,
+      })),
+      lastSelection: state.presets.lastSelection === null
+        ? null : JSON.parse(JSON.stringify(state.presets.lastSelection)),
+      lastTrace: clonePresetTrace(state.presets.lastTrace),
+      /** The live three-layer trace while a preset is still executing (null when idle). */
+      currentTrace: state.presets.active.length === 0
+        ? null : clonePresetTrace(state.presets.active[state.presets.active.length - 1].trace),
+      recent: state.presets.recent.map((trace) => clonePresetTrace(trace)),
+    };
+  }
+
 
   /**
    * Draw one variant for `kind` from that intent's own seeded stream. The previous variant of the
@@ -1577,6 +2689,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // A generation switch also drops the autonomous expression layer: no old gaze/brow offset may
     // survive onto the pose of the next turn.
     clearExpressions(`intents:${String(reason ?? 'invalidate')}`);
+    // A barge-in is a smooth exit; a model/lock/generation switch is a hard stop. Neither may ever
+    // let a late trajectory contribute to the next turn (the preset list is the only owner).
+    const presetFade = /interrupt/i.test(String(reason)) ? 240 : 0;
+    clearPresets(reason, { fadeMs: presetFade, at: now });
     const removed = [];
     for (let index = state.intents.length - 1; index >= 0; index -= 1) {
       const item = state.intents[index];
@@ -2014,11 +3130,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // offset stays separate: it is added to the idle base, so an explicit attention target wins.
     const expression = expressionFrame(now);
     for (const channel of Object.keys(adds)) adds[channel] += expression.adds[channel];
+    // Motion presets are symbolic trajectories on the SAME additive fold. They are never rewritten
+    // into nod/tilt/lookAtUser intents: the operations keep their own order, channels and timing.
+    const preset = presetFrame(now);
+    for (const channel of Object.keys(adds)) adds[channel] += finite(preset.adds[channel], 0);
     return {
       adds,
       gaze,
       eyeOpen,
-      expressionGaze: expression.gaze,
+      eyeClose: preset.eye,
+      expressionGaze: {
+        x: finite(expression.gaze.x, 0) + finite(preset.gaze.x, 0),
+        y: finite(expression.gaze.y, 0) + finite(preset.gaze.y, 0),
+      },
       centerGaze: expression.centerGaze,
     };
   }
@@ -2328,6 +3452,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
 
     // The rare micro-action is decided on the same tick, never by a new timer.
     maybeScheduleOccasional(now);
+    // Autonomous preset boundary: the low-frequency idle draw. A hold result writes nothing.
+    maybeAutoPreset(now);
     const intent = intentFrame(now);
     state.lastIntentFrame = intent;
     state.expressionGaze = intent.expressionGaze ?? { x: 0, y: 0 };
@@ -2345,6 +3471,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (intent.eyeOpen !== null) {
       if (intent.eyeOpen.left === true) frame.pose.eyeOpenL = 1;
       if (intent.eyeOpen.right === true) frame.pose.eyeOpenR = 1;
+    }
+    // A preset blink writes the eye-open value itself; it is applied after the surprise widening
+    // so a preset closure always wins, while the blink machine still applies its own factor.
+    if (intent.eyeClose !== null && intent.eyeClose !== undefined) {
+      if (Number.isFinite(intent.eyeClose.left)) frame.pose.eyeOpenL = clamp01(intent.eyeClose.left);
+      if (Number.isFinite(intent.eyeClose.right)) frame.pose.eyeOpenR = clamp01(intent.eyeClose.right);
     }
     const generators = advanceGenerators(dt, frame);
     const composed = composeChannels(frame, generators, ARBITRATION);
@@ -2366,6 +3498,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     composed.headZ = clampHeadRoll(composed.headZ);
     const pose = applyDynamics(composed, frame, dt);
     publish(pose);
+    notePresetCommitted(pose, now);
     stepIdleActions(frame, dt, now);
     state.counters.computed += 1;
     return pose;
@@ -2850,6 +3983,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
             bodyDegrees: EXPRESSION_MOTION.MAX_BODY_DEGREES,
           },
         },
+        /**
+         * Motion preset execution: selection evidence, the bounded three-layer trace, active
+         * symbolic trajectories and the user overrides in force. See presets/README.md.
+         */
+        presets: presetsSnapshot(),
       },
       errors: state.errors,
       events: state.events.slice(-8),
@@ -2871,6 +4009,16 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     setStatus,
     setIdleActions,
     intent,
+    // Motion preset execution: selection, execution, interruption and the proof-bearing state.
+    selectPreset,
+    startPreset,
+    preset,
+    cancelPreset,
+    clearPresets,
+    setPresetExecution,
+    setPresetCapabilities,
+    setPresetOverrides,
+    presetsSnapshot,
     /**
      * Autonomous expression layer entry points (thinking / listening / occasional). The facade
      * calls these on a communication phase edge; they start one bounded envelope on the same tick.
@@ -2911,4 +4059,8 @@ export {
   DEFAULT_CONFIG,
   neutralPose,
   levelIndex,
+  PRESET_EXECUTION,
+  PRESET_EVENT_BY_STATE,
+  PRESET_EVENT_FOR_PHASE,
+  PRESET_OPERATION_PROFILE,
 };

@@ -97,7 +97,7 @@ export {
   toInputValue,
 } from './dynamics.js';
 export { composeChannels } from './mixer.js';
-import { DEFAULT_CONFIG, createBehaviorRuntime } from './motion-controller.js';
+import { DEFAULT_CONFIG, PRESET_EVENT_FOR_PHASE, createBehaviorRuntime } from './motion-controller.js';
 export {
   MOTION_DECISION_HZ,
   POSTURE_HOLD_MIN_MS,
@@ -305,6 +305,12 @@ function normalizeIdleParams(raw) {
  */
 export function createAvatarRuntime({ transport = null, now = null, log = null, config = {} } = {}) {
   const userConfig = config ?? {};
+  /**
+   * Preset execution is opt-in at the facade: the legacy four-intent path stays byte-identical
+   * unless the host asks for the preset library. `inner` receives the same flag through the
+   * `...userConfig` spread below, so there is still exactly one decision point.
+   */
+  let presetExecution = userConfig.presetExecution === true;
   const host = {
     autoTickMs: Number.isFinite(userConfig.autoTickMs) ? userConfig.autoTickMs : DEFAULT_HOST_CONFIG.autoTickMs,
     flushIntervalMs: Number.isFinite(userConfig.flushIntervalMs) && userConfig.flushIntervalMs > 0
@@ -1380,6 +1386,19 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     };
   };
 
+  /**
+   * Publish the executor's capability proof. Only verified channels are sent; the core filters
+   * the body/breath channels it leaves to VTS native animation.
+   */
+  function refreshPresetCapabilities() {
+    const controlled = statusChannels().controlled;
+    const attention = inner.snapshot().motion?.attention ?? null;
+    inner.setPresetCapabilities({
+      channels: controlled,
+      targetVerified: attention?.verified === true && attention?.mode === 'user',
+    });
+  }
+
   /** One structured diagnostic per channel/reason per window; repeated frames cannot flood it. */
   function noteChannelEvent(type, channel, reason, data = {}) {
     const key = `${type}\u0000${channel}\u0000${reason}`;
@@ -1590,6 +1609,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     syncChannelMouth();
     // The discrete pool depends on the verified set: recompute it (and record it once) here.
     refreshIdleActionPool('channels');
+    refreshPresetCapabilities();
     return { ok: true, code: null, channels: statusChannels() };
   }
 
@@ -1990,6 +2010,44 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     return inner.setStatus(status, options);
   }
 
+  /**
+   * Opt into (or out of) the read-only preset library as the action executor. A hold draw is a
+   * legal outcome and writes nothing. Enabling also publishes the verified capability proof.
+   */
+  function setPresetExecution(enabled, { at = null } = {}) {
+    if (state.disposed) return disposedResult();
+    presetExecution = enabled === true;
+    const result = inner.setPresetExecution(presetExecution, {
+      at: Number.isFinite(at) ? at : clockNow(),
+    });
+    if (presetExecution === true) refreshPresetCapabilities();
+    return result;
+  }
+
+  /** Replace the user override set (same shape as `<root>/data/motion-presets.json`). */
+  function setPresetOverrides(overrides) {
+    if (state.disposed) return disposedResult();
+    return inner.setPresetOverrides(overrides);
+  }
+
+  /** Dry-run selection with the current capability proof and style. */
+  function selectPreset(context = {}) {
+    if (state.disposed) return disposedResult();
+    return inner.selectPreset(context);
+  }
+
+  /** Select + execute one action boundary (a hold returns `started:false`, writing nothing). */
+  function preset(context = {}) {
+    if (state.disposed) return disposedResult();
+    return inner.preset(context);
+  }
+
+  /** Smooth exit for the active preset trajectory (a cancel, not a resource close). */
+  function cancelPreset(options = {}) {
+    if (state.disposed) return disposedResult();
+    return inner.cancelPreset(options);
+  }
+
   /** Patch the intent (gaze/pose/flags). Observation + writes only; no scheduler side effect. */
   function setIntent(patch = {}) {
     if (state.disposed) return disposedResult();
@@ -2178,6 +2236,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const controlled = statusChannels().controlled;
     const hasGaze = controlled.includes('gazeX') || controlled.includes('gazeY');
     const attention = inner.setAttention(target, { verified: verified === true && hasGaze, source });
+    refreshPresetCapabilities();
     recordIdleEvent('avatar.attention', { ...attention });
     return { ok: true, code: null, attention };
   }
@@ -2709,6 +2768,39 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       // The sentence boundary is the ONE release point for a staged communication intent. At most
       // one intent starts per clip, and an action still running simply defers it to the next clip.
       if (intentState.servedClip !== clipState.index) releaseIntent(time, 'sentence-start');
+      // A sentence gap is a REAL playback boundary: only here may the executor draw a
+      // `sentence-gap` preset. It is skipped when a staged intent already owns this boundary or an
+      // action is still running, so two gestures never overlap.
+      if (presetExecution === true && intentState.pending === null && actionState.current === null
+        && clipState.starts > 1) {
+        const controlled = statusChannels().controlled;
+        const attention = inner.snapshot().motion?.attention ?? null;
+        const drawn = inner.preset({
+          state: 'speaking',
+          event: 'sentence-gap',
+          at: time,
+          verifiedChannels: controlled,
+          targetVerified: attention?.verified === true && attention?.mode === 'user',
+          directionVerified: false,
+          seed: `gap:${clipState.index}:${clipState.starts}`,
+        });
+        if (drawn.started === true) {
+          startAction({ name: drawn.presetId }, time, {
+            deliver: false,
+            intentDurationMs: drawn.durationMs,
+            intentInfo: drawn,
+            release: { event: 'sentence-gap', releasedBy: 'sentence-start', releasedAt: time },
+          });
+          Object.assign(actionState.current, {
+            event: 'sentence-gap',
+            presetId: drawn.presetId,
+            presetOperations: [...drawn.operations],
+          });
+          recordIdleEvent('avatar.preset.action', {
+            presetId: drawn.presetId, event: 'sentence-gap', operations: [...drawn.operations], at: time,
+          });
+        }
+      }
       // Sentence boundary: release the held candidate exactly here, never on a mid-sentence tick.
       if (actionState.current === null) startWaitingCandidate(time, { timed: true });
       return {
@@ -2838,6 +2930,92 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const actionId = pending.ticket;
     intentState.lastIntent = pending.intent;
     intentState.lastActionId = actionId;
+    // ---- preset execution branch -------------------------------------------------------
+    // The preset library is executed as its own symbolic trajectory. The four legacy intents are
+    // NOT consulted here: the event name picks the preset event and the executor consumes the
+    // selected operation list in order.
+    if (presetExecution === true) {
+      const presetEvent = PRESET_EVENT_FOR_PHASE[pending.event] ?? pending.event;
+      const snap = inner.snapshot();
+      const presetState = pending.event === 'answer-end' || pending.event === 'idle'
+        ? 'idle' : (snap.status ?? 'idle');
+      const controlled = statusChannels().controlled;
+      const attention = snap.motion?.attention ?? null;
+      const targetVerified = attention?.verified === true && attention?.mode === 'user'
+        && (controlled.includes('gazeX') || controlled.includes('gazeY'));
+      // One preset trajectory at a time: an autonomous idle draw already in flight owns the pose
+      // until it ends, so this boundary holds instead of stacking a second choreography.
+      const presetBusy = (snap.motion?.presets?.active?.length ?? 0) > 0;
+      const drawn = presetBusy
+        ? { started: false, trace: { output: { reason: 'preset-busy' }, selection: { reasons: ['preset-busy'] } } }
+        : inner.preset({
+          state: presetState,
+          event: presetEvent,
+          at,
+          verifiedChannels: controlled,
+          targetVerified,
+          directionVerified: false,
+          generation: pending.generation,
+          seed: `intent:${pending.ticket}:${pending.event}`,
+        });
+      // Release-path evidence is identical for a preset: a real gesture released at a clip start
+      // is a clip-start release, every other path is "other". An unselected hold is neither.
+      if (reason === 'sentence-start' && clipState.active === true) intentState.releasedAtClipStart += 1;
+      else intentState.releasedOther += 1;
+      if (drawn.started === true) {
+        intentState.lastIntent = drawn.presetId;
+        intentState.started += 1;
+        intentState.lastIntentProfile = null;
+        startAction({ name: drawn.presetId }, at, {
+          deliver: false,
+          actionId,
+          intentDurationMs: drawn.durationMs,
+          intentInfo: drawn,
+          release: {
+            event: pending.event,
+            stagedAt: Number.isFinite(pending.pendingSince) ? pending.pendingSince : pending.at,
+            releasedBy: reason,
+            releasedAt: at,
+            actionBusy: pending.deferredByActionBusy === true,
+          },
+        });
+        Object.assign(actionState.current, {
+          intentGeneration: pending.generation,
+          sessionId: pending.sessionId,
+          turnId: pending.turnId,
+          event: pending.event,
+          profile: null,
+          presetId: drawn.presetId,
+          presetOperations: [...drawn.operations],
+        });
+        recordIdleEvent('avatar.preset.action', {
+          actionId,
+          presetId: drawn.presetId,
+          operations: [...drawn.operations],
+          channels: [...drawn.channels],
+          event: pending.event,
+          at,
+        });
+        return {
+          ok: true, code: null, intent: 'preset', presetId: drawn.presetId, actionId,
+          released: true, dropped: false, durationMs: drawn.durationMs,
+          channels: [...drawn.channels], operations: [...drawn.operations],
+        };
+      }
+      // The selector held: keep the current posture, write no preset channel, and say why.
+      intentState.lastIntent = 'hold';
+      recordIdleEvent('avatar.preset.hold', {
+        actionId,
+        event: pending.event,
+        reason: drawn.trace?.output?.reason ?? 'hold',
+        trace: drawn.trace?.selection?.reasons ?? [],
+        at,
+      });
+      return {
+        ok: true, code: null, intent: 'hold', actionId, released: true, dropped: false,
+        reason: 'preset-hold', trace: drawn.trace,
+      };
+    }
     if (pending.intent === NEUTRAL_INTENT) {
       // `settle` is not a gesture: fade the current action and let the idle posture resume.
       const cancelled = inner.cancelIntent(null, { fadeMs: host.intentSettleFadeMs, at });
@@ -4002,6 +4180,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           event: actionState.current.event ?? '',
           /** Stage 4: the expression profile the action carries ('conclusion' | 'confused' | null). */
           profile: actionState.current.profile ?? null,
+          /** Preset execution: the stable preset id and the ordered symbolic operations in flight. */
+          presetId: actionState.current.presetId ?? null,
+          presetOperations: [...(actionState.current.presetOperations ?? [])],
           /** Scheduling time (when the scheduler started the action), not the animation's start. */
           startedAt: actionState.current.startedAt,
           /** Authoritative end: `startedAt + durationMs` for the fallback, `animation.startedAt + durationMs` when real. */
@@ -4114,6 +4295,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     setStyle,
     setStatus,
     setIntent,
+    // Motion preset execution (read-only library; symbolic operations, never the four intents).
+    setPresetExecution,
+    setPresetOverrides,
+    selectPreset,
+    preset,
+    cancelPreset,
     setAnimation,
     interrupt,
     cancelAction,

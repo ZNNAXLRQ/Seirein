@@ -170,4 +170,95 @@ export const ALIVE_FALLBACK_GAIN = 1.5;
 /** The confused gesture's extra channels: already-mapped brow channels, never a new mapping. */
 export const CONFUSED_BROW_CHANNELS = Object.freeze(['browL', 'browR']);
 
+
+// ---------------------------------------------------------------------------------------------
+// Motion preset execution (presets/README.md protocol → the ONE 30 Hz controller)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Channels a preset operation may drive. A preset is executed as a sequence of symbolic
+ * operations, never mapped back to the four legacy intents: each entry is the operation's own
+ * channel set, and the executor drops a channel only when the operation itself is one-sided
+ * (`brow-one` without `browR`).
+ */
+export const PRESET_OPERATION_CHANNELS = Object.freeze({
+  'head-turn': Object.freeze(['headX']),
+  'head-lower': Object.freeze(['headY']),
+  'head-lift': Object.freeze(['headY']),
+  'head-tilt': Object.freeze(['headZ']),
+  'head-center': Object.freeze(['headX', 'headZ']),
+  nod: Object.freeze(['headY']),
+  'double-nod': Object.freeze(['headY']),
+  shake: Object.freeze(['headX']),
+  'gaze-side': Object.freeze(['gazeX']),
+  'gaze-down': Object.freeze(['gazeY']),
+  'gaze-up': Object.freeze(['gazeY']),
+  'gaze-target': Object.freeze(['gazeX', 'gazeY']),
+  'gaze-center': Object.freeze(['gazeX', 'gazeY']),
+  blink: Object.freeze(['eyeOpenL', 'eyeOpenR']),
+  'double-blink': Object.freeze(['eyeOpenL', 'eyeOpenR']),
+  'brow-lift': Object.freeze(['browL', 'browR']),
+  'brow-knit': Object.freeze(['browL', 'browR']),
+  'brow-one': Object.freeze(['browL', 'browR']),
+  'body-lean': Object.freeze(['bodyX']),
+  'body-settle': Object.freeze(['bodyY']),
+  'body-tilt': Object.freeze(['bodyZ']),
+  'breath-cycle': Object.freeze(['breath']),
+});
+
+/** One-sided operations: the unverified side is dropped, the verified side still executes. */
+export const PRESET_OPTIONAL_OPERATION_CHANNELS = Object.freeze({
+  'brow-one': Object.freeze(['browR']),
+});
+
+/**
+ * Body and breath keep VTS's own native animation ownership. The preset executor NEVER writes
+ * them, so a preset that needs one is not a legal candidate at all — it is filtered out before
+ * scoring instead of being silently executed as a partial gesture.
+ */
+export const PRESET_NATIVE_CHANNELS = Object.freeze(['bodyX', 'bodyY', 'bodyZ', 'breath']);
+
+/**
+ * Qualitative timing vocabulary from the library. Durations are resolved by the executor from
+ * the persona tempo and the current posture; the numbers here are the only tuning surface.
+ * There is deliberately NO visible-amplitude floor: a quiet persona may execute a smaller
+ * gesture, and standing still (a hold draw) is a first-class outcome.
+ */
+export const PRESET_EXECUTION = Object.freeze({
+  /** Cross-fade into the first operation and out of the last one (ms at tempo 1). */
+  ENTER_MS: 180,
+  EXIT_MS: 240,
+  /** `release: 'unhurried'` stretches the exit. */
+  UNHURRIED_EXIT_MS: 460,
+  /** `pause-before`: the quiet beat before the first active motion. */
+  PAUSE_BEFORE_MS: 320,
+  /** `separated`: the gap between two operations; `connected` overlaps their exit/entry. */
+  SEPARATED_GAP_MS: 180,
+  CONNECTED_OVERLAP_RATIO: 0.55,
+  /** The prepare leg is a small opposite-direction wind-up, as seen by the current pose. */
+  PREPARE_RATIO: 0.18,
+  PREPARE_MS: 140,
+  /** `hold: 'brief'` / `'lingering'` after an operation's active phase. */
+  HOLD_MIN_MS: 160,
+  HOLD_LINGER_MS: 720,
+  /** Per-operation active durations (tempo-scaled); one unit = 30° for head channels. */
+  TURN_ACTIVE_MS: 620,
+  TILT_ACTIVE_MS: 640,
+  NOD_ACTIVE_MS: 430,
+  DOUBLE_NOD_ACTIVE_MS: 780,
+  SHAKE_ACTIVE_MS: 620,
+  GAZE_ACTIVE_MS: 540,
+  BLINK_ACTIVE_MS: 170,
+  DOUBLE_BLINK_ACTIVE_MS: 380,
+  BROW_ACTIVE_MS: 430,
+  /** Headroom kept under the hardest pose limit; a direction with less room is not chosen. */
+  HEADROOM_MARGIN: 0.08,
+  /** A long run of draws without a legal candidate must not spin every frame. */
+  DECISION_MIN_MS: 2_000,
+  DECISION_MAX_MS: 9_000,
+  /** Bounded trace history/samples: evidence, never another writer. */
+  TRACE_LIMIT: 8,
+  SAMPLE_LIMIT: 96,
+});
+
 export { STATUS_MODIFIERS, INTENT_SETTLE_MS };
