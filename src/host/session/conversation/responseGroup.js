@@ -247,6 +247,33 @@ function answerFullyPlayed(answer, maxSentences = RESPONSE_GROUP_DEFAULTS.maxPen
 }
 
 /**
+ * P2: the spoken organization/stream has explicitly ended (its end marker was produced). Until
+ * this is true, a finished first unit says nothing about the rest of the answer: more units may
+ * still arrive, so the group must not close.
+ */
+function answerPlanSealed(answer) {
+  return answer !== null && answer !== undefined && answer.planSealed === true;
+}
+
+/**
+ * P2: every unit really fed to this answer completed. The sealed plan's unit count is authoritative
+ * (a comma-split plan has MORE units than punctuation sentences); fall back to the plan text only
+ * when a caller sealed without a count.
+ */
+function answerUnitsCompleted(answer) {
+  if (!answerPlanSealed(answer)) return false;
+  const completed = new Set((answer.completedSentenceIds ?? []).filter((id) => Number.isInteger(id)));
+  // A streamed plan knows its real unit count; a whole-text plan follows its final (adjusted)
+  // text, because `adjustSpeech` may drop already-played sentences AFTER the plan was sealed.
+  const units = answer.planUnitsExplicit === true && Number(answer.planUnits) > 0
+    ? Math.trunc(Number(answer.planUnits))
+    : splitSpeechSentences(answerSource(answer)).length;
+  if (units <= 0) return false;
+  if (completed.size < units) return false;
+  return (answer.partialSentences ?? []).length === 0;
+}
+
+/**
  * The spoken plan of a continuation: keep the part of the new answer that was not already heard,
  * and make sure nothing from the previous answer's unvoiced remainder is lost.
  *
@@ -456,6 +483,12 @@ function createAnswer(version, { at }) {
     bodyChars: 0,
     planText: '',
     planChars: 0,
+    /** P2: the spoken organization produced its end marker; no completion may precede it. */
+    planSealed: false,
+    /** P2: how many real units (clips/sentences) the sealed plan holds. */
+    planUnits: 0,
+    /** P2: true when the caller supplied the real unit count (streamed units), not a text split. */
+    planUnitsExplicit: false,
     feedText: '',
     source: '',
     playedSentences: [],
@@ -1240,8 +1273,24 @@ export function createResponseGroupStore({
     });
   };
 
+  /**
+   * P2: the ONLY completion path. `done` needs BOTH the sealed plan and every real unit completed;
+   * a missing plan, an unfinished unit or an unvoiced remainder keeps the group open.
+   */
+  const completeSealedAnswer = ({ group, version, reason = 'played' } = {}) => {
+    const answer = findAnswer(group, version);
+    if (answer === null || !isCurrentAnswer(group, version)) return false;
+    if (group.pendingSentences.length !== 0) return false;
+    if (!answerPlanSealed(answer) || !answerUnitsCompleted(answer)) return false;
+    if (!answerFullyPlayed(answer, pendingLimit)) return false;
+    completeAnswer({ group, version, reason });
+    return true;
+  };
+
   /** Store the decided spoken plan (what the voice would say), even if a newer version took over. */
-  const noteAnswerPlan = ({ group, version, turn = null, text = '', feedText = '', source = '', chars = 0 } = {}) => {
+  const noteAnswerPlan = ({
+    group, version, turn = null, text = '', feedText = '', source = '', chars = 0, units = 0,
+  } = {}) => {
     const answer = findAnswer(group, version);
     if (answer === null) return null;
     answer.planText = String(text ?? '');
@@ -1251,6 +1300,21 @@ export function createResponseGroupStore({
     answer.updatedAt = now();
     if (Number.isInteger(turn)) answer.turn = turn;
     if (answer.state === 'generating') answer.state = 'ready';
+    // P2: the decided plan IS the end marker of the spoken organization. Sealing is reported for
+    // observation and is a prerequisite for every completion (never a completion by itself).
+    if (!answerPlanSealed(answer)) {
+      answer.planSealed = true;
+      answer.planUnitsExplicit = Number(units) > 0;
+      answer.planUnits = answer.planUnitsExplicit
+        ? Math.trunc(Number(units))
+        : splitSpeechSentences(answerSource(answer)).length;
+      publish('voice.response.group.sealed', {
+        groupId: group.id,
+        sessionId: group.sessionId,
+        version,
+        units: answer.planUnits,
+      });
+    }
     // A superseded version that decides its plan late still contributes its unvoiced sentences;
     // the current version's plan is handled by adjustSpeech (condensed share, exact coverage).
     if (!isCurrentAnswer(group, version)) rememberPending(group, answer.planText);
@@ -1264,6 +1328,8 @@ export function createResponseGroupStore({
         chars: answer.planChars,
         source: answer.source,
       });
+      // Units that already finished before the seal must still be able to close the answer here.
+      completeSealedAnswer({ group, version, reason: 'sealed-played' });
     }
     return answer;
   };
@@ -1444,11 +1510,10 @@ export function createResponseGroupStore({
       chars: Number(answer.clips.find((clip) => clip.sentenceId === sentenceId)?.chars) || 0,
     });
     if (status === 'partial') return;
-    // The last block of the plan that really finished closes the group. A partial sentence keeps
-    // it open: its tail was never heard and must stay available.
-    if (isCurrentAnswer(group, version) && answerFullyPlayed(answer, pendingLimit)
-      && group.pendingSentences.length === 0) {
-      completeAnswer({ group, version, reason: 'played' });
+    // P2: the last block of the plan closes the group ONLY once that plan is sealed. A first unit
+    // finishing while the organizer is still writing is not evidence that the answer ended.
+    if (isCurrentAnswer(group, version)) {
+      completeSealedAnswer({ group, version, reason: 'played' });
     }
   };
 
@@ -1474,6 +1539,9 @@ export function createResponseGroupStore({
     const answer = findAnswer(group, version);
     if (answer === null) return;
     if (answer.state === 'cancelled' || answer.state === 'failed' || answer.state === 'done') return;
+    // P2: an unsealed plan may still grow; it can never claim the answer is complete. The one
+    // trusted exception above this guard is the whole-plan fallback (one clip = the whole plan).
+    if (!answerPlanSealed(answer)) return;
     answer.state = 'done';
     answer.completedReason = reason;
     answer.updatedAt = now();

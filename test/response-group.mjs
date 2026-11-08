@@ -1438,6 +1438,8 @@ test('24. a 1158-char carry plus a 106-char conclusion with a failed organizer k
   const retained = store.carryForSpeech(first.group, 2);
   assert.deepEqual(retained.sentences, splitSpeechSentences(oldText), 'old points remain as 待传达');
 
+  // The host records the decided fallback plan before playback; only a sealed plan may complete.
+  store.noteAnswerPlan({ group: first.group, version: 2, text: fallback.text });
   // What actually plays is the new conclusion only.
   store.notePlaybackStart({ group: first.group, version: 2, sentenceId: 0, text: newText });
   const played = store.get(first.group.id).played;
@@ -1545,6 +1547,8 @@ test('27. A -> correcting B -> C fallback never revives the corrected A point', 
 
   const adjusted = store.adjustSpeech({ group: second.group, version: 2, text: fallback.text });
   assert.equal(adjusted.text, B, 'the correction is the whole plan: the old point is not prepended');
+  // The host records the decided fallback plan before playback; only a sealed plan may complete.
+  store.noteAnswerPlan({ group: second.group, version: 2, text: fallback.text });
   store.notePlaybackStart({ group: second.group, version: 2, sentenceId: 0, text: B });
   store.notePlaybackEnd({
     group: second.group, version: 2, sentenceId: 0, chunkIndex: 0, chunkCount: 1, status: 'completed', text: B,
@@ -1769,4 +1773,91 @@ test('31. a stale defer is refused and never overwrites the current version\'s c
     `v3carry kept after stale defer=${carryBefore.sentences.length}句 `
     + `staleDeferred=${staleRow.deferred} currentDeferred=${deferRow.deferred}句 version=${applied.carry.version}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 32. P2: a first unit finishing before the plan is sealed never closes the group
+// ---------------------------------------------------------------------------
+
+test('32. a first unit finishing before the plan is sealed never completes the group', (t) => {
+  const { store, clock, events } = groupStore();
+  const input = store.beginInput({ sessionId: 's-seal-early', text: '长回答怎么讲', at: clock.t });
+  const group = input.group;
+  const version = input.answerVersion;
+  // The committed body is ONE punctuation sentence, so it looks complete on its own.
+  const body = '这是一段只有一句的长回答。';
+  store.noteAnswerBody({ group, version, text: body });
+  store.notePlaybackStart({ group, version, sentenceId: 0, chunkIndex: 0, chunkCount: 1, text: body });
+  store.notePlaybackEnd({
+    group, version, sentenceId: 0, chunkIndex: 0, chunkCount: 1, status: 'completed', text: body,
+  });
+  assert.equal(store.get(group.id).state, 'playing', 'the first unit alone does not close the group');
+  assert.equal(events.filter((row) => row.type === 'voice.response.group.done').length, 0);
+
+  // The spoken organization now produces its end marker for the very same text: the plan is
+  // sealed, and because every real unit already completed the group closes exactly here.
+  store.noteAnswerPlan({ group, version, text: body, units: 1 });
+  const sealed = events.find((row) => row.type === 'voice.response.group.sealed');
+  assert.deepEqual({ groupId: sealed.payload.groupId, units: sealed.payload.units }, { groupId: group.id, units: 1 });
+  const done = events.find((row) => row.type === 'voice.response.group.done');
+  assert.equal(done.payload.reason, 'sealed-played');
+  assert.equal(store.get(group.id).state, 'done');
+  t.diagnostic(
+    `firstUnitState=playing sealedUnits=${sealed.payload.units} done=${done.payload.reason} `
+    + `doneBeforeSeal=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 33. P2: sealed plan but one unit unfinished -> still no done; the last one closes it
+// ---------------------------------------------------------------------------
+
+test('33. a sealed plan closes only after EVERY unit completed', (t) => {
+  const { store, clock, events } = groupStore();
+  const input = store.beginInput({ sessionId: 's-seal-units', text: '两句话', at: clock.t });
+  const group = input.group;
+  const version = input.answerVersion;
+  store.noteAnswerPlan({ group, version, text: '第一句。第二句。', units: 2 });
+  store.notePlaybackStart({ group, version, sentenceId: 0, chunkIndex: 0, chunkCount: 1, text: '第一句。' });
+  store.notePlaybackEnd({
+    group, version, sentenceId: 0, chunkIndex: 0, chunkCount: 1, status: 'completed', text: '第一句。',
+  });
+  assert.equal(events.filter((row) => row.type === 'voice.response.group.done').length, 0,
+    'one of two sealed units is not completion');
+
+  store.notePlaybackStart({ group, version, sentenceId: 1, chunkIndex: 0, chunkCount: 1, text: '第二句。' });
+  store.notePlaybackEnd({
+    group, version, sentenceId: 1, chunkIndex: 0, chunkCount: 1, status: 'completed', text: '第二句。',
+  });
+  const done = events.find((row) => row.type === 'voice.response.group.done');
+  assert.equal(done.payload.reason, 'played');
+  assert.equal(store.get(group.id).state, 'done');
+  t.diagnostic(`sealedUnits=2 doneAfterUnit2=${done.payload.reason}`);
+});
+
+// ---------------------------------------------------------------------------
+// 34. P2: completion counts the REAL units fed, not punctuation sentences
+// ---------------------------------------------------------------------------
+
+test('34. completion counts the real units fed, not punctuation sentences', (t) => {
+  const { store, clock, events } = groupStore();
+  const input = store.beginInput({ sessionId: 's-seal-real-units', text: '长句拆开读', at: clock.t });
+  const group = input.group;
+  const version = input.answerVersion;
+  const units = ['第五句前半，', '第五句中间，', '第五句结尾。'];
+  // One punctuation sentence, but three real semantic units (a comma-split streamed plan).
+  store.noteAnswerPlan({ group, version, text: units.join(''), units: 3 });
+  const sealed = events.find((row) => row.type === 'voice.response.group.sealed');
+  assert.equal(sealed.payload.units, 3, 'the sealed event reports the real unit count');
+  for (const [sentenceId, text] of units.slice(0, 2).entries()) {
+    store.notePlaybackStart({ group, version, sentenceId, text });
+    store.notePlaybackEnd({ group, version, sentenceId, chunkIndex: 0, chunkCount: 1, status: 'completed', text });
+  }
+  assert.equal(store.get(group.id).state, 'playing', 'two of three real units is not completion');
+  store.notePlaybackStart({ group, version, sentenceId: 2, text: units[2] });
+  store.notePlaybackEnd({
+    group, version, sentenceId: 2, chunkIndex: 0, chunkCount: 1, status: 'completed', text: units[2],
+  });
+  assert.equal(store.get(group.id).state, 'done');
+  t.diagnostic(`punctuationSentences=1 realUnits=${sealed.payload.units} doneAfterUnit3=done`);
 });

@@ -12284,6 +12284,9 @@ export function apply(ctx, config) {
           feedText: plan.feedText,
           source: plan.source,
           chars: plan.chars,
+          // P2: the exact real units the speaker was fed. The group's sealed event and its
+          // "all units completed" test count these, never punctuation sentences.
+          units: fedUnits.length,
         });
         if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
