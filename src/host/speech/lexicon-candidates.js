@@ -23,6 +23,13 @@
  *   - both kinds are still CANDIDATES. Only `confirmCandidate()` with a speakerId makes an entry
  *     effective, and only `listEntries()` returns effective entries.
  *
+ * Correction tightening: only a word-form/reading correction ("不是小满，是向晚" with 写法/读作/…
+ * or two short name-shaped sides), a unique target and a confirmed speaker may take effect. A
+ * fact correction ("不是周五，是周六", "不是3个，是4个") is returned as kind `fact-correction`
+ * with `ignored:true` and a reason; it never enters the lexicon. Every correction entry carries a
+ * replacement `context` ({before, after}), and `applyCorrection()` refuses to replace anything
+ * when that context does not match — there is no whole-text replacement.
+ *
  * Normalization: `lexiconKey` is NFKC + case fold + whitespace removal. The requested
  * `shared/host-text.js` does not exist in this checkout (the shared text module is
  * `shared/text.js`), and neither it nor `memory-normalize.js` exports a width/case/space fold
@@ -56,7 +63,11 @@ export const LEXICON_STATE_VERSION = 1;
 export const LEXICON_DEFAULTS = Object.freeze({
   threshold: 2,
   maxTextChars: 40,
+  contextWindow: 4,
 });
+
+/** Upper bound for a stored replacement context, so one entry cannot carry a whole sentence. */
+const CONTEXT_MAX_CHARS = 16;
 
 export const LEXICON_KINDS = Object.freeze({
   PROPER_NOUN: 'proper-noun',
@@ -478,6 +489,10 @@ function collectCorrectionEvidence(corrections, { nowMs, maxChars }) {
     if (correction === null || typeof correction !== 'object') continue;
     // Only a user-explicit correction is high trust; an inferred edit must not enter this lane.
     if (correction.explicit !== true) continue;
+    // A fact correction (周五 → 周六) and an unclear fragment are not language rules; a caller
+    // that forwards a raw `parseExplicitCorrection` result must not smuggle one into the lexicon.
+    if (correction.ignored === true) continue;
+    if (correction.kind !== undefined && correction.kind !== KIND_CORRECTION) continue;
     const wrong = cleanForm(correction.wrong);
     const right = cleanForm(correction.right);
     if (wrong.length === 0 || right.length === 0) continue;
@@ -485,6 +500,8 @@ function collectCorrectionEvidence(corrections, { nowMs, maxChars }) {
     const key = lexiconKey(right);
     const wrongKey = lexiconKey(wrong);
     if (key.length === 0 || wrongKey.length === 0 || key === wrongKey) continue;
+    const ambiguous = correction.ambiguous === true;
+    const context = normalizeContext(correction.context);
 
     const atMs = instant(correction.at, nowMs);
     let record = records.get(key);
@@ -497,6 +514,8 @@ function collectCorrectionEvidence(corrections, { nowMs, maxChars }) {
         sourceIds: [],
         sourceSet: new Set(),
         speakers: new Set(),
+        context: null,
+        ambiguous: false,
         at: new Date(atMs).toISOString(),
         atMs,
       };
@@ -511,6 +530,9 @@ function collectCorrectionEvidence(corrections, { nowMs, maxChars }) {
       record.wrongKeys.add(wrongKey);
       record.wrongForms.push(wrong);
     }
+    // One context is enough for the replacement gate; the first correction's context wins.
+    if (record.context === null && context !== null) record.context = context;
+    if (ambiguous) record.ambiguous = true;
     const correctionId = correction.id ?? correction.sourceId;
     if (correctionId !== null && correctionId !== undefined) {
       const sourceId = String(correctionId);
@@ -519,8 +541,11 @@ function collectCorrectionEvidence(corrections, { nowMs, maxChars }) {
         record.sourceIds.push(sourceId);
       }
     }
-    const speaker = normalizeSpeaker(correction.speakerId);
-    if (speaker !== null) record.speakers.add(speaker);
+    // An ambiguous target is not attributed: uniqueness is part of the confirmation condition.
+    if (!ambiguous) {
+      const speaker = normalizeSpeaker(correction.speakerId);
+      if (speaker !== null) record.speakers.add(speaker);
+    }
   }
   return records;
 }
@@ -581,9 +606,10 @@ export function extractLexiconCandidates({
   const candidates = new Map();
   for (const [key, record] of correctionRecords) {
     // A correction is trusted evidence, but a word attributed to two different speakers is not
-    // one person's personal word: it stays unassigned rather than silently pick a side.
+    // one person's personal word: it stays unassigned rather than silently pick a side. An
+    // ambiguous target is not attributed at all, even when the correction carries a speakerId.
     const speakers = [...record.speakers];
-    const assigned = speakers.length === 1;
+    const assigned = !record.ambiguous && speakers.length === 1;
     candidates.set(key, {
       key,
       text: record.text,
@@ -594,6 +620,8 @@ export function extractLexiconCandidates({
       assigned,
       at: record.at,
       atMs: record.atMs,
+      context: record.context,
+      ambiguous: record.ambiguous,
     });
   }
   for (const [key, record] of normal) {
@@ -628,27 +656,208 @@ export function extractLexiconCandidates({
       if (left.atMs !== right.atMs) return left.atMs - right.atMs;
       return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
     })
-    .map((candidate) => ({
-      text: candidate.text,
-      kind: candidate.kind,
-      sourceIds: candidate.sourceIds,
-      wrongForms: candidate.wrongForms,
-      speakerId: candidate.speakerId,
-      assigned: candidate.assigned,
-      at: candidate.at,
-    }));
+    .map((candidate) => {
+      const output = {
+        text: candidate.text,
+        kind: candidate.kind,
+        sourceIds: candidate.sourceIds,
+        wrongForms: candidate.wrongForms,
+        speakerId: candidate.speakerId,
+        assigned: candidate.assigned,
+        at: candidate.at,
+      };
+      // Replacement context and the ambiguity flag only apply to correction candidates; the
+      // proper-noun candidate surface stays the seven fields stage 1 already promised.
+      if (candidate.kind === KIND_CORRECTION) {
+        output.context = candidate.context ?? null;
+        output.ambiguous = candidate.ambiguous === true;
+      }
+      return output;
+    });
 }
 
 // ---- explicit correction parser (convenience for callers) -----------------
+//
+// A "不是甲，是乙" utterance is only a lexicon correction when it names a word form/reading:
+//   - form/reading: the object is name-like (person/work/term/acronym/form of address) and either
+//     a form cue (写法/读作/叫/名字是/拼写/说的是) is present or both sides are short nouns;
+//   - fact: either side is a time/date, quantity, state or action (周五/周六, 3个/4个, 去了/没去)
+//     → kind `fact-correction`, ignored: true, reason `fact-correction`; it never enters the
+//     lexicon and never becomes a replacement rule;
+//   - unclear: neither a fact nor a name-shaped word form → ignored with `no-word-form-cue`.
+// A target that is not unique (two 不是…是… in one sentence, or a pronoun side) still becomes a
+// candidate, but it is marked `ambiguous` and is never auto-assigned or confirmable.
 
 const CORRECTION_PATTERNS = [
   // 不是小满，是向晚
-  /不是\s*([^，,。！？!?；;\n]{1,40}?)\s*[，,]\s*(?:而是|是|应该是|其实是)\s*([^，,。！？!?；;\n]{1,40})/u,
+  /不是\s*([^，,。！？!?；;\n]{1,40}?)\s*[，,]\s*(?:而是|是|应该是|其实是)\s*([^，,。！？!?；;\n]{1,40})/du,
   // 不是小满而是向晚
-  /不是\s*([^，,。！？!?；;\n]{1,40}?)\s*(?:而是|是)\s*([^，,。！？!?；;\n]{1,40})/u,
+  /不是\s*([^，,。！？!?；;\n]{1,40}?)\s*(?:而是|是)\s*([^，,。！？!?；;\n]{1,40})/du,
   // 是向晚，不是小满
-  /(?:而是|是|应该是|其实是)\s*([^，,。！？!?；;\n]{1,40})\s*[，,]\s*不是\s*([^，,。！？!?；;\n]{1,40})/u,
+  /(?:而是|是|应该是|其实是)\s*([^，,。！？!?；;\n]{1,40})\s*[，,]\s*不是\s*([^，,。！？!?；;\n]{1,40})/du,
 ];
+
+const FORM_CUE_RE = /(?:写法|读法|读音|读作|读成|拼写|拼作|写成|写作|名字(?:是|叫)|名叫|叫做|叫|说的是|指的是|正确(?:的)?(?:写法|读法|拼写))/u;
+
+const PRONOUN_RE = /^(?:这个|那个|哪个|这些|那些|这边|那边|这里|那里|他|她|它|他们|她们|它们|我|你|您|我们|你们|人家|对方)$/u;
+
+const LATIN_NAME_RE = /^[A-Za-z][A-Za-z0-9._'’\-]*(?:[ \t]+[A-Za-z][A-Za-z0-9._'’\-]*)*$/u;
+const KATAKANA_NAME_RE = /[\p{Script=Katakana}ー・]{2,}/u;
+
+const WEEKDAY_RE = /(?:周|星期|礼拜)[一二三四五六日天末1-7]/u;
+const DATE_RE = /(?:\d{1,4}\s*[年月日号]|[一二三四五六七八九十]{1,3}\s*[月日号]|今天|明天|昨天|前天|后天|今晚|今早|明早|明晚|早上|上午|中午|下午|晚上|凌晨|半夜|现在|刚才|之前|之后|以前|以后|周末|工作日|月底|月初|年底|年初|时间)/u;
+const QUANTITY_RE = /(?:\d+|[一二三四五六七八九十百千万两半]+)\s*(?:个|只|次|遍|条|张|份|位|名|本|台|辆|双|套|杯|瓶|斤|公斤|克|米|公里|岁|年|月|天|小时|分钟|分|秒|块|元|毛|件|头|匹|颗|粒|根|支|把|间|栋|层|页|章|节|段|句|字|人|倍|成|折|楼|号|点)/u;
+const PURE_NUMBER_RE = /^[一二三四五六七八九十百千万两\d]+$/u;
+
+const ACTION_VERBS = new Set([...'去来走吃看做说买卖写读听睡起坐站跑跳玩学教给拿放开关想要会能在有']);
+const ACTION_PHRASES = new Set([
+  '喜欢', '讨厌', '知道', '记得', '忘记', '同意', '反对', '开始', '结束', '在家', '出门',
+  '上班', '下班', '加班', '休息', '睡觉', '起床', '吃饭', '喝水', '开会', '上课', '放学',
+  '回家', '出去', '进来', '可以', '不行', '行', '对的', '错的', '好的', '真的', '假的',
+]);
+const ACTION_COMBO_RE = /(?:想|要|会|能|敢|肯|喜欢|讨厌|在)(?:去|来|做|说|看|吃|买|走|睡|玩|学)/u;
+
+/** One side of the correction as an action/state phrase (去了 / 没去 / 想去 / 会做). */
+function actionLike(value) {
+  const text = cleanForm(value);
+  if (text.length === 0) return false;
+  if (ACTION_PHRASES.has(text)) return true;
+  if (ACTION_COMBO_RE.test(text)) return true;
+  const core = text.replace(/^(?:不|没|没有|别)/u, '').replace(/(?:了|过|着|完|成|好)$/u, '');
+  return [...core].length === 1 && ACTION_VERBS.has(core);
+}
+
+/** The fact category of one side, or null when it does not look like a fact. */
+function factSide(value) {
+  const text = cleanForm(value);
+  if (text.length === 0) return null;
+  if (WEEKDAY_RE.test(text) || DATE_RE.test(text)) return 'time';
+  if (QUANTITY_RE.test(text) || PURE_NUMBER_RE.test(text)) return 'quantity';
+  if (actionLike(text)) return 'action';
+  return null;
+}
+
+/** A short noun-like side with no time/quantity/action phrase and no sentence particle. */
+function shortNounLike(value) {
+  const text = cleanForm(value);
+  const chars = [...text];
+  if (chars.length === 0 || chars.length > 8) return false;
+  if (factSide(text) !== null || PRONOUN_RE.test(text)) return false;
+  if (/[，,。！？!?；;：:、\n]/u.test(text)) return false;
+  if (chars.length > 2 && /[的了着过吗呢吧啊呀哦嘛啦]/u.test(text)) return false;
+  return true;
+}
+
+/** Does one side look like a name / title / term / acronym / form of address? */
+function nameClassLike(value, maxChars = LEXICON_DEFAULTS.maxTextChars) {
+  const text = cleanForm(value);
+  if (text.length === 0) return false;
+  if (/[《〈》〉]/u.test(text)) return true;
+  if (KATAKANA_NAME_RE.test(text)) return true;
+  if (LATIN_NAME_RE.test(text)) return latinTokenWanted(text, maxChars);
+  return [...text].length <= 4 && HAN_WORD_RE.test(text) && nameShaped(text);
+}
+
+/** The classification that decides whether this correction may become a lexicon rule. */
+function classifyCorrection(value, wrong, right, ambiguous) {
+  if (factSide(wrong) !== null || factSide(right) !== null) {
+    return { kind: 'fact-correction', ignored: true, reason: 'fact-correction' };
+  }
+  const cue = FORM_CUE_RE.test(value);
+  const shortPair = shortNounLike(wrong) && shortNounLike(right);
+  const named = nameClassLike(wrong) || nameClassLike(right);
+  if ((cue && shortPair) || (named && (cue || shortPair || ambiguous))) {
+    return { kind: KIND_CORRECTION, ignored: false };
+  }
+  return { kind: 'unclear-correction', ignored: true, reason: 'no-word-form-cue' };
+}
+
+/** Keep at most `window` characters on each side of a span of the original sentence. */
+function contextAround(value, start, end, window = LEXICON_DEFAULTS.contextWindow) {
+  const limit = Math.max(1, Math.min(CONTEXT_MAX_CHARS, Math.floor(window)));
+  return {
+    before: value.slice(Math.max(0, start - limit), start),
+    after: value.slice(end, end + limit),
+  };
+}
+
+/** A stored replacement context; both sides empty means "no context", which is not usable. */
+function normalizeContext(value) {
+  if (value === null || typeof value !== 'object') return null;
+  const before = [...(typeof value.before === 'string' ? value.before : '')]
+    .slice(-CONTEXT_MAX_CHARS)
+    .join('');
+  const after = [...(typeof value.after === 'string' ? value.after : '')]
+    .slice(0, CONTEXT_MAX_CHARS)
+    .join('');
+  if (before.length === 0 && after.length === 0) return null;
+  return { before, after };
+}
+
+function contextWindowLimit(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return LEXICON_DEFAULTS.contextWindow;
+  return Math.max(0, Math.min(CONTEXT_MAX_CHARS, Math.floor(value)));
+}
+
+/**
+ * Apply a correction entry to one text, but only where the stored context still matches.
+ *
+ * A replacement is a pure transformation: no state, no clock, no I/O. An entry without a usable
+ * `context` is refused (`context-required`) — there is deliberately no whole-text replacement.
+ * `contextWindow` is how many stored context characters must match on each side (default 4).
+ *
+ * @param {unknown} text the transcript to correct
+ * @param {{text?: string, canonical?: string, wrongForms?: string[], wrong?: string,
+ *   context?: {before?: string, after?: string}}} entry
+ * @param {{contextWindow?: number}} [options]
+ * @returns {{ok: true, text: string, replaced: number, changed: boolean}
+ *   | {ok: false, reason: string, text: string, replaced: 0, changed: false}}
+ */
+export function applyCorrection(text, entry, { contextWindow = LEXICON_DEFAULTS.contextWindow } = {}) {
+  const source = typeof text === 'string' ? text : '';
+  const refuse = (reason) => ({ ok: false, reason, text: source, replaced: 0, changed: false });
+  if (source.length === 0) return refuse('invalid-text');
+  if (entry === null || typeof entry !== 'object') return refuse('invalid-entry');
+  const right = cleanForm(entry.canonical) || cleanForm(entry.text) || cleanForm(entry.right);
+  const wrongForms = normalizeWrongForms(
+    Array.isArray(entry.wrongForms) ? entry.wrongForms : (typeof entry.wrong === 'string' ? [entry.wrong] : []),
+  );
+  if (right.length === 0) return refuse('canonical-empty');
+  if (wrongForms.length === 0) return refuse('wrong-forms-empty');
+  const context = normalizeContext(entry.context);
+  if (context === null) return refuse('context-required');
+  const window = contextWindowLimit(contextWindow);
+  if (window < 1) return refuse('context-required');
+  const beforeNeed = [...context.before].slice(-window).join('');
+  const afterNeed = [...context.after].slice(0, window).join('');
+  if (beforeNeed.length === 0 && afterNeed.length === 0) return refuse('context-required');
+
+  const spans = [];
+  for (const wrong of wrongForms) {
+    let from = 0;
+    while (from <= source.length - wrong.length) {
+      const start = source.indexOf(wrong, from);
+      if (start === -1) break;
+      const end = start + wrong.length;
+      const beforeOk = beforeNeed.length === 0 || source.slice(0, start).endsWith(beforeNeed);
+      const afterOk = afterNeed.length === 0 || source.slice(end).startsWith(afterNeed);
+      if (beforeOk && afterOk) spans.push({ start, end });
+      from = start + Math.max(1, wrong.length);
+    }
+  }
+  spans.sort((left, rightSpan) => left.start - rightSpan.start || rightSpan.end - left.end);
+  let output = '';
+  let cursor = 0;
+  let replaced = 0;
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    output += source.slice(cursor, span.start) + right;
+    cursor = span.end;
+    replaced += 1;
+  }
+  output += source.slice(cursor);
+  return { ok: true, text: output, replaced, changed: replaced > 0 };
+}
 
 /**
  * Parse one explicit spoken correction into the `corrections` shape this module consumes.
@@ -656,7 +865,9 @@ const CORRECTION_PATTERNS = [
  * transcript cannot accidentally become a correction.
  *
  * @param {unknown} text one utterance ("不是小满，是向晚")
- * @returns {{wrong: string, right: string, explicit: true}|null}
+ * @returns {{wrong: string, right: string, explicit: true, kind: string,
+ *   context: {before: string, after: string}, ambiguous: boolean, ignored?: true,
+ *   reason?: string}|null}
  */
 export function parseExplicitCorrection(text) {
   const value = typeof text === 'string' ? text : '';
@@ -666,11 +877,29 @@ export function parseExplicitCorrection(text) {
     if (match === null) continue;
     // The reversed pattern has [right, wrong]; the first two have [wrong, right].
     const reversed = index === 2;
+    const wrongSpan = match.indices[reversed ? 2 : 1];
     const wrong = cleanForm(reversed ? match[2] : match[1]);
     const right = cleanForm(reversed ? match[1] : match[2]);
     if (wrong.length === 0 || right.length === 0) continue;
     if (lexiconKey(wrong) === lexiconKey(right)) continue;
-    return { wrong, right, explicit: true };
+    const occurrenceCount = (value.match(/不是/gu) ?? []).length;
+    const ambiguous = occurrenceCount > 1 || PRONOUN_RE.test(wrong) || PRONOUN_RE.test(right);
+    const verdict = classifyCorrection(value, wrong, right, ambiguous);
+    const result = {
+      wrong,
+      right,
+      explicit: true,
+      kind: verdict.kind,
+      context: contextAround(value, wrongSpan[0], wrongSpan[1]),
+      ambiguous,
+    };
+    if (verdict.ignored) {
+      result.ignored = true;
+      result.reason = verdict.reason;
+    } else if (ambiguous) {
+      result.reason = 'ambiguous-target';
+    }
+    return result;
   }
   return null;
 }
@@ -702,6 +931,8 @@ function ensureEntry(entry) {
   if (typeof entry.canonical !== 'string') entry.canonical = '';
   if (!Array.isArray(entry.wrongForms)) entry.wrongForms = [];
   if (!Array.isArray(entry.sourceIds)) entry.sourceIds = [];
+  entry.context = normalizeContext(entry.context);
+  entry.ambiguous = entry.ambiguous === true;
   entry.speakerId = normalizeSpeaker(entry.speakerId);
   entry.assigned = entry.assigned === true;
   if (typeof entry.at !== 'string' || entry.at.length === 0) entry.at = new Date(0).toISOString();
@@ -784,6 +1015,8 @@ function publicEntry(entry) {
     speakerId: normalizeSpeaker(entry.speakerId),
     wrongForms: Array.isArray(entry.wrongForms) ? [...entry.wrongForms] : [],
     sourceIds: Array.isArray(entry.sourceIds) ? [...entry.sourceIds] : [],
+    context: normalizeContext(entry.context),
+    ambiguous: entry.ambiguous === true,
     at: typeof entry.at === 'string' ? entry.at : '',
     confirmedAt: typeof entry.confirmedAt === 'string' ? entry.confirmedAt : '',
     rejectedAt: typeof entry.rejectedAt === 'string' ? entry.rejectedAt : '',
@@ -851,12 +1084,14 @@ export function mergeCandidates(state, candidates) {
       speakerId,
       wrongForms: kind === KIND_CORRECTION ? normalizeWrongForms(candidate.wrongForms) : [],
       sourceIds: normalizeIds(candidate.sourceIds),
+      context: kind === KIND_CORRECTION ? normalizeContext(candidate.context) : null,
+      ambiguous: kind === KIND_CORRECTION && candidate.ambiguous === true,
       at: isoOf(candidate.at, Date.now()),
     };
 
     const existing = byKey.get(key) ?? byCanonical.get(key);
     if (existing === undefined) {
-      const assigned = kind === KIND_CORRECTION && speakerId !== null;
+      const assigned = kind === KIND_CORRECTION && speakerId !== null && !incoming.ambiguous;
       const entry = {
         id: nextEntryId(state),
         key,
@@ -866,6 +1101,8 @@ export function mergeCandidates(state, candidates) {
         canonical: '',
         wrongForms: [...incoming.wrongForms],
         sourceIds: [...incoming.sourceIds],
+        context: incoming.context,
+        ambiguous: incoming.ambiguous,
         speakerId: assigned ? speakerId : null,
         assigned,
         at: incoming.at,
@@ -884,6 +1121,7 @@ export function mergeCandidates(state, candidates) {
 
     addSourceIds(existing, incoming.sourceIds);
     if (instant(incoming.at, 0) < instant(existing.at, 0)) existing.at = incoming.at;
+    if (existing.context === null && incoming.context !== null) existing.context = incoming.context;
     if (incoming.kind === KIND_CORRECTION) {
       if (existing.status !== STATUS_CONFIRMED) {
         if (existing.kind !== KIND_CORRECTION) {
@@ -894,7 +1132,11 @@ export function mergeCandidates(state, candidates) {
         const speakers = new Set();
         if (existing.speakerId !== null) speakers.add(existing.speakerId);
         if (incoming.speakerId !== null) speakers.add(incoming.speakerId);
-        if (speakers.size === 1) {
+        if (existing.ambiguous === true || incoming.ambiguous) {
+          existing.ambiguous = true;
+          existing.speakerId = null;
+          existing.assigned = false;
+        } else if (speakers.size === 1) {
           existing.speakerId = [...speakers][0];
           existing.assigned = true;
         } else {
@@ -931,6 +1173,8 @@ export function confirmCandidate(state, { text = '', id = undefined, speakerId =
   const entry = findEntry(entries, { text, id });
   if (entry === null) return { ok: false, reason: 'not-found' };
   if (entry.status === STATUS_REJECTED) return { ok: false, reason: 'rejected' };
+  // "不是甲，是乙" with two possible targets is not confirmable, even manually.
+  if (entry.ambiguous === true) return { ok: false, reason: 'ambiguous-target' };
   const speaker = normalizeSpeaker(speakerId);
   if (speaker === null) return { ok: false, reason: 'speaker-required' };
   const display = cleanForm(canonical) || entry.text;

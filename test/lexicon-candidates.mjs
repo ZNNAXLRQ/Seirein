@@ -95,9 +95,23 @@ test('1. 同一专有名词出现 2 次 → 候选；只 1 次 → 不候选', (
 
 test('2. 明确纠正“不是小满，是向晚” → correction 候选，wrongForms 含小满，assigned 依 speakerId', () => {
   const parsed = parseExplicitCorrection('不是小满，是向晚');
-  assert.deepEqual(parsed, { wrong: '小满', right: '向晚', explicit: true });
-  assert.deepEqual(parseExplicitCorrection('不是小满而是向晚'), { wrong: '小满', right: '向晚', explicit: true });
-  assert.deepEqual(parseExplicitCorrection('是向晚，不是小满'), { wrong: '小满', right: '向晚', explicit: true });
+  assert.equal(parsed.wrong, '小满');
+  assert.equal(parsed.right, '向晚');
+  assert.equal(parsed.explicit, true);
+  assert.equal(parsed.kind, 'correction');
+  assert.equal(parsed.ambiguous, false);
+  assert.deepEqual(parsed.context, { before: '不是', after: '，是向晚' });
+
+  const withoutComma = parseExplicitCorrection('不是小满而是向晚');
+  assert.equal(withoutComma.wrong, '小满');
+  assert.equal(withoutComma.right, '向晚');
+  assert.equal(withoutComma.kind, 'correction');
+  assert.deepEqual(withoutComma.context, { before: '不是', after: '而是向晚' });
+
+  const reversed = parseExplicitCorrection('是向晚，不是小满');
+  assert.equal(reversed.wrong, '小满');
+  assert.equal(reversed.right, '向晚');
+  assert.equal(reversed.kind, 'correction');
   assert.equal(parseExplicitCorrection('今天下雨了'), null);
 
   const candidates = extractLexiconCandidates({
