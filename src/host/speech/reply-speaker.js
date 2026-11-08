@@ -142,8 +142,11 @@ async function speakSingleBlock({ chunks, first = null, sentenceId = 0, play, si
  * as it is queued, never behind the prefetch window. `finish({fullText})` flushes the unterminated
  * tail exactly once, waits for the last clip to end, and — only when nothing was ever played —
  * speaks the whole reply, so a split/synthesis failure or an empty delta stream cannot swallow the
- * answer. `cancel()` closes the queue, aborts the clip in flight, and deletes every prefetched clip
- * that never reached the player; later pushes are ignored.
+ * answer. An EXTERNAL cancel (barge-in, a newer reply, the caller's signal aborting) cuts both the
+ * sentence run and that fallback wait, so a cancelled turn never pins `finish()`; the fallback's
+ * late result is then cleaned up (and counted only if it really played). `cancel()` closes the
+ * queue, aborts the clip in flight, and deletes every prefetched clip that never reached the
+ * player; later pushes are ignored.
  *
  * Injected seams keep the ordering rules testable: `synthesize({text, signal})` produces audio,
  * `play({audio, text, signal})` resolves once the player has actually started, with
@@ -184,6 +187,30 @@ export function createReplySpeaker({
 } = {}) {
   const controller = new AbortController();
   const lane = signal === undefined || signal === null ? controller.signal : AbortSignal.any([signal, controller.signal]);
+  // ---- P2: external cancel vs. the internal failure that aborted the lane --------------
+  // A split/synthesis/play failure aborts `lane` itself while deciding to fall back, so
+  // `lane.aborted` cannot mean "the user stopped this reply". Only an EXTERNAL stop (barge-in via
+  // `cancel()`, a newer reply, a teardown aborting the caller's signal) may cut the fallback.
+  let externalCancel = false;
+  let noteExternalCancel = null;
+  const externalCancelSignal = new Promise((resolve) => { noteExternalCancel = resolve; });
+  const markExternalCancel = () => {
+    if (externalCancel) return;
+    externalCancel = true;
+    noteExternalCancel?.();
+  };
+  // The internal abort is `controller.abort()`; the caller's own signal is observed here.
+  const detachExternalCancel = () => {
+    try { signal?.removeEventListener?.('abort', markExternalCancel); } catch { /* foreign signal */ }
+  };
+  try {
+    if (signal !== undefined && signal !== null) {
+      if (signal.aborted === true) markExternalCancel();
+      else signal.addEventListener('abort', markExternalCancel, { once: true });
+    }
+  } catch {
+    /* a foreign signal object without listeners: only `cancel()` can mark the stop */
+  }
   // ---- C: lifecycle + explicit release -----------------------------------
   // One clip may be replaced/cancelled while its player never settles. The speaker must still let
   // go of its active ownership, otherwise the response group stays "playing" for minutes.
@@ -725,13 +752,15 @@ export function createReplySpeaker({
       && Number.isFinite(Number(startSession.playerReadyMs))) {
       stats.firstSpawnToPlayerReadyMs = Math.max(0, Math.round(Number(startSession.playerReadyMs)));
     }
-    if (cancelled || (lane.aborted && failure === null)) {
-      // An external abort (barge-in, mute, teardown) is a cancellation: never speak the whole
-      // reply after the user interrupted. A failure that aborted the lane still falls back below.
+    if (externalCancel || cancelled || (lane.aborted && failure === null)) {
+      // An external stop (barge-in, mute, teardown, a newer reply) is a cancellation: never speak
+      // the whole reply after the user interrupted. A run failure that merely aborted the lane
+      // still falls back below — that abort is internal, not an external cancel.
       stats.cancelled = true;
       reportBudget();
       // finish() is the caller's end callback: it must release even when no run ever started.
       releaseActive('cancelled');
+      detachExternalCancel();
       return stats;
     }
     if (failure !== null) stats.error = String(failure?.message ?? failure);
@@ -764,14 +793,30 @@ export function createReplySpeaker({
               }
             }
           };
+          /**
+           * P2: an external cancel cut the fallback wait. Never block finish() on the late result;
+           * once it lands, an unplayed clip is deleted and only a played one is recorded (A1).
+           */
+          const adoptLateFallback = () => {
+            void fallback.then((spoken) => {
+              if ((Number(spoken?.audioStartedAt) || 0) > 0) recordFallback(spoken);
+              else void discardAudio(spoken);
+            }, () => {});
+          };
           try {
             fallback = Promise.resolve(speakWhole(limited.text));
-            // A run failure already aborted the lane, but the fallback is the only voice left: wait
-            // for it so its real stats are recorded. A live lane still releases finish() on abort;
-            // the aborted clip's stats land when it settles (exactly one settlement records them).
-            recordFallback(lane.aborted ? await fallback : await abortable(fallback));
+            // A run failure already aborted the lane, so `lane.aborted` cannot decide this wait: the
+            // fallback is the only voice left and is awaited for its real stats. Only an EXTERNAL
+            // cancel may interrupt it; the late settlement is adopted above and never revives us.
+            const outcome = await Promise.race([
+              fallback.then((spoken) => ({ spoke: true, spoken }), (error) => ({ spoke: false, error })),
+              externalCancelSignal.then(() => ({ external: true })),
+            ]);
+            if (outcome.external === true) adoptLateFallback();
+            else if (outcome.spoke !== true) throw outcome.error;
+            else recordFallback(outcome.spoken);
           } catch (error) {
-            if (fallback !== null) void fallback.then(recordFallback, () => {});
+            if (fallback !== null && !externalCancel) void fallback.then(recordFallback, () => {});
             if (stats.error.length === 0) stats.error = String(error?.message ?? error);
           }
         }
@@ -780,11 +825,13 @@ export function createReplySpeaker({
       // Replaying from the top would repeat text the user already heard; report the partial tail.
       stats.partial = true;
     }
-    // A lane aborted during the fallback is still a cancellation, never a finished answer.
-    if (!stats.cancelled && lane.aborted && failure === null) stats.cancelled = true;
+    // An external stop during the fallback is still a cancellation, never a finished answer; a
+    // run failure that aborted the lane is not — it already produced the real stats above.
+    if (!stats.cancelled && (externalCancel || (lane.aborted && failure === null))) stats.cancelled = true;
     reportBudget();
     if (running === null) emitLifecycle('finished', 'no-clip');
     releaseActive(cancelled || lane.aborted ? 'cancelled' : (failure !== null ? 'failed' : 'finished'));
+    detachExternalCancel();
     return stats;
   };
 
@@ -792,6 +839,8 @@ export function createReplySpeaker({
     if (cancelled) return false;
     cancelled = true;
     stats.cancelled = true;
+    // P2: a user/new-version stop is EXTERNAL and may interrupt an in-flight fallback in finish().
+    markExternalCancel();
     buffer = '';
     queue = [];
     release(null);
@@ -800,6 +849,7 @@ export function createReplySpeaker({
     // The version was replaced or stopped: it owns no active playback from this instant, even if
     // its player/run promise settles later. This is what keeps a superseded version inactive.
     releaseActive(`cancel:${String(reason ?? 'cancel')}`);
+    detachExternalCancel();
     return true;
   };
 

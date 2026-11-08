@@ -263,3 +263,46 @@ test('4. a failing unlink only writes a debug row and never fails finish()', asy
   assert.equal(failures[0].file, stuck);
   t.diagnostic(`cleanupFailures=${failures.length} level=${failures[0].level}`);
 });
+
+// ---------------------------------------------------------------------------
+// 5. P2: the late whole-reply fallback is owned by the speaker after a cancel
+// ---------------------------------------------------------------------------
+
+test('5. P2: a fallback settling after the cancel deletes unplayed audio and keeps played audio', async (t) => {
+  const dir = await tempDir(t);
+  const unplayedFile = join(dir, 'fallback-unplayed.mp3');
+  const playedFile = join(dir, 'fallback-played.mp3');
+  await writeFile(unplayedFile, 'late');
+  await writeFile(playedFile, 'heard');
+  const runFallback = async ({ file, audioStartedAt }) => {
+    const gate = deferred();
+    const started = deferred();
+    const events = [];
+    const speaker = createReplySpeaker({
+      startedAt: Date.now(),
+      onEvent: (event) => events.push(event),
+      // The internal failure that aborts the lane and sends finish() to the whole-reply fallback.
+      synthesize: async () => { throw new Error('tts down'); },
+      play: async () => assert.fail('nothing may play after a synthesis failure'),
+      speakWhole: () => { started.resolve(); return gate.promise; },
+    });
+    speaker.push('第一句。');
+    const finishing = speaker.finish({ fullText: '第一句。' });
+    await started.promise;
+    speaker.cancel('barge-in');
+    const stats = await finishing;
+    gate.resolve({ file, audioStartedAt }); // the fallback lands after finish() already returned
+    return { stats, events, speaker };
+  };
+
+  const unplayed = await runFallback({ file: unplayedFile, audioStartedAt: 0 });
+  await waitUntil(async () => !(await exists(unplayedFile)), 'the unplayed late fallback was deleted');
+  assert.equal(unplayed.stats.firstPlayStartedAt, 0, 'an unplayed fallback is never counted');
+
+  const played = await runFallback({ file: playedFile, audioStartedAt: 777 });
+  await waitUntil(() => played.stats.firstPlayStartedAt === 777, 'the played late fallback was counted');
+  assert.equal(await exists(playedFile), true, 'played fallback audio is never cleanup');
+  assert.equal(played.speaker.isActive(), false, 'counting a late fallback never revives the speaker');
+  assert.equal(playing(played.events), false, 'no playing row is reopened after the release');
+  t.diagnostic(`unplayedDeleted=true playedKept=true playedStamp=${played.stats.firstPlayStartedAt}`);
+});
