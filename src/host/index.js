@@ -1172,8 +1172,9 @@ export function apply(ctx, config) {
     }
   };
 
-  // P0: Seirein's dated voice agent mounts a compaction-only preset in its OWN scope. The profile
-  // declares the preset (draft handed to the user); the plugin only binds it per Agent and never
+  // P0: Seirein's dated voice agent mounts a compaction-only preset in its OWN scope. The module
+  // REGISTERS that preset when it mounts (plugin-owned, so a fresh profile needs no hand-written
+  // declaration), reuses a leftover profile declaration of the same id during migration, and never
   // enables host-global compaction. Covers new, resumed and reload-swept Agents.
   const voiceCompaction = createVoiceCompaction({ getService, log });
   voiceCompaction.attach(ctx);
@@ -13938,6 +13939,9 @@ export function apply(ctx, config) {
     const status = await buildStatus();
     return {
       ...status,
+      // P0 portability evidence: where the voice compaction preset came from (registered by the
+      // plugin, or a leftover builtin/profile declaration) and the registration result.
+      voiceCompaction: voiceCompaction.presetStatus(),
       // One authoritative self identity for the lexicon card: the explicit registration wins, a
       // speaker-shadow match is only a fallback, and `source` says which one answered.
       lexicon: resolveSelfSpeakerId({ settings: readSettings(), shadow: speakerLastShadow }),

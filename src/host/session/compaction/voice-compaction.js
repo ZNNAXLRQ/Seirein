@@ -8,22 +8,26 @@
  * a compaction-ONLY preset, so it gains condensation and `/compact` without importing the
  * standard preset's coding persona, filesystem tools or permission choices.
  *
- * The declaration itself lives in the profile (see the draft handed to the user); this module only
- * mounts it. `mount()` is the registry's own composition API: it binds the Agent scope's parent to
- * the retained preset revision, so the preset's scoped listeners receive that Agent's events and
- * its isolated `compaction` service is reachable through `serviceFor`.
+ * The declaration belongs to this module: `attach()` (or the first `ensure()`) registers it with
+ * the Agent preset registry, so the capability travels with the plugin instead of living in the
+ * user's profile patch. A profile that still declares the same id — the migration window — is
+ * detected and reused, never registered a second time. `mount()` is the registry's own composition
+ * API: it binds the Agent scope's parent to the retained preset revision, so the preset's scoped
+ * listeners receive that Agent's events and its isolated `compaction` service is reachable through
+ * `serviceFor`.
  *
  * Everything Harness-specific is reached through the Host context (`getService` + `ctx.on`); no
  * Harness package is imported, so a profile without the preset registry keeps working (the voice
  * agent simply stays uncompacted).
  */
 
-/** Preset identity Seirein's voice agent runs. Mirrors the profile draft exactly. */
+/** Preset identity Seirein's voice agent runs. */
 export const VOICE_COMPACTION_PRESET_ID = 'seirein-voice';
 
 /**
- * The declaration the profile is expected to carry. Exported so the draft and the tests use one
- * source of truth; `createVoiceCompaction` never registers it itself (the profile owns presets).
+ * The declaration this module registers. Exported so the recovery path and the tests use one
+ * source of truth; it is identical to the declaration the profile used to carry, so reusing a
+ * leftover profile entry is seamless.
  */
 export const VOICE_COMPACTION_PRESET = Object.freeze({
   id: VOICE_COMPACTION_PRESET_ID,
@@ -53,7 +57,6 @@ export const VOICE_COMPACTION_PRESET = Object.freeze({
 
 /** The only Session identities this module may touch: `seirein-YYYY-MM-DD`. */
 const VOICE_SESSION_ID_RE = /^seirein-\d{4}-\d{2}-\d{2}$/u;
-
 /** @param {unknown} id @returns {boolean} whether the Session id is Seirein's dated voice session. */
 export function isVoiceSessionId(id) {
   return typeof id === 'string' && VOICE_SESSION_ID_RE.test(id);
@@ -64,15 +67,29 @@ export function isVoiceSessionId(id) {
  *   getService: (name: string) => any,
  *   log?: { emit?: (type: string, payload: object) => unknown } | null,
  *   presetId?: string,
+ *   presetDefinition?: object,
  * }} options
  */
-export function createVoiceCompaction({ getService, log = null, presetId = VOICE_COMPACTION_PRESET_ID }) {
+export function createVoiceCompaction({
+  getService,
+  log = null,
+  presetId = VOICE_COMPACTION_PRESET_ID,
+  presetDefinition = VOICE_COMPACTION_PRESET,
+}) {
   /** Agents whose composition this instance already verified. */
   const mounted = new WeakSet();
   /** Concurrent ensure() calls for one Agent settle together. */
   const inFlight = new WeakMap();
   /** Verified evidence per Agent; never derived from the recorded marker. */
   const records = new WeakMap();
+  /** Registration state of the preset itself (one per plugin instance). */
+  let presetState = { status: 'idle', source: null, registered: false, error: null, at: 0 };
+  /** In-flight registration; concurrent callers settle together. */
+  let presetPending = null;
+  /** Disposer returned by `agentPresets.register()`; owned only when this instance registered. */
+  let presetUnregister = null;
+  /** A detach in progress; a later attach waits for the previous definition to be gone. */
+  let presetRelease = null;
 
   const note = (type, payload) => {
     try {
@@ -93,6 +110,158 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
   const failure = (agent, reason, error, extra = {}) => {
     note('voice.compaction.failed', { sessionId: agent?.id ?? '', reason, error: describe(error), ...extra });
     return { ok: false, reason, error: describe(error), ...extra };
+  };
+
+  /**
+   * Provenance of an existing declaration. The plugin's own registration never reaches this path
+   * (it is recorded before the next read). A leftover declaration is the migration case — it came
+   * from the profile patch, or from a bundle that declared the same id — so "profile" is the honest
+   * default; only an explicit marker upgrades it to "builtin".
+   */
+  const sourceOf = (record) => {
+    if (typeof record?.source === 'string' && record.source.length > 0) return record.source;
+    if (record?.builtin === true) return 'builtin';
+    return 'profile';
+  };
+
+  /** Read a declaration without the registry's loader-settling diagnostic (safe during activation). */
+  const readExisting = async (presets) => {
+    const declarations = presets?.definitions;
+    if (declarations instanceof Map) return declarations.get(presetId);
+    if (typeof presets?.has === 'function') {
+      try {
+        return presets.has(presetId) ? { config: { id: presetId } } : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    // Other registry builds answer only metadata; that is still enough to avoid a duplicate.
+    if (typeof presets?.list === 'function') {
+      try {
+        const rows = await presets.list();
+        return Array.isArray(rows) ? rows.find((row) => row?.id === presetId) : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  };
+
+  /**
+   * Ensure the plugin-owned preset exists, at most once per instance.
+   *
+   * Existing (same id) → reuse and never call `register()`. Missing → `register(definition)`.
+   * Failure → one `voice.compaction.preset.register-failed` event and a latched failed state;
+   * callers fail open, so voice keeps running without compaction. `unavailable` is retried by the
+   * next call because the registry service may simply not be mounted yet.
+   */
+  const ensurePreset = async (presetsArg) => {
+    if (presetRelease !== null) await presetRelease.catch(() => {});
+    if (presetState.status === 'registered' || presetState.status === 'reused' || presetState.status === 'failed') {
+      return presetState;
+    }
+    if (presetPending !== null) return await presetPending;
+    const presets = presetsArg ?? getService('agentPresets');
+    if (presets === undefined || presets === null) {
+      presetState = { status: 'unavailable', source: null, registered: false, error: null, at: Date.now() };
+      return presetState;
+    }
+
+    const run = (async () => {
+      const existing = await readExisting(presets);
+      if (existing !== undefined) {
+        presetState = { status: 'reused', source: sourceOf(existing), registered: false, error: null, at: Date.now() };
+        note('voice.compaction.preset.reused', { presetId, source: presetState.source });
+        return presetState;
+      }
+      if (typeof presets.register !== 'function') {
+        presetState = {
+          status: 'failed',
+          source: null,
+          registered: false,
+          error: 'agentPresets.register() is unavailable',
+          at: Date.now(),
+        };
+        note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
+        return presetState;
+      }
+      try {
+        const disposer = await presets.register(presetDefinition);
+        presetUnregister = typeof disposer === 'function' ? disposer : null;
+        presetState = { status: 'registered', source: 'registered', registered: true, error: null, at: Date.now() };
+        note('voice.compaction.preset.registered', {
+          presetId,
+          source: 'registered',
+          plugins: Array.isArray(presetDefinition?.plugins) ? presetDefinition.plugins.length : 0,
+        });
+      } catch (error) {
+        // A declaration that appeared between the read and register() is a migration race, not a
+        // failure: the existing declaration wins and this instance must not remove it.
+        if (/duplicate agent preset/iu.test(describe(error))) {
+          presetState = { status: 'reused', source: 'profile', registered: false, error: null, at: Date.now() };
+          note('voice.compaction.preset.reused', { presetId, source: presetState.source, reason: 'duplicate' });
+        } else {
+          presetState = { status: 'failed', source: null, registered: false, error: describe(error), at: Date.now() };
+          note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
+        }
+      }
+      return presetState;
+    })();
+
+    presetPending = run;
+    try {
+      return await run;
+    } finally {
+      if (presetPending === run) presetPending = null;
+    }
+  };
+
+  /** Read-only snapshot for `status` and tests; never includes the declaration itself. */
+  const presetStatus = () => ({ presetId, ...presetState });
+
+  /** Release only a registration this instance made; a reused declaration is never removed. */
+  const releasePreset = () => {
+    if (presetRelease !== null) return presetRelease;
+    const pending = presetPending;
+    const early = presetUnregister;
+    presetUnregister = null;
+    presetState = { status: 'idle', source: null, registered: false, error: null, at: 0 };
+    if (pending === null && typeof early !== 'function') return null;
+    const release = (async () => {
+      if (pending !== null) await pending.catch(() => {});
+      // A registration that settled while detach waited is still ours to remove.
+      const disposer = early ?? presetUnregister;
+      presetUnregister = null;
+      if (typeof disposer === 'function') await disposer();
+    })().catch(() => {});
+    presetRelease = release;
+    void release.finally(() => {
+      if (presetRelease === release) presetRelease = null;
+    });
+    return release;
+  };
+
+  /**
+   * Start the one eager registration. During Host startup a transitional profile row declaring the
+   * same id may still be activating, so wait for the Loader tree to settle first: the existing
+   * declaration then wins and is reused. A host without a readable Loader registers immediately;
+   * either way the Agent path calls `ensurePreset()` before mounting.
+   */
+  const startRegistration = (presetsArg) => {
+    const presets = presetsArg ?? getService('agentPresets');
+    if (presets === undefined || presets === null) return;
+    let settled = null;
+    try {
+      const loader = presets?.owner?.loader;
+      settled = typeof loader?.await === 'function' ? loader.await() : null;
+    } catch {
+      settled = null;
+    }
+    if (settled !== null && typeof settled?.then === 'function') {
+      void settled.then(() => (attached ? ensurePreset(presets) : undefined)).catch(() => {});
+      return;
+    }
+    void ensurePreset(presets).catch(() => {});
   };
 
   /**
@@ -137,6 +306,16 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
       if (presets === undefined || typeof presets.mount !== 'function') {
         return skip(agent, 'preset-registry-unavailable');
       }
+      // Self-registration is what makes compaction portable: a fresh machine has no profile
+      // declaration, so the preset must exist before mount() is attempted. A failure here is
+      // contained; the voice Agent still runs, just without condensation.
+      const preset = await ensurePreset(presets);
+      if (preset.status === 'failed' || preset.status === 'unavailable') {
+        return skip(agent, preset.status === 'failed' ? 'preset-register-failed' : 'preset-registry-unavailable', {
+          presetId,
+          ...(typeof preset.error === 'string' && preset.error.length > 0 ? { error: preset.error } : {}),
+        });
+      }
       const ctx = agentCtx ?? agent?.ctx;
       if (ctx === undefined || ctx === null) return skip(agent, 'agent-context-unavailable');
 
@@ -159,11 +338,12 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
             composed: presetId,
             service: true,
             reused: true,
+            presetSource: preset.source,
             mountedAt: Date.now(),
           };
           mounted.add(agent);
           records.set(agent, record);
-          note('voice.compaction.reused', { sessionId: agent.id, presetId });
+          note('voice.compaction.reused', { sessionId: agent.id, presetId, presetSource: preset.source });
           return record;
         }
       }
@@ -203,6 +383,7 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
         service: compaction !== undefined,
         marked,
         reused: false,
+        presetSource: preset.source,
         mountedAt: Date.now(),
       };
       mounted.add(agent);
@@ -213,6 +394,7 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
         composed: record.composed,
         service: record.service,
         marked,
+        presetSource: record.presetSource,
       });
       return record;
     })();
@@ -237,8 +419,13 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
    * @param {any} ctx Host context
    * @returns {() => void} detach (the Host fiber also disposes the registration)
    */
+  let attached = false;
+  /** Idempotent detach; also closes the preset registration this instance owns. */
+  let detach = () => {};
   const attach = (ctx) => {
     if (ctx === undefined || ctx === null) return () => {};
+    if (attached) return detach;
+    attached = true;
     let off = null;
     if (typeof ctx.on === 'function') {
       off = ctx.on('agent/created', (payload) => {
@@ -246,21 +433,25 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
         // is always fulfilled, so a missing preset can never fail Agent creation.
         return ensure(payload?.agent);
       });
-      if (typeof ctx.effect === 'function' && typeof off === 'function') {
-        ctx.effect(() => off);
-        off = null;
-      }
     }
+    // Register as soon as the plugin mounts; if the registry service is not ready yet, the next
+    // voice Agent's ensure() retries (an unavailable state is deliberately not latched).
+    startRegistration();
+    detach = () => {
+      if (!attached) return undefined;
+      attached = false;
+      if (typeof off === 'function') off();
+      off = null;
+      return releasePreset();
+    };
+    if (typeof ctx.effect === 'function') ctx.effect(() => detach);
     const agents = getService('agents');
     if (typeof agents?.list === 'function') {
       for (const agent of agents.list()) {
         void ensure(agent).catch(() => {});
       }
     }
-    return () => {
-      if (typeof off === 'function') off();
-      off = null;
-    };
+    return detach;
   };
 
   /** Evidence recorded for an Agent (tests / status); `undefined` until verified. */
@@ -283,7 +474,7 @@ export function createVoiceCompaction({ getService, log = null, presetId = VOICE
     }
   };
 
-  return { presetId, setup, ensure, attach, evidenceOf };
+  return { presetId, setup, ensure, attach, evidenceOf, ensurePreset, presetStatus, status: presetStatus };
 }
 
 /** The ONE action that may re-assemble an existing voice session by hand. */
@@ -305,7 +496,10 @@ export const VOICE_SESSION_AGENT_OWNED_REASON = '需重启 DSH 释放 agent 后�
  *   getService: (name: string) => any,
  *   log?: { emit?: (type: string, payload: object) => unknown } | null,
  *   ownerCtx?: any,
- *   compaction?: { ensure: (agent: any, agentCtx?: any) => Promise<any> } | null,
+ *   compaction?: {
+ *     ensure: (agent: any, agentCtx?: any) => Promise<any>,
+ *     ensurePreset?: (presets?: any) => Promise<any>,
+ *   } | null,
  *   defaultSessionId?: (() => string) | null,
  *   presetId?: string,
  * }} options
@@ -411,13 +605,13 @@ export function createVoiceSessionRecovery({
         return { code: 'preset-invalid', reason: `preset ${presetId}: ${describe(resolved.broken)}` };
       }
       if (resolved?.id !== undefined && resolved.id !== presetId) {
-        return { code: 'preset-missing', reason: `profile 未声明 ${presetId}` };
+        return { code: 'preset-missing', reason: `语音压缩 preset 未注册: ${presetId}` };
       }
       return null;
     } catch (error) {
       const code = typeof error?.code === 'string' ? error.code : '';
       if (code === 'agent-preset/not-found' || /unknown agent preset/iu.test(describe(error))) {
-        return { code: 'preset-missing', reason: `profile 未声明 ${presetId}` };
+        return { code: 'preset-missing', reason: `语音压缩 preset 未注册: ${presetId}` };
       }
       return { code: 'preset-unavailable', reason: describe(error) };
     }
@@ -447,6 +641,15 @@ export function createVoiceSessionRecovery({
     }
 
     const presets = getService('agentPresets');
+    // The recovery action may be the first thing that ever needs the preset (no voice Agent was
+    // created in this process). Register it now; a failure is reported by presetProblem below.
+    if (typeof engine?.ensurePreset === 'function') {
+      try {
+        await engine.ensurePreset(presets);
+      } catch {
+        /* fail-open: presetProblem turns a missing registration into an actionable refusal */
+      }
+    }
     const problem = await presetProblem(presets);
     if (problem !== null) return fail({ sessionId, code: problem.code, reason: problem.reason });
 

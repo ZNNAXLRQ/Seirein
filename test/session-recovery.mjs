@@ -47,10 +47,12 @@ function history() {
  */
 function createHost({
   definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPACTION_PRESET },
+  registerError = null,
   resumeError = null,
   compactionError = null,
 } = {}) {
   const declared = new Map(Object.entries(definitions));
+  let registerCalls = 0;
   const persisted = new Map(); // sessionId -> messages (the durable log)
   const live = new Map(); // sessionId -> live agent
   const mounts = []; // { agentId, presetId }
@@ -85,6 +87,15 @@ function createHost({
   }
 
   const agentPresets = {
+    // The shipped registry exposes its declarations; recovery reuses one instead of registering.
+    definitions: declared,
+    async register(definition) {
+      registerCalls += 1;
+      if (registerError !== null) throw registerError;
+      if (declared.has(definition.id)) throw new Error(`Duplicate agent preset: ${definition.id}`);
+      declared.set(definition.id, { ...definition, source: 'registered' });
+      return async () => { declared.delete(definition.id); };
+    },
     async mount(agentCtx, presetId) {
       const definition = declared.get(presetId);
       if (definition === undefined) {
@@ -170,6 +181,7 @@ function createHost({
 
   return {
     log, events, mounts, compactionRuns, resumes, creates, announces, resolveCalls,
+    get registerCalls() { return registerCalls; },
     persisted, live, ownerCtx, getService, recover,
     addLiveAgent(sessionId) {
       const agent = { id: sessionId, session: createSession(sessionId) };
@@ -197,6 +209,7 @@ test('1. no live agent + preset available: resume once, mount once, compactNow o
   assert.equal(host.creates.length, 0, 'recovery never creates a session');
   assert.equal(host.mounts.length, 1, 'preset mounted once');
   assert.equal(host.mounts[0].presetId, VOICE_COMPACTION_PRESET_ID);
+  assert.equal(host.registerCalls, 0, 'the existing declaration is reused, not registered again');
   assert.equal(host.compactionRuns.length, 1, 'compactNow called exactly once');
   assert.equal(typeof result.before, 'number');
   assert.equal(typeof result.after, 'number');
@@ -240,23 +253,26 @@ test('2. a live agent is refused: no resume, no preset lookup, no compaction', a
   assert.equal(host.live.get('seirein-2026-11-08').session.messages.length, 20);
 });
 
-test('3. an undeclared preset is refused before any resume', async () => {
-  const host = createHost({ definitions: {} });
+test('3. a preset registration failure is refused before any resume', async () => {
+  const host = createHost({ definitions: {}, registerError: new Error('preset registry offline') });
   host.persisted.set('seirein-2026-11-08', history());
 
   const result = await host.recover({ sessionId: 'seirein-2026-11-08' });
 
   assert.equal(result.ok, false);
   assert.equal(result.code, 'preset-missing');
+  assert.equal(host.registerCalls, 1, 'the plugin tried to self-register first');
   assert.equal(host.resumes.length, 0, 'nothing was resumed');
   assert.equal(host.creates.length, 0);
   assert.equal(host.mounts.length, 0, 'nothing was mounted');
   assert.equal(host.compactionRuns.length, 0);
   assert.equal(host.persisted.get('seirein-2026-11-08').length, 20, 'history untouched');
+  const registered = host.events.find((entry) => entry.type === 'voice.compaction.preset.register-failed');
+  assert.ok(registered !== undefined, 'the registration failure is observable');
   const event = host.events.filter((entry) => entry.type === VOICE_SESSION_RECOVER_ACTION).at(-1);
   assert.equal(event.payload.ok, false);
   assert.equal(event.payload.reason, 'preset-missing');
-  console.log('[3] refused: code=preset-missing resumes=0 mounts=0');
+  console.log('[3] refused: code=preset-missing resumes=0 mounts=0 register=1');
 });
 
 test('4. a resume failure is returned verbatim: one attempt, no new session, no history change', async () => {
@@ -335,4 +351,23 @@ test('6. the action is manual only: no timer, listener or delivery path can run 
   const callers = owners.map((path) => path.slice(HOST_ROOT.length).replaceAll('\\', '/')).sort();
   assert.deepEqual(callers, ['index.js', 'session/compaction/voice-compaction.js'], 'only the module and the index register it');
   console.log(`[6] static: index occurrences=2, action-name constants=1, timer hits=0, callers=${callers.length}`);
+});
+
+test('7. recovery registers the preset itself, then resumes, mounts and compacts once', async () => {
+  const host = createHost({ definitions: {} });
+  host.persisted.set('seirein-2026-11-08', history());
+
+  const result = await host.recover({});
+
+  assert.equal(result.ok, true, 'a fresh profile needs no hand-written preset declaration');
+  assert.equal(host.registerCalls, 1, 'the plugin registered the preset exactly once');
+  assert.equal(host.mounts.length, 1);
+  assert.equal(host.mounts[0].presetId, VOICE_COMPACTION_PRESET_ID);
+  assert.equal(host.resumes.length, 1);
+  assert.equal(host.compactionRuns.length, 1);
+  assert.ok(result.before > result.after, `request tokens drop (${result.before} -> ${result.after})`);
+  const registered = host.events.find((entry) => entry.type === 'voice.compaction.preset.registered');
+  assert.ok(registered !== undefined, 'the self-registration is observable');
+  assert.equal(registered.payload.source, 'registered');
+  console.log(`[7] self-registered: register=1 mount=1 compactNow=1 ${result.before} -> ${result.after}`);
 });

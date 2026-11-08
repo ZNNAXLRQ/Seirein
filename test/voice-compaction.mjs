@@ -6,6 +6,8 @@
  *  - the shipped `initializeAgent` awaits `setup(agent.ctx, agent)` and then runs
  *    `setupCommit?.commit()`, so a valid setup returns void or `{ commit() }` — never a state object;
  *  - `agentPresets.mount(agentCtx, id)` binds the Agent scope to a retained preset revision;
+ *  - `agentPresets.register(definition)` installs the plugin-owned declaration, and a duplicate id
+ *    is rejected (the real registry throws `Duplicate agent preset: <id>`);
  *  - the preset's plugins register scoped `agent/pre-step` listeners and a scoped `/compact`
  *    command, visible only to Agents bound to that preset;
  *  - `composedPreset`/`serviceFor` read the binding back (the success evidence), while
@@ -45,8 +47,12 @@ function createMessage(text) {
 }
 
 /** One fake Host: preset registry, scoped event bus, scoped command registry, live Agent list. */
-function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPACTION_PRESET } } = {}) {
+function createHost({
+  definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPACTION_PRESET },
+  registerError = null,
+} = {}) {
   const declared = new Map(Object.entries(definitions));
+  let registerCalls = 0;
   const meter = createMeter();
   const mounts = [];
   const bindings = new Map(); // agent -> binding
@@ -166,6 +172,17 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
   }
 
   const agentPresets = {
+    // Mirrors the shipped registry's own definition map: a same-id declaration is readable
+    // without an audit, so a plugin can reuse it instead of calling register().
+    definitions: declared,
+    async register(definition) {
+      registerCalls += 1;
+      if (registerError !== null) throw registerError;
+      if (declared.has(definition.id)) throw new Error(`Duplicate agent preset: ${definition.id}`);
+      // The fake marks plugin-installed declarations, like the plugin's own provenance record.
+      declared.set(definition.id, { ...definition, source: 'registered' });
+      return async () => { declared.delete(definition.id); };
+    },
     async mount(agentCtx, presetId) { return mountPreset(agentCtx, presetId); },
     async resolve(presetId) {
       const wanted = presetId ?? VOICE_COMPACTION_PRESET_ID;
@@ -256,7 +273,8 @@ function createHost({ definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPAC
   }
 
   return {
-    meter, log, events, mounts, liveAgents, services, ctx, agentPresets,
+    meter, log, events, mounts, liveAgents, services, ctx, agentPresets, declared,
+    get registerCalls() { return registerCalls; },
     createAgent, createAndAnnounce, announce, emit,
     listenersFor, commandFor, compactionFor, getService, cleanups,
     listenerCount: (agent, type) => listenersFor(agent, type).length,
@@ -353,6 +371,10 @@ test('1. setup mounts the preset once, and a repeated setup adds no second insta
   assert.equal(record.ok, true, 'setup reports a verified mount through evidence');
   assert.equal(record.presetId, VOICE_COMPACTION_PRESET_ID);
   assert.equal(record.reused, false);
+  assert.equal(record.presetSource, 'profile', 'the pre-existing declaration is reused');
+  assert.equal(host.registerCalls, 0, 'an existing declaration is never registered again');
+  assert.equal(helper.presetStatus().status, 'reused');
+  assert.equal(helper.presetStatus().source, 'profile');
   assert.equal(host.mounts.length, 1, 'exactly one mount call');
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1, 'exactly one compaction listener');
   assert.equal(host.commandCount(agent, 'compact'), 1, 'exactly one scoped /compact registration');
@@ -406,6 +428,8 @@ test('3. new, resumed and reload-swept Agents all bind; a reload adds no second 
   // Component reload: a NEW plugin instance sweeps the live Agents it did not create.
   const secondRun = createVoiceCompaction({ getService: host.getService, log: host.log });
   secondRun.attach(host.ctx);
+  // The reload sweep is deliberately asynchronous (it never blocks mount); let it settle.
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(host.mounts.length, 2, 'already-bound Agents are verified/reused, never remounted');
   assert.equal(host.listenerCount(fresh, 'agent/pre-step'), 1);
   assert.equal(host.listenerCount(resumed, 'agent/pre-step'), 1);
@@ -502,17 +526,25 @@ test('6. compaction lowers the measured request size', async () => {
   assert.deepEqual(agent.session.compactions[0].after, after);
 });
 
-test('7. no declared preset: the voice agent keeps running and reports an actionable skip', async () => {
-  const host = createHost({ definitions: {} });
+test('7. a registration failure is logged once, fails open, and leaves the voice agent running', async () => {
+  const host = createHost({ definitions: {}, registerError: new Error('preset registry offline') });
   const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
   const agent = host.createAgent('seirein-2026-11-08');
 
   const setupCommit = await consumeSetupLikeHost(helper.setup, agent);
-  assert.equal(setupCommit, undefined, 'a missing preset still resolves the setup callback void');
+  assert.equal(setupCommit, undefined, 'a failed registration still resolves the setup callback void');
+  assert.equal(host.registerCalls, 1, 'the plugin tried to register the declaration once');
   assert.equal(host.mounts.length, 0, 'nothing was mounted');
   assert.equal(host.listenerCount(agent, 'agent/pre-step'), 0);
+  const failed = host.events.find((event) => event.type === 'voice.compaction.preset.register-failed');
+  assert.ok(failed !== undefined, 'the failure is observable');
+  assert.equal(failed.payload.presetId, VOICE_COMPACTION_PRESET_ID);
+  assert.match(failed.payload.error, /offline/u);
+  assert.equal(helper.presetStatus().status, 'failed');
+  assert.equal(helper.presetStatus().registered, false);
   const skipped = host.events.find((event) => event.type === 'voice.compaction.skipped');
-  assert.equal(skipped.payload.reason, 'preset-missing');
+  assert.equal(skipped.payload.reason, 'preset-register-failed');
 });
 
 test('8. apply() installs the binding for real voice Agents through agent/created', async (t) => {
@@ -650,8 +682,10 @@ test('12. host protocol with a preset: setup resolves void, creation completes, 
   assert.equal(host.commandCount(first.agent, 'compact'), 1, 'no second command');
 });
 
-test('13. host protocol without a preset: fail-open, creation completes, setup never rejects', async () => {
-  const host = createHost({ definitions: {} });
+test('13. host protocol without a preset registry: fail-open, creation completes, setup never rejects', async () => {
+  const host = createHost();
+  // A build that does not mount `agentPresets` at all: registration is unavailable, not an error.
+  host.services.agentPresets = undefined;
   const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
   helper.attach(host.ctx);
 
@@ -672,4 +706,94 @@ test('13. host protocol without a preset: fail-open, creation completes, setup n
   assert.equal(setupCommit, undefined);
   const failed = host.events.find((event) => event.type === 'voice.compaction.failed');
   assert.equal(failed.payload.reason, 'setup');
+});
+
+test('14. no profile declaration: the plugin registers the preset, then agent/created mounts it', async () => {
+  const host = createHost({ definitions: {} });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(host.registerCalls, 1, 'the plugin registered the declaration exactly once');
+  const state = helper.presetStatus();
+  assert.equal(state.status, 'registered');
+  assert.equal(state.source, 'registered');
+  assert.equal(state.registered, true);
+  assert.equal(state.error, null);
+  assert.equal(host.mounts.length, 1, 'the newly registered preset was mounted');
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1, 'the compaction listener exists');
+  assert.equal(host.commandCount(agent, 'compact'), 1, 'the scoped /compact command exists');
+  assert.equal(helper.evidenceOf(agent).presetSource, 'registered');
+
+  const registered = host.events.find((event) => event.type === 'voice.compaction.preset.registered');
+  assert.ok(registered !== undefined, 'the registration is observable');
+  assert.equal(registered.payload.source, 'registered');
+
+  // The definition content is the compaction-only composition the profile used to carry.
+  const stored = host.agentPresets.definitions.get(VOICE_COMPACTION_PRESET_ID);
+  const group = stored.plugins[0];
+  assert.equal(group.id, 'compaction');
+  assert.equal(group.name, 'cordis:group');
+  assert.equal(group.group, true);
+  assert.deepEqual(group.isolate, { compaction: true, toolResultPruner: true });
+  assert.deepEqual(group.config.map((row) => row.id), [
+    'compaction-basic',
+    'command-compact',
+    'tool-result-pruner',
+  ]);
+  assert.deepEqual(group.config[2].config, { thresholdChars: 8192, headChars: 4096, tailChars: 1024 });
+});
+
+test('15. a leftover profile declaration is reused: zero register calls and a profile source', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(host.registerCalls, 0, 'the existing declaration is never registered again');
+  const state = helper.presetStatus();
+  assert.equal(state.status, 'reused');
+  assert.equal(state.source, 'profile');
+  assert.equal(state.registered, false);
+  assert.equal(host.mounts.length, 1, 'the reused preset still mounts for the Agent');
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1);
+
+  const reused = host.events.find((event) => event.type === 'voice.compaction.preset.reused');
+  assert.ok(reused !== undefined, 'the reuse is observable');
+  assert.equal(reused.payload.source, 'profile');
+});
+
+test('16. repeated attach (component reload) keeps registration and mount idempotent', async () => {
+  const host = createHost({ definitions: {} });
+  const first = createVoiceCompaction({ getService: host.getService, log: host.log });
+  first.attach(host.ctx);
+  const agent1 = await host.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(host.registerCalls, 1);
+
+  // Component reload: a NEW plugin instance attaches while the first registration and Agent live.
+  const second = createVoiceCompaction({ getService: host.getService, log: host.log });
+  second.attach(host.ctx);
+  const agent2 = await host.createAndAnnounce('seirein-2026-11-09');
+
+  assert.equal(host.registerCalls, 1, 'the reload reused the existing registration');
+  assert.equal(second.presetStatus().status, 'reused');
+  assert.equal(second.presetStatus().source, 'registered');
+  assert.equal(host.mounts.filter((mount) => mount.agentId === agent1.id).length, 1, 'agent 1 mounted once');
+  assert.equal(host.mounts.filter((mount) => mount.agentId === agent2.id).length, 1, 'agent 2 mounted once');
+  assert.equal(host.listenerCount(agent1, 'agent/pre-step'), 1);
+  assert.equal(host.listenerCount(agent2, 'agent/pre-step'), 1);
+  assert.equal(second.evidenceOf(agent1).reused, true, 'the live Agent is verified, not remounted');
+});
+
+test('17. status classifies a builtin declaration separately from a profile one', async () => {
+  const host = createHost({
+    definitions: { [VOICE_COMPACTION_PRESET_ID]: { ...VOICE_COMPACTION_PRESET, builtin: true } },
+  });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  const agent = host.createAgent('seirein-2026-11-08');
+
+  await helper.setup(agent.ctx, agent);
+  assert.equal(host.registerCalls, 0);
+  assert.equal(helper.presetStatus().status, 'reused');
+  assert.equal(helper.presetStatus().source, 'builtin');
 });
