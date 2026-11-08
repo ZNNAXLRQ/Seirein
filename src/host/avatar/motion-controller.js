@@ -458,9 +458,9 @@ const DEFAULT_CONFIG = Object.freeze({
   relaxAmplitudeDrop: RELAXATION.AMPLITUDE_DROP,
   relaxTempoDrop: RELAXATION.TEMPO_DROP,
   /**
-   * Local diagnosis only: whether preset DECISIONS are also reported as throttled debug events
-   * (`avatar.preset.select/skip/commit`). It never gates selection/execution/transport — the
-   * `status.live2d.runtime.motion.presets` projection is maintained either way.
+   * Local diagnosis only: whether preset DECISIONS/EXECUTION are also reported as throttled debug
+   * events (`avatar.preset.select/skip/commit/start`). It never gates selection/execution/transport
+   * — the `status.live2d.runtime.motion.presets` projection is maintained either way.
    */
   presetDebugEvents: true,
   random: Math.random,
@@ -548,14 +548,44 @@ const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
 
 /**
  * Preset decision observability (read-only). `config.presetDebugEvents` only gates the EVENTS —
- * the projection counters below are always maintained — and one class is emitted at most once per
- * second so a 30 Hz tick can never flood the event log.
+ * the projection counters below are always maintained. Selection decisions stay at one per class
+ * per second; a commit is per acknowledged SEND, so 250 ms keeps every acknowledgement visible
+ * without letting a 30 Hz tick flood the log. The ring buffer still caps the total.
  */
 const PRESET_DEBUG_THROTTLE_MS = 1000;
+const PRESET_COMMIT_THROTTLE_MS = 250;
 /** Closed vocabulary of "why no preset ran" (`status.live2d.runtime.motion.presets.skips`). */
 const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
 
 const presetClamp = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
+
+/**
+ * Planned amplitude of one stage, read from the executor's OWN already-resolved amounts (never a
+ * new physical quantity): the largest |offset| it may ask for on any channel of that stage.
+ */
+function presetStageAmplitude(stage) {
+  let peak = 0;
+  for (const map of [stage.channelAmounts, stage.cancelOffsets, stage.targetOffsets]) {
+    for (const value of Object.values(map ?? {})) {
+      if (Number.isFinite(value)) peak = Math.max(peak, Math.abs(value));
+    }
+  }
+  return peak;
+}
+
+/** Plain copy of the planned stages for the start event (the live trace objects mutate later). */
+function presetPlannedStages(stages) {
+  return stages.map((stage) => ({
+    op: stage.op,
+    kind: stage.kind,
+    channels: [...stage.channels],
+    startMs: Math.round(stage.start),
+    activeMs: Math.round(stage.activeMs),
+    holdMs: Math.round(stage.holdMs),
+    exitMs: Math.round(stage.exitMs),
+    amplitude: presetStageAmplitude(stage),
+  }));
+}
 
 /** True when one operation list contains a head roll (the tilt family, used for style bias). */
 const hasTiltOperation = (preset) => Array.isArray(preset?.operations)
@@ -1807,7 +1837,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    * Record ONE preset decision for diagnosis. The projection counters and `last*` values are
    * updated for every decision, so they stay truthful even with `config.presetDebugEvents:false`;
    * the debug EVENT itself (`state.events` + the host log sink) is throttled to one per class per
-   * second. Nothing here is read back by selection, the pose or the transport.
+   * second (commit evidence: one per 250 ms). Nothing here is read back by selection, the pose or
+   * the transport.
    */
   function notePresetDebugEvent(type, payload = {}, at = null) {
     const debug = state.presets.debug;
@@ -1824,7 +1855,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     if (debug.enabled !== true) return false;
     const last = debug.lastEmitAt[type];
-    if (Number.isFinite(last) && now - last < PRESET_DEBUG_THROTTLE_MS) return false;
+    // A commit is evidence of one acknowledged SEND, not of a slow decision: 250 ms keeps an
+    // action's whole acknowledgement trail; select/skip keep the 1 s decision budget. `EVENTS_MAX`
+    // still caps the total buffer.
+    const throttle = type === 'avatar.preset.commit'
+      ? PRESET_COMMIT_THROTTLE_MS : PRESET_DEBUG_THROTTLE_MS;
+    if (Number.isFinite(last) && now - last < throttle) return false;
     debug.lastEmitAt[type] = now;
     recordEvent(type, payload);
     if (typeof cfg.debugEvent === 'function') {
@@ -1858,18 +1894,22 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const debug = state.presets.debug;
     if (debug.gate === key) return;
     debug.gate = key;
-    notePresetDebugEvent('avatar.preset.skip', { reason, event, droppedChannels: [] }, at);
+    notePresetDebugEvent('avatar.preset.skip', {
+      reason, event, state: state.status, reasons: [], droppedChannels: [],
+    }, at);
   }
 
   /**
    * Report a decision that never reached the selector (the host refused the boundary itself, e.g.
    * `busy`: one preset already owns the pose). Read-only; it selects, executes and writes nothing.
    */
-  function notePresetSkip(reason, { event = '', droppedChannels = [], at = null } = {}) {
+  function notePresetSkip(reason, { event = '', reasons = null, droppedChannels = [], at = null } = {}) {
     const why = PRESET_SKIP_REASONS.includes(reason) ? reason : 'hold';
     notePresetDebugEvent('avatar.preset.skip', {
       reason: why,
       event: typeof event === 'string' ? event : '',
+      state: state.status,
+      reasons: Array.isArray(reasons) ? [...reasons] : [],
       droppedChannels: [...(Array.isArray(droppedChannels) ? droppedChannels : [])],
     }, at);
     return { ok: true, reason: why };
@@ -1961,6 +2001,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       notePresetDebugEvent('avatar.preset.skip', {
         reason: presetSkipReason(normalized, context),
         event: context.event,
+        /** Payload-only diagnosis: the selector's own reasons plus the state/verified set. */
+        state: context.state,
+        verifiedChannels: [...(normalized.verifiedChannels ?? [])],
+        reasons: [...normalized.reasons],
         droppedChannels: [...(normalized.droppedChannels ?? [])],
       }, context.now);
     }
@@ -2375,6 +2419,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       notePresetDebugEvent('avatar.preset.skip', {
         reason: presetSkipReason(hold, context),
         event: context.event,
+        state: context.state,
+        verifiedChannels: [...(context.verifiedChannels ?? [])],
+        reasons: [...(hold.reasons ?? [])],
         droppedChannels: [...(hold.droppedChannels ?? [])],
       }, at);
       return { ok: true, started: false, kind: 'hold', selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
@@ -2387,6 +2434,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       notePresetDebugEvent('avatar.preset.skip', {
         reason: presetSkipReason(hold, context),
         event: context.event,
+        state: context.state,
+        verifiedChannels: [...(context.verifiedChannels ?? [])],
+        reasons: [...(hold.reasons ?? [])],
         droppedChannels: [...(hold.droppedChannels ?? [])],
       }, at);
       return { ok: true, started: false, kind: 'hold', reason, selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
@@ -2433,6 +2483,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       cancelFadeMs: 0,
       done: false,
       written: new Set(),
+      /** First acknowledged value per channel, for commit evidence only (`{at, values}`). */
+      firstCommitted: null,
       trace,
     };
     state.presets.active.push(item);
@@ -2451,14 +2503,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     while (state.presets.recentFamilies.length > 8) state.presets.recentFamilies.shift();
     state.presets.recentActions.push(selection.presetId);
     while (state.presets.recentActions.length > 8) state.presets.recentActions.shift();
-    recordEvent('avatar.preset.start', {
+    // Observability only: the executor already resolved these amounts; the event publishes them so
+    // "it started" can be judged together with "how large / how long" (and reaches the host log).
+    const plannedStages = presetPlannedStages(built.stages);
+    const plannedAmplitude = plannedStages.reduce((max, stage) => Math.max(max, stage.amplitude), 0);
+    notePresetDebugEvent('avatar.preset.start', {
       presetId: selection.presetId,
       family: selection.family,
       recipe: selection.recipe,
       variant: selection.variant,
+      event: context.event ?? '',
       operations: [...(selection.operations ?? [])],
       channels: [...item.channels],
+      amplitude: plannedAmplitude,
       durationMs: built.durationMs,
+      stages: plannedStages,
       at,
     });
     return {
@@ -2656,11 +2715,28 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         && Object.keys(item.trace.output.committed).length > 0
       ));
       if (committedItem !== undefined) {
+        const output = committedItem.trace.output;
+        const lastValue = { ...output.committed };
+        if (committedItem.firstCommitted === null) {
+          committedItem.firstCommitted = { at: now, values: {} };
+        }
+        const firstValue = committedItem.firstCommitted.values;
+        for (const [channel, value] of Object.entries(lastValue)) {
+          if (!Object.prototype.hasOwnProperty.call(firstValue, channel)) firstValue[channel] = value;
+        }
+        const peak = Object.values(lastValue).reduce((max, value) => (
+          Number.isFinite(value) ? Math.max(max, Math.abs(value)) : max
+        ), 0);
         notePresetDebugEvent('avatar.preset.commit', {
           presetId: committedItem.presetId,
           channels: [...committedItem.channels],
-          committed: Object.keys(committedItem.trace.output.committed),
-          skippedByTransport: { ...committedItem.trace.output.skippedByTransport },
+          committed: Object.keys(output.committed),
+          skippedByTransport: { ...output.skippedByTransport },
+          /** All values below are the ACKNOWLEDGED values, never a new physical quantity. */
+          peak,
+          firstValue: { ...firstValue },
+          lastValue,
+          spanMs: Math.max(0, now - committedItem.firstCommitted.at),
         }, now);
       }
       return { committed: committed > 0, stale: false, reason: '' };

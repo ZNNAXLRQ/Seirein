@@ -2646,10 +2646,11 @@ export function apply(ctx, config) {
       void log.emit('avatar.action.trace', payload).catch(() => {});
       return;
     }
-    // Preset decision observability: the controller already throttles select/skip/commit to one
-    // per class per second and silences them with `presetDebugEvents:false`. Log sink only.
+    // Preset observability: the controller already throttles select/skip to one per class per
+    // second and commits to one per 250 ms, and silences them with `presetDebugEvents:false`.
+    // Log sink only (start carries amplitude/duration/stages evidence; never a second writer).
     if (message === 'avatar.preset.select' || message === 'avatar.preset.skip'
-      || message === 'avatar.preset.commit') {
+      || message === 'avatar.preset.commit' || message === 'avatar.preset.start') {
       const payload = { ...data };
       delete payload.level;
       void log.emit(message, payload).catch(() => {});

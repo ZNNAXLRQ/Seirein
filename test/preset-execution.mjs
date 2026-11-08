@@ -549,7 +549,8 @@ test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 de
   const commit = commits[0];
   assert.deepEqual(
     Object.keys(commit).sort(),
-    ['at', 'channels', 'committed', 'presetId', 'skippedByTransport', 'type'],
+    ['at', 'channels', 'committed', 'firstValue', 'lastValue', 'peak', 'presetId',
+      'skippedByTransport', 'spanMs', 'type'],
   );
   assert.equal(commit.presetId, started.presetId);
   assert.deepEqual(commit.channels, started.channels);
@@ -568,4 +569,189 @@ test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 de
   assert.equal(select.event, 'idle', 'the payload keeps the preset event vocabulary');
   assert.equal(typeof select.score, 'number');
   assert.ok(Array.isArray(select.channels));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Amplitude / duration evidence (read-only). These only READ the new payload fields: selection,
+// amplitude and write cadence stay exactly as before.
+// ---------------------------------------------------------------------------------------------
+
+/** One avatar runtime on a fake clock whose transport records every motion frame. */
+async function makeTransportRuntime() {
+  let clock = 0;
+  const frames = [];
+  const logs = [];
+  const transport = {
+    connect: async () => {},
+    disconnect: async () => {},
+    write: async () => ({ ok: true }),
+    writeMotion: async (payload) => {
+      frames.push({
+        at: payload.at,
+        entries: payload.entries.map((entry) => ({ channel: entry.channel, value: entry.value })),
+      });
+      return { ok: true };
+    },
+  };
+  const runtime = createAvatarRuntime({
+    transport,
+    now: () => clock,
+    log: (message, data = {}) => logs.push({ message, ...data }),
+    config: {
+      seed: 11,
+      autoTickMs: 0,
+      flushIntervalMs: 1,
+      idleActions: [],
+      idleSwayScale: 0,
+      motionWrites: true,
+      motionOutputHz: 30,
+      presetExecution: true,
+    },
+  });
+  assert.equal((await runtime.connect()).ok, true);
+  const rows = ['headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'eyeOpenL', 'eyeOpenR', 'browL', 'browR']
+    .map((channel) => ({ channel, inputName: `P_${channel}`, injectable: true, verified: true }));
+  await runtime.setChannelMappings(rows, { channelMap: {} });
+  return {
+    runtime,
+    frames,
+    logs,
+    tick: async (at) => {
+      clock = at;
+      runtime.tick(at);
+      await new Promise((resolve) => setImmediate(resolve));
+      return frames.at(-1) ?? null;
+    },
+  };
+}
+
+/** Start one deterministic idle-tilt trajectory (the same draw the existing tests use). */
+function startIdleTilt(runtime) {
+  for (let seed = 0; seed < 96; seed += 1) {
+    const drawn = runtime.preset({ state: 'idle', event: 'idle', recipe: 'idle-tilt', seed, at: 0 });
+    if (drawn.started === true) return drawn;
+  }
+  return null;
+}
+
+test('16. commit 幅度证据：peak/firstValue/lastValue/spanMs 与最终发送值一致', async () => {
+  const { runtime, frames, logs, tick } = await makeTransportRuntime();
+  const started = startIdleTilt(runtime);
+  assert.ok(started !== null, 'a preset trajectory started');
+  runtime.takeEvents(); // the start/select of this trajectory is covered by test 17
+
+  const sentByAt = new Map();
+  for (const at of [0, 250, 500, 750, 1000]) {
+    const frame = await tick(at);
+    const sent = new Map();
+    for (const entry of frame?.entries ?? []) if (entry.channel) sent.set(entry.channel, entry.value);
+    sentByAt.set(at, sent);
+  }
+
+  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.ok(commits.length >= 2, `several acknowledgements are evidence: ${commits.length}`);
+  const commit = commits.at(-1);
+  assert.equal(commit.presetId, started.presetId);
+  assert.equal(typeof commit.peak, 'number');
+  assert.equal(typeof commit.spanMs, 'number');
+  assert.equal(commit.lastValue !== null && typeof commit.lastValue === 'object', true);
+  assert.equal(commit.firstValue !== null && typeof commit.firstValue === 'object', true);
+
+  // The evidence must be the acknowledged values, not a recomputed physical quantity.
+  const sent = sentByAt.get(commit.at);
+  assert.ok(sent !== undefined, `a frame was sent at the commit time ${commit.at}`);
+  for (const channel of commit.committed) {
+    assert.equal(commit.lastValue[channel], sent.get(channel),
+      `lastValue equals the final sent value: ${channel}`);
+    assert.ok(Number.isFinite(commit.firstValue[channel]), `firstValue is finite: ${channel}`);
+  }
+  assert.equal(commit.peak, Math.max(...Object.values(commit.lastValue).map(Math.abs)));
+  assert.equal(commit.spanMs, commit.at - commits[0].at, 'span = first ack -> last ack');
+  assert.ok(commit.spanMs >= 750, `the trail spans several acknowledgements: ${commit.spanMs}`);
+
+  // The same observability reaches the host log sink.
+  assert.ok(logs.some((row) => row.message === 'avatar.preset.start'), 'start is logged too');
+  assert.ok(logs.some((row) => row.message === 'avatar.preset.commit'), 'commit is logged');
+});
+
+test('17. start 事件带幅度/时长/阶段，并已放开宿主白名单', () => {
+  const runtime = makeRuntime();
+  const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-tilt' });
+  assert.ok(selection !== null);
+  runtime.takeEvents();
+
+  const started = runtime.startPreset(selection, { at: 0 });
+  assert.equal(started.started, true);
+  const start = runtime.takeEvents().find((event) => event.type === 'avatar.preset.start');
+  assert.ok(start, 'the start event is emitted');
+  assert.equal(start.presetId, started.presetId);
+  assert.equal(start.event, 'idle');
+  assert.deepEqual(start.channels, started.channels);
+  assert.equal(typeof start.amplitude, 'number');
+  assert.ok(start.amplitude > 0, `planned amplitude ${start.amplitude}`);
+  assert.ok(start.durationMs > 0, `planned duration ${start.durationMs}`);
+  assert.ok(Array.isArray(start.stages) && start.stages.length > 0);
+  const stage = start.stages[0];
+  assert.equal(stage.op, 'head-tilt');
+  assert.deepEqual(stage.channels, started.channels);
+  assert.ok(stage.amplitude > 0);
+  assert.ok(stage.activeMs > 0 && stage.holdMs >= 0 && stage.exitMs > 0);
+
+  // Source wiring proof: index.js forwards the start payload to the host debug log.
+  const source = readFileSync(new URL('../src/host/index.js', import.meta.url), 'utf8');
+  assert.match(source, /message === 'avatar\.preset\.start'/u);
+});
+
+test('18. answer-start 空候选：skip 带 reasons 与 state，可区分 state-mismatch / requires-target', () => {
+  const runtime = makeRuntime();
+  runtime.tick(0);
+  runtime.takeEvents();
+
+  // answer-start presets exist only for state 'speaking'; thinking is a state mismatch.
+  const held = runtime.selectPreset({
+    state: 'thinking', event: 'answer-start',
+    verifiedChannels: [...ALL_CHANNELS], targetVerified: true, now: 1000,
+  });
+  assert.equal(held.kind, 'hold');
+  const mismatch = runtime.takeEvents().find((event) => event.type === 'avatar.preset.skip');
+  assert.ok(mismatch, 'an empty answer-start candidate is an explicit skip');
+  assert.equal(mismatch.event, 'answer-start');
+  assert.equal(mismatch.state, 'thinking');
+  assert.equal(mismatch.reason, 'no-candidate');
+  assert.ok(Array.isArray(mismatch.verifiedChannels) && mismatch.verifiedChannels.includes('headZ'));
+  assert.ok(Array.isArray(mismatch.reasons) && mismatch.reasons.length > 0);
+  assert.ok(mismatch.reasons.includes('no-candidates'));
+  assert.ok(mismatch.reasons.includes('state:thinking'));
+  assert.equal(mismatch.reasons.includes('requires-target'), false);
+
+  // The same event with a targeted recipe but no verified target fails for a DIFFERENT reason.
+  const targeted = runtime.selectPreset({
+    state: 'speaking', event: 'answer-start', recipe: 'answer-attend',
+    verifiedChannels: ['gazeX', 'gazeY'], targetVerified: false, now: 3000,
+  });
+  assert.equal(targeted.kind, 'hold');
+  const requiresTarget = runtime.takeEvents().find((event) => event.type === 'avatar.preset.skip');
+  assert.ok(requiresTarget);
+  assert.equal(requiresTarget.state, 'speaking');
+  assert.ok(requiresTarget.reasons.length > 0);
+  assert.ok(requiresTarget.reasons.includes('requires-target'));
+  assert.equal(requiresTarget.reasons.includes('state:thinking'), false);
+  assert.notEqual(requiresTarget.reasons.join('|'), mismatch.reasons.join('|'),
+    'the two empty-candidate causes are distinguishable');
+});
+
+test('19. commit 单独 250ms 节流：同一秒 4 次提交 = 4 条（旧实现只有 1 条）', async () => {
+  const { runtime, tick } = await makeTransportRuntime();
+  const started = startIdleTilt(runtime);
+  assert.ok(started !== null);
+  runtime.takeEvents();
+
+  for (const at of [0, 250, 500, 750]) await tick(at);
+  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(commits.length, 4, `four acknowledgements 250 ms apart are four events: ${commits.length}`);
+  for (let index = 1; index < commits.length; index += 1) {
+    assert.ok(commits[index].at - commits[index - 1].at >= 250,
+      `commit throttle: ${commits[index - 1].at} -> ${commits[index].at}`);
+  }
+  assert.ok(commits.every((event) => event.presetId === started.presetId));
 });
