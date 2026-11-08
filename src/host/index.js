@@ -10796,6 +10796,68 @@ export function apply(ctx, config) {
       spoken: measureRedundancy(spokenText),
     }).catch(() => {});
   };
+  // ---- spoken-text observability (debug) ---------------------------------
+  // The voice log used to keep only the spoken version's SIZE, so "the audio does not match the
+  // text" could not be checked. `voice.spoken.text` keeps a bounded copy of the expression that
+  // was actually handed to the voice outlet. Observation only: no text, delivery or playback is
+  // read back into any decision, and the row is local diagnosis (`config.voiceSpokenTextLog`).
+  const SPOKEN_TEXT_LOG_MAX = 200;
+  /** Local diagnosis only, default on: never a user-facing setting and never a feature. */
+  const spokenTextLogEnabled = () => config?.voiceSpokenTextLog !== false;
+  /** (purpose, turn) already reported: one row per spoken outlet per round, never a duplicate. */
+  const spokenTextLogSeen = new Set();
+  /**
+   * Share of the spoken character pairs that also occur in the body. 0 means the two expressions
+   * share no wording at all (a possible off-topic mixing); null means it cannot be measured.
+   * Recorded as-is, never judged: it changes nothing about what is spoken.
+   */
+  const spokenTopicOverlap = (body, spoken) => {
+    const pairs = (value) => {
+      const chars = [...String(value ?? '').replace(/[\s\p{P}\p{S}]/gu, '')];
+      const set = new Set();
+      for (let index = 0; index + 1 < chars.length; index += 1) set.add(chars[index] + chars[index + 1]);
+      return set;
+    };
+    const bodyPairs = pairs(body);
+    const spokenPairs = pairs(spoken);
+    if (bodyPairs.size === 0 || spokenPairs.size === 0) return null;
+    let shared = 0;
+    for (const pair of spokenPairs) if (bodyPairs.has(pair)) shared += 1;
+    return Math.round((shared / spokenPairs.size) * 1000) / 1000;
+  };
+  /**
+   * One `voice.spoken.text` row: the spoken expression of one round, truncated to
+   * SPOKEN_TEXT_LOG_MAX characters with an explicit `truncated:true`. It never carries the user's
+   * input or the persona, never edits the text, and is throttled per (purpose, turn).
+   */
+  const emitSpokenText = ({
+    turn = null, purpose = 'answer', bodyText = '', text = '', source = 'original',
+    groupId = '', answerVersion = null,
+  } = {}) => {
+    if (!spokenTextLogEnabled()) return;
+    const spoken = String(text ?? '');
+    if (spoken.length === 0) return;
+    if (Number.isSafeInteger(turn)) {
+      const key = `${purpose}\u0000${turn}`;
+      if (spokenTextLogSeen.has(key)) return;
+      spokenTextLogSeen.add(key);
+      if (spokenTextLogSeen.size > 512) spokenTextLogSeen.delete(spokenTextLogSeen.values().next().value);
+    }
+    const points = [...spoken];
+    const truncated = points.length > SPOKEN_TEXT_LOG_MAX;
+    void log.emit('voice.spoken.text', {
+      turn: Number.isSafeInteger(turn) ? turn : null,
+      purpose,
+      bodyChars: speechCharCount(bodyText),
+      spokenChars: points.length,
+      spokenText: truncated ? `${points.slice(0, SPOKEN_TEXT_LOG_MAX).join('')}…` : spoken,
+      ...(truncated ? { truncated: true } : {}),
+      source,
+      ...(String(groupId ?? '').length > 0 ? { groupId: String(groupId) } : {}),
+      ...(Number.isSafeInteger(answerVersion) ? { answerVersion } : {}),
+      topicOverlap: spokenTopicOverlap(bodyText, spoken),
+    }).catch(() => {});
+  };
   /**
    * The typed round gets the same speech treatment as a voice round: the session keeps the full
    * body, the voice outlet says the condensed version. Short answers and explicit "read it all"
@@ -10811,6 +10873,10 @@ export function apply(ctx, config) {
     // Every exit is measured once (body vs. spoken), so a short/verbatim round is covered too.
     const finish = (result) => {
       emitReplyRedundancy({ turn: boundTurn, bodyText: full, spokenText: result.text });
+      // The typed outlet: the expression this round hands to the speaker (same call, no new text).
+      emitSpokenText({
+        turn: boundTurn, purpose: 'typed', bodyText: full, text: result.text, source: result.source,
+      });
       return result;
     };
     if (full.length === 0) return finish({ text: raw, caption: raw, source: 'original' });
@@ -11690,6 +11756,9 @@ export function apply(ctx, config) {
             reason,
             turn: turnId,
             replyVersion,
+            // The body this expression was decided from (observability compares the two; it is
+            // never spoken by itself and never replaces `text`).
+            bodyText: full,
           };
           if (full.length === 0) {
             await emitSpokenVersion(plan, 'original', 0, 0);
@@ -11802,6 +11871,12 @@ export function apply(ctx, config) {
         feedMarkdown(true);
         const speaker = ensureSentenceVoice();
         if (speaker === null) return null;
+        // The answer outlet: exactly the text this round is about to speak (post-adjustment), with
+        // the group keys. Observability only — `finish` receives the same `plan.text` unchanged.
+        emitSpokenText({
+          turn: plan.turn, purpose: 'answer', bodyText: plan.bodyText ?? '', text: plan.text,
+          source: plan.source, groupId: voiceGroup.id, answerVersion: voiceGroupVersion,
+        });
         return speaker.finish({ fullText: plan.text });
       };
       const applyWholeSpokenVersion = async () => speakWholePlan(await decideSpokenVersion('apply'));
@@ -11832,6 +11907,8 @@ export function apply(ctx, config) {
           reason: 'apply',
           turn: turnId,
           replyVersion,
+          // Same observation seam as the whole-text decision: the body beside the spoken text.
+          bodyText: full,
         };
         const speaker = ensureSentenceVoice();
         if (speaker === null) return null;
@@ -11987,6 +12064,11 @@ export function apply(ctx, config) {
         });
         if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
+        // The streamed answer outlet: the decided expression of this round, never the raw units.
+        emitSpokenText({
+          turn: turnId, purpose: 'answer', bodyText: plan.bodyText ?? full, text: plan.text,
+          source: plan.source, groupId: voiceGroup.id, answerVersion: voiceGroupVersion,
+        });
         return speaker.finish({ fullText: plan.text });
       };
 
