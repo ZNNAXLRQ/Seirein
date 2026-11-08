@@ -142,9 +142,15 @@ export {
   lowEvidenceVerdict,
   echoTextKey,
   echoMatch,
+  echoResidual,
+  echoExtraContent,
   echoGate,
   ECHO_MIN_CHARS,
   ECHO_MIN_COVERAGE,
+  ECHO_EXTRA_MIN_CHARS,
+  ECHO_EXTRA_STOP_WORDS,
+  ECHO_EXTRA_CORRECTION_WORDS,
+  ECHO_EXTRA_NEGATION_WORDS,
   noiseSuspects,
   onlineOfflineAgree,
   ASR_OBSERVE_WINDOW_MS,
@@ -266,11 +272,12 @@ export function startHearing({
    */
   isVoicePlaying = null,
   /**
-   * The text that is sounding right now, read at the moment a final is judged. Required for the
-   * high-confidence echo filter: without it the input can never match a playing line and every
-   * final is delivered (the playback state alone is not enough — that is how the shadow's old
-   * `playback-echo` guess could mistake an interjection for an echo). A getter throws safely:
-   * the failure is treated as "no playing text", never as capture failure.
+   * The text that was really sent to TTS for the clip sounding right now, read at the moment a
+   * final is judged. It may be a string (the speech text itself) or
+   * `{ speechText, subtitle }` — the two texts of one sounding clip, kept apart. Only `speechText`
+   * is ever used as the echo reference: a subtitle in another language is not the audio, so
+   * comparing with it can only produce a false echo. When no speech text is available the final is
+   * delivered and the row says `no-speech-text`; the subtitle is never guessed at.
    */
   playingText = null,
   /**
@@ -903,17 +910,26 @@ export function startHearing({
     }
   };
   /**
-   * The line that is sounding right now, from the host's getter (live subtitle, else the playback
-   * session's subtitle). `''` means "nothing to compare against" — an echo cannot be claimed then.
+   * What is sounding right now: the clip's **speech text** (what was actually sent to TTS) and,
+   * separately, its subtitle. The echo filter matches the former only; the latter is what the
+   * screen shows and is never used as an echo reference. A getter throws safely: the failure is
+   * treated as "no speech text", never as capture failure.
    */
   const playingTextNow = () => {
-    if (typeof playingText !== 'function') return '';
+    if (typeof playingText !== 'function') return { speechText: '', subtitle: '' };
+    let value;
     try {
-      const value = playingText();
-      return typeof value === 'string' ? value : '';
+      value = playingText();
     } catch {
-      return '';
+      return { speechText: '', subtitle: '' };
     }
+    // A plain string is the sounding speech text itself (legacy callers and tests).
+    if (typeof value === 'string') return { speechText: value, subtitle: value };
+    if (value === null || typeof value !== 'object') return { speechText: '', subtitle: '' };
+    return {
+      speechText: typeof value.speechText === 'string' ? value.speechText : '',
+      subtitle: typeof value.subtitle === 'string' ? value.subtitle : '',
+    };
   };
   /**
    * Echo candidates already logged. This is a log throttle only: the delivery decision has already
@@ -927,7 +943,7 @@ export function startHearing({
       for (let index = echoCandidates.length - 1; index >= 0; index -= 1) {
         if (at - echoCandidates[index].at >= SHADOW_SUPPRESS_WINDOW_MS) echoCandidates.splice(index, 1);
       }
-      const key = `${verdict.reason}:${verdict.match.reason}:${verdict.match.matchedChars}:${verdict.match.playingChars}`;
+      const key = `${verdict.reason}:${verdict.match.reason}:${verdict.match.matchedChars}:${verdict.match.playingChars}:${verdict.extraKind}`;
       if (echoCandidates.some((row) => row.key === key)) return;
       echoCandidates.push({ at, key });
       if (echoCandidates.length > 64) echoCandidates.shift();
@@ -939,6 +955,9 @@ export function startHearing({
         reason: verdict.reason,
         matchedChars: verdict.match.matchedChars,
         playingChars: verdict.match.playingChars,
+        // P1 evidence: how much of the input the echo did not cover, and what it was.
+        extraChars: verdict.extraChars ?? 0,
+        extraKind: verdict.extraKind ?? '',
       });
     } catch {
       /* a diagnostic row must never break delivery */
@@ -1495,14 +1514,16 @@ export function startHearing({
     const candidate = audible && loudEnough && meaningful.length > 0;
     /**
      * Gate 4 (the only applied noise rule): a **high-confidence playback echo**. The gate combines
-     * the live playback state, the text that is actually sounding and the real VAD ratio, so an
-     * interjection, a protected short answer or an uncertain match always passes through.
+     * the live playback state, the clip's speech text (never its subtitle) and the real VAD ratio, so
+     * an interjection, a protected short answer, a mixed input or an uncertain match passes through.
      */
     const playingNow = voiceSounding();
+    const sounding = playingTextNow();
     const echo = candidate && echoFilter !== false
       ? echoGate({
         text: outcome.text,
-        playingText: playingTextNow(),
+        // P2: the reference is what TTS was actually given; `sounding.subtitle` is display-only.
+        playingText: sounding.speechText,
         playing: playingNow,
         vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
       })
@@ -1535,6 +1556,9 @@ export function startHearing({
           matchedChars: echo.match.matchedChars,
           playingChars: echo.match.playingChars,
           reason: echo.reason,
+          // A drop is a PURE echo: no uncovered characters, no extra kind.
+          extraChars: echo.extraChars ?? 0,
+          extraKind: echo.extraKind ?? '',
         });
       } catch {
         /* an event sink must never break capture */

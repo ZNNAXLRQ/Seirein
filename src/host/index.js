@@ -3820,13 +3820,19 @@ export function apply(ctx, config) {
    * `startedAt` is a host/player clock anchor, not a measured sound-card first-audio instant.
    * Streaming sessions wait for a transport start notification before setting this anchor.
    */
-  const createPlayback = ({ file = '', durationMs = 0, subtitle = '' } = {}) => {
+  const createPlayback = ({ file = '', durationMs = 0, subtitle = '', speechText = '' } = {}) => {
     const token = ++playbackToken;
     const session = {
       token,
       file,
       durationMs: Math.max(0, Number(durationMs) || 0),
       subtitle,
+      /**
+       * The text really sent to TTS for this clip (speech language). It is the echo filter's
+       * reference; `subtitle` above is display-only and may be a different language. `''` means
+       * "unknown", and the filter then passes instead of guessing from the subtitle.
+       */
+      speechText: typeof speechText === 'string' ? speechText : '',
       startedAt: 0,
       endedAt: 0,
       cancelled: false,
@@ -4129,6 +4135,9 @@ export function apply(ctx, config) {
   const playAudio = async ({
     file, durationMs, ffplayPath = null, subtitleText = '', captionStream = null, signal,
     onPlaybackSession = null, onSubtitle = null, owner = null, subtitleFinal = true,
+    // P2: the text this clip's audio was synthesized from (the voice language). The echo filter
+    // matches this, never `subtitleText`; omitted keeps `''` = unknown, so the filter passes.
+    speechText = '',
     // P-54: the sentence this clip belongs to and its position inside that sentence. A lane that
     // does not know them (a whole line) leaves `sentenceId` null and plays as a one-block clip.
     sentenceId = null, chunkIndex = 0, chunkCount = 1,
@@ -4146,7 +4155,7 @@ export function apply(ctx, config) {
       // seat was being granted must release the grant, never start an audible clip.
       signal?.throwIfAborted();
       if (playbackSeatValid(seat) !== true) throw new DOMException('Playback seat superseded', 'AbortError');
-      session = createPlayback({ file, durationMs, subtitle: subtitleText });
+      session = createPlayback({ file, durationMs, subtitle: subtitleText, speechText });
       session.seat = seat;
       session.owner = owner;
       session.sentenceId = Number.isInteger(sentenceId) ? sentenceId : null;
@@ -4258,6 +4267,8 @@ export function apply(ctx, config) {
     onPlaybackSession = null, onSubtitle = null, owner = null, subtitleFinal = true,
     // Observation only: the lane purpose reported by the streamed TTS request row.
     purpose = 'speech',
+    // P2: the text the stream is synthesized from — `text` itself unless a lane says otherwise.
+    speechText = text,
   }) => {
     signal?.throwIfAborted();
     // FIFO: a queued sentence starts only after the sounding one finished; no mid-sentence cut.
@@ -4271,7 +4282,7 @@ export function apply(ctx, config) {
       // already cancelled or superseded.
       signal?.throwIfAborted();
       if (playbackSeatValid(seat) !== true) throw new DOMException('Playback seat superseded', 'AbortError');
-      session = createPlayback({ subtitle: subtitleText });
+      session = createPlayback({ subtitle: subtitleText, speechText });
       session.seat = seat;
       session.owner = owner;
       session.subtitleFinal = subtitleFinal !== false;
@@ -6407,6 +6418,9 @@ export function apply(ctx, config) {
         let subtitleShown = false;
         let bodyStarted = false;
         let blockZeroAudio = null;
+        // P2: per-block speech text of this line (`null` = one block). The echo filter matches the
+        // block that is really sounding, never the previous one and never the caption.
+        let blockTexts = null;
         let clipDoneResolve = null;
         const clipDone = new Promise((resolve) => { clipDoneResolve = resolve; });
         // Preparing/synthesizing/queueing a tool line never cancels a waiting line: only its real
@@ -6466,6 +6480,8 @@ export function apply(ctx, config) {
             durationMs: block.durationMs,
             ffplayPath: ffplay,
             subtitleText: first ? subtitleText : '',
+            // The audio of this block was synthesized from this exact text (voice language).
+            speechText: blockTexts?.[index] ?? spokenText,
             captionStream: first ? captionStream : null,
             onSubtitle: first ? (shown) => { subtitleShown = shown === true; } : null,
             signal: lane,
@@ -6591,6 +6607,8 @@ export function apply(ctx, config) {
               // Register ownership the instant block 0 exists, BEFORE the playback-turn wait: a
               // cancel while queued must still delete this file (the finally below owns it).
               blockZeroAudio = chunked.audio;
+              // P2: the block texts the audio was cut from, so each playing block reports its own.
+              blockTexts = chunked.chunkTexts;
               chunkMs = Date.now() - blockStartedAt;
               synthMs = chunkMs;
               producedBytes = Number(chunked.audio?.bytes) || 0;
@@ -9219,6 +9237,8 @@ export function apply(ctx, config) {
         durationMs: block.durationMs,
         ffplayPath: resolveFfplay(root, config),
         subtitleText: index === 0 ? prepared.captionText : '',
+        // The audio of this block was synthesized from this exact text (voice language).
+        speechText: chunkTexts?.[index] ?? prepared.speechText,
         captionStream: index === 0 ? captionStream : null,
         signal: live,
         // One caption for the sentence: only its last block ends the caption's life.
@@ -10032,6 +10052,7 @@ export function apply(ctx, config) {
         durationMs: result.durationMs,
         ffplayPath: resolveFfplay(root, config),
         subtitleText: caption,
+        speechText: prepared.speechText,
         signal,
       });
       // Legacy metric: a synchronous host clock anchor, NOT measured speaker first audio (A1).
@@ -10091,6 +10112,8 @@ export function apply(ctx, config) {
       durationMs: audio.durationMs,
       ffplayPath: resolveFfplay(root, config),
       subtitleText: formatted.caption,
+      // The waiting line's audio was synthesized from this text, not from its caption.
+      speechText: typeof audio?.speechText === 'string' ? audio.speechText : '',
       signal,
     });
     // A superseded record aborts this signal: that stops its own clip instead of leaving the
@@ -10553,6 +10576,8 @@ export function apply(ctx, config) {
         durationMs: audio.durationMs,
         ffplayPath: resolveFfplay(root, config),
         subtitleText: showing ? (audio?.captionText ?? formatCaption(text)) : '',
+        // The block's own speech text (voice language); the caption above is display-only.
+        speechText: audio?.chunkTexts?.[chunkIndex] ?? audio?.speechText ?? '',
         captionStream: showing ? (audio?.captionStream ?? null) : null,
         signal: combined,
         owner: { sessionId, turn: Number.isInteger(turnId) ? turnId : null, lane: 'typed' },
@@ -11018,6 +11043,8 @@ export function apply(ctx, config) {
                     durationMs: audio.durationMs,
                     ffplayPath: resolveFfplay(root, config),
                     subtitleText: showing ? caption : '',
+                    // The block's own speech text (voice language); the caption above is display-only.
+                    speechText: audio?.chunkTexts?.[chunkIndex] ?? audio?.speechText ?? '',
                     captionStream: showing ? (audio?.captionStream ?? null) : null,
                     signal: laneSignal,
                     owner: { speechId, sessionId, turn: turnId, lane: 'reply' },
@@ -12448,7 +12475,13 @@ export function apply(ctx, config) {
           // What is sounding right now: the high-confidence echo filter compares the final with
           // this text; the playback state above alone never drops an utterance. Read lazily, so a
           // worker result settling after the sentence changed is judged against the current line.
-          playingText: () => playback?.subtitle ?? subtitleLive?.text ?? '',
+          // Both texts of the sounding clip, kept apart: `speechText` is what was really sent to
+          // TTS (the echo filter's only reference), `subtitle` is what the screen shows. Unknown
+          // speech text stays `''` — the filter then passes instead of guessing from the subtitle.
+          playingText: () => ({
+            subtitle: playback?.subtitle ?? subtitleLive?.text ?? '',
+            speechText: typeof playback?.speechText === 'string' ? playback.speechText : '',
+          }),
           // Worker telemetry (started/degraded/decode/stopped) reaches events.jsonl; hearing emits
           // counts, timings and reasons only, never audio or transcript text.
           onEvent: (type, payload) => {
@@ -12674,7 +12707,13 @@ export function apply(ctx, config) {
           dialogueContext,
           // Echo evidence for the high-confidence filter, exactly like the microphone lane: the
           // final is compared with the line that is sounding at judgment time.
-          playingText: () => playback?.subtitle ?? subtitleLive?.text ?? '',
+          // Both texts of the sounding clip, kept apart: `speechText` is what was really sent to
+          // TTS (the echo filter's only reference), `subtitle` is what the screen shows. Unknown
+          // speech text stays `''` — the filter then passes instead of guessing from the subtitle.
+          playingText: () => ({
+            subtitle: playback?.subtitle ?? subtitleLive?.text ?? '',
+            speechText: typeof playback?.speechText === 'string' ? playback.speechText : '',
+          }),
           // The loopback lane is a second ASR session: the same worker telemetry is logged.
           onEvent: (type, payload) => {
             // The same one buffer: a loopback final can make a summary due too.
