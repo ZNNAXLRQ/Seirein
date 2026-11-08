@@ -236,23 +236,24 @@ export const DROP_SHORT_LATIN_MAX_CHARS = 3;
 export const ECHO_MIN_CHARS = 4;
 
 /**
- * How much of the input must be covered by the playing line. Below this the input contains extra
- * words the assistant never said (the user and the echo are mixed), so it is delivered, not dropped.
- * The extra-content rule below already catches most of these; this stays as the coarse guard for a
- * residual that is too short to count as new words.
+ * How much of the input must be covered by the playing line. Kept as a defensive belt: the residual
+ * rule below already passes any input with one real character of its own, so a coverage shortfall
+ * without such a character cannot arise — this only guards against a future matching change.
  */
 export const ECHO_MIN_COVERAGE = 0.7;
 
 /**
- * Minimum number of real characters outside the echoed span that make the input new speech. One
- * leftover character can be a tone particle or a decode artifact; two cannot.
+ * @deprecated P2 no longer uses a character count to judge noise: **one** real character outside
+ * the echo is enough to prove the user is speaking. Kept as an export only because `hearing.js`
+ * still imports it; no decision reads it.
  */
 export const ECHO_EXTRA_MIN_CHARS = 2;
 
 /**
- * Words that make the uncovered part of a mixed input real speech, grouped by what they do. They are
- * looked for in the residual only: a stop word *inside* the echoed sentence is not new content (an
- * exact echo of a sentence that happens to contain 不 is still an echo).
+ * Words that *label* the uncovered part of a mixed input (`extraKind`). They are looked for in the
+ * residual only, and they never decide the delivery: the residual rule below already passes every
+ * real character, so these lists only annotate a stop / correction / negation for the debug row.
+ * Do not grow them into a gate.
  */
 export const ECHO_EXTRA_STOP_WORDS = Object.freeze([
   '停下', '别说了', '等一下', '等等', '取消', '停', '别',
@@ -268,10 +269,11 @@ const NO_ECHO_EXTRA = Object.freeze({
 });
 
 /**
- * Filler syllables ignored when comparing with the playing line. This is a comparison-only
- * normalization: it never edits the delivered text and never protects a stop word.
+ * Tone/filler syllables ignored when comparing with the playing line and when deciding whether the
+ * residual contains any real word. This is a comparison-only normalization: it never edits the
+ * delivered text and never protects a stop word.
  */
-const ECHO_FILLERS = /[嗯哼啊呃哦噢喔哎唉呀吧呢嘛啦哟诶欸]/gu;
+const ECHO_FILLERS = /[啊呀吧呢哦嗯嘛啦哇咯诶欸]/gu;
 
 
 /**
@@ -365,55 +367,49 @@ export function echoResidual(text, playingText) {
 }
 
 
-/** A contiguous pair of residual characters that the playing line never said, as its first run. */
-function echoExtraPhrase(residual, playing) {
-  const chars = [...residual];
-  for (let start = 0; start + ECHO_EXTRA_MIN_CHARS <= chars.length; start += 1) {
-    const phrase = chars.slice(start, start + ECHO_EXTRA_MIN_CHARS).join('');
-    if (!playing.includes(phrase)) return phrase;
-  }
-  return '';
+/**
+ * The real content of a residual: everything that is not punctuation, spacing or a tone/filler
+ * syllable. `echoResidual` already normalizes those away; the second pass keeps the rule true even
+ * if that normalization ever changes.
+ */
+function echoResidualContent(residual) {
+  return residual.replace(ECHO_FILLERS, '').replace(/[\s\p{P}\p{S}]/gu, '');
+}
+
+
+/** Which protection word the residual contains — a label for `extraKind`, never a decision. */
+function echoExtraKindOf(residual) {
+  const contains = (words) => words.some((word) => residual.includes(word));
+  if (contains(ECHO_EXTRA_STOP_WORDS)) return 'stop';
+  if (contains(ECHO_EXTRA_CORRECTION_WORDS)) return 'correction';
+  if (contains(ECHO_EXTRA_NEGATION_WORDS)) return 'negation';
+  return 'other';
 }
 
 
 /**
  * Is this a **mixed input** — the echoed sentence plus real speech of the user's own? Only a pure
- * echo is ever dropped, so this is the rule that protects a negation, a correction or a stop order
- * that happens to sit next to words the assistant is saying.
+ * echo is ever dropped, so this is the rule that protects a negation, a correction, a stop order or
+ * a one-character change that happens next to words the assistant is saying.
  *
- * Three independent tests, any one of which means "the user is talking, not echoing":
- *  - the uncovered text contains a stop / correction / negation word (`extraKind` says which);
- *  - it is a contiguous phrase the playing line never contained (`extraKind: 'other'`);
- *  - it keeps at least `ECHO_EXTRA_MIN_CHARS` real characters after punctuation and filler
- *    syllables are removed (`extraKind: 'other'`).
- *
- * One leftover character is a tone particle or a decode artifact, not new speech: it stays an echo.
+ * P2 is deliberately conservative: **any** character outside the echoed span that is not
+ * punctuation, spacing or a tone/filler syllable means the user is talking, so the input passes.
+ * There is no 2-character threshold (a single 「吗」 turns a statement into a question) and the
+ * protection word lists below only set `extraKind` for the debug row, never the verdict.
  *
  * @returns {{extraChars: number, extraKind: ''|'negation'|'stop'|'correction'|'other',
- *   extraReason: string, residual: string}} `extraChars` counts the uncovered characters;
- *   `extraKind` is set only when they are real content and the input must be delivered.
+ *   extraReason: string, residual: string}} `extraChars` counts the real uncovered characters and
+ *   is `0` for a pure echo; `extraKind` annotates non-zero content only.
  */
 export function echoExtraContent(text, playingText) {
   const residual = echoResidual(text, playingText);
   if (residual === '') return NO_ECHO_EXTRA;
-  const extraChars = [...residual].length;
-  const contains = (words) => words.some((word) => residual.includes(word));
-  if (contains(ECHO_EXTRA_STOP_WORDS)) {
-    return { extraChars, extraKind: 'stop', extraReason: 'stop-word', residual };
+  const extraChars = [...echoResidualContent(residual)].length;
+  if (extraChars === 0) {
+    // Punctuation / spacing / tone particles only: still the echo, nothing of the user's own.
+    return { extraChars: 0, extraKind: '', extraReason: '', residual };
   }
-  if (contains(ECHO_EXTRA_CORRECTION_WORDS)) {
-    return { extraChars, extraKind: 'correction', extraReason: 'correction-word', residual };
-  }
-  if (contains(ECHO_EXTRA_NEGATION_WORDS)) {
-    return { extraChars, extraKind: 'negation', extraReason: 'negation-word', residual };
-  }
-  if (echoExtraPhrase(residual, echoTextKey(playingText)) !== '') {
-    return { extraChars, extraKind: 'other', extraReason: 'extra-phrase', residual };
-  }
-  if (extraChars >= ECHO_EXTRA_MIN_CHARS) {
-    return { extraChars, extraKind: 'other', extraReason: 'extra-chars', residual };
-  }
-  return { extraChars, extraKind: '', extraReason: '', residual };
+  return { extraChars, extraKind: echoExtraKindOf(residual), extraReason: 'extra-content', residual };
 }
 
 
@@ -433,43 +429,50 @@ export function echoExtraContent(text, playingText) {
  * in the shadow row — it is not applied here.
  *
  * @returns {{drop: boolean, reason: string, match: object, extraChars: number,
- *   extraKind: ''|'negation'|'stop'|'correction'|'other'}}
+ *   extraKind: ''|'negation'|'stop'|'correction'|'other', residual: string}}
  */
 export function echoGate(input = {}) {
   const text = typeof input?.text === 'string' ? input.text : '';
   if (isProtectedShortAnswer(text)) {
     return {
-      drop: false, reason: 'whitelisted', extraChars: 0, extraKind: '', match: echoMatch(text, input?.playingText),
+      drop: false, reason: 'whitelisted', extraChars: 0, extraKind: '', residual: '', match: echoMatch(text, input?.playingText),
     };
   }
   const match = echoMatch(text, input?.playingText);
   // P2: no speech text means no reliable reference. Do not fall back to the subtitle: pass.
   if (typeof input?.playingText !== 'string' || shadowTextKey(input.playingText) === '') {
-    return { drop: false, reason: 'no-speech-text', extraChars: 0, extraKind: '', match };
+    return { drop: false, reason: 'no-speech-text', extraChars: 0, extraKind: '', residual: '', match };
   }
   if (!match.matched) {
-    return { drop: false, reason: match.reason, extraChars: 0, extraKind: '', match };
+    return { drop: false, reason: match.reason, extraChars: 0, extraKind: '', residual: '', match };
   }
   if (input?.playing !== true) {
-    return { drop: false, reason: 'not-playing', extraChars: 0, extraKind: '', match };
+    return { drop: false, reason: 'not-playing', extraChars: 0, extraKind: '', residual: '', match };
   }
-  // P1: anything the playing line does not cover is the user's own speech. A mixed input always
-  // passes, whatever the coverage ratio says.
+  // P1/P2: anything the playing line does not cover is the user's own speech. A single real
+  // character (「吗」, 「谁」, 「不」, 「停」) is already enough, so a mixed input always passes.
   const extra = echoExtraContent(text, input.playingText);
-  if (extra.extraKind !== '') {
-    return { drop: false, reason: 'mixed', extraChars: extra.extraChars, extraKind: extra.extraKind, match };
+  if (extra.extraChars > 0 || extra.extraKind !== '') {
+    return {
+      drop: false,
+      reason: 'mixed',
+      extraChars: extra.extraChars,
+      extraKind: extra.extraKind,
+      residual: extra.residual,
+      match,
+    };
   }
   if (match.coverage < ECHO_MIN_COVERAGE) {
-    return { drop: false, reason: 'mixed', extraChars: extra.extraChars, extraKind: '', match };
+    return { drop: false, reason: 'mixed', extraChars: extra.extraChars, extraKind: '', residual: extra.residual, match };
   }
   const ratio = Number.isFinite(input?.vadSpeechRatio) ? Number(input.vadSpeechRatio) : null;
   if (ratio === null) {
-    return { drop: false, reason: 'no-vad', extraChars: extra.extraChars, extraKind: '', match };
+    return { drop: false, reason: 'no-vad', extraChars: extra.extraChars, extraKind: '', residual: extra.residual, match };
   }
   if (ratio >= PLAYBACK_ECHO_MAX_RATIO) {
-    return { drop: false, reason: 'vad-high', extraChars: extra.extraChars, extraKind: '', match };
+    return { drop: false, reason: 'vad-high', extraChars: extra.extraChars, extraKind: '', residual: extra.residual, match };
   }
-  return { drop: true, reason: 'playback-echo', extraChars: extra.extraChars, extraKind: '', match };
+  return { drop: true, reason: 'playback-echo', extraChars: extra.extraChars, extraKind: '', residual: extra.residual, match };
 }
 
 

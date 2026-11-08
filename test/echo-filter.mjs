@@ -6,7 +6,8 @@
  * over the reply. This suite pins the applied rule:
  *  1. only `playing === true` + a real content match with the sounding text + a low Silero ratio
  *     drops a final — and only when the input is a PURE echo (P1: any extra content means the user
- *     is talking, so a negation / stop order / extra phrase always passes);
+ *     is talking, so a negation / stop order / extra phrase always passes; P2 is conservative:
+ *     ONE real character outside the echo, such as 「吗」, is already extra content);
  *  2. a protected short answer/stop word always passes (whitelist first, even on an exact match);
  *  3. an uncertain match (different wording, short text, mixed user+echo content, no VAD) passes
  *     and writes one `hearing.echo.candidate` row instead;
@@ -410,12 +411,20 @@ test('10) echoMatch / echoGate 边界：只认精确或连续子串，不确定�
   assert.equal(echoMatch('你好', '你好世界').reason, 'short-text');
   assert.equal(echoMatch('今天天气很好', PLAYING).reason, 'not-similar');
   assert.equal(echoMatch('', PLAYING).reason, 'no-text');
-  // 9/10 coverage with ONE leftover character: that character is a tone particle, so it is still
-  // an echo and is dropped. Two or more leftover real characters are the user's own speech.
-  assert.equal(echoGate({ text: '一二三四五六七八九十', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 }).drop, true);
-  assert.equal(echoGate({ text: '一二三四五六七八九十一', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 }).reason, 'mixed');
+  // 9/10 coverage with ONE leftover character: P2 treats that character as real user speech, so the
+  // input passes (「吗」 turns the echoed statement into a question). A pure echo still drops.
+  assert.equal(echoGate({ text: '一二三四五六七八九', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 }).drop, true);
+  const oneCharMore = echoGate({ text: '一二三四五六七八九十一', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 });
+  assert.equal(oneCharMore.reason, 'mixed');
+  assert.equal(oneCharMore.extraChars, 2, '「十一」is real uncovered content');
+  // One leftover real character is already enough (P2: no 2-character threshold).
+  const single = echoGate({ text: '一二三四五六七八九十', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 });
+  assert.equal(single.reason, 'mixed');
+  assert.equal(single.extraChars, 1, '「十」');
   // P1 boundary: the residual decides, whatever the coverage ratio says.
   assert.equal(echoGate({ text: '不，一二三四五六七八九', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 }).extraKind, 'negation');
+  // A pure echo with only a filler syllable is still the echo (filler stripped for comparison).
+  assert.equal(echoGate({ text: '一二三四五六七八九啊', playingText: '一二三四五六七八九', playing: true, vadSpeechRatio: 0.05 }).drop, true);
   // P2 boundary: an empty reference is never guessed; it passes and says why.
   assert.equal(echoGate({ text: PLAYING, playingText: '', playing: true, vadSpeechRatio: 0 }).reason, 'no-speech-text');
   // Every missing condition passes, with the reason that explains it.
@@ -650,16 +659,174 @@ test('18) P1 新增内容判定：correction / other / 单字符残余', async (
   assert.equal(phrase.candidates[0].payload.extraKind, 'other');
   assert.equal(phrase.candidates[0].payload.extraChars, 6, '「顺便买杯咖啡」');
 
-  // One leftover non-filler character is a tone particle: still a pure echo, still dropped.
+  // One leftover real character is already user speech under P2: no 2-character threshold.
   const single = await runClip({
-    streamingText: `${TOMORROW}哇`,
-    workerText: `${TOMORROW}哇`,
+    streamingText: `${TOMORROW}吗`,
+    workerText: `${TOMORROW}吗`,
     playing: true,
     playingText: TOMORROW,
     vadSegments: [{ startMs: 100, endMs: 160 }],
   });
-  assert.equal(single.finals.length, 0);
-  assert.equal(single.drops.length, 1);
-  assert.equal(single.drops[0].payload.extraChars, 1, 'the residual is counted…');
-  assert.equal(single.drops[0].payload.extraKind, '', '…but one character is not new speech');
+  assert.equal(single.drops.length, 0, '「吗」turns the statement into a question');
+  assert.equal(single.final.final, `${TOMORROW}吗`);
+  assert.equal(single.candidates[0].payload.reason, 'mixed');
+  assert.equal(single.candidates[0].payload.extraChars, 1, 'the residual is counted…');
+  assert.equal(single.candidates[0].payload.extraKind, 'other', '…and is not a tone particle');
+});
+
+// ---------------------------------------------------------------------------
+// P2: the residual rule is conservative — ANY real character outside the echo passes
+// ---------------------------------------------------------------------------
+
+/** The verdict for one input against the sounding line TOMORROW (playing, VAD exactly 0). */
+const gateTomorrow = (text) => echoGate({
+  text,
+  playingText: TOMORROW,
+  playing: true,
+  vadSpeechRatio: 0,
+});
+
+test('19) P2 反例：单字「吗」把陈述变提问 → 放行，extraChars=1，residual=「吗」', async () => {
+  const text = `${TOMORROW}吗`;
+  const { final, drops, candidates, stats } = await runClip({
+    streamingText: text,
+    workerText: text,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(drops.length, 0, 'one real character is enough: no 2-character threshold');
+  assert.equal(final.final, text, 'delivered verbatim');
+  assert.equal(stats.echoDropped, 0);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].payload.reason, 'mixed');
+  assert.equal(candidates[0].payload.extraChars, 1);
+  assert.equal(candidates[0].payload.extraKind, 'other', '「吗」is real content, not a protection word');
+  assert.equal(candidates[0].payload.delivered, true);
+
+  // The residual is carried on the verdict (`hearing.js` writes extraChars/extraKind to the event).
+  const verdict = gateTomorrow(text);
+  assert.equal(verdict.drop, false);
+  assert.equal(verdict.reason, 'mixed');
+  assert.equal(verdict.extraChars, 1);
+  assert.equal(verdict.residual, '吗');
+});
+
+test('20) P2 纯回声对照：「我明天会去图书馆学习」→ 仍 drop（功能未关闭）', async () => {
+  const { finals, drops, candidates, stats } = await runClip({
+    streamingText: TOMORROW,
+    workerText: TOMORROW,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(finals.length, 0, 'a pure echo is still withheld');
+  assert.equal(drops.length, 1);
+  assert.equal(drops[0].payload.reason, 'playback-echo');
+  assert.equal(drops[0].payload.extraChars, 0);
+  assert.equal(drops[0].payload.extraKind, '');
+  assert.equal(candidates.length, 0);
+  assert.equal(stats.echoDropped, 1);
+  const verdict = gateTomorrow(TOMORROW);
+  assert.equal(verdict.drop, true);
+  assert.equal(verdict.residual, '');
+});
+
+test('21) P2 纯回声 + 语气词/标点「…啊。」「…呢」→ 仍 drop', async () => {
+  for (const suffix of ['啊。', '呢', '吧', '嘛', '啦', '哇', '咯', '诶', '欸', '呀', '哦', '嗯']) {
+    const verdict = gateTomorrow(`${TOMORROW}${suffix}`);
+    assert.equal(verdict.drop, true, `「${suffix}」is a tone particle/punctuation, not new speech`);
+    assert.equal(verdict.extraChars, 0, `「${suffix}」is stripped before counting`);
+    assert.equal(verdict.extraKind, '');
+  }
+  // The same answer through the real delivery path, for the two suffixes named in the ticket.
+  const withParticle = await runClip({
+    streamingText: `${TOMORROW}啊。`,
+    workerText: `${TOMORROW}啊。`,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(withParticle.finals.length, 0);
+  assert.equal(withParticle.drops.length, 1);
+  assert.equal(withParticle.drops[0].payload.extraChars, 0);
+
+  const withNe = await runClip({
+    streamingText: `${TOMORROW}呢`,
+    workerText: `${TOMORROW}呢`,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(withNe.finals.length, 0);
+  assert.equal(withNe.drops.length, 1);
+});
+
+test('22) P2 单字新增「谁」「不」「停」→ 放行（判定不看词表）', async () => {
+  const cases = [
+    { suffix: '谁', kind: 'other' },
+    { suffix: '不', kind: 'negation', label: 'negation label only; the pass comes from the residual' },
+    { suffix: '停', kind: 'stop', label: 'stop label only; the pass comes from the residual' },
+  ];
+  for (const { suffix, kind } of cases) {
+    const verdict = gateTomorrow(`${TOMORROW}${suffix}`);
+    assert.equal(verdict.drop, false, `「${suffix}」must pass`);
+    assert.equal(verdict.reason, 'mixed');
+    assert.equal(verdict.extraChars, 1);
+    assert.equal(verdict.extraKind, kind);
+  }
+
+  const stop = await runClip({
+    streamingText: `${TOMORROW}停`,
+    workerText: `${TOMORROW}停`,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(stop.drops.length, 0);
+  assert.equal(stop.final.final, `${TOMORROW}停`);
+  assert.equal(stop.candidates[0].payload.reason, 'mixed');
+  assert.equal(stop.candidates[0].payload.extraKind, 'stop');
+  assert.equal(stop.candidates[0].payload.extraChars, 1);
+});
+
+test('23) P2 新增 2 字以上实词「顺便买咖啡」→ 放行', async () => {
+  const text = `${TOMORROW}，顺便买咖啡`;
+  const { final, drops, candidates } = await runClip({
+    streamingText: text,
+    workerText: text,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(drops.length, 0);
+  assert.equal(final.final, text);
+  assert.equal(candidates[0].payload.reason, 'mixed');
+  assert.equal(candidates[0].payload.extraKind, 'other');
+  assert.equal(candidates[0].payload.extraChars, 5, '「顺便买咖啡」');
+
+  const verdict = gateTomorrow(text);
+  assert.equal(verdict.drop, false);
+  assert.equal(verdict.residual, '顺便买咖啡');
+  assert.equal(verdict.extraChars, 5);
+});
+
+test('24) P2 回归：无 speechText / 未播放 → 放行（含单字新增）', async () => {
+  const text = `${TOMORROW}吗`;
+  assert.equal(echoGate({ text, playingText: '', playing: true, vadSpeechRatio: 0 }).reason, 'no-speech-text');
+  assert.equal(echoGate({ text, playingText: TOMORROW, playing: false, vadSpeechRatio: 0 }).reason, 'not-playing');
+  // A high real VAD still passes, and a null VAD is never guessed.
+  assert.equal(echoGate({ text: TOMORROW, playingText: TOMORROW, playing: true, vadSpeechRatio: 0.3 }).reason, 'vad-high');
+  assert.equal(echoGate({ text: TOMORROW, playingText: TOMORROW, playing: true, vadSpeechRatio: null }).reason, 'no-vad');
+
+  const notPlaying = await runClip({
+    streamingText: text,
+    workerText: text,
+    playing: false,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(notPlaying.final.final, text);
+  assert.equal(notPlaying.drops.length, 0);
+  assert.equal(notPlaying.candidates[0].payload.reason, 'not-playing');
 });
