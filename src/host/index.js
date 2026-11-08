@@ -509,6 +509,13 @@ import { ACTIONS as visionActions, createVisionSettingsActions } from './vision/
 import { ACTIONS as profileActions, createProfileSettingsActions } from './profile/settings-actions.js';
 import { createSettingsRouter } from './runtime/http/actions.js';
 import { createVoiceContextObserver } from './session/events/voice-context.js';
+import {
+  buildTurnTimeline,
+  classifyToolKind,
+  timelineOrigin,
+  turnTimelineStats,
+  VOICE_LATENCY_TIMELINE_FIELDS,
+} from './session/timeline/turn-timeline.js';
 import { createConversationPreStep } from './session/conversation/pre-step.js';
 // The public export surface is frozen by `test/host-api.mjs`; this lane is internal wiring only
 // and is imported directly from its module (tests included).
@@ -891,7 +898,22 @@ export async function prepareVoiceTurn({
   // delivery (onAck), so it starts null and is never guessed. `acceptTurn` snapshots that same
   // acknowledgement for the stable join; `turn` may be re-read around a boundary and drift, so
   // observability should prefer `acceptTurn`/`deliveryMessageId`.
-  const stage = { injectedAt: 0, ackAt: 0, firstTextAt: 0, turn: null, acceptTurn: null };
+  // P-46: the round's own anchors live here in memory only (never persisted): the round opened /
+  // the session was ready / the request was injected / accepted / the reply settled / the first
+  // audio started. `timeline` is the delivery wait's desensitized event observations.
+  const stage = {
+    injectedAt: 0,
+    ackAt: 0,
+    firstTextAt: 0,
+    turn: null,
+    acceptTurn: null,
+    roundOpenedAt: 0,
+    sessionReadyAt: 0,
+    acceptedAt: 0,
+    replyAt: 0,
+    audioAt: 0,
+    timeline: null,
+  };
   const resultPromise = awaitSessionResult({
     ctx,
     sessionId,
@@ -901,6 +923,10 @@ export async function prepareVoiceTurn({
       if (stage.ackAt === 0) stage.ackAt = Number(info?.at) || Date.now();
       if (stage.turn === null && Number.isSafeInteger(info?.turn)) stage.turn = info.turn;
       if (stage.acceptTurn === null && Number.isSafeInteger(info?.turn)) stage.acceptTurn = info.turn;
+    },
+    // P-46: the delivery wait's raw boundaries for `voice.turn.timeline`. Observability only.
+    onTimeline: (info) => {
+      stage.timeline = Array.isArray(info?.observations) ? info.observations : [];
     },
     onAssistantText: (info) => {
       if (stage.firstTextAt === 0) stage.firstTextAt = Number(info?.at) || Date.now();
@@ -980,6 +1006,72 @@ export async function prepareVoiceTurn({
     await log?.emit?.('voice.prepare.failed', { sessionId, error: error?.message ?? String(error) });
     throw error;
   }
+}
+
+/**
+ * P-46: emit the one `voice.turn.timeline` row of a spoken round and return its derived numbers.
+ *
+ * The row is built from the round's in-memory anchors (round opened / session ready / injected /
+ * accepted / reply / first audio) and the desensitized session-event observations the delivery
+ * wait collected. It is observation only: it opens no request and no timer, changes no pending
+ * tool or first-sentence decision, and a stamp that was never taken stays null. `status` says how
+ * far the round got (`ok` / `no-body` / `no-audio` / `cancelled` / `timeout` / `failed`), and
+ * `reason` is an enum or a short error code — never an error message.
+ *
+ * @returns {Promise<object|null>} `turnTimelineStats` of the same round, or null when the emit failed
+ */
+async function publishVoiceTurnTimeline({
+  log,
+  sessionId = '',
+  deliveryMessageId = '',
+  turn = null,
+  acceptTurn = null,
+  groupId = '',
+  answerVersion = null,
+  lane = 'voice',
+  status = 'ok',
+  reason = null,
+  stage = null,
+  endpointAt = 0,
+  transcriptAt = 0,
+  firstTextAt = 0,
+  audioAt = 0,
+  classifyTool = classifyToolKind,
+} = {}) {
+  const observations = Array.isArray(stage?.timeline) ? stage.timeline : null;
+  const origin = timelineOrigin({ endpointAt, transcriptAt, injectedAt: stage?.injectedAt ?? 0 });
+  const safeTurn = Number.isSafeInteger(turn) ? turn : null;
+  const payload = buildTurnTimeline({
+    sessionId,
+    turn: safeTurn,
+    acceptTurn,
+    deliveryMessageId,
+    groupId,
+    answerVersion,
+    lane,
+    status,
+    reason,
+    origin,
+    observations,
+    anchors: {
+      roundOpenedAt: stage?.roundOpenedAt,
+      sessionReadyAt: stage?.sessionReadyAt,
+      injectedAt: stage?.injectedAt,
+      acceptedAt: stage?.acceptedAt,
+      replyAt: stage?.replyAt,
+      audioAt: stage?.audioAt ?? audioAt,
+    },
+    classifyTool,
+  });
+  const stats = turnTimelineStats(payload, {
+    firstTextAt,
+    audioAt: stage?.audioAt ?? audioAt,
+    transcriptAt,
+    injectedAt: stage?.injectedAt ?? 0,
+    collected: observations === null ? null : observations.length,
+  });
+  await log.emit('voice.turn.timeline', payload);
+  return stats;
 }
 
 /**
@@ -1724,6 +1816,20 @@ export function apply(ctx, config) {
     for (const [field, value] of Object.entries(observations)) {
       if (value !== null) entry[field] = value;
     }
+    // P-46: the turn timeline's derived numbers ride beside the stage set as well (model rounds,
+    // tool union/sum, first text/audio after the last tool, prepare and residual). They are never
+    // canonical stages: the ring row keeps its fixed shape (only measured values are written),
+    // while the EVENT carries the whole group with nulls, exactly like the observations above.
+    const timelineFields = row?.turnTimeline ?? null;
+    const timelineObservations = {};
+    if (timelineFields !== null && typeof timelineFields === 'object') {
+      for (const field of VOICE_LATENCY_TIMELINE_FIELDS) {
+        const value = timelineFields[field];
+        const measured = value === null || value === undefined ? null : value;
+        timelineObservations[field] = measured;
+        if (measured !== null) entry[field] = measured;
+      }
+    }
     // `turn` joins this row to its `turn/start`…`turn/end` in the session log. The ring row keeps
     // its documented shape, so the join key rides on the event payload only. `turn` may be off by
     // one around a boundary; `deliveryMessageId`/`acceptTurn` are the stable keys.
@@ -1732,6 +1838,7 @@ export function apply(ctx, config) {
       ...entry,
       ...voiceJoinKeys({ deliveryMessageId: row?.deliveryMessageId, acceptTurn: row?.acceptTurn, turn: row?.turn }),
       ...observations,
+      ...timelineObservations,
     };
     // The spoken-version decision rides beside the canonical stage set (the ring row keeps its
     // fixed shape): how long the rewrite took and whether it was adopted.
@@ -9920,6 +10027,19 @@ export function apply(ctx, config) {
     '保留必要的强调、纠正和自然的情绪表达；若人设明确要求重复风格，以人设文本为准。',
   ].join('\n');
 
+  // HISTORY SUMMARY MODE. The compaction provider replays this session's own system prompt inside
+  // its summarization request, so the persona/expression sections would otherwise make the summary
+  // answer as the character. This functional rule applies ONLY when the model is asked to summarize,
+  // and it explicitly outranks the persona style; normal dialogue is untouched.
+  const SUMMARY_CONVENTION = [
+    '## 历史摘要模式',
+    '当系统要求你总结、压缩或摘要对话历史时：',
+    '用第三人称、客观要点输出（当前话题、已确认结论、未完成事项、用户明确纠正、关键约束）；',
+    '不要以角色口吻回复，不要添加铺垫/情绪/称呼，不要输出对话式回答。',
+    '此模式优先于人设中的表达风格。',
+  ].join('\n');
+  const SUMMARY_CONVENTION_ORDER = 331;
+
   // One answer, two expressions, one voice outlet. The final answer is spoken by the host, so
   // `assistant_say` is no longer the mandatory speaking channel; a progress line is a different
   // event from the answer and must never replace it.
@@ -10334,6 +10454,27 @@ export function apply(ctx, config) {
         text: scopedText(EXPRESSION_CONVENTION),
       }),
     );
+    // The summary-mode rule must reach the compaction request, which replays the system prompt
+    // verbatim; the one `summary.mode.prompt` debug event proves the paragraph is registered.
+    scope.effect(() => {
+      const off = registerSection({
+        name: 'assistant:summary',
+        order: SUMMARY_CONVENTION_ORDER,
+        text: scopedText(SUMMARY_CONVENTION),
+      });
+      try {
+        const pending = log.emit('summary.mode.prompt', {
+          name: 'assistant:summary',
+          order: SUMMARY_CONVENTION_ORDER,
+          chars: SUMMARY_CONVENTION.length,
+          text: SUMMARY_CONVENTION,
+        });
+        if (pending !== undefined && typeof pending?.catch === 'function') pending.catch(() => {});
+      } catch {
+        /* diagnostics must never block the prompt section */
+      }
+      return off;
+    });
     // No `assistant:memory-fixed` section any more (2026-11-06): importance never grants
     // every-turn residency. The fixed-memory resources below are the only resident layer.
     // Day continuity is no longer a system-prompt section: it is injected into the target
@@ -11618,6 +11759,11 @@ export function apply(ctx, config) {
    * @param {string} [spoken] - the bare transcript; the memory query uses the user's own words.
    */
   const handleVoiceTask = async (text, spoken = text, timing = {}) => {
+    // P-46: the round's own clock. Every timeline stamp below is taken in this round; a stamp that
+    // is never taken stays 0 and becomes null in the payload (never a fabricated 0).
+    const roundOpenedAt = Date.now();
+    const endpointAt = Number(timing.endpointAt) || 0;
+    const transcriptAt = Number(timing.transcriptAt) || 0;
     // The waiter acquired by `prepareVoiceTurn`; kept outside `try` so a failed delivery can
     // release it instead of leaving the session owned until timeout.
     let pendingResult = null;
@@ -11632,6 +11778,8 @@ export function apply(ctx, config) {
     // The instant the delivery was ACCEPTED during this utterance: the origin of every spoken
     // pipeline stage. The hosting ack may also carry its own stamp; that one wins when present.
     let acceptedAt = 0;
+    // P-46: when `ensureSession` returned for this round (the session this turn runs in).
+    let sessionReadyAt = 0;
     // B: raw Markdown not yet spoken (a fragment that is not balanced or has no sentence end yet)
     // and the caption of every speech sentence already handed to the speaker, parsed once.
     let markdownTail = '';
@@ -11672,6 +11820,39 @@ export function apply(ctx, config) {
     let voiceGroup = null;
     let voiceGroupVersion = 0;
     let voiceGroupRound = null;
+    // P-46: the one-timeline-row bookkeeping. `timelineStage` is this round's anchor / observation
+    // holder (assigned once `prepareVoiceTurn` returns); `timelineSent` makes the row exactly one
+    // per round even when several failure paths run.
+    let timelineStage = null;
+    let timelineSent = false;
+    let roundSessionId = '';
+    /** P-46: emit this round's one `voice.turn.timeline` row (a failed round included). */
+    const timelineEmit = async (status, reason = null) => {
+      if (timelineSent) return null;
+      timelineSent = true;
+      try {
+        const stage = timelineStage;
+        return await publishVoiceTurnTimeline({
+          log,
+          sessionId: roundSessionId,
+          deliveryMessageId,
+          turn: Number.isSafeInteger(stage?.turn) ? stage.turn : acceptTurn,
+          acceptTurn: acceptTurn ?? (Number.isSafeInteger(stage?.acceptTurn) ? stage.acceptTurn : null),
+          groupId: voiceGroup?.id ?? '',
+          answerVersion: voiceGroupVersion,
+          status,
+          reason,
+          stage,
+          endpointAt,
+          transcriptAt,
+          firstTextAt: Number(stage?.firstTextAt) || 0,
+          audioAt: Number(stage?.audioAt) || 0,
+        });
+      } catch {
+        // Observability is additive: a timeline that cannot be recorded never fails the round.
+        return null;
+      }
+    };
     const releaseVoiceTurn = (id = '') => {
       if (turnReleased) return;
       turnReleased = true;
@@ -11698,6 +11879,8 @@ export function apply(ctx, config) {
       // or absent, so voice can never land in whichever browser session happens to be focused.
       const target = voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR });
       const sessionId = target.sessionId;
+      // P-46: the timeline row is joinable by session even when the delivery never got a message id.
+      roundSessionId = sessionId;
       // Batch 2: one continuous expression is one response group. A second segment that arrives
       // while the previous answer is still generating/ready/playing continues that group instead
       // of replacing it; a terminal group starts a new one. The group is bookkeeping only: the
@@ -11747,9 +11930,12 @@ export function apply(ctx, config) {
           group: voiceGroup, version: voiceGroupVersion, status: 'session-unavailable',
           error: session.error ?? '',
         });
+        // P-46: a round that never delivered still gets its one row (no body, no turn).
+        await timelineEmit('failed', 'session-unavailable');
         if (features.enabled('voice')) await speakLine('语音通道暂时不可用。');
         return;
       }
+      sessionReadyAt = Date.now();
       // Startup self-check: one event that later proves what the voice session actually loaded
       // (persona, fixed memory, day digest, memory table size) without re-reading the prompt.
       // A title that could not be pinned is reported, never invented.
@@ -12715,6 +12901,10 @@ export function apply(ctx, config) {
       // `voice.speech.cancelled`/stale rows stay `user-input` for both input paths.
       stopTypedSpeechForUserInput('user-input');
       const { request, resultPromise, stage } = prepared;
+      // P-46: hand the round's anchors and observation buffer to the timeline emitter.
+      stage.roundOpenedAt = roundOpenedAt;
+      stage.sessionReadyAt = sessionReadyAt;
+      timelineStage = stage;
       pendingResult = resultPromise;
       // Batch 2: remember the live round so the next segment can wait for this turn instead of
       // opening a parallel listener; attach the delivery to its group while the turn id is filled.
@@ -12776,6 +12966,7 @@ export function apply(ctx, config) {
       }
       // The delivery was accepted: this is the origin of the spoken-pipeline timeline below.
       acceptedAt = Date.now();
+      stage.acceptedAt = acceptedAt;
       // Join keys: `deliveryMessageId` is exactly the id the session log writes as
       // `user/message.data.id`, and `turn` is resolved at emit time (below) so this row can be
       // lined up with turn/start … turn/end without guessing.
@@ -12813,6 +13004,8 @@ export function apply(ctx, config) {
         });
       })().catch(() => {});
       if (!features.enabled('voice')) {
+        // P-46: the utterance was delivered but this round speaks nothing; the row still exists.
+        await timelineEmit('no-audio', 'voice-disabled');
         releaseVoiceTurn(sessionId);
         return;
       }
@@ -12837,6 +13030,7 @@ export function apply(ctx, config) {
         const done = await resultPromise;
         // The body text is already streaming; this remaining stamp only positions the last stage.
         const replyAt = Date.now();
+        stage.replyAt = replyAt;
         // Batch 2: the accepted turn is known now; line it up with the group's segment.
         const boundTurn = Number.isInteger(stage.acceptTurn) ? stage.acceptTurn
           : (Number.isInteger(stage.turn) ? stage.turn : null);
@@ -12876,6 +13070,11 @@ export function apply(ctx, config) {
             partial: !interrupted,
             spoken: Number(sentenceVoice?.stats?.played ?? 0),
           });
+          // P-46: a failed round still gets its one row; the reason is the wait's status code.
+          await timelineEmit(
+            interrupted ? 'cancelled' : (status === 'timeout' ? 'timeout' : 'failed'),
+            done.error || status || 'error',
+          );
           return;
         }
         const summary = (done.text ?? '').replace(/\s+/gu, ' ').trim();
@@ -12957,6 +13156,10 @@ export function apply(ctx, config) {
               ? stage.injectedAt
               : (acceptedAt > 0 ? acceptedAt : (stage.ackAt > 0 ? stage.ackAt : replyAt));
             await log.emit('voice.pipeline.timeline', {
+              // P-46 stage 0: the same join keys as `voice.latency` / `voice.first-sentence`.
+              // Additive only: the existing fields and the accepted-delivery origin are untouched.
+              sessionId,
+              deliveryMessageId: request.id,
               ...buildPipelineTimeline({
                 turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
                 origin: pipelineInputAt,
@@ -12996,6 +13199,13 @@ export function apply(ctx, config) {
             void showSubtitle(SPEECH_TRUNCATION_NOTE, 2500, null).catch(() => {});
           }
           const audioAt = Number(streamed?.firstPlayStartedAt) || 0;
+          stage.audioAt = audioAt;
+          // P-46: one timeline row per round. The audio anchor is the last boundary this path can
+          // measure, so the row (and its derived numbers) are fixed here, before `voice.latency`.
+          const roundTimeline = await timelineEmit(
+            audioAt > 0 ? 'ok' : 'no-audio',
+            audioAt > 0 ? null : 'no-audio',
+          );
           if (audioAt > 0) {
             const injectedAt = stage.injectedAt > 0 ? stage.injectedAt : Number(timing.transcriptAt) || audioAt;
             const ackAt = stage.ackAt > 0 ? stage.ackAt : injectedAt;
@@ -13067,8 +13277,14 @@ export function apply(ctx, config) {
               spokenVersionMs: Number(spokenPlan?.ms) || 0,
               spokenVersionUsed: spokenPlan?.source === 'condensed',
               spokenSource: spokenPlan?.source ?? 'original',
+              // P-46: the same round's turn-timeline numbers (model/tool split, residual, ...).
+              turnTimeline: roundTimeline,
             });
           }
+        } else {
+          // No body-eligible text (e.g. a tool-call-only turn): no speech, but the round happened
+          // and still gets its one timeline row.
+          await timelineEmit('no-body', 'no-body');
         }
         detachSentenceVoice?.();
         detachSentenceVoice = null;
@@ -13079,6 +13295,8 @@ export function apply(ctx, config) {
         } catch {
           /* logging is best-effort too */
         }
+        // P-46: the round settled; whatever stage broke, it still gets its one row.
+        await timelineEmit('failed', error?.code || 'error');
       }).finally(() => {
         detachSentenceVoice?.();
         detachSentenceVoice = null;
@@ -13120,6 +13338,8 @@ export function apply(ctx, config) {
       // The failed delivery never bound a session id: `idle` keeps whatever identity is current.
       releaseVoiceTurn();
       await log.emit('voice.inject.failed', { error: error?.message ?? String(error) });
+      // P-46: a round that never delivered records why; the message itself never enters the row.
+      await timelineEmit('failed', 'delivery-failed');
     }
   };
   const acceptFinal = (text, durationMs = 0, meta = {}) => {

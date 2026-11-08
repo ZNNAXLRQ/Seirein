@@ -417,6 +417,10 @@ async function runVoiceRound(app, utterance) {
     firstSentence: app.rows('voice.first-sentence')[0]?.payload ?? null,
     latency: app.rows('voice.latency')[0].payload,
     probe: app.rows('voice.stream.probe')[0]?.payload ?? null,
+    // P-46: the round's own timeline row, emitted before `voice.latency` on the spoken path.
+    timeline: app.rows('voice.turn.timeline')[0]?.payload ?? null,
+    // P-46 stage 0: `voice.pipeline.timeline` gained the same session/delivery join keys.
+    pipeline: app.rows('voice.pipeline.timeline')[0]?.payload ?? null,
     recalls: app.rows('memory.recall').map((entry) => entry.payload),
   };
 }
@@ -490,14 +494,29 @@ test('2) voice.reply, voice.first-sentence, voice.latency and the stream probe c
   assert.equal(round.latency.turn, 1, 'voice.latency.turn');
   assert.equal(round.probe.turn, 1, 'voice.stream.probe.turn');
   assert.equal(round.injected.turn, 1, 'and the injected row agrees');
+  // P-46: the round's timeline row joins on the same delivery, session and turn.
+  assert.ok(round.timeline !== null, 'the spoken round logged voice.turn.timeline');
+  assert.equal(round.timeline.sessionId, round.injected.sessionId, 'voice.turn.timeline.sessionId');
+  assert.equal(round.timeline.deliveryMessageId, request.id, 'voice.turn.timeline.deliveryMessageId');
+  assert.equal(round.timeline.acceptTurn, 1, 'voice.turn.timeline.acceptTurn');
+  assert.equal(round.timeline.turn, 1, 'voice.turn.timeline.turn');
+  assert.equal(round.timeline.status, 'ok');
+  // P-46 stage 0: the existing pipeline timeline is joinable too; its own fields are unchanged.
+  assert.ok(round.pipeline !== null, 'the round logged voice.pipeline.timeline');
+  assert.equal(round.pipeline.sessionId, round.injected.sessionId, 'voice.pipeline.timeline.sessionId');
+  assert.equal(round.pipeline.deliveryMessageId, request.id, 'voice.pipeline.timeline.deliveryMessageId');
+  assert.equal(round.pipeline.turn, 1, 'voice.pipeline.timeline still carries its own turn');
+  assert.ok(Number.isInteger(round.pipeline.bodyReadyMs), 'the existing stages are untouched');
   // The same round: every join key points at one turn.
   assert.deepEqual(
-    new Set([round.injected.turn, round.reply.turn, round.firstSentence.turn, round.latency.turn, round.probe.turn]),
+    new Set([round.injected.turn, round.reply.turn, round.firstSentence.turn, round.latency.turn,
+      round.probe.turn, round.timeline.turn]),
     new Set([1]),
   );
 
   console.log(`[2] reply turn=${round.reply.turn} first-sentence turn=${round.firstSentence.turn} `
-    + `latency turn=${round.latency.turn} probe turn=${round.probe.turn} deliveryMessageId=${round.reply.deliveryMessageId}`);
+    + `latency turn=${round.latency.turn} probe turn=${round.probe.turn} deliveryMessageId=${round.reply.deliveryMessageId} `
+    + `timeline turn=${round.timeline.turn} status=${round.timeline.status}`);
 });
 
 // ---------------------------------------------------------------------------

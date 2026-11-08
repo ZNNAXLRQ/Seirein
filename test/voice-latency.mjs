@@ -39,6 +39,11 @@ import {
 } from '../src/host/session/delivery/dispatch.js';
 import { createTranslator, prepareSpeech } from '../src/host/speech/translate.js';
 import { apply, createReplySpeaker, voiceLatencyObservationFields } from '../src/host/index.js';
+import {
+  buildTurnTimeline,
+  turnTimelineStats,
+  VOICE_LATENCY_TIMELINE_FIELDS,
+} from '../src/host/session/timeline/turn-timeline.js';
 
 const EXAMPLE = {
   sessionId: 'seirein-2026-11-04',
@@ -554,4 +559,87 @@ test('status.voiceLatency exposes recent rows and p50/p95 keys', async (t) => {
   }
   // No disabled capability leaks into the status payload this round.
   assert.equal(status.reasoningPolicy, undefined, 'no dormant reasoning policy in status');
+});
+
+// ---------------------------------------------------------------------------
+// E) P-46: the turn timeline's derived numbers beside the canonical stage set
+// ---------------------------------------------------------------------------
+
+test('the turn timeline adds observation numbers without touching the canonical 8 stages', () => {
+  // The documented P-46 group, in order: model / tool split, first text/audio after the last
+  // tool, prepare and residual, plus how many raw observations fed the round.
+  assert.deepEqual([...VOICE_LATENCY_TIMELINE_FIELDS], [
+    'modelMs', 'modelRounds', 'preToolMs', 'toolMs', 'toolMsSum', 'toolCalls', 'toolFailures',
+    'firstTextAfterLastToolMs', 'firstAudioAfterLastToolMs', 'prepareMs', 'residualMs', 'collected',
+  ]);
+  for (const field of VOICE_LATENCY_TIMELINE_FIELDS) {
+    assert.ok(!VOICE_LATENCY_FIELDS.includes(field), `${field} must not become a canonical stage`);
+  }
+  const T0 = 1_760_000_000_000;
+  const observations = [
+    { type: 'turn/start', at: T0, turn: 4, step: null },
+    { type: 'step/start', at: T0 + 100, turn: 4, step: 1 },
+    { type: 'assistant/message', at: T0 + 1_100, turn: 4, step: 1, hasTool: true, chars: 5 },
+    { type: 'tool/call', at: T0 + 1_110, turn: 4, step: 1, callId: 't1', toolName: 'assistant_say' },
+    { type: 'tool/call', at: T0 + 1_110, turn: 4, step: 1, callId: 't2', toolName: 'session_search' },
+    { type: 'tool/result', at: T0 + 1_910, turn: 4, step: 1, callId: 't1', ok: true, reason: null },
+    { type: 'tool/result', at: T0 + 2_310, turn: 4, step: 1, callId: 't2', ok: false, reason: 'TIMEOUT' },
+    { type: 'turn/end', at: T0 + 2_400, turn: 4, step: null, status: 'completed' },
+  ];
+  const payload = buildTurnTimeline({
+    sessionId: 'seirein-latency-timeline',
+    turn: 4,
+    origin: { at: T0, source: 'transcript' },
+    observations,
+    status: 'ok',
+  });
+  const stats = turnTimelineStats(payload, {
+    firstTextAt: T0 + 2_500,
+    audioAt: T0 + 2_700,
+    transcriptAt: T0 + 40,
+    injectedAt: T0 + 90,
+    collected: observations.length,
+  });
+  assert.deepEqual(Object.keys(stats), [...VOICE_LATENCY_TIMELINE_FIELDS]);
+  assert.equal(stats.modelMs, 1_000, 'one model round of 1 s');
+  assert.equal(stats.modelRounds, 1);
+  assert.equal(stats.preToolMs, 1_110, 'origin -> first tool call');
+  // t1 800 ms and t2 1200 ms overlap from 1110 to 1910: union 1200, sum 2000.
+  assert.equal(stats.toolMs, 1_200, 'the union is the wall time spent in tools');
+  assert.equal(stats.toolMsSum, 2_000, 'the additive sum keeps the overlap visible');
+  assert.equal(stats.toolCalls, 2);
+  assert.equal(stats.toolFailures, 1);
+  assert.equal(stats.firstTextAfterLastToolMs, 190, 'first text - last tool end');
+  assert.equal(stats.firstAudioAfterLastToolMs, 390);
+  assert.equal(stats.prepareMs, 50, 'transcript -> injected');
+  assert.equal(stats.collected, observations.length);
+
+  // An explicit measured 0 is kept (no tool call really spent 0 ms in tools); an unmeasured value
+  // is null, never 0. The canonical event row itself is unchanged.
+  const noTools = buildTurnTimeline({
+    sessionId: 'seirein-latency-timeline',
+    turn: 5,
+    origin: { at: T0, source: 'injected' },
+    observations: [
+      { type: 'step/start', at: T0 + 10, turn: 5, step: 1 },
+      { type: 'assistant/message', at: T0 + 10, turn: 5, step: 1, hasTool: false, chars: 3 },
+    ],
+  });
+  const noToolStats = turnTimelineStats(noTools, { collected: 2 });
+  assert.equal(noToolStats.modelMs, 0, 'an explicit 0 duration is a measurement');
+  assert.equal(noToolStats.toolMs, 0, 'a tool-less round measured 0 ms of tool time');
+  assert.equal(noToolStats.toolCalls, 0);
+  assert.equal(noToolStats.preToolMs, null, 'no tool call -> no pre-tool stage');
+  assert.equal(noToolStats.prepareMs, null, 'no transcript/injected pair -> null');
+
+  // The canonical payload (the 8 stages and their p50/p95 card) is untouched by this group.
+  assert.deepEqual(Object.keys(voiceLatencyEvent(EXAMPLE)), ['sessionId', ...VOICE_LATENCY_FIELDS]);
+  const summary = summarizeVoiceLatency([voiceLatencyEvent(EXAMPLE)]);
+  for (const field of VOICE_LATENCY_TIMELINE_FIELDS) {
+    assert.ok(!(field in summary.p50), `${field} has no p50`);
+  }
+  console.log(`ℹ P-46 latency group: modelMs=${stats.modelMs} modelRounds=${stats.modelRounds} `
+    + `preToolMs=${stats.preToolMs} toolMs=${stats.toolMs} toolMsSum=${stats.toolMsSum} `
+    + `toolCalls=${stats.toolCalls} toolFailures=${stats.toolFailures} `
+    + `residualMs=${stats.residualMs} collected=${stats.collected}`);
 });

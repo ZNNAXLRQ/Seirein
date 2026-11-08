@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { resolveInstanceRoot } from '../../runtime/root.js';
+import { timelineObservation } from '../timeline/turn-timeline.js';
 
 /**
  * Session ids this process already switched to full access. The session log is the durable
@@ -896,6 +897,15 @@ function sessionBaselineSeq(ctx, sessionId) {
  * the first three real frames (field names + types, never text). `onCommitMismatch` receives one
  * note per step whose buffered text differed from its commit. Both only record.
  *
+ * `onTimeline` receives one `{at, sessionId, turn, bound, observations}` snapshot when the wait
+ * settles: the round's `turn/start`, `step/start`, `assistant/message`, `tool/call`,
+ * `tool/result`, `turn/end` and `assistant/attempt` boundaries reduced to desensitized
+ * observations (times, turn/step numbers, call ids, tool names, short status tokens — never text,
+ * tool arguments, tool output or an error message). A boundary that arrives before the delivery's
+ * `user/message` binds the turn is buffered per turn and flushed when that turn binds, so a
+ * pre-bind `turn/start` is not lost. This only records; `pendingTools`, the stream state machine
+ * and every binding rule are untouched.
+ *
  * The result also carries `speechText` **only when body-eligible text differs from `text`**
  * (e.g. a turn whose only text was pre-tool commentary): callers must use it, not `text`, for a
  * whole-reply fallback, and treat `''` as "subtitle only, do not play".
@@ -911,6 +921,7 @@ export function awaitSessionResult({
   onAssistantText,
   onCommitMismatch,
   onProbe,
+  onTimeline,
 } = {}) {
   const hasSession = typeof sessionId === 'string' && sessionId.length > 0;
   const identityMode = typeof deliveryMessageId === 'string' && deliveryMessageId.length > 0;
@@ -966,6 +977,59 @@ export function awaitSessionResult({
    */
   let activeAttempt = null;
   const pendingAttempts = new Map();
+  /**
+   * P-46 turn timeline (observation only). `timelineNote` reduces each session event to a small,
+   * desensitized observation; nothing here reads or changes `pendingTools`, the stream buffers or
+   * the binding rules. A `turn/start` / `step/start` that arrives before the delivery's
+   * `user/message` bound the turn is kept in a bounded per-turn pre-bind buffer and flushed when
+   * that turn binds.
+   */
+  const timelineMode = typeof onTimeline === 'function';
+  const TIMELINE_PREBIND_TURNS = 2;
+  const TIMELINE_OBSERVATIONS_CAP = 512;
+  const timelineSeen = [];
+  const timelinePreBind = new Map();
+  const timelineNote = (event) => {
+    if (!timelineMode || timelineSeen.length >= TIMELINE_OBSERVATIONS_CAP) return;
+    const observation = timelineObservation(event, Date.now());
+    if (observation === null) return;
+    if (turnStarted && (targetTurn === null || observation.turn === null || observation.turn === targetTurn)) {
+      timelineSeen.push(observation);
+      return;
+    }
+    const key = observation.turn === null ? '' : String(observation.turn);
+    if (!timelinePreBind.has(key)) {
+      timelinePreBind.set(key, []);
+      // Only the last two turns are worth keeping: an older replay turn can never be this delivery.
+      while (timelinePreBind.size > TIMELINE_PREBIND_TURNS) {
+        timelinePreBind.delete(timelinePreBind.keys().next().value);
+      }
+    }
+    const bucket = timelinePreBind.get(key);
+    if (bucket.length < TIMELINE_OBSERVATIONS_CAP) bucket.push(observation);
+  };
+  /** Flush the pre-bind buffer of the turn that just bound (the bound turn's own boundaries). */
+  const timelineTakeBound = (turn) => {
+    if (!timelineMode) return;
+    const key = turn === null || turn === undefined ? '' : String(turn);
+    const keys = key === '' ? [''] : [key, ''];
+    for (const name of keys) {
+      const bucket = timelinePreBind.get(name);
+      if (bucket === undefined) continue;
+      timelinePreBind.delete(name);
+      timelineSeen.push(...bucket);
+    }
+  };
+  /** Ordered observations for the settled round; unbound leftovers are kept only when nothing bound. */
+  const timelineSnapshot = () => {
+    if (!timelineMode) return null;
+    const rows = timelineSeen.slice();
+    if (!turnStarted) {
+      for (const bucket of timelinePreBind.values()) rows.push(...bucket);
+    }
+    timelinePreBind.clear();
+    return rows.sort((a, b) => a.at - b.at);
+  };
   let timer;
   let abortListener;
   let resolveOnce = () => {};
@@ -1014,6 +1078,15 @@ export function awaitSessionResult({
       commitMismatch,
       // First real frame shapes (field names + types, never text) for `voice.stream.sample`.
       sample: sampleShapes.slice(0, 3),
+    });
+    // P-46: the round's raw, desensitized boundaries for `voice.turn.timeline`. The host builds
+    // the payload (it owns the anchors/status); this callback only hands the observations over.
+    notify(onTimeline, {
+      at: Date.now(),
+      sessionId,
+      turn: targetTurn ?? currentTurn,
+      bound: turnStarted,
+      observations: timelineSnapshot(),
     });
     // Gap 4: only body-eligible text may feed a whole-reply fallback. `speechText` is present
     // only when it differs from `text`, so every existing result shape stays unchanged.
@@ -1218,6 +1291,8 @@ export function awaitSessionResult({
   try {
     off = ctx.on('session/event', (session, event) => {
       if (session?.id !== sessionId || !event || !afterDelivery(event)) return;
+      // Observation only: every boundary of this delivery's round is recorded for the timeline.
+      timelineNote(event);
       const turn = eventTurnId(event);
       if (event.type === 'turn/start') {
         currentTurn = turn;
@@ -1229,6 +1304,7 @@ export function awaitSessionResult({
         // delivery's answer. Nothing else is sent into a session before its request.
         targetTurn = turn;
         turnStarted = true;
+        timelineTakeBound(turn);
         last = '';
         lastBodyText = '';
         lastBodyStep = null;
@@ -1244,6 +1320,7 @@ export function awaitSessionResult({
         if (ownerTurn === null || targetTurn !== null) return;
         targetTurn = ownerTurn;
         turnStarted = true;
+        timelineTakeBound(ownerTurn);
         last = '';
         lastBodyText = '';
         lastBodyStep = null;
