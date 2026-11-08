@@ -11321,27 +11321,6 @@ export function apply(ctx, config) {
     return Number.isInteger(turn) ? { sessionId, turnId: turn } : null;
   };
 
-  /** One agent session per day: voice transcripts are injected into it headlessly. */
-  let dailyAgent = { date: '', agent: null };
-  const dailySessionId = () => `seirein-${new Date().toISOString().slice(0, 10)}`;
-  const ensureDailyAgent = async () => {
-    const date = new Date().toISOString().slice(0, 10);
-    if (dailyAgent.date === date && dailyAgent.agent !== null) return dailyAgent.agent;
-    const agentLoop = getService('agentLoop');
-    if (agentLoop === undefined) throw new Error('agentLoop 服务不可用');
-    // `agentPreset` is only a header marker: write it when the declaration resolves, and let the
-    // setup's verified mount (not the marker) decide whether compaction is actually composed.
-    const presetReady = await voiceCompaction.presetReady();
-    const handle = await agentLoop.createAgent(ctx, voiceCompaction.dailyCreateOptions({
-      sessionId: dailySessionId(),
-      cwd: join(root, 'workspace'),
-      presetReady,
-    }));
-    dailyAgent = { date, agent: handle.agent };
-    await log.emit('voice.session', { sessionId: handle.agent.id });
-    return handle.agent;
-  };
-
   /**
    * Long-task result replay: answer inline for the first 90 s, then keep waiting in the background
    * for up to 30 more minutes on the same listener, so a long result is still spoken once.
