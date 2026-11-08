@@ -1302,6 +1302,91 @@ export function speechChunkTexts(text, { chunking = true, minChars = DEFAULT_CHU
 }
 
 /**
+ * P-148: the first semantic unit's OPENING block targets about one second of audio instead of the
+ * whole unit. The character budget is either configured (`voice.firstBlockTargetChars`), derived
+ * from a target duration and the MEASURED synthesis cost (`voice.firstBlockTargetMs`), or — before
+ * any measurement exists — the ~30-character default. A guessed rate never sizes the first block.
+ */
+export const DEFAULT_FIRST_BLOCK_TARGET_CHARS = 30;
+export const DEFAULT_FIRST_BLOCK_TARGET_MS = 1200;
+export const FIRST_BLOCK_TARGET_CHARS_MIN = 4;
+export const FIRST_BLOCK_TARGET_CHARS_MAX = 120;
+/** A unit at or below this size is synthesized whole (the old, unsplit path). */
+export const DEFAULT_FIRST_BLOCK_SHORT_CHARS = 40;
+
+/** Resolve the first-block character budget: explicit chars > measured ms/char > 30 chars. */
+export function resolveFirstBlockTarget({ targetChars, targetMs, msPerChar, measured = false } = {}) {
+  const ms = Number(targetMs) > 0 ? Math.round(Number(targetMs)) : DEFAULT_FIRST_BLOCK_TARGET_MS;
+  const rate = Number(msPerChar);
+  const sized = measured === true && Number.isFinite(rate) && rate > 0
+    ? ms / rate
+    : DEFAULT_FIRST_BLOCK_TARGET_CHARS;
+  const explicit = Number(targetChars);
+  const chosen = Number.isFinite(explicit) && explicit > 0 ? explicit : sized;
+  return {
+    targetChars: Math.min(FIRST_BLOCK_TARGET_CHARS_MAX, Math.max(FIRST_BLOCK_TARGET_CHARS_MIN, Math.round(chosen))),
+    targetMs: ms,
+  };
+}
+
+/**
+ * P-148: cut the opening block of one semantic unit near the target size.
+ *
+ * Only the first block is cut: the rest of the unit stays ONE later block, so the whole block list
+ * is a lossless partition of the trimmed input (join === input, no character repeated or dropped).
+ * A cut happens only after a comma-level pause outside brackets/quotes, and only when both sides
+ * stay speakable; a short unit, or one whose first usable pause lies beyond the target window,
+ * stays whole rather than being cut inside a word.
+ *
+ * @returns {{blocks: string[], chars: number, chunked: boolean, firstBlockChars: number,
+ *   targetChars: number, targetMs: number}}
+ */
+export function splitFirstBlockChunks(text, {
+  targetChars, targetMs, msPerChar, measured = false,
+  minChars = DEFAULT_CHUNK_MIN_CHARS, shortChars = DEFAULT_FIRST_BLOCK_SHORT_CHARS,
+} = {}) {
+  const source = typeof text === 'string' ? text.trim() : '';
+  const target = resolveFirstBlockTarget({ targetChars, targetMs, msPerChar, measured });
+  const points = [...source];
+  const minimum = resolveChunkMinChars(minChars);
+  const slack = Math.max(minimum, Math.round(target.targetChars / 4));
+  const window = target.targetChars + slack;
+  const summary = {
+    blocks: source.length === 0 ? [] : [source],
+    chars: points.length,
+    chunked: false,
+    firstBlockChars: points.length,
+    ...target,
+  };
+  // A short unit is never cut, and a cut only happens when its pause fits the target window.
+  if (points.length <= Math.max(DEFAULT_FIRST_BLOCK_SHORT_CHARS, window)) return summary;
+  let depth = 0;
+  let quote = '';
+  let cut = 0;
+  for (let index = 0; index < points.length; index += 1) {
+    const char = points[index];
+    if (quote !== '') { if (char === quote) quote = ''; continue; }
+    if (CHUNK_OPENERS.has(char)) { depth += 1; continue; }
+    if (CHUNK_CLOSERS.has(char)) { depth = Math.max(0, depth - 1); continue; }
+    const closing = CHUNK_QUOTES.get(char);
+    if (closing !== undefined) { quote = closing; continue; }
+    if (depth !== 0 || !CHUNK_PAUSES.has(char)) continue;
+    let end = index + 1;
+    while (end < points.length && /\s/u.test(points[end])) end += 1;
+    // Neither side may become a stub, and the opening block must stay inside the target window.
+    if (index + 1 < minimum || points.length - end < minimum || index + 1 > window) continue;
+    cut = end;
+  }
+  if (cut <= 0) return summary;
+  return {
+    ...summary,
+    blocks: [points.slice(0, cut).join(''), points.slice(cut).join('')],
+    chunked: true,
+    firstBlockChars: cut,
+  };
+}
+
+/**
  * Pull-based, one playing + one synthesizing/ready. The caller must supply a bounded iterable,
  * not an event callback spawning unbounded push promises. Only this invocation's files are removed.
  */

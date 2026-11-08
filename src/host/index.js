@@ -155,6 +155,11 @@ const SubtitleGeometryTracker = typeof subtitleModule.SubtitleGeometryTracker ==
 const probeSubtitleWorkArea = typeof subtitleModule.probeSubtitleWorkArea === 'function'
   ? subtitleModule.probeSubtitleWorkArea
   : async () => null;
+// P-148: the first-semantic-unit splitter is optional too, so a pre-P-148 tts.js double keeps the
+// old one-block-per-unit path instead of failing to link.
+const firstBlockCuts = typeof ttsModule.splitFirstBlockChunks === 'function'
+  ? ttsModule.splitFirstBlockChunks
+  : null;
 /** Caption reading time; a subtitle mock may omit it, so keep the same rule locally. */
 const readableHoldMs = typeof subtitleModule.readableHoldMs === 'function'
   ? subtitleModule.readableHoldMs
@@ -1229,6 +1234,19 @@ export function apply(ctx, config) {
     return {
       chunking: chunking !== false && chunkCuts !== null && chunkPlayer !== null,
       minChars: chunkClamp === null ? undefined : chunkClamp(minChars),
+    };
+  };
+  /** P-148: `voice.firstBlockTargetChars` / `voice.firstBlockTargetMs`, settings.json then config. */
+  const firstBlockTargetSettings = () => {
+    const saved = readSettings().voice;
+    const stored = saved !== null && typeof saved === 'object' ? saved : {};
+    return {
+      targetChars: stored.firstBlockTargetChars !== undefined
+        ? stored.firstBlockTargetChars
+        : config?.voice?.firstBlockTargetChars,
+      targetMs: stored.firstBlockTargetMs !== undefined
+        ? stored.firstBlockTargetMs
+        : config?.voice?.firstBlockTargetMs,
     };
   };
   // ---- call mode (phase 1b) ---------------------------------------------
@@ -3732,21 +3750,43 @@ export function apply(ctx, config) {
    * P-65: block plan for one already-prepared (translated) sentence. The first block goes through
    * the normal prefetch path; `synthesizeChunk` synthesizes a later block with the same prepared
    * language and voice while the previous one plays, so translation happens once per sentence and
-   * the caption stays the whole sentence. `chunking:false` returns one block (the old path).
+   * the caption stays the whole sentence. `chunking:false` returns one block (the old path), except
+   * for the first semantic unit (`firstBlock`), whose opening block is cut near the target size.
    */
   const synthesizeChunked = async (prepared, {
     voice, signal, liveSignal = null, chunking: chunkingOverride = undefined,
-    purpose = 'answer', sentenceId = 0,
+    purpose = 'answer', sentenceId = 0, firstBlock = false,
   }) => {
     // `chunking:false` is the streamed spoken-version path: the semantic unit is already sized
     // from measured synthesis cost, so the comma-level block splitter must not cut it again.
     const settings = voiceChunkSettings();
     const chunking = chunkingOverride === undefined ? settings.chunking : chunkingOverride;
     const { minChars } = settings;
-    const blocks = chunking && chunkCuts !== null
-      ? chunkCuts(prepared.speechText, { minChars })
-      : [prepared.speechText];
+    // P-148: only the FIRST semantic unit is cut, and only its OPENING block: block 0 is then
+    // synthesized at once while the rest of the unit follows as one later block. Every later unit
+    // (and every block of it) keeps the existing one-block path, and `voice.chunking:false` still
+    // means "no splitting at all". The plan is also the event payload (`firstPlan`).
+    const firstPlan = firstBlock && chunking === false && settings.chunking && firstBlockCuts !== null
+      ? firstBlockCuts(prepared.speechText, {
+        ...firstBlockTargetSettings(),
+        minChars,
+        msPerChar: voiceUnitSizer.msPerChar(),
+        measured: voiceUnitSizer.samples() > 0,
+      })
+      : null;
+    const blocks = firstPlan !== null
+      ? firstPlan.blocks
+      : (chunking && chunkCuts !== null ? chunkCuts(prepared.speechText, { minChars }) : [prepared.speechText]);
     const list = blocks.length > 0 ? blocks : [prepared.speechText];
+    if (firstPlan !== null && list.length > 1) {
+      void log.emit('voice.first-block.chunked', {
+        chars: firstPlan.chars,
+        targetChars: firstPlan.targetChars,
+        targetMs: firstPlan.targetMs,
+        chunks: list.length,
+        firstBlockChars: firstPlan.firstBlockChars,
+      }).catch(() => {});
+    }
     const synthesizeBlock = (text, blockSignal, priority = 0, chunkIndex = 0) => synthesizeWatched({
       text,
       voice,
@@ -11381,8 +11421,9 @@ export function apply(ctx, config) {
                 // Observation only: this sentence is the answer's body, tagged with its block id.
                 purpose: 'answer', sentenceId,
                 // The streamed spoken-version path already sized this unit from measured synthesis
-                // cost; re-cutting it at a comma would defeat that measurement.
-                ...(semanticUnitMode ? { chunking: false } : {}),
+                // cost; re-cutting it at a comma would defeat that measurement. P-148: its FIRST
+                // unit is still cut once, near the target, so block 0 does not wait for the unit.
+                ...(semanticUnitMode ? { chunking: false, firstBlock: Number(sentenceId) === 0 } : {}),
               });
               if (Number(sentenceId) === 0 && spokenMarks.firstChunkAt === 0) {
                 spokenMarks.firstChunkAt = Date.now();

@@ -296,6 +296,50 @@ test('timing: no segment -> no synthesis at all until the closing flush', async 
 });
 
 // ---------------------------------------------------------------------------
+// B2) first-block chunking: one sentence, several blocks, one played count
+// ---------------------------------------------------------------------------
+
+test('blocks: a chunked first sentence plays in block order and counts once', async (t) => {
+  // P-148: the first semantic unit is synthesized as a smaller opening block plus the rest, so
+  // block 0 can start playing before the whole sentence exists as audio. The speaker must still
+  // treat those blocks as ONE sentence: block order, one played count, and the whole sentence text
+  // on every play call (the caption and the ledger stay sentence-wide).
+  const sentence = '今天先把桌面整理干净，再把明天的计划写清楚。';
+  const blocks = ['今天先把桌面整理干净，', '再把明天的计划写清楚。'];
+  const plays = [];
+  const restSynth = [];
+  const speaker = createReplySpeaker({
+    now: () => 0,
+    startedAt: 0,
+    synthesize: async ({ text, sentenceId }) => ({
+      file: `${sentenceId}-0.mp3`,
+      bytes: 8,
+      durationMs: 100,
+      chunkTexts: text === sentence ? blocks : null,
+      synthesizeChunk: text === sentence
+        ? async ({ text: blockText, index }) => {
+          restSynth.push({ text: blockText, index });
+          return { file: `block-${index}.mp3`, bytes: 8, durationMs: 100 };
+        }
+        : null,
+    }),
+    play: async ({ text, chunkIndex, chunkCount }) => {
+      plays.push({ text, chunkIndex, chunkCount });
+      return { audioStartedAt: 1, done: Promise.resolve() };
+    },
+  });
+  t.after(() => speaker.cancel('test-teardown'));
+  speaker.push(sentence);
+  const stats = await speaker.finish({ fullText: sentence });
+  assert.deepEqual(plays.map((entry) => entry.chunkIndex), [0, 1], 'block order is 0 -> 1');
+  assert.ok(plays.every((entry) => entry.chunkCount === 2), 'both blocks know the block count');
+  assert.ok(plays.every((entry) => entry.text === sentence), 'every block carries the whole sentence text');
+  assert.deepEqual(restSynth.map((entry) => entry.text), [blocks[1]], 'the rest is synthesized as a later block');
+  assert.equal(stats.played, 1, 'the sentence counts once, not once per block');
+  assert.equal(stats.sentences, 1);
+});
+
+// ---------------------------------------------------------------------------
 // C) tool gate: nothing plays before the tool result and the post-tool body
 // ---------------------------------------------------------------------------
 
