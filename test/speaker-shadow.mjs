@@ -3,14 +3,18 @@
  *
  * The embedder is a fake in these tests (no microphone, ffmpeg, sherpa model or ONNX session):
  *  1. default OFF — the embedder is never built and no `speaker.*` event exists;
- *  2. ON + audio shorter than 600 ms — `unsure/too-short` and no `embed()` call at all;
+ *  2. ON + audio shorter than 600 ms — `unsure/too-short`, quality `short`, no `embed()` call at all;
  *  3. ON + an enrolled voice + a fake embedder — `match` with score/speakerId/ms/utteranceId,
  *     while the delivered text is byte-identical;
  *  4. missing model — exactly one `speaker.model.failed`, delivery continues (explicit path and
  *     the background-download failure path);
  *  5. empty library — `no-speakers`, no error, no embedding call;
  *  6. the synchronous fallback keeps its event log empty and never builds the shadow;
- *  7. regression: `node --check`, the hearing/speaker/vad suites and `node test/smoke.mjs`.
+ *  7. stage 2: a good self clip is `class=self`, a different voice is `class=other`/`mismatch`;
+ *  8. stage 2: a soft clip is `quality=quiet`/`unsure`, never `self`;
+ *  9. stage 2: the loopback lane is only a `source=loopback` annotation (it may still be `self`);
+ * 10. stage 2: a best-vs-runner-up margin below `minMargin` is `unsure`, never `self`;
+ * 11. regression: `node --check`, the hearing/speaker/vad suites and `node test/smoke.mjs`.
  *
  * Run: node --test test/speaker-shadow.mjs
  */
@@ -26,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { parseUtteranceId, startHearing } from '../src/host/hearing/hearing.js';
-import { createSpeakerLibrary } from '../src/host/hearing/speakerVoice.js';
+import { classifyQuality, createSpeakerLibrary } from '../src/host/hearing/speakerVoice.js';
 
 const run = promisify(execFile);
 const SAMPLE_RATE = 16000;
@@ -56,11 +60,11 @@ class FakeChild extends EventEmitter {
   }
 }
 
-/** A 440 Hz tone at -12 dBFS: loud enough to pass the RMS gate. */
-function tone(ms) {
+/** A 440 Hz tone at -12 dBFS (or the given peak amplitude): loud enough to pass the RMS gate. */
+function tone(ms, amplitude = 0.25) {
   const samples = new Int16Array(Math.round((SAMPLE_RATE * ms) / 1000));
   for (let index = 0; index < samples.length; index += 1) {
-    samples[index] = Math.round(Math.sin((2 * Math.PI * 440 * index) / SAMPLE_RATE) * 0.25 * 32767);
+    samples[index] = Math.round(Math.sin((2 * Math.PI * 440 * index) / SAMPLE_RATE) * amplitude * 32767);
   }
   const buffer = Buffer.alloc(samples.length * 2);
   for (let index = 0; index < samples.length; index += 1) buffer.writeInt16LE(samples[index], index * 2);
@@ -161,6 +165,8 @@ function fakeEmbedderFactory(result = vector([0.9, 0.3, 0.1, 0.2])) {
  */
 async function runClip(t, {
   ms = 1000,
+  amplitude = 0.25,
+  device = 'fake-device',
   workerText = '好',
   speakerShadow,
   speakerEmbedderFactory,
@@ -175,12 +181,12 @@ async function runClip(t, {
   const child = new FakeChild();
   const updates = [];
   const events = [];
-  const clip = tone(ms);
+  const clip = tone(ms, amplitude);
   const hearing = startHearing({
     ffmpegPath: 'ffmpeg-not-used',
     modelDir,
     finalModelDir: '',
-    device: 'fake-device',
+    device,
     recognizer: fakeStreaming({ endpointAtSamples: clip.length / 2, text: '好' }),
     spawnProcess: () => child,
     ...(syncFinal === null ? { asrWorkerFactory: () => fakeWorker(workerText) } : { finalRecognizer: fakeFinal(syncFinal) }),
@@ -224,7 +230,7 @@ test('1) 默认关闭：embedder 不构建、无 speaker.* 事件、投递不变
 // 2. Too short
 // ---------------------------------------------------------------------------
 
-test('2) 开启 + <0.6s：unsure/too-short，embed 不调用', async (t) => {
+test('2) 开启 + <0.6s：unsure/too-short + quality=short，embed 不调用', async (t) => {
   const embedder = fakeEmbedderFactory();
   const { finals, events } = await runClip(t, {
     ms: 400,
@@ -234,13 +240,20 @@ test('2) 开启 + <0.6s：unsure/too-short，embed 不调用', async (t) => {
   });
 
   const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
-  assert.deepEqual(shadow, { decision: 'unsure', reason: 'too-short' });
+  assert.deepEqual(shadow, {
+    decision: 'unsure',
+    reason: 'too-short',
+    class: 'unknown-identity',
+    quality: 'short',
+    source: 'mic',
+  });
   assert.equal(embedder.built, 0, 'a short clip never loads the model');
   assert.equal(embedder.calls.length, 0, 'and never computes an embedding');
   assert.deepEqual(finals.map((event) => event.final), ['好']);
   console.log(
     `[speaker-shadow 2] samples=${400 * 16} min=${600 * 16} decision=${shadow.decision} `
-    + `reason=${shadow.reason} embedCalls=${embedder.calls.length} final=${finals[0].final}`,
+    + `class=${shadow.class} quality=${shadow.quality} reason=${shadow.reason} `
+    + `embedCalls=${embedder.calls.length} final=${finals[0].final}`,
   );
 });
 
@@ -265,8 +278,15 @@ test('3) 开启 + 已注册声纹 + 假 embedder：match 含 score/speakerId，�
   const rows = ofType(events, 'speaker.shadow').map((event) => event.payload);
   assert.equal(rows.length, 1, 'one row per delivered utterance');
   const [shadow] = rows;
-  assert.deepEqual(Object.keys(shadow).sort(), ['decision', 'ms', 'score', 'speakerId', 'utteranceId']);
+  assert.deepEqual(
+    Object.keys(shadow).sort(),
+    ['class', 'decision', 'ms', 'quality', 'reason', 'score', 'source', 'speakerId', 'utteranceId'],
+  );
   assert.equal(shadow.decision, 'match');
+  assert.equal(shadow.class, 'self');
+  assert.equal(shadow.quality, 'ok');
+  assert.equal(shadow.source, 'mic');
+  assert.equal(shadow.reason, 'match');
   assert.equal(shadow.score, 1, 'the enrolled direction scores 1.0');
   assert.equal(shadow.speakerId, 'alice');
   assert.equal(parseUtteranceId(shadow.utteranceId).seq, 1);
@@ -278,7 +298,8 @@ test('3) 开启 + 已注册声纹 + 假 embedder：match 含 score/speakerId，�
   assert.equal(embedder.calls[0].length, SAMPLE_RATE, 'the utterance’s own 1 s of 16 kHz PCM is used');
   assert.deepEqual(finals.map((event) => event.final), ['好'], 'the delivered text is byte-identical');
   console.log(
-    `[speaker-shadow 3] decision=${shadow.decision} score=${shadow.score} speakerId=${shadow.speakerId} `
+    `[speaker-shadow 3] decision=${shadow.decision} class=${shadow.class} quality=${shadow.quality} `
+    + `source=${shadow.source} score=${shadow.score} speakerId=${shadow.speakerId} `
     + `ms=${shadow.ms} utteranceId=${shadow.utteranceId} embedSamples=${embedder.calls[0].length} `
     + `final=${finals[0].final}`,
   );
@@ -346,13 +367,19 @@ test('5) 库为空：no-speakers，不报错、不计算 embedding', async (t) =
   });
 
   const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
-  assert.deepEqual(shadow, { decision: 'no-speakers' });
+  assert.deepEqual(shadow, {
+    decision: 'no-speakers',
+    class: 'unknown-identity',
+    quality: 'ok',
+    source: 'mic',
+    reason: 'no-speakers',
+  });
   assert.equal(embedder.calls.length, 0, 'an empty library is answered before embedding');
   assert.deepEqual(ofType(events, 'speaker.model.failed'), [], 'an empty library is not an error');
   assert.deepEqual(finals.map((event) => event.final), ['好']);
   console.log(
-    `[speaker-shadow 5] decision=${shadow.decision} embedCalls=${embedder.calls.length} `
-    + `modelFailed=${ofType(events, 'speaker.model.failed').length}`,
+    `[speaker-shadow 5] decision=${shadow.decision} class=${shadow.class} quality=${shadow.quality} `
+    + `embedCalls=${embedder.calls.length} modelFailed=${ofType(events, 'speaker.model.failed').length}`,
   );
 });
 
@@ -375,10 +402,183 @@ test('6) 同步回退：事件日志为空，且不构建声纹影子', async (t
 });
 
 // ---------------------------------------------------------------------------
-// 7. Regression
+// 7. Stage 2: a good self clip is classified as self
 // ---------------------------------------------------------------------------
 
-test('7) 回归：node --check、hearing-*/vad-*/speaker-voice 套件、smoke', async (t) => {
+test('7) 高质量本人：class=self / decision=match / quality=ok / source=mic', async (t) => {
+  const { library } = await freshLibrary(t);
+  const alice = vector([0.9, 0.3, 0.1, 0.2]);
+  assert.equal(library.register('alice', alice).ok, true);
+
+  const embedder = fakeEmbedderFactory(alice);
+  const { finals, events } = await runClip(t, {
+    ms: 1200,
+    speakerShadow: true,
+    speakerEmbedderFactory: embedder.factory,
+    speakerLibrary: library,
+    waitFor: 'speaker.shadow',
+  });
+
+  const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
+  assert.equal(shadow.decision, 'match');
+  assert.equal(shadow.class, 'self');
+  assert.equal(shadow.quality, 'ok');
+  assert.equal(shadow.source, 'mic');
+  assert.equal(shadow.reason, 'match');
+  assert.equal(shadow.speakerId, 'alice');
+  assert.deepEqual(finals.map((event) => event.final), ['好'], 'delivery is untouched');
+  console.log(
+    `[speaker-shadow 7] class=${shadow.class} decision=${shadow.decision} quality=${shadow.quality} `
+    + `source=${shadow.source} score=${shadow.score} final=${finals[0].final}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. Stage 2: a different enrolled voice is classified as other
+// ---------------------------------------------------------------------------
+
+test('8) 高质量他人：class=other / decision=mismatch（不属于本人）', async (t) => {
+  const { library } = await freshLibrary(t);
+  assert.equal(library.register('alice', vector([1, 0, 0, 0])).ok, true);
+
+  const embedder = fakeEmbedderFactory(vector([0, 1, 0, 0]));
+  const { finals, events } = await runClip(t, {
+    ms: 1200,
+    speakerShadow: true,
+    speakerEmbedderFactory: embedder.factory,
+    speakerLibrary: library,
+    waitFor: 'speaker.shadow',
+  });
+
+  const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
+  assert.equal(shadow.decision, 'mismatch');
+  assert.equal(shadow.class, 'other');
+  assert.equal(shadow.quality, 'ok');
+  assert.equal(shadow.source, 'mic');
+  assert.equal(shadow.reason, 'mismatch');
+  assert.equal(shadow.score, 0);
+  assert.deepEqual(finals.map((event) => event.final), ['好'], 'classification never drops a final');
+  console.log(
+    `[speaker-shadow 8] class=${shadow.class} decision=${shadow.decision} score=${shadow.score} `
+    + `final=${finals[0].final}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 9. Stage 2: a soft clip is quiet, not self
+// ---------------------------------------------------------------------------
+
+test('9) 轻声/低能量：quality=quiet / decision=unsure（不得归 self）', async (t) => {
+  const { library } = await freshLibrary(t);
+  const alice = vector([0.9, 0.3, 0.1, 0.2]);
+  assert.equal(library.register('alice', alice).ok, true);
+
+  // ~-45 dBFS RMS: above the -50 dB capture gate, below a stable embedding's level.
+  const embedder = fakeEmbedderFactory(alice);
+  const { finals, events } = await runClip(t, {
+    ms: 1200,
+    amplitude: 0.008,
+    speakerShadow: true,
+    speakerEmbedderFactory: embedder.factory,
+    speakerLibrary: library,
+    waitFor: 'speaker.shadow',
+  });
+
+  const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
+  assert.equal(shadow.quality, 'quiet');
+  assert.equal(shadow.decision, 'unsure');
+  assert.equal(shadow.class, 'unknown-identity', 'a soft clip is never claimed as self');
+  assert.equal(shadow.reason, 'quiet');
+  assert.equal(embedder.calls.length, 1, 'the row still reports what the score would have been');
+  assert.ok(shadow.score > 0.9, 'the score itself is unchanged; only the class is guarded');
+  // The fourth quality value, measured on the same pure classifier: a noisy window is not ok.
+  assert.equal(
+    classifyQuality({ durationMs: 1200, rmsDb: -20, peakDb: -12, speechRatio: 0.1 }).quality,
+    'noisy',
+  );
+  assert.equal(classifyQuality({ durationMs: 500, rmsDb: -20, peakDb: -12 }).quality, 'short');
+  assert.equal(classifyQuality({ durationMs: 1200, rmsDb: -20, peakDb: -12, speechRatio: 0.9 }).quality, 'ok');
+  assert.deepEqual(finals.map((event) => event.final), ['好']);
+  console.log(
+    `[speaker-shadow 9] quality=${shadow.quality} decision=${shadow.decision} class=${shadow.class} `
+    + `score=${shadow.score} reason=${shadow.reason}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 10. Stage 2: loopback is a source annotation, not an identity verdict
+// ---------------------------------------------------------------------------
+
+test('10) loopback 来源：source=loopback 标注，且不因来源直接判 other', async (t) => {
+  const { library } = await freshLibrary(t);
+  const alice = vector([0.9, 0.3, 0.1, 0.2]);
+  assert.equal(library.register('alice', alice).ok, true);
+
+  const embedder = fakeEmbedderFactory(alice);
+  const { finals, events } = await runClip(t, {
+    ms: 1200,
+    device: 'CABLE Input (VB-Audio Virtual Cable)',
+    speakerShadow: true,
+    speakerEmbedderFactory: embedder.factory,
+    speakerLibrary: library,
+    waitFor: 'speaker.shadow',
+  });
+
+  const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
+  assert.equal(shadow.source, 'loopback', 'the echo/video-bleed lane is named');
+  assert.notEqual(shadow.class, 'other', 'the source alone never decides an identity');
+  assert.equal(shadow.class, 'self');
+  assert.equal(shadow.decision, 'match');
+  assert.equal(shadow.reason, 'loopback-match');
+  assert.deepEqual(finals.map((event) => event.final), ['好']);
+  console.log(
+    `[speaker-shadow 10] source=${shadow.source} class=${shadow.class} decision=${shadow.decision} `
+    + `reason=${shadow.reason} final=${finals[0].final}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 11. Stage 2: too small a margin is unsure, never self
+// ---------------------------------------------------------------------------
+
+test('11) 分差不足：class=unknown-identity / decision=unsure（不归 self）', async (t) => {
+  const { library } = await freshLibrary(t);
+  const alice = vector([1, 0, 0, 0]);
+  // A second enrolled voice only ~0.02 rad away: a genuine runner-up for the same clip.
+  const bob = vector([Math.cos(0.02), Math.sin(0.02), 0, 0]);
+  assert.equal(library.register('alice', alice).ok, true);
+  assert.equal(library.register('bob', bob).ok, true);
+
+  const scored = library.match(alice);
+  assert.equal(scored.decision, 'match', 'the threshold verdict alone would say match');
+  assert.ok(scored.margin < 0.05, `best-vs-runner-up margin is below minMargin: ${scored.margin}`);
+
+  const embedder = fakeEmbedderFactory(alice);
+  const { finals, events } = await runClip(t, {
+    ms: 1200,
+    speakerShadow: true,
+    speakerEmbedderFactory: embedder.factory,
+    speakerLibrary: library,
+    waitFor: 'speaker.shadow',
+  });
+
+  const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
+  assert.equal(shadow.decision, 'unsure');
+  assert.equal(shadow.class, 'unknown-identity');
+  assert.equal(shadow.reason, 'low-margin');
+  assert.equal(shadow.speakerId, 'alice', 'the closest candidate is still reported as evidence');
+  assert.deepEqual(finals.map((event) => event.final), ['好']);
+  console.log(
+    `[speaker-shadow 11] margin=${scored.margin} decision=${shadow.decision} class=${shadow.class} `
+    + `reason=${shadow.reason} speakerId=${shadow.speakerId}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 12. Regression
+// ---------------------------------------------------------------------------
+
+test('12) 回归：node --check、hearing-*/vad-*/speaker-voice 套件、smoke', async (t) => {
   t.timeout = 300_000;
 
   await assert.doesNotReject(run(process.execPath, ['--check', join(PROJECT_ROOT, 'src', 'host', 'hearing', 'hearing.js')]));
@@ -414,7 +614,7 @@ test('7) 回归：node --check、hearing-*/vad-*/speaker-voice 套件、smoke', 
   assert.match(smoke.stdout, /SMOKE TEST PASSED/u);
 
   console.log(
-    `[speaker-shadow 7] node --check=ok suites=${suites.length} `
+    `[speaker-shadow 12] node --check=ok suites=${suites.length} `
     + `(hearing-*/vad-*/speaker-voice) smoke=ok`,
   );
 });

@@ -38,7 +38,7 @@ import {
   speakerModelTarget,
   vadModelTarget,
 } from '../platform/modelDownload.js';
-import { createSpeakerEmbedder, createSpeakerLibrary } from './speakerVoice.js';
+import { classifyShadow, createSpeakerEmbedder, createSpeakerLibrary } from './speakerVoice.js';
 import {
   openAudioRetention,
   pcm16FromChunks,
@@ -807,6 +807,23 @@ export function startHearing({
       /* a diagnostic row must never break delivery */
     }
   };
+  /**
+   * Stage-2 context of one utterance: the capture's own duration/energy/VAD numbers, plus the lane.
+   * Nothing is measured a second time here; an unmeasured value stays null and the classifier says
+   * so. The loopback lane is the echo/video-bleed cue — it never turns a row into `other` by itself.
+   */
+  const speakerSource = inputSource === 'loopback' ? 'loopback' : 'mic';
+  const speakerContext = (snapshot) => ({
+    durationMs: snapshot.durationMs,
+    samples: snapshot.speakerSamples,
+    rmsDb: snapshot.rmsDb,
+    peakDb: snapshot.peakDb,
+    // The real (Silero) ratio wins; the energy VAD is the fallback, and null still means "unmeasured".
+    speechRatio: Number.isFinite(snapshot.vadSpeechRatio) ? snapshot.vadSpeechRatio : snapshot.voicedRatio,
+    source: speakerSource,
+  });
+  /** The annotated three-state verdict for one row; the classifier is the one source of truth. */
+  const speakerVerdict = (snapshot, input) => classifyShadow({ ...speakerContext(snapshot), ...input });
   /** Score one utterance against the library. Runs after delivery and never touches its update. */
   const runSpeakerShadow = (snapshot) => {
     if (stopped) return;
@@ -816,23 +833,49 @@ export function startHearing({
       const library = ensureSpeakerLibrary();
       if (library === null) return;
       if (library.list().filter((speaker) => speaker.enabled !== false).length === 0) {
-        emitSpeakerShadow({ decision: 'no-speakers' });
+        const verdict = speakerVerdict(snapshot, {});
+        emitSpeakerShadow({
+          decision: 'no-speakers',
+          class: verdict.class,
+          quality: verdict.quality,
+          source: verdict.source,
+          reason: 'no-speakers',
+        });
         return;
       }
       const embedding = embedder.embed(snapshot.speakerSamples);
       if (!(embedding instanceof Float32Array) || embedding.length === 0) {
-        emitSpeakerShadow({ decision: 'unsure', reason: 'no-embedding', utteranceId: snapshot.utteranceId });
+        const verdict = speakerVerdict(snapshot, {});
+        emitSpeakerShadow({
+          decision: 'unsure',
+          reason: 'no-embedding',
+          class: verdict.class,
+          quality: verdict.quality,
+          source: verdict.source,
+          utteranceId: snapshot.utteranceId,
+        });
         return;
       }
       const startedAt = Date.now();
       const result = library.match(embedding);
       const ms = Math.max(0, Math.round(Date.now() - startedAt));
-      emitSpeakerShadow({
+      const verdict = speakerVerdict(snapshot, {
         decision: result.decision,
+        score: result.score,
+        speakerId: result.speakerId,
+        runnerUpScore: result.runnerUpScore,
+        margin: result.margin,
+      });
+      emitSpeakerShadow({
+        decision: verdict.decision,
         score: result.score,
         speakerId: result.speakerId,
         ms,
         utteranceId: snapshot.utteranceId,
+        class: verdict.class,
+        quality: verdict.quality,
+        source: verdict.source,
+        reason: verdict.reason,
       });
     } catch (error) {
       noteSpeakerDebug('shadow-failed', error);
@@ -843,7 +886,14 @@ export function startHearing({
     if (!speakerShadowOn || stopped) return;
     const samples = snapshot.speakerSamples;
     if (!(samples instanceof Float32Array) || samples.length < SPEAKER_SHADOW_MIN_SAMPLES) {
-      emitSpeakerShadow({ decision: 'unsure', reason: 'too-short' });
+      const verdict = speakerVerdict(snapshot, {});
+      emitSpeakerShadow({
+        decision: 'unsure',
+        reason: 'too-short',
+        class: verdict.class,
+        quality: verdict.quality,
+        source: verdict.source,
+      });
       return;
     }
     setImmediate(() => runSpeakerShadow(snapshot));

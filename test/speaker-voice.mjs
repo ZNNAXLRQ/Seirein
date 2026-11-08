@@ -4,9 +4,10 @@
  * These tests pin the layer's contract, not CAM++'s accuracy (no model, no microphone, no ONNX
  * session and no network is touched here):
  *  1. enroll → matching the same voice scores ~1.0 and decides `match`; one `speaker.shadow` row
- *     carries exactly `{decision, score, speakerId, ms}` and the template is stamped as used;
- *  2. a different voice is `no-match`, a score inside the threshold band is `unsure`, and the
- *     threshold edge is exact (0.60 = match, 0.5999 = unsure, 0.52 = unsure, 0.5199 = no-match);
+ *     carries `{decision, score, speakerId, ms, class, quality, source, reason}` and the template is
+ *     stamped as used;
+ *  2. a different voice is `mismatch`, a score inside the threshold band is `unsure`, and the
+ *     threshold edge is exact (0.60 = match, 0.5999 = unsure, 0.52 = unsure, 0.5199 = mismatch);
  *  3. the pinned model entry (URL / bytes / sha256 / target) is fixed, a missing model yields a
  *     null embedder, and matching without an embedding neither throws nor claims a speaker;
  *  4. a removed `speakerId` is retired forever: registering it again is refused, even after the
@@ -107,7 +108,16 @@ test('1) 注册 → 同向量匹配 score≈1 → decision=match，事件字段�
 
   const rows = ofType(events, 'speaker.shadow').map((event) => event.payload);
   assert.equal(rows.length, 1, 'one row per shadow() call, and match() alone emits nothing');
-  assert.deepEqual(rows[0], { decision: 'match', score: 1, speakerId: 'alice', ms: shadow.ms });
+  assert.deepEqual(rows[0], {
+    decision: 'match',
+    score: 1,
+    speakerId: 'alice',
+    ms: shadow.ms,
+    class: 'self',
+    quality: 'ok',
+    source: 'mic',
+    reason: 'match',
+  });
 
   const stored = library.get('alice');
   assert.equal(stored.activeCount, 1);
@@ -126,13 +136,13 @@ test('1) 注册 → 同向量匹配 score≈1 → decision=match，事件字段�
   );
 });
 
-test('2) 不同向量 → no-match；阈值带内 → unsure；阈值边界精确', async (t) => {
+test('2) 不同向量 → mismatch；阈值带内 → unsure；阈值边界精确', async (t) => {
   const { library } = await fresh(t);
   library.register('alice', vector([1, 0, 0, 0]));
 
   // Orthogonal voice: cosine 0, clearly below the band.
   const different = library.match(vector([0, 1, 0, 0]));
-  assert.equal(different.decision, 'no-match');
+  assert.equal(different.decision, 'mismatch');
   assert.equal(different.score, 0);
   assert.equal(different.speakerId, 'alice', 'the best candidate is still reported as evidence');
 
@@ -145,9 +155,9 @@ test('2) 不同向量 → no-match；阈值带内 → unsure；阈值边界精�
 
   // The threshold band is configurable, and moving it moves the verdict, not the score.
   assert.equal(library.match(cosine036, { threshold: 0.35 }).decision, 'match');
-  assert.equal(library.match(cosine036, { threshold: 0.4, unsureMargin: 0.02 }).decision, 'no-match');
+  assert.equal(library.match(cosine036, { threshold: 0.4, unsureMargin: 0.02 }).decision, 'mismatch');
 
-  // Exact edges of the default band: match >= T, unsure in [T-M, T), no-match < T-M.
+  // Exact edges of the default band: match >= T, unsure in [T-M, T), mismatch < T-M.
   const { threshold, unsureMargin } = SPEAKER_MATCH_DEFAULTS;
   const lowerEdge = threshold - unsureMargin;
   assert.equal(threshold, 0.4, 'the upstream example default, kept as the documented starting point');
@@ -155,7 +165,7 @@ test('2) 不同向量 → no-match；阈值带内 → unsure；阈值边界精�
   assert.equal(classifyScore(threshold), 'match');
   assert.equal(classifyScore(threshold - 1e-6), 'unsure');
   assert.equal(classifyScore(lowerEdge), 'unsure', 'the lower edge belongs to unsure');
-  assert.equal(classifyScore(lowerEdge - 1e-6), 'no-match');
+  assert.equal(classifyScore(lowerEdge - 1e-6), 'mismatch');
   assert.equal(classifyScore(Number.NaN), 'unsure', 'an unmeasured score claims nothing');
 
   console.log(
@@ -236,7 +246,9 @@ test('3) 模型条目固定；模型缺失 → embedder=null、match/shadow 不�
 
   // No embedding means "unsure", not "not them": the shadow refuses to guess and never throws.
   const result = library.match(null);
-  assert.deepEqual(result, { decision: 'unsure', speakerId: null, score: 0 });
+  assert.deepEqual(result, {
+    decision: 'unsure', speakerId: null, score: 0, runnerUpScore: null, margin: null,
+  });
   assert.doesNotThrow(() => library.shadow(null));
   assert.equal(library.shadow(null).decision, 'unsure');
 

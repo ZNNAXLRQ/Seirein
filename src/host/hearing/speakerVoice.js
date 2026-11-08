@@ -1,11 +1,19 @@
 /**
- * Speaker-voice shadow — core layer (match only; it never touches delivery).
+ * Speaker-voice shadow — core layer (observation only; it never touches delivery).
  *
  * The assistant already knows "someone spoke"; this layer answers the weaker question "does this
  * utterance sound like a voice we have enrolled before?" using sherpa-onnx's pretrained speaker
  * embedding model. Nothing here filters, reorders, drops or reroutes a transcript: `match()` only
- * scores, `shadow()` only records, and a `no-match`/`unsure` is evidence, never a verdict on the
+ * scores, `shadow()` only records, and a `mismatch`/`unsure` is evidence, never a verdict on the
  * turn. The host wiring (hearing → speaker.shadow) is deliberately NOT part of this layer yet.
+ *
+ * Stage 2 classification (shadow only): one row now also says WHAT kind of utterance produced the
+ * verdict — `class` (self / other / unknown-identity), `quality` (ok / short / quiet / noisy) and
+ * `source` (mic / loopback, i.e. echo or video bleed is a cue, not a verdict). The three-state
+ * `decision` stays match / mismatch / unsure, and anything uncertain (a short or quiet clip, a low
+ * score, or a best-vs-runner-up margin below `minMargin`) is `unsure` and `unknown-identity`.
+ * Classification NEVER feeds a rejection, a mute, an interruption or a memory attribution, and it
+ * never retroactively claims an earlier transcript: it only annotates the row it already owns.
  *
  * What is stored: one L2-normalized template vector per speaker plus bookkeeping (label, created
  * time, last match time, enrollment count, enabled flag). Raw audio is never written — the caller
@@ -27,6 +35,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { nowIso, resolveRoot } from '../memory/store.js';
+import { SPEAKER_SHADOW_MIN_MS } from './audio-evidence.js';
 
 const require = createRequire(import.meta.url);
 
@@ -42,13 +51,39 @@ export const SPEAKER_SAMPLE_RATE = 16000;
  * this machine, this microphone or this room — no real-device verification has been done — so it is
  * an empirical starting point and must stay configurable. `unsureMargin` is this layer's own
  * conservative band: a score inside `[threshold - unsureMargin, threshold)` is reported as `unsure`
- * instead of a false `no-match`, so the shadow can show its uncertainty. Both are empirical; nothing
- * below treats them as calibrated.
+ * instead of a false `mismatch`, so the shadow can show its uncertainty. `minMargin` is the second
+ * half of the stage-2 guard: when the best template and the runner-up are closer than this, the
+ * utterance is ambiguous between two enrolled voices and the row must say `unsure` rather than pick
+ * one. All three are empirical; nothing below treats them as calibrated.
  */
 export const SPEAKER_MATCH_DEFAULTS = Object.freeze({
   threshold: 0.4,
   unsureMargin: 0.08,
+  minMargin: 0.05,
 });
+
+/**
+ * Stage-2 quality defaults (shadow only; the row reports them, nothing gates on them).
+ *
+ * The measurement is deliberately the one the capture already made — duration, utterance RMS, peak
+ * and a speech ratio — never a second analysis of the clip:
+ *  - `minSpeechMs`: below the same 600 ms floor the shadow refuses to embed (`too-short`);
+ *  - `quietRmsDb` / `quietPeakDb`: a clip at or below either level is too soft for a stable
+ *    embedding (the capture gate itself starts at -50 dBFS, so this is the "audible but soft" edge);
+ *  - `noisySpeechRatio`: below this share of the window being speech, noise/other audio dominates.
+ * The numbers are an empirical starting point, like the match thresholds above.
+ */
+export const SPEAKER_QUALITY_DEFAULTS = Object.freeze({
+  minSpeechMs: SPEAKER_SHADOW_MIN_MS,
+  quietRmsDb: -42,
+  quietPeakDb: -28,
+  noisySpeechRatio: 0.35,
+});
+
+/** The closed stage-2 vocabulary; a row never invents a fourth value for these. */
+export const SPEAKER_SHADOW_CLASSES = Object.freeze(['self', 'other', 'unknown-identity']);
+export const SPEAKER_SHADOW_QUALITIES = Object.freeze(['ok', 'short', 'quiet', 'noisy']);
+export const SPEAKER_SHADOW_SOURCES = Object.freeze(['mic', 'loopback']);
 
 /**
  * Identity window default: 4 s, inside the 3–5 s the short-answer rule expects. A window is a
@@ -109,13 +144,26 @@ export function cosineSimilarity(left, right) {
   return Number.isFinite(score) ? Math.max(-1, Math.min(1, score)) : 0;
 }
 
-/** Resolve `{threshold, unsureMargin}` with the documented defaults; a bad value falls back. */
-export function resolveMatchOptions({ threshold, unsureMargin } = {}) {
+/** Resolve `{threshold, unsureMargin, minMargin}` with the documented defaults; a bad value falls back. */
+export function resolveMatchOptions({ threshold, unsureMargin, minMargin } = {}) {
   const floor = Number(threshold);
   const margin = Number(unsureMargin);
+  const separation = Number(minMargin);
   return {
     threshold: Number.isFinite(floor) ? floor : SPEAKER_MATCH_DEFAULTS.threshold,
     unsureMargin: Number.isFinite(margin) && margin >= 0 ? margin : SPEAKER_MATCH_DEFAULTS.unsureMargin,
+    minMargin: Number.isFinite(separation) && separation >= 0 ? separation : SPEAKER_MATCH_DEFAULTS.minMargin,
+  };
+}
+
+/** Resolve the quality defaults; a bad/partial object falls back per field (null never means 0). */
+export function resolveQualityOptions(options = {}) {
+  const pick = (value, fallback) => (finiteOrNull(value) ?? fallback);
+  return {
+    minSpeechMs: pick(options.minSpeechMs, SPEAKER_QUALITY_DEFAULTS.minSpeechMs),
+    quietRmsDb: pick(options.quietRmsDb, SPEAKER_QUALITY_DEFAULTS.quietRmsDb),
+    quietPeakDb: pick(options.quietPeakDb, SPEAKER_QUALITY_DEFAULTS.quietPeakDb),
+    noisySpeechRatio: pick(options.noisySpeechRatio, SPEAKER_QUALITY_DEFAULTS.noisySpeechRatio),
   };
 }
 
@@ -123,7 +171,7 @@ export function resolveMatchOptions({ threshold, unsureMargin } = {}) {
  * Map one score onto a decision. Pure and exported so the threshold edge is testable exactly:
  *   score >= threshold            → 'match'
  *   threshold - margin <= score   → 'unsure'   (inclusive lower edge)
- *   score < threshold - margin    → 'no-match'
+ *   score < threshold - margin    → 'mismatch'
  * A non-finite score is 'unsure' (nothing was measured, so nothing is claimed).
  */
 export function classifyScore(score, options = {}) {
@@ -131,7 +179,134 @@ export function classifyScore(score, options = {}) {
   if (!Number.isFinite(value)) return 'unsure';
   const { threshold, unsureMargin } = resolveMatchOptions(options);
   if (value >= threshold) return 'match';
-  return value < threshold - unsureMargin ? 'no-match' : 'unsure';
+  return value < threshold - unsureMargin ? 'mismatch' : 'unsure';
+}
+
+/** A finite number, or null: `null`/`undefined`/''/NaN never collapse to 0 dB or 0 ratio. */
+const finiteOrNull = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+};
+
+/** Round a level for a row: one decimal is enough evidence and stays readable. */
+const roundDb = (value) => Math.round(value * 10) / 10;
+
+/**
+ * RMS and peak of one utterance's own PCM, in dBFS (0 dBFS = full scale). Null when there is no
+ * audio; a silent buffer still reports -100 dB rather than "not measured". The caller usually hands
+ * over the capture's own numbers instead — this is for callers that only have samples.
+ *
+ * @param {Float32Array|null} samples
+ * @returns {{rmsDb: number, peakDb: number}|null}
+ */
+export function measureLevels(samples) {
+  if (!(samples instanceof Float32Array) || samples.length === 0) return null;
+  let sum = 0;
+  let peak = 0;
+  let counted = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    const value = samples[index];
+    if (!Number.isFinite(value)) continue;
+    sum += value * value;
+    peak = Math.max(peak, Math.abs(value));
+    counted += 1;
+  }
+  if (counted === 0) return null;
+  return {
+    rmsDb: sum > 0 ? roundDb(20 * Math.log10(Math.sqrt(sum / counted))) : -100,
+    peakDb: peak > 0 ? roundDb(20 * Math.log10(peak)) : -100,
+  };
+}
+
+/**
+ * Stage-2 quality of one utterance: `ok` / `short` / `quiet` / `noisy`.
+ *
+ * Purely descriptive; nothing downstream gates on it. Order matters: a clip too short to embed is
+ * `short` even when it is also quiet, and a soft clip is `quiet` even when noise is present, so the
+ * row names the first reason that makes the embedding unreliable. A missing duration and missing
+ * audio mean "not measured", reported as `ok` with null evidence — the classifier never invents a
+ * too-short clip from absent context.
+ *
+ * @param {{durationMs?: number, samples?: Float32Array|null, rmsDb?: number|null,
+ *          peakDb?: number|null, speechRatio?: number|null}} [input]
+ * @param {object} [options] overrides of SPEAKER_QUALITY_DEFAULTS
+ * @returns {{quality: 'ok'|'short'|'quiet'|'noisy', reason: string|null,
+ *            durationMs: number|null, rmsDb: number|null, peakDb: number|null,
+ *            speechRatio: number|null}}
+ */
+export function classifyQuality(input = {}, options = {}) {
+  const settings = resolveQualityOptions(options);
+  const samples = input.samples instanceof Float32Array && input.samples.length > 0 ? input.samples : null;
+  const measured = measureLevels(samples);
+  const explicitMs = finiteOrNull(input.durationMs);
+  const durationMs = explicitMs !== null && explicitMs > 0
+    ? explicitMs
+    : (samples === null ? null : (samples.length / SPEAKER_SAMPLE_RATE) * 1000);
+  const rmsDb = finiteOrNull(input.rmsDb) ?? (measured === null ? null : measured.rmsDb);
+  const peakDb = finiteOrNull(input.peakDb) ?? (measured === null ? null : measured.peakDb);
+  const speechRatio = finiteOrNull(input.speechRatio);
+  const evidence = {
+    durationMs: durationMs === null ? null : Math.round(durationMs),
+    rmsDb,
+    peakDb,
+    speechRatio,
+  };
+  if (durationMs !== null && durationMs < settings.minSpeechMs) {
+    return { quality: 'short', reason: 'too-short', ...evidence };
+  }
+  if ((rmsDb !== null && rmsDb <= settings.quietRmsDb) || (peakDb !== null && peakDb <= settings.quietPeakDb)) {
+    return { quality: 'quiet', reason: 'quiet', ...evidence };
+  }
+  if (speechRatio !== null && speechRatio < settings.noisySpeechRatio) {
+    return { quality: 'noisy', reason: 'noisy', ...evidence };
+  }
+  return { quality: 'ok', reason: null, ...evidence };
+}
+
+/**
+ * The stage-2 identity class of one row: `self` / `other` / `unknown-identity`.
+ *
+ * The three-state `decision` is preserved (match / mismatch / unsure) and this function is where an
+ * otherwise-positive score is downgraded: a non-`ok` quality, no usable score, or a best-vs-runner-up
+ * margin below `minMargin` all become `unknown-identity` + `unsure`. `loopback` only annotates the
+ * source — it never forces `other` — because the same lane can carry the user's own voice.
+ *
+ * @param {{decision?: string, score?: number, speakerId?: string|null, margin?: number|null,
+ *          runnerUpScore?: number|null, source?: string, durationMs?: number,
+ *          samples?: Float32Array|null, rmsDb?: number|null, peakDb?: number|null,
+ *          speechRatio?: number|null}} [input]
+ * @param {object} [options] threshold / margin overrides
+ * @returns {{class: 'self'|'other'|'unknown-identity', decision: 'match'|'mismatch'|'unsure',
+ *            quality: 'ok'|'short'|'quiet'|'noisy', source: 'mic'|'loopback', reason: string}}
+ */
+export function classifyShadow(input = {}, options = {}) {
+  const settings = resolveMatchOptions(options);
+  const quality = classifyQuality(input, options);
+  const source = input.source === 'loopback' ? 'loopback' : 'mic';
+  const base = { quality: quality.quality, source };
+  const unsure = (reason) => ({ class: 'unknown-identity', decision: 'unsure', reason, ...base });
+  if (quality.quality !== 'ok') return unsure(quality.reason);
+  const score = finiteOrNull(input.score);
+  const speakerId = normalizeSpeakerId(input.speakerId);
+  if (score === null || speakerId === '') return unsure('no-score');
+  const margin = finiteOrNull(input.margin)
+    ?? (finiteOrNull(input.runnerUpScore) === null
+      ? null
+      : roundScore(score - finiteOrNull(input.runnerUpScore)));
+  if (margin !== null && margin < settings.minMargin) return unsure('low-margin');
+  if (input.decision === 'match') {
+    return { class: 'self', decision: 'match', reason: source === 'loopback' ? 'loopback-match' : 'match', ...base };
+  }
+  if (input.decision === 'mismatch' || input.decision === 'no-match') {
+    return {
+      class: 'other',
+      decision: 'mismatch',
+      reason: source === 'loopback' ? 'loopback-mismatch' : 'mismatch',
+      ...base,
+    };
+  }
+  return unsure('low-score');
 }
 
 /** Round a score for events: four decimals is enough evidence and stays readable. */
@@ -457,56 +632,104 @@ export class SpeakerLibrary {
    * Pure scoring: no event, no bookkeeping. `speakerId` is the best-scoring candidate whenever any
    * comparison happened (null when nothing could be scored) and is NOT an attribution by itself —
    * `decision` is. A missing/degenerate embedding, an empty library or a dimension mismatch all
-   * yield `{decision:'unsure', score:0, speakerId:null}` rather than a throw.
+   * yield `{decision:'unsure', score:0, speakerId:null}` rather than a throw. `runnerUpScore` /
+   * `margin` are the second-best candidate and the best-vs-second gap (null when only one template
+   * could be compared): the shadow uses them to refuse a winner that is too close to a rival.
    *
    * @param {Float32Array|null} embedding
-   * @param {{threshold?: number, unsureMargin?: number}} [options]
-   * @returns {{decision: 'match'|'no-match'|'unsure', speakerId: string|null, score: number}}
+   * @param {{threshold?: number, unsureMargin?: number, minMargin?: number}} [options]
+   * @returns {{decision: 'match'|'mismatch'|'unsure', speakerId: string|null, score: number,
+   *            runnerUpScore: number|null, margin: number|null}}
    */
   match(embedding, options = {}) {
     const settings = resolveMatchOptions(options);
+    const empty = { decision: 'unsure', speakerId: null, score: 0, runnerUpScore: null, margin: null };
     const query = embedding instanceof Float32Array ? embedding : null;
-    if (query === null || query.length === 0) {
-      return { decision: 'unsure', speakerId: null, score: 0 };
-    }
+    if (query === null || query.length === 0) return empty;
     const rows = this.open()
       .prepare('SELECT speaker_id, embedding FROM speaker_template WHERE enabled = 1')
       .all();
-    if (rows.length === 0) return { decision: 'unsure', speakerId: null, score: 0 };
+    if (rows.length === 0) return empty;
     let best = null;
+    let runnerUp = null;
     for (const row of rows) {
       const template = decodeVector(row.embedding);
       if (template === null || template.length !== query.length) continue;
       const score = cosineSimilarity(query, template);
-      if (best === null || score > best.score) best = { speakerId: row.speaker_id, score };
+      if (best === null || score > best.score) {
+        runnerUp = best;
+        best = { speakerId: row.speaker_id, score };
+      } else if (runnerUp === null || score > runnerUp.score) {
+        runnerUp = { speakerId: row.speaker_id, score };
+      }
     }
-    if (best === null) return { decision: 'unsure', speakerId: null, score: 0 };
+    if (best === null) return empty;
     const score = roundScore(best.score);
-    return { decision: classifyScore(score, settings), speakerId: best.speakerId, score };
+    const runnerUpScore = runnerUp === null ? null : roundScore(runnerUp.score);
+    return {
+      decision: classifyScore(score, settings),
+      speakerId: best.speakerId,
+      score,
+      runnerUpScore,
+      margin: runnerUpScore === null ? null : roundScore(score - runnerUpScore),
+    };
   }
 
   /**
-   * The shadow: score, record, emit. Never gates anything.
+   * The shadow: score, classify, record, emit. Never gates anything.
    *
-   * On a `match` the template's `lastMatchedAt` is stamped (a match is the only thing that counts
-   * as use). Then one `speaker.shadow {decision, score, speakerId, ms}` row is emitted. The return
-   * value adds the measured `ms` to `match()`'s result.
+   * On a `self` row the template's `lastMatchedAt` is stamped (a use is only a confident match).
+   * One `speaker.shadow` row is emitted with the legacy fields (`decision/score/speakerId/ms`) plus
+   * the stage-2 annotation (`class/quality/source/reason`); quality/source context is passed in
+   * `options` and defaults to "not measured" / `mic`. The return value adds the annotated verdict
+   * and the measured `ms` to `match()`'s result.
+   *
+   * @param {Float32Array|null} embedding
+   * @param {{threshold?: number, unsureMargin?: number, minMargin?: number, durationMs?: number,
+   *          samples?: Float32Array|null, rmsDb?: number|null, peakDb?: number|null,
+   *          speechRatio?: number|null, source?: 'mic'|'loopback'}} [options]
    */
   shadow(embedding, options = {}) {
     const startedAt = this.now();
     const result = this.match(embedding, options);
+    const verdict = classifyShadow({
+      decision: result.decision,
+      score: result.score,
+      speakerId: result.speakerId,
+      margin: result.margin,
+      runnerUpScore: result.runnerUpScore,
+      durationMs: options.durationMs,
+      samples: options.samples,
+      rmsDb: options.rmsDb,
+      peakDb: options.peakDb,
+      speechRatio: options.speechRatio,
+      source: options.source,
+    }, options);
     const ms = Math.max(0, Math.round(this.now() - startedAt));
-    if (result.decision === 'match' && result.speakerId !== null) {
+    if (verdict.class === 'self' && result.speakerId !== null) {
       this.open().prepare('UPDATE speaker_template SET last_matched_at = ? WHERE speaker_id = ?')
         .run(nowIso(), result.speakerId);
     }
     this.emit('speaker.shadow', {
-      decision: result.decision,
+      decision: verdict.decision,
       score: result.score,
       speakerId: result.speakerId,
       ms,
+      class: verdict.class,
+      quality: verdict.quality,
+      source: verdict.source,
+      reason: verdict.reason,
     });
-    return { ...result, ms };
+    return {
+      decision: verdict.decision,
+      speakerId: result.speakerId,
+      score: result.score,
+      class: verdict.class,
+      quality: verdict.quality,
+      source: verdict.source,
+      reason: verdict.reason,
+      ms,
+    };
   }
 }
 
