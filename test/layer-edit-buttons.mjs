@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 import { createLayerEditController } from '../src/host/index.js';
 import { createAvatarSettingsActions } from '../src/host/avatar/settings-actions.js';
 
@@ -52,21 +51,52 @@ for (const backend of ['wpf', 'spout']) {
 
 for (const editing of [false, true]) {
   test(`settings button derives edit=${editing} from the backend, not stale AvatarLayer state`, async () => {
-    const marker = client.indexOf('const backendLayer = status.layer ?? {}');
-    const start = client.lastIndexOf('(() => {', marker);
-    const end = client.indexOf('})(),', marker) + 4;
+    const from = client.indexOf('    function layerSettingsBody(h, state, handlers) {');
+    const to = client.indexOf('    function Panel() {', from);
+    assert.ok(from > 0 && to > from, 'the shipped layerSettingsBody is found in client.js');
+    const layerSettingsBody = new Function(
+      'styles', 'line', 'MUTED', 'BORDER',
+      `${client.slice(from, to)}\nreturn layerSettingsBody;`,
+    )(new Proxy({}, { get: () => ({}) }), () => null, '#6b7280', '#d8dce3');
+
     const actions = [];
-    const tree = vm.runInNewContext(client.slice(start, end), {
-      status: {layer:{backend:'spout', running:!editing, editMode:editing}, avatarLayer:{adjusting:!editing}},
-      h: (tag, props, ...children) => ({tag, props, children}),
-      line: () => null, styles:{}, busy:'', act: async body => actions.push(body),
+    const h = (tag, props, ...children) => ({ tag, props: props ?? {}, children });
+    const tree = layerSettingsBody(h, {
+      layer: { backend: 'spout', running: !editing, editMode: editing },
+      spout: {},
+      transparent: {},
+      draft: { left: 1600, top: 300, width: 420, height: 760 },
+      busy: '',
+      // Contradicts layer.editMode on purpose: the button must follow the backend.
+      avatarGeometry: { width: 420, height: 760, left: 1600, top: 300 },
+    }, {
+      switchBackend: () => {},
+      setField: () => {},
+      setSpoutDraft: () => {},
+      pickSpout: () => {},
+      saveSpoutPath: () => {},
+      probeSpout: () => {},
+      startSpout: () => {},
+      stopSpout: () => {},
+      startWpf: () => {},
+      stopWpf: () => {},
+      toggleEditMode: () => actions.push({ action: editing ? 'layer.edit.exit' : 'layer.edit.enter' }),
     });
+
     const nodes = [];
-    const visit = node => { if (!node || typeof node !== 'object') return; nodes.push(node); for (const child of node.children ?? []) visit(child); };
+    const visit = (node) => {
+      if (!node || typeof node !== 'object') return;
+      nodes.push(node);
+      for (const child of node.children ?? []) visit(child);
+    };
     visit(tree);
-    const button = nodes.find(node => node.tag === 'button');
+    const button = nodes.find((node) => node.tag === 'button');
     assert.equal(button.children[0], editing ? '完成编辑' : '编辑模式');
     await button.props.onClick();
     assert.equal(actions[0].action, editing ? 'layer.edit.exit' : 'layer.edit.enter');
+
+    // The shipped handler (in the transparent-layer IIFE) derives the direction from layer.editMode.
+    assert.match(client, /action: lay\.editMode === true \? 'layer\.edit\.exit' : 'layer\.edit\.enter'/u,
+      'the toggle sends layer.edit.exit while editing, layer.edit.enter otherwise');
   });
 }
