@@ -12,7 +12,10 @@
  *  4. `deleteOne` / `deleteAll` really remove the audio; a file deleted outside the store stays
  *     listed as `missing`; `exportPath` returns a path (never audio through an event);
  *  5. the privacy lock refuses the write (no file, no entry, no row);
- *  6. startup cleanup drops expired clips and is idempotent;
+ *  6. expiry is a throttled lazy pass, not a one-shot: a clip older than `maxAgeMs` is deleted (and
+ *     its `.wav` removed, plus one pruned row) on the next `retain()` / `list()` / `exportPath()`
+ *     once `cleanupIntervalMs` has passed, and not before; a restart (a new store on the same root)
+ *     cleans on its first read, and `cleanupOnce()` is repeatable but throttled;
  *  7. the settings actions: the switch persists and follows live, `list` has no audio bytes,
  *     `delete` takes `{id}` or `{all}`, `export` returns the file path.
  *
@@ -34,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_RETENTION_LIMITS,
+  RETENTION_CLEANUP_INTERVAL_MS,
   RETENTION_SAMPLE_RATE,
   createAudioRetention,
   encodeWav16,
@@ -195,6 +199,25 @@ async function tempDir(t) {
     await rm(dir, { recursive: true, force: true });
   });
   return dir;
+}
+
+/**
+ * A store on an injected fake clock: `advance(ms)` moves time forward with no real waiting, so the
+ * lazy-expiry interval is exercised deterministically. Returns the store, its emitted rows and a
+ * clock handle the test reads as `clock.now`.
+ */
+function fakeStore(dir, { start = 1_000_000, limits = {}, cleanupIntervalMs = 30 * 1000 } = {}) {
+  const clock = { now: start };
+  const events = [];
+  const store = createAudioRetention({
+    dir,
+    enabled: true,
+    now: () => clock.now,
+    cleanupIntervalMs,
+    limits,
+    emit: (type, payload) => events.push({ type, payload }),
+  });
+  return { store, clock, events, advance: (ms) => { clock.now += ms; } };
 }
 
 test('1) 默认关闭：关闭时不写任何音频、索引或事件', async (t) => {
@@ -384,7 +407,7 @@ test('5) 隐私期间不写：写入即拒绝，且不在会话层产生事件',
   hearing.stop();
 });
 
-test('6) 启动清理：过期片段被删除，cleanupOnce 幂等', async (t) => {
+test('6) 启动清理：过期片段被删除，cleanupOnce 在节流窗口内幂等', async (t) => {
   const dir = await tempDir(t);
   const oldAt = Date.now() - 10 * 60 * 60 * 1000;
   const old = createAudioRetention({
@@ -407,7 +430,7 @@ test('6) 启动清理：过期片段被删除，cleanupOnce 幂等', async (t) =
   assert.equal(existsSync(one.path), false);
   assert.equal(existsSync(two.path), false);
   const again = await fresh.cleanupOnce();
-  assert.equal(again.skipped, true, 'startup cleanup runs once per store');
+  assert.equal(again.skipped, true, 'inside the throttle window: a cheap skipped answer');
 
   // A fresh clip survives a boot cleanup, and the defaults are the documented caps.
   const currentDir = await tempDir(t);
@@ -421,6 +444,150 @@ test('6) 启动清理：过期片段被删除，cleanupOnce 幂等', async (t) =
   assert.equal(DEFAULT_RETENTION_LIMITS.maxDurationMs, 300000);
   assert.equal(DEFAULT_RETENTION_LIMITS.maxBytes, 50 * 1024 * 1024);
   assert.equal(existsSync(kept.path), true);
+});
+
+test('9) 惰性清理：超过 maxAgeMs 后 list() 删除条目、文件并写 pruned 事件', async (t) => {
+  const dir = await tempDir(t);
+  const { store, events, advance } = fakeStore(dir, { limits: { maxAgeMs: 60 * 1000 } });
+  const kept = await store.retain({ utteranceId: 1, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+  assert.equal(kept.ok, true);
+  assert.equal(existsSync(kept.path), true);
+  assert.equal((await store.list()).count, 1, 'fresh: listed');
+
+  advance(61 * 1000);
+  const listed = await store.list();
+  assert.equal(listed.count, 0, 'an expired clip is not listed');
+  assert.deepEqual(listed.items, []);
+  assert.equal(listed.missing, 0);
+  assert.equal(existsSync(kept.path), false, 'the expired .wav is deleted');
+  const pruned = ofType(events, 'hearing.audio.pruned');
+  assert.equal(pruned.length, 1, 'one prune row for the lazy pass');
+  assert.equal(pruned[0].payload.level, 'debug');
+  assert.equal(pruned[0].payload.count, 1);
+  const raw = JSON.parse(await readFile(join(dir, 'index.json'), 'utf8'));
+  assert.deepEqual(raw.items, [], 'the index on disk was saved without it');
+  console.log(`[retention-lazy 9] listAfterExpiry count=${listed.count} fileExists=${existsSync(kept.path)} `
+    + `pruned=${pruned.length} count=${pruned[0].payload.count}`);
+});
+
+test('10) 惰性清理：超过 maxAgeMs 后 exportPath() 先清理并返回 NOT_FOUND', async (t) => {
+  const dir = await tempDir(t);
+  const { store, events, advance } = fakeStore(dir, { limits: { maxAgeMs: 60 * 1000 } });
+  const kept = await store.retain({ utteranceId: 2, samples: pcm(100), reason: 'echo' });
+  await store.flush();
+  const fresh = await store.exportPath(kept.id);
+  assert.equal(fresh.ok, true, 'playable while fresh');
+  assert.equal(fresh.path, kept.path);
+
+  advance(2 * 60 * 1000);
+  const exported = await store.exportPath(kept.id);
+  assert.equal(exported.ok, false);
+  assert.equal(exported.code, 'NOT_FOUND', 'an expired clip is gone, not merely MISSING');
+  assert.equal(existsSync(kept.path), false, 'the cleanup ran before the lookup');
+  const pruned = ofType(events, 'hearing.audio.pruned');
+  assert.equal(pruned.at(-1).payload.count, 1);
+  assert.equal((await store.list()).count, 0);
+  console.log(`[retention-lazy 10] exportFresh=${fresh.ok} exportExpired=${exported.code} `
+    + `fileExists=${existsSync(kept.path)} pruned=${pruned.at(-1).payload.count}`);
+});
+
+test('11) 惰性清理：写入触发清理，按 cleanupIntervalMs 节流（窗口内不重复，窗口外再清）', async (t) => {
+  const dir = await tempDir(t);
+  const { store, events, advance } = fakeStore(dir, {
+    limits: { maxAgeMs: 60 * 1000 },
+    cleanupIntervalMs: 30 * 1000,
+  });
+  const first = await store.retain({ utteranceId: 1, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+
+  // t+40 s: the window is open again, but clip 1 (40 s) is not old enough to expire.
+  advance(40 * 1000);
+  await store.retain({ utteranceId: 2, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+  assert.equal(existsSync(first.path), true);
+  assert.equal(ofType(events, 'hearing.audio.pruned').length, 0);
+
+  // t+60 s: clip 1 is now past maxAgeMs, but only 20 s since the last pass ⇒ no cleanup at all.
+  advance(20 * 1000);
+  await store.retain({ utteranceId: 3, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+  assert.equal(ofType(events, 'hearing.audio.pruned').length, 0, 'inside the window: no second pass');
+  assert.equal(existsSync(first.path), true, 'expired by age, still here until the window opens');
+  assert.equal((await store.list()).count, 3, 'list() is inside the same window, so it does not clean');
+
+  // t+80 s: 40 s since the last pass ⇒ the write expires clip 1 and nothing else.
+  advance(20 * 1000);
+  await store.retain({ utteranceId: 4, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+  const pruned = ofType(events, 'hearing.audio.pruned');
+  assert.equal(pruned.length, 1, 'exactly one lazy pass went out');
+  assert.equal(pruned[0].payload.count, 1, 'only the expired clip went');
+  assert.equal(existsSync(first.path), false);
+  const listed = await store.list();
+  assert.deepEqual(listed.items.map((item) => item.utteranceId), [2, 3, 4]);
+  console.log(`[retention-lazy 11] inWindowPruned=0 outOfWindowPruned=${pruned[0].payload.count} `
+    + `kept=${JSON.stringify(listed.items.map((item) => item.utteranceId))}`);
+});
+
+test('12) 重启采集：同一 root 的新 store 首次 list 即清掉旧过期条目；cleanupOnce 可重复但受节流', async (t) => {
+  const dir = await tempDir(t);
+  const first = fakeStore(dir, { limits: { maxAgeMs: 60 * 1000 } });
+  const one = await first.store.retain({ utteranceId: 1, samples: pcm(100), reason: 'noise' });
+  const two = await first.store.retain({ utteranceId: 2, samples: pcm(100), reason: 'noise' });
+  await first.store.flush();
+  assert.equal((await first.store.list()).count, 2);
+
+  // A new hearing session opens a new store on the same root, two hours later. There is no capture
+  // hook and no cleanupOnce() call: the first read must be the cleanup.
+  const restarted = fakeStore(dir, {
+    start: first.clock.now + 2 * 60 * 60 * 1000,
+    limits: { maxAgeMs: 60 * 1000 },
+  });
+  const listed = await restarted.store.list();
+  assert.equal(listed.count, 0);
+  assert.equal(existsSync(one.path), false);
+  assert.equal(existsSync(two.path), false);
+  assert.equal(ofType(restarted.events, 'hearing.audio.pruned')[0].payload.count, 2);
+
+  // cleanupOnce() is no longer a one-shot flag: throttled inside the window, real once it opens.
+  const kept = await restarted.store.retain({ utteranceId: 3, samples: pcm(100), reason: 'noise' });
+  await restarted.store.flush();
+  assert.equal((await restarted.store.cleanupOnce()).skipped, true, 'inside the window');
+  assert.equal(existsSync(kept.path), true);
+  restarted.advance(61 * 1000);
+  const forced = await restarted.store.cleanupOnce();
+  assert.equal(forced.skipped, undefined, 'the window is open: it really cleans');
+  assert.equal(forced.removed, 1);
+  assert.equal(existsSync(kept.path), false);
+  assert.equal((await restarted.store.list()).count, 0);
+  console.log(`[retention-lazy 12] restartList=0 restartPruned=${ofType(restarted.events, 'hearing.audio.pruned')[0].payload.count} `
+    + `firstCleanupSkipped=true secondCleanupRemoved=${forced.removed}`);
+});
+
+test('13) 未过期条目不受惰性清理影响', async (t) => {
+  const dir = await tempDir(t);
+  const { store, events, advance } = fakeStore(dir, {
+    limits: { maxAgeMs: 60 * 1000 },
+    cleanupIntervalMs: 10 * 1000,
+  });
+  const old = await store.retain({ utteranceId: 1, samples: pcm(100), reason: 'noise' });
+  await store.flush();
+  advance(50 * 1000); // past the throttle window, still inside maxAgeMs
+  const fresh = await store.retain({ utteranceId: 2, samples: pcm(100), reason: 'echo' });
+  await store.flush();
+  assert.equal(ofType(events, 'hearing.audio.pruned').length, 0, 'nothing expired ⇒ nothing pruned');
+
+  const listed = await store.list();
+  assert.equal(listed.count, 2);
+  assert.deepEqual(listed.items.map((item) => item.utteranceId), [1, 2]);
+  assert.equal(listed.missing, 0);
+  assert.equal(existsSync(old.path), true);
+  assert.equal(existsSync(fresh.path), true);
+  assert.equal((await store.exportPath(fresh.id)).ok, true);
+  assert.equal(RETENTION_CLEANUP_INTERVAL_MS, 30 * 1000, 'the default lazy interval is 30 s');
+  console.log(`[retention-lazy 13] count=${listed.count} pruned=${ofType(events, 'hearing.audio.pruned').length} `
+    + `defaultIntervalMs=${RETENTION_CLEANUP_INTERVAL_MS}`);
 });
 
 test('7) 设置动作：开关持久化并即时生效，list 不含音频，delete/export 可用', async (t) => {

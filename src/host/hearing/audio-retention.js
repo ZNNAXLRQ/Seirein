@@ -12,7 +12,10 @@
  *  - the index is the source of truth (time / utteranceId / rms / vad / text / reason / bytes) and is
  *    validated on every read: a deleted `.wav` is reported as `missing`, never silently dropped;
  *  - `maxClips` / `maxDurationMs` / `maxBytes` bound the store, oldest-first (FIFO); `maxAgeMs`
- *    expires clips and is applied by `cleanup()` (called at startup and lazily at capture start);
+ *    expires clips. Expiry is *lazy*: `retain()` (after a successful write), `list()` and
+ *    `exportPath()` each run one expired+FIFO pass, throttled by `cleanupIntervalMs` (30 s), so a
+ *    long-running store expires on its own and a restart (a new store on the same root) cleans on
+ *    its first read without any capture hook; `cleanup()` forces a pass at startup;
  *  - a prune writes the debug row `hearing.audio.pruned { count }`; a write the row
  *    `hearing.audio.retained { utteranceId, bytes, reason }`. Neither carries audio;
  *  - privacy is checked at write time: while the privacy lock is on, `retain()` returns `PRIVACY`
@@ -36,7 +39,8 @@ export const RETENTION_TEXT_MAX = 240;
 
 /**
  * Bound of the store. FIFO: the oldest clip goes first when any one of the three totals is passed.
- * `maxAgeMs` is a separate lifetime bound, applied by `cleanup()` rather than by a write.
+ * `maxAgeMs` is a separate lifetime bound, applied by the throttled lazy cleanup rather than by a
+ * write itself.
  */
 export const DEFAULT_RETENTION_LIMITS = Object.freeze({
   maxClips: 20,
@@ -44,6 +48,12 @@ export const DEFAULT_RETENTION_LIMITS = Object.freeze({
   maxBytes: 50 * 1024 * 1024,
   maxAgeMs: 6 * 60 * 60 * 1000,
 });
+
+/**
+ * How often a store expires clips on its own. `retain()` / `list()` / `exportPath()` ask "is it
+ * time?" and only then scan the index, so a busy capture never stats the store per clip.
+ */
+export const RETENTION_CLEANUP_INTERVAL_MS = 30 * 1000;
 
 /** Reasons a clip may be kept; each names one diagnosis hypothesis (see `retentionVerdictOf`). */
 export const RETENTION_REASONS = Object.freeze(['low-evidence', 'echo', 'noise', 'filtered']);
@@ -193,14 +203,15 @@ const plainWavName = (name) => typeof name === 'string' && name !== ''
 /**
  * Create one store. `dir` wins over `root` (tests); production passes the plugin root.
  *
- * @param {{root?: string, dir?: string, limits?: object, now?: () => number,
- *          enabled?: boolean|(() => boolean), isPrivacy?: () => boolean,
- *          emit?: (type: string, payload: object) => void}} [config]
+ * @param {{root?: string, dir?: string, limits?: object, cleanupIntervalMs?: number,
+ *          now?: () => number, enabled?: boolean|(() => boolean),
+ *          isPrivacy?: () => boolean, emit?: (type: string, payload: object) => void}} [config]
  */
 export function createAudioRetention({
   root = '',
   dir = '',
   limits = null,
+  cleanupIntervalMs = RETENTION_CLEANUP_INTERVAL_MS,
   now = Date.now,
   enabled = () => true,
   isPrivacy = () => false,
@@ -211,6 +222,9 @@ export function createAudioRetention({
     : join(typeof root === 'string' ? root : '', RETENTION_SUBDIR[0], RETENTION_SUBDIR[1]);
   const indexFile = join(baseDir, 'index.json');
   const cap = resolveRetentionLimits(limits);
+  const cleanupEveryMs = Number.isFinite(Number(cleanupIntervalMs)) && Number(cleanupIntervalMs) > 0
+    ? Math.floor(Number(cleanupIntervalMs))
+    : RETENTION_CLEANUP_INTERVAL_MS;
   const clock = typeof now === 'function' ? now : Date.now;
 
   let gate = typeof enabled === 'function' ? enabled : () => enabled === true;
@@ -220,7 +234,8 @@ export function createAudioRetention({
   let override = null;
   let index = null;
   let chain = Promise.resolve();
-  let cleanedOnce = false;
+  /** When the last expired+FIFO pass ran; `-Infinity` makes the first call after creation due. */
+  let lastCleanupAt = Number.NEGATIVE_INFINITY;
 
   const isEnabled = () => {
     if (override !== null) return override;
@@ -299,15 +314,16 @@ export function createAudioRetention({
   /**
    * Drop missing files (the index is validated, not trusted) and then apply the FIFO caps.
    * `expired` additionally drops clips older than `maxAgeMs` — the startup/lazy cleanup.
+   * `dropMissing:false` keeps the read-side contract (a deleted `.wav` is reported as `missing`).
    * Returns the removed entries; the caller saves the index once.
    */
-  const pruneLocked = async ({ expired = false } = {}) => {
+  const pruneLocked = async ({ expired = false, dropMissing = true } = {}) => {
     const at = clock();
     const kept = [];
     const removed = [];
     for (const item of index.items) {
       const tooOld = expired && cap.maxAgeMs > 0 && at - Number(item.createdAtMs ?? 0) >= cap.maxAgeMs;
-      if (tooOld || !(await fileExists(pathOf(item)))) {
+      if (tooOld || (dropMissing && !(await fileExists(pathOf(item))))) {
         removed.push(item);
         continue;
       }
@@ -334,6 +350,27 @@ export function createAudioRetention({
     return next.catch((error) => ({ ok: false, code: 'RETENTION_ERROR', error: error?.message ?? String(error) }));
   };
 
+  /** Throttle gate: one expired+FIFO pass per `cleanupEveryMs`; the first call is always due. */
+  const cleanupDue = () => clock() - lastCleanupAt >= cleanupEveryMs;
+
+  /**
+   * Read-side hygiene: expire old clips before answering a read, so a long-running store (or a
+   * restart's first `list()`) never shows a clip past `maxAgeMs`. A store that was never written
+   * stays untouched (no directory, no index), and a `.wav` deleted outside the store is still
+   * reported as `missing` — only `cleanup()` forgets those.
+   */
+  const lazyCleanupLocked = async () => {
+    if (!cleanupDue()) return 0;
+    lastCleanupAt = clock();
+    if (index === null && !(await fileExists(indexFile))) return 0;
+    await loadIndex();
+    const removed = await pruneLocked({ expired: true, dropMissing: false });
+    if (removed.length === 0) return 0;
+    await saveIndex();
+    emitEvent('hearing.audio.pruned', { level: 'debug', count: removed.length });
+    return removed.length;
+  };
+
   /** Accept Int16 (hearing converts once), Float32 (a caller/test) or capture chunks. */
   const pcm16Of = (samples) => {
     if (samples instanceof Int16Array) return samples.length > 0 ? samples : null;
@@ -349,6 +386,8 @@ export function createAudioRetention({
     if (pcm === null) return { ok: false, code: 'NO_AUDIO' };
     await loadIndex();
     const createdAtMs = clock();
+    const expiredDue = cleanupDue();
+    if (expiredDue) lastCleanupAt = createdAtMs;
     const seed = `${stampOf(createdAtMs)}-${safeSegment(input.utteranceId)}`;
     let id = seed;
     for (let seq = 2; index.items.some((entry) => entry.id === id); seq += 1) id = `${seed}-${seq}`;
@@ -374,7 +413,9 @@ export function createAudioRetention({
     await mkdir(baseDir, { recursive: true });
     await writeFile(pathOf(item), wav);
     index.items.push(item);
-    const pruned = await pruneLocked();
+    // The write itself is a lazy-cleanup trigger: when the interval elapsed, the FIFO prune below
+    // also expires old clips (one save, one `pruned` row). `retain` is never awaited by delivery.
+    const pruned = await pruneLocked({ expired: expiredDue });
     await saveIndex();
     if (pruned.length > 0) emitEvent('hearing.audio.pruned', { level: 'debug', count: pruned.length });
     // The clip itself can be the oldest-and-only entry when a cap is smaller than one clip.
@@ -395,6 +436,7 @@ export function createAudioRetention({
   });
 
   const list = () => run(async () => {
+    await lazyCleanupLocked();
     await loadIndex();
     const items = [];
     for (const item of index.items) {
@@ -451,6 +493,8 @@ export function createAudioRetention({
   });
 
   const exportPath = (id) => run(async () => {
+    // Expire first: an expired clip must answer NOT_FOUND, not a path to a deleted file.
+    await lazyCleanupLocked();
     await loadIndex();
     const item = findItem(id);
     if (item === null) return { ok: false, code: 'NOT_FOUND', id: String(id ?? '') };
@@ -467,21 +511,28 @@ export function createAudioRetention({
     };
   });
 
-  const cleanup = () => run(async () => {
-    // The switch being off does not block hygiene, but a store that was never written must not be
-    // created by a cleanup either (the default-off path stays byte-for-byte silent).
-    if (!(await fileExists(indexFile))) return { ok: true, removed: 0 };
-    await loadIndex();
-    const removed = await pruneLocked({ expired: true });
-    if (removed.length > 0) await saveIndex();
-    if (removed.length > 0) emitEvent('hearing.audio.pruned', { level: 'debug', count: removed.length });
-    return { ok: true, removed: removed.length };
-  });
+  const cleanup = () => {
+    // A forced pass counts as the last cleanup, so the lazy triggers stay quiet for one interval.
+    lastCleanupAt = clock();
+    return run(async () => {
+      // The switch being off does not block hygiene, but a store that was never written must not be
+      // created by a cleanup either (the default-off path stays byte-for-byte silent).
+      if (!(await fileExists(indexFile))) return { ok: true, removed: 0 };
+      await loadIndex();
+      const removed = await pruneLocked({ expired: true });
+      if (removed.length > 0) await saveIndex();
+      if (removed.length > 0) emitEvent('hearing.audio.pruned', { level: 'debug', count: removed.length });
+      return { ok: true, removed: removed.length };
+    });
+  };
 
-  /** Startup cleanup: the first capture start (or the host boot) runs it once per store. */
+  /**
+   * Capture-start hygiene. Repeatable but throttled: within `cleanupIntervalMs` it answers
+   * `skipped` without touching the disk, so a restart (new session, same root) re-checks instead
+   * of a one-shot flag that could never clean again. `cleanup()` stays the forced pass.
+   */
   const cleanupOnce = () => {
-    if (cleanedOnce) return Promise.resolve({ ok: true, removed: 0, skipped: true });
-    cleanedOnce = true;
+    if (!cleanupDue()) return Promise.resolve({ ok: true, removed: 0, skipped: true });
     return cleanup();
   };
 
