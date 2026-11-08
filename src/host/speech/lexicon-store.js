@@ -47,6 +47,13 @@
  * call returns `{ok:false, reason}` and leaves the file untouched. `edit()` is the only way to
  * change a stored spelling: it can set canonical/wrongForms/context and stamps `editedAt`, and it
  * ignores id/kind/status so those can never be rewritten by an edit call.
+ *
+ * Stage B4 (ASR post-processing closed loop): `applyLexiconText()` applies only the CONFIRMED
+ * entries (`listConfirmed()` → `lexiconHints()`) to the text that is delivered/subtitled. The raw
+ * ASR result is never rewritten. `proper-noun` replaces whole words only (never a substring), a
+ * `correction` is applied only where its stored context matches, and a failing store/rule leaves
+ * the input byte-for-byte unchanged (fail-open). Each applied hit is reported as
+ * `lexicon.applied {utteranceId, id, from, to, kind}` with truncated texts (debug only).
  */
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -490,4 +497,219 @@ export function lexiconHints(entries = []) {
       };
     })
     .filter((hint) => hint.canonical.length > 0 && hint.wrongForms.length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Stage B4: apply CONFIRMED words to the delivered transcript (pure + fail-open wrapper)
+// ---------------------------------------------------------------------------
+
+/** How many stored context characters must match on each side; mirrors lexicon-candidates. */
+const APPLY_CONTEXT_WINDOW = 4;
+
+/** A Latin/digit token continues through these, so a neighbour here means a partial match. */
+const ASCII_WORD_RE = /[A-Za-z0-9_]/u;
+
+/** Han edges are decided by ICU, except for these: 小满子/小满儿 is a longer word, not a bare name. */
+const HAN_CONTINUATION = new Set([...'子儿女们家氏仔哥姐弟妹叔姨婆爷总']);
+
+const HAN_EDGE_RE = /[\p{Script=Han}]/u;
+
+/** ICU is part of Node; without it a Han-edge hit stays conservative (no replacement). */
+const APPLY_SEGMENTER = typeof Intl?.Segmenter === 'function'
+  ? new Intl.Segmenter('zh-CN', { granularity: 'word' })
+  : null;
+
+/** Debug texts are clipped by code points, so an event never splits an emoji either. */
+const APPLIED_TEXT_MAX = 24;
+
+/** One clipped debug value; never throws, never splits a surrogate pair. */
+function clipped(value) {
+  const text = typeof value === 'string' ? value : String(value ?? '');
+  const chars = [...text];
+  return chars.length <= APPLIED_TEXT_MAX ? text : `${chars.slice(0, APPLIED_TEXT_MAX).join('')}…`;
+}
+
+/** Word-like segment boundaries for `text`, or null when ICU is unavailable / unhappy. */
+function segmentBounds(text) {
+  if (APPLY_SEGMENTER === null) return null;
+  const starts = new Set();
+  const ends = new Set();
+  try {
+    for (const part of APPLY_SEGMENTER.segment(text)) {
+      if (part.isWordLike !== true) continue;
+      starts.add(part.index);
+      ends.add(part.index + part.segment.length);
+    }
+  } catch {
+    return null;
+  }
+  return { starts, ends };
+}
+
+/**
+ * Is `[start, end)` a complete word (not a substring of a longer token)?
+ *
+ * Latin/digit neighbours (`GPT4x`, `xGPT4`) always mean a partial match. Han has no spaces, so a
+ * Han neighbour is normal word order (叫|小满|来了) and ICU word segmentation decides; a name
+ * continuation (小满|子) is rejected by the small suffix guard instead. Emoji/punctuation
+ * neighbours are delimiters and match, and the cut itself is always a whole UTF-16 span.
+ */
+function wholeWordAt(text, start, end, bounds) {
+  const left = start > 0 ? text[start - 1] : '';
+  const right = end < text.length ? text[end] : '';
+  if (left !== '' && ASCII_WORD_RE.test(left)) return false;
+  if (right !== '' && ASCII_WORD_RE.test(right)) return false;
+  const hanEdge = HAN_EDGE_RE.test(text[start]) || HAN_EDGE_RE.test(text[end - 1]);
+  if (hanEdge !== true) return true;
+  if (right !== '' && HAN_CONTINUATION.has(right)) return false;
+  return bounds !== null && bounds.starts.has(start) && bounds.ends.has(end);
+}
+
+/** Quote one wrong form for a combined literal alternation. */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+/** A stored correction context cropped to the applied window, or null when it is unusable. */
+function usableContext(value) {
+  if (value === null || typeof value !== 'object') return null;
+  const before = typeof value.before === 'string'
+    ? [...value.before].slice(-APPLY_CONTEXT_WINDOW).join('')
+    : '';
+  const after = typeof value.after === 'string'
+    ? [...value.after].slice(0, APPLY_CONTEXT_WINDOW).join('')
+    : '';
+  if (before.length === 0 && after.length === 0) return null;
+  return { before, after };
+}
+
+/** Does the stored context still surround this span? */
+function contextMatches(source, start, end, context) {
+  const beforeOk = context.before.length === 0 || source.slice(0, start).endsWith(context.before);
+  const afterOk = context.after.length === 0 || source.slice(end).startsWith(context.after);
+  return beforeOk && afterOk;
+}
+
+/**
+ * Apply confirmed lexicon rules to one ASR text, purely (no I/O, no clock, no state).
+ *
+ * - `proper-noun`: every WHOLE-WORD occurrence of a `wrongForm` becomes `canonical`; a substring
+ *   inside a longer word is never touched;
+ * - `correction`: applied only where the stored `context` (before/after) still matches; a row
+ *   without context is refused (there is deliberately no global replacement);
+ * - all rules compete on the same spans and the longest match at a position wins.
+ *
+ * Work is bounded: one text scan per rule, so an utterance scans at most as many times as there
+ * are confirmed entries (`scans` reports the exact count). Every replacement covers whole UTF-16
+ * spans, so emoji and other astral characters are never split. No hit → the exact input string.
+ *
+ * @param {unknown} text
+ * @param {object[]} [hints] `lexiconHints()` output (confirmed entries only)
+ * @returns {{text: string, applied: Array<{id: string, kind: string, from: string, to: string}>,
+ *   scans: number}}
+ */
+export function applyLexiconHints(text, hints = []) {
+  const source = typeof text === 'string' ? text : '';
+  const rules = (Array.isArray(hints) ? hints : []).filter((hint) => hint !== null
+    && typeof hint === 'object'
+    && typeof hint.canonical === 'string'
+    && hint.canonical.length > 0
+    && Array.isArray(hint.wrongForms)
+    && hint.wrongForms.length > 0);
+  const result = { text: source, applied: [], scans: 0 };
+  if (source.length === 0 || rules.length === 0) return result;
+  const bounds = segmentBounds(source);
+  const spans = [];
+  for (const hint of rules) {
+    result.scans += 1;
+    const kind = hint.kind === 'correction' ? 'correction' : 'proper-noun';
+    const context = kind === 'correction' ? usableContext(hint.context) : null;
+    if (kind === 'correction' && context === null) continue;
+    // One combined literal pattern per entry = ONE text scan per confirmed entry, with the
+    // longest form first so 小满子 wins over 小满 at the same position.
+    const forms = [];
+    for (const raw of hint.wrongForms) {
+      const form = typeof raw === 'string' ? raw.trim() : '';
+      if (form.length === 0 || form === hint.canonical || forms.includes(form)) continue;
+      if (typeof form.isWellFormed === 'function' && form.isWellFormed() !== true) continue;
+      forms.push(form);
+    }
+    if (forms.length === 0) continue;
+    forms.sort((left, right) => right.length - left.length);
+    let pattern;
+    try {
+      pattern = new RegExp(forms.map(escapeRegExp).join('|'), 'giu');
+    } catch {
+      continue; // a form the engine refuses must never break the scan
+    }
+    for (const match of source.matchAll(pattern)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      const contextOk = context === null || contextMatches(source, start, end, context);
+      const wordOk = kind !== 'proper-noun' || wholeWordAt(source, start, end, bounds);
+      if (contextOk && wordOk) {
+        spans.push({ start, end, id: hint.id, kind, from: source.slice(start, end), to: hint.canonical });
+      }
+    }
+  }
+  // Longest match first at the same start; an earlier span wins over a later overlapping one.
+  spans.sort((left, right) => left.start - right.start
+    || (right.end - right.start) - (left.end - left.start)
+    || (left.kind === 'proper-noun' ? -1 : 1));
+  let cursor = 0;
+  let output = '';
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    output += source.slice(cursor, span.start) + span.to;
+    cursor = span.end;
+    result.applied.push({ id: span.id, kind: span.kind, from: span.from, to: span.to });
+  }
+  if (result.applied.length === 0) return result;
+  result.text = output + source.slice(cursor);
+  return result;
+}
+
+/** Debug logging for the applied/failed rows; a throwing or absent logger never breaks delivery. */
+function emitApplyEvent(log, event, payload) {
+  try {
+    void log?.emit?.(event, payload)?.catch?.(() => {});
+  } catch {
+    /* ignore a throwing logger */
+  }
+}
+
+/**
+ * The recognition post-processing point: apply the CONFIRMED personal lexicon to the text used
+ * for delivery and subtitles, and report each hit as a debug `lexicon.applied` row.
+ *
+ * Fail-open: a missing/throwing store, a corrupt entry or a hint-building error returns the input
+ * unchanged, so ASR delivery never depends on the lexicon. The raw ASR result is never rewritten
+ * here; callers keep it as the archive/`rawText`.
+ *
+ * @param {unknown} text the delivered transcript (not the raw archive copy)
+ * @param {{store?: {listConfirmed?: () => object[]}|null, log?: object|null,
+ *   utteranceId?: string}} [options]
+ * @returns {string} the post-processed text, or `text` unchanged on any failure/no hit
+ */
+export function applyLexiconText(text, { store = null, log = null, utteranceId = '' } = {}) {
+  const source = typeof text === 'string' ? text : '';
+  const id = typeof utteranceId === 'string' ? utteranceId : '';
+  let result;
+  try {
+    if (store === null || typeof store.listConfirmed !== 'function') return source;
+    result = applyLexiconHints(source, lexiconHints(store.listConfirmed()));
+  } catch (error) {
+    emitApplyEvent(log, 'lexicon.apply.failed', { utteranceId: id, error: error?.message ?? String(error) });
+    return source;
+  }
+  for (const hit of result.applied) {
+    emitApplyEvent(log, 'lexicon.applied', {
+      utteranceId: id,
+      id: hit.id,
+      from: clipped(hit.from),
+      to: clipped(hit.to),
+      kind: hit.kind,
+    });
+  }
+  return result.text;
 }

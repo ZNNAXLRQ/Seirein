@@ -435,7 +435,7 @@ import {
 } from './speech/format.js';
 export { feedMarkdownSentences } from './speech/format.js';
 import { extractLexiconCandidates, parseExplicitCorrection } from './speech/lexicon-candidates.js';
-import { createLexiconStore } from './speech/lexicon-store.js';
+import { applyLexiconText, createLexiconStore } from './speech/lexicon-store.js';
 import {
   resolveVoicePrefetchDepth,
   SPOKEN_VERSION_TIMEOUT_MS,
@@ -10406,6 +10406,9 @@ export function apply(ctx, config) {
     // explicit form correction; it never turns an ordinary transcript into a confirmed word.
     speakerId: null,
     speakerConfirmed: false,
+    // Outward identity of the utterance this delivery belongs to (first held final wins). Only
+    // used to label `lexicon.applied`; it never changes what is delivered.
+    utteranceId: '',
   });
   let mergeMeta = emptyMergeMeta();
   // ---- personal lexicon: conversation → candidates (never a rewrite) -----------------
@@ -10641,8 +10644,16 @@ export function apply(ctx, config) {
       void log.emit('hearing.utterance', { text, merged: true, ...truncation, ...offline });
       const refined = await refineTranscript(text);
       if (refined !== text) void log.emit('hearing.refined', { from: text.length, to: refined.length });
+      // 个人语言库闭环：只有「已确认」词条改投递/字幕文本。`text`（原始 ASR）逐字保留在
+      // `voice.transcript.rawText` 与上面的 `hearing.utterance` 存档行里；store/规则异常时
+      // fail-open 返回原文。
+      const corrected = applyLexiconText(refined, {
+        store: lexiconStore,
+        log,
+        utteranceId: meta.utteranceId,
+      });
       // The note reaches the agent (fast path or task session) before the transcript itself.
-      const delivered = annotateTranscript(refined, meta);
+      const delivered = annotateTranscript(corrected, meta);
       void log.emit('voice.transcript', {
         text: delivered,
         rawText: text,
@@ -10660,9 +10671,9 @@ export function apply(ctx, config) {
       // its pending speech and is never auto-resumed. Content spoken after the opener is still a
       // new input and takes the normal delivery path (as a new group, not an automatic resume).
       if (!features.enabled('fastpath')) {
-        const cancelInput = isExplicitCancelInput(refined);
+        const cancelInput = isExplicitCancelInput(corrected);
         if (cancelInput.cancel === true) {
-          const cancelled = responseGroups.cancelByUserInput({ sessionId: voiceSessionId, text: refined });
+          const cancelled = responseGroups.cancelByUserInput({ sessionId: voiceSessionId, text: corrected });
           cancelGroupAnswerSpeech(cancelled?.id ?? '', 'user-cancel');
           cancelFastReply('user-cancel');
           void log.emit('voice.response.user-cancel', {
@@ -10683,14 +10694,15 @@ export function apply(ctx, config) {
       });
       if (features.enabled('fastpath')) void runFastReply(delivered);
       else {
-        void handleVoiceTask(delivered, refined, {
+        void handleVoiceTask(delivered, corrected, {
           endpointAt: Number(meta.endpointAt) || 0,
           asrMs: Number(meta.asrMs) || 0,
           transcriptAt,
         });
       }
-      // Candidate extraction is observation only: `delivered`/`refined` are already fixed above
-      // and this never awaits or rewrites them. Nothing here confirms a word.
+      // Candidate extraction is observation only: it sees the ASR text BEFORE the personal-lexicon
+      // replacement (so a confirmed word cannot re-enter as its own evidence) and never rewrites
+      // `delivered`/`corrected`. Nothing here confirms a word.
       noteLexiconTranscript(refined, meta);
     }
   };
@@ -13031,6 +13043,10 @@ export function apply(ctx, config) {
       mergeMeta.speakerId = speaker;
       mergeMeta.speakerConfirmed = true;
     }
+    // The delivery identity for `lexicon.applied`: the first held final names the merged utterance.
+    if (mergeMeta.utteranceId === '' && typeof meta.utteranceId === 'string') {
+      mergeMeta.utteranceId = meta.utteranceId;
+    }
     if (mergeTimer !== null) clearTimeout(mergeTimer);
     mergeTimer = setTimeout(flushMerged, MERGE_WINDOW_MS);
     mergeTimer.unref?.();
@@ -13432,6 +13448,8 @@ export function apply(ctx, config) {
                 // Personal-lexicon attribution only; capture leaves these unset today.
                 speakerId: event.speakerId,
                 speakerConfirmed: event.speakerConfirmed === true,
+                // Delivery identity (hearing always supplies it); only labels `lexicon.applied`.
+                utteranceId: event.utteranceId,
               });
             }
             // 台词缓冲门禁：正常投递 accepted:true；组件关闭/停止中到达的片段仍照常投递，
