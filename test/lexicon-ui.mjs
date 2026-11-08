@@ -202,6 +202,12 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
       unassigned: [
         candidate(),
         candidate({ id: 'cand-2', text: '阿晚', kind: 'correction', count: 5, sourceIds: [] }),
+        // The backend now keeps assigned-but-unconfirmed corrections in the visible list, marked
+        // `assigned:true`; the card must render that row (and allow confirming it with an identity).
+        candidate({
+          id: 'cand-3', text: '林晚', kind: 'correction', assigned: true, speakerId: 'spk-1',
+          wrongForms: ['林晚'], sourceIds: ['u3'],
+        }),
       ],
       entries: [word(), word({ id: 'draft-1', status: 'candidate', canonical: '草稿', wrongForms: [] })],
       loading: false,
@@ -211,9 +217,10 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   const tree = view.render();
   const texts = textsOf(tree);
 
-  assert.ok(texts.includes('未归属候选（2）'), 'the unassigned header carries its count');
+  assert.ok(texts.includes('未归属候选（3）'), 'the unassigned header carries its count');
   assert.ok(texts.includes('个人词库（1）'), 'the confirmed header carries its count');
   assert.ok(texts.includes('向晚'), 'the candidate text is visible');
+  assert.ok(texts.includes('林晚'), 'an assigned-but-unconfirmed candidate is visible too');
   assert.ok(texts.includes('专有名词'), 'the kind is labelled in Chinese');
   assert.ok(texts.includes('纠正'), 'a correction candidate shows its own kind');
   assert.ok(texts.some((text) => text.includes('出现 2 次')), 'evidence count comes from sourceIds');
@@ -224,7 +231,11 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
 
   const rowA = nodeOf(tree, 'data-lexicon-candidate', 'cand-1');
   const rowB = nodeOf(tree, 'data-lexicon-candidate', 'cand-2');
+  const rowC = nodeOf(tree, 'data-lexicon-candidate', 'cand-3');
   assert.ok(rowA !== undefined && rowB !== undefined, 'both candidates render their own row');
+  assert.ok(rowC !== undefined, 'the assigned candidate is not dropped from the visible list');
+  assert.equal(rowC.props['data-lexicon-candidate'], 'cand-3');
+  assert.ok(buttonOf(rowC, '确认') !== undefined, 'an assigned candidate is still confirmable');
   assert.ok(buttonOf(rowA, '确认') !== undefined && buttonOf(rowA, '忽略') !== undefined);
   assert.ok(nodeOf(tree, 'data-lexicon-entry', 'word-1') !== undefined, 'the confirmed word has its row');
   assert.equal(nodeOf(tree, 'data-lexicon-entry', 'draft-1'), undefined,
@@ -240,15 +251,21 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   assert.ok(textsOf(mount({ data: { loading: true } }).render()).includes('正在读取语言库…'),
     'an explicit loading flag renders the same text');
 
-  console.log('[lexicon-ui 1] unassigned=2 entries=1 empty=0/0 loading=正在读取语言库…');
+  console.log('[lexicon-ui 1] unassigned=3 entries=1 assignedVisible=cand-3 empty=0/0 loading=正在读取语言库…');
 });
 
 // ---------------------------------------------------------------------------------------------
 // 2. Confirm: speakerId comes from host status; body matches lexicon.confirm
 // ---------------------------------------------------------------------------------------------
 test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时按钮禁用', async () => {
+  assert.equal(lexicon.lexiconSpeakerId({ lexicon: { speakerId: 'spk-9', source: 'setting' } }), 'spk-9',
+    'the authoritative status.lexicon.speakerId is the primary source');
   assert.equal(lexicon.lexiconSpeakerId({ lexicon: { speakerId: 'spk-9' } }), 'spk-9',
     'the host lexicon block is the primary source');
+  assert.equal(lexicon.lexiconSpeakerId({
+    lexicon: { speakerId: null, source: null },
+    speaker: { lastShadow: { decision: 'match', speakerId: 'spk-5' } },
+  }), 'spk-5', 'a null host identity falls back to the matched shadow');
   assert.equal(lexicon.lexiconSpeakerId({ speaker: { selfId: 'spk-8' } }), 'spk-8',
     'the speaker status self id is the fallback');
   assert.equal(lexicon.lexiconSpeakerId({ speaker: { speakerId: 'spk-7' } }), 'spk-7',
@@ -315,6 +332,24 @@ test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时�
     action: 'lexicon.confirm', speakerId: 'spk-9', text: '阿晚', canonical: '阿晚',
   }, 'without an id the contract falls back to text');
 
+  // The Panel resolves the identity from `/assistant/status` and the section never invents one.
+  const selfId = lexicon.lexiconSpeakerId({ lexicon: { speakerId: 'spk-self', source: 'setting' } });
+  assert.equal(selfId, 'spk-self');
+  const statusView = mount({
+    speakerId: selfId,
+    data: {
+      unassigned: [candidate({ id: 'cand-9', kind: 'correction', assigned: true, speakerId: 'spk-self' })],
+      entries: [],
+      error: '',
+    },
+  });
+  const statusRow = nodeOf(statusView.render(), 'data-lexicon-candidate', 'cand-9');
+  assert.ok(statusRow !== undefined, 'an assigned candidate from the host is rendered');
+  assert.equal(buttonOf(statusRow, '确认').props.disabled, false,
+    'a speakerId taken from status.lexicon enables the confirm button');
+  await buttonOf(statusRow, '确认').props.onClick();
+  assert.deepEqual(statusView.calls.openConfirm.map((entry) => entry.id), ['cand-9']);
+
   const anonymous = mount({ speakerId: '', data: { unassigned: [candidate()], entries: [], error: '' } });
   assert.equal(buttonOf(nodeOf(anonymous.render(), 'data-lexicon-candidate', 'cand-1'), '确认').props.disabled,
     true, 'without a host identity the confirm button is disabled');
@@ -323,7 +358,8 @@ test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时�
   assert.equal(buttonOf(anonymousDialog, '确认').props.disabled, true,
     'the dialog cannot be saved without a host identity');
 
-  console.log('[lexicon-ui 2] speakerId=spk-9 body=', JSON.stringify(body));
+  console.log('[lexicon-ui 2] speakerId=spk-9 body=', JSON.stringify(body),
+    'status-speakerId=spk-self confirmEnabled=true');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -422,12 +458,14 @@ test('4. 忽略与删除都是两步确认，第一次点击不写入', async ()
 // 5. Failure branch: unwired / unreadable / malformed data renders text, never throws
 // ---------------------------------------------------------------------------------------------
 test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，不崩溃', () => {
-  const contractShape = lexicon.lexiconListData({ ok: true, entries: [word()], unassigned: [candidate()] });
+  const contractShape = lexicon.lexiconListData({
+    ok: true, entries: [word()], unassigned: [candidate()], candidates: [candidate()],
+  });
   assert.deepEqual(contractShape, { entries: [word()], unassigned: [candidate()], loading: false, error: '' },
-    'the documented {ok:true, entries, unassigned} shape is accepted');
+    'the documented {ok:true, entries, unassigned, candidates} shape is accepted');
   const bareShape = lexicon.lexiconListData({ entries: [], unassigned: [] });
   assert.deepEqual(bareShape, { entries: [], unassigned: [], loading: false, error: '' },
-    'the host shape without ok (current backend) is accepted too');
+    'a host shape without ok (older backend) is still accepted');
   assert.equal(lexicon.lexiconListData({ ok: false, code: 'LEXICON_UNAVAILABLE' }).error,
     'LEXICON_UNAVAILABLE', 'an explicit ok:false is a failure');
   assert.equal(lexicon.lexiconListData({ ok: false, reason: 'not-found' }).error, 'not-found',

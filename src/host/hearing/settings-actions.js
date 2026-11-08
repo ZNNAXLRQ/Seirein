@@ -130,8 +130,11 @@ export function createHearingSettingsActions(services) {
       case 'lexicon.list': {
         const store = lexiconStore();
         if (store === null) return LEXICON_UNAVAILABLE;
-        // Confirmed words only; everything not yet confirmed stays in the unassigned area.
-        return { entries: store.listConfirmed(), unassigned: store.listUnassigned() };
+        // Pending candidates stay visible even when already attributed: `unassigned` keeps the
+        // unassigned area AND the assigned-but-unconfirmed corrections (each carries
+        // `assigned:true`), so neither row is lost; `candidates` is the same full pending set.
+        const candidates = store.listCandidates();
+        return { ok: true, entries: store.listConfirmed(), unassigned: candidates, candidates };
       }
       case 'lexicon.candidates': {
         const store = lexiconStore();
@@ -310,6 +313,28 @@ export function createHearingSettingsActions(services) {
   }
 };
   return handler;
+}
+
+/**
+ * The authoritative "本人" speaker id for the language library: `voice.selfSpeakerId` from
+ * settings.json (written by the user or a later voiceprint registration) wins; otherwise a
+ * speaker-shadow `match` supplies it; otherwise there is no identity. Pure, so the Host can
+ * project it from a settings snapshot and the live shadow verdict without extra state.
+ *
+ * @param {{settings?: object, shadow?: object|null}} [evidence]
+ * @returns {{speakerId: string|null, source: 'setting'|'shadow'|null}}
+ */
+export function resolveSelfSpeakerId({ settings = {}, shadow = null } = {}) {
+  const saved = settings?.voice?.selfSpeakerId;
+  if (typeof saved === 'string' && saved.trim() !== '') {
+    return { speakerId: saved.trim(), source: 'setting' };
+  }
+  if (shadow?.decision === 'match'
+    && typeof shadow?.speakerId === 'string'
+    && shadow.speakerId.trim() !== '') {
+    return { speakerId: shadow.speakerId.trim(), source: 'shadow' };
+  }
+  return { speakerId: null, source: null };
 }
 
 /**

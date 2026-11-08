@@ -481,7 +481,7 @@ import {
 
 import { createStatusBuilder } from './runtime/http/status.js';
 import { createSettingsRoutes } from './runtime/http/routes.js';
-import { ACTIONS as hearingActions, createHearingSettingsActions, projectHearingStatus } from './hearing/settings-actions.js';
+import { ACTIONS as hearingActions, createHearingSettingsActions, projectHearingStatus, resolveSelfSpeakerId } from './hearing/settings-actions.js';
 import { ACTIONS as memoryActions, createMemorySettingsActions } from './memory/settings-actions.js';
 import { ACTIONS as speechActions, createSpeechSettingsActions } from './speech/settings-actions.js';
 import {
@@ -13823,6 +13823,9 @@ export function apply(ctx, config) {
     const status = await buildStatus();
     return {
       ...status,
+      // One authoritative self identity for the lexicon card: the explicit registration wins, a
+      // speaker-shadow match is only a fallback, and `source` says which one answered.
+      lexicon: resolveSelfSpeakerId({ settings: readSettings(), shadow: speakerLastShadow }),
       // The 听觉 card's 音频保留 switch follows the persisted setting (default off), not a local
       // toggle; the clips themselves are read through `audio.retention.list`.
       retention: { enabled: audioRetention.isEnabled(), limits: { ...audioRetention.limits } },

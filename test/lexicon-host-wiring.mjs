@@ -6,14 +6,17 @@
  * `extractLexiconCandidates`, but the transcript itself is never rewritten and nothing is
  * auto-confirmed:
  *
- *   1. `lexicon.list` is empty at first; confirm/edit/reject/remove pass through the store and the
- *      persisted `data/lexicon.json` reflects every step;
+ *   1. `lexicon.list` answers the documented `{ok:true, entries, unassigned, candidates}` contract;
+ *      confirm/edit/reject/remove pass through the store and the persisted `data/lexicon.json`
+ *      reflects every step;
  *   2. a delivered transcript produces CANDIDATES: an explicit form correction from a confirmed
- *      speaker is `assigned`, the same correction without a confirmed identity and every ordinary
- *      transcript stays in the unassigned area;
+ *      speaker is `assigned` and STILL visible in `unassigned` (with `assigned:true`), the same
+ *      correction without a confirmed identity and every ordinary transcript stays unassigned;
  *   3. a fact correction (「不是周五，是周六」) never enters the lexicon and writes no file;
  *   4. a second Host mount over the same root reads the stored entries back (restart);
- *   5. regression: the candidate/correction semantics and the confirmed `wrongForms→canonical`
+ *   5. `/assistant/status` exposes `lexicon.speakerId` from `voice.selfSpeakerId`, falling back to
+ *      a speaker-shadow match and then to null, with the source labelled;
+ *   6. regression: the candidate/correction semantics and the confirmed `wrongForms→canonical`
  *      hints are unchanged, and the six action names are registered.
  *
  * A synthetic microphone (registerHooks stub) feeds `onUpdate` exactly like the real capture loop;
@@ -37,7 +40,7 @@ import {
 } from '../src/host/speech/lexicon-candidates.js';
 import { createLexiconStore, lexiconHints } from '../src/host/speech/lexicon-store.js';
 
-const state = { onUpdate: null };
+const state = { onUpdate: null, onEvent: null };
 globalThis.__lexiconHost = state;
 
 const hearingUrl = new URL('../src/host/hearing/hearing.js', import.meta.url).href;
@@ -57,6 +60,7 @@ const hooks = registerHooks({
     export const listDevices = async () => ['Fake Mic'];
     export const startHearing = (options) => {
       s.onUpdate = options.onUpdate;
+      s.onEvent = options.onEvent;
       return { device: options.device, stop() {}, stats: () => ({ rmsDb: -20 }) };
     };
     export const watchHearingExit = () => {};
@@ -117,6 +121,7 @@ async function newRoot() {
 
 async function mount(root) {
   state.onUpdate = null;
+  state.onEvent = null;
   const cleanups = [];
   const tools = new Map();
   const routes = new Map();
@@ -185,6 +190,16 @@ async function mount(root) {
       return [];
     }
   };
+  const status = async () => {
+    const handler = routes.get('/assistant/status');
+    assert.equal(typeof handler, 'function', 'the status route is registered');
+    let result = '';
+    await handler({ method: 'GET', url: '/assistant/status' }, {
+      writeHead() {},
+      end(value) { result = value; },
+    });
+    return JSON.parse(result);
+  };
   const waitFor = async (check, message, timeoutMs = 4000) => {
     const startedAt = Date.now();
     for (;;) {
@@ -198,6 +213,7 @@ async function mount(root) {
     root,
     action,
     events,
+    status,
     waitFor,
     /** Feed one delivered transcript through the real merge/flush path. */
     say: (text, meta = {}) => state.onUpdate({ final: text, durationMs: 100, ...meta }),
@@ -225,7 +241,11 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
   const host = await mount(root);
   t.after(async () => { await host.close(); await cleanupRoot(root); });
 
-  assert.deepEqual(await host.list(), { entries: [], unassigned: [] });
+  const initial = await host.list();
+  assert.deepEqual(initial, { ok: true, entries: [], unassigned: [], candidates: [] });
+  for (const field of ['entries', 'unassigned', 'candidates']) {
+    assert.ok(Array.isArray(initial[field]), `lexicon.list returns an array for ${field}`);
+  }
 
   // Two mentions in one delivered transcript reach the extractor's default threshold.
   host.say('向晚来了，向晚走了。');
@@ -237,6 +257,11 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
   assert.equal(candidate.status, 'candidate');
   assert.equal(candidate.assigned, false);
   assert.deepEqual((await host.latestCandidates()).map((entry) => entry.text), ['向晚']);
+
+  // The new list contract keeps pending rows in both the visible area and `candidates`.
+  const pending = await host.list();
+  assert.deepEqual(pending.unassigned.map((entry) => [entry.text, entry.assigned]), [['向晚', false]]);
+  assert.deepEqual(pending.candidates.map((entry) => [entry.text, entry.assigned]), [['向晚', false]]);
 
   const confirmed = await host.action({
     action: 'lexicon.confirm', text: '向晚', speakerId: 'spk-1', canonical: '向晚',
@@ -283,7 +308,7 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
 
   const removed = await host.action({ action: 'lexicon.remove', id: candidate.id });
   assert.equal(removed.ok, true);
-  assert.deepEqual((await host.list()).entries, []);
+  assert.deepEqual(await host.list(), { ok: true, entries: [], unassigned: [], candidates: [] });
   saved = await readLexicon(root);
   assert.deepEqual(saved.entries.map((entry) => entry.text), ['Seirein']);
   assert.deepEqual(await host.action({ action: 'lexicon.remove', text: '向晚晚' }), { ok: false, reason: 'not-found' });
@@ -297,7 +322,7 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
   assert.equal(added.payload.kind, 'proper-noun');
   assert.equal(added.payload.assigned, false);
 
-  console.log('[1] empty=true', 'confirmed=', JSON.stringify(confirmed.entry), 'edited=', JSON.stringify(edited.entry), 'rejected=', JSON.stringify(rejected.entry.status), 'removed=', JSON.stringify(removed.entry.id), 'file=', JSON.stringify(saved.entries.map((entry) => [entry.text, entry.status])));
+  console.log('[1] ok=true arrays=entries,unassigned,candidates', 'empty=', JSON.stringify(initial), 'confirmed=', JSON.stringify(confirmed.entry), 'edited=', JSON.stringify(edited.entry), 'rejected=', JSON.stringify(rejected.entry.status), 'removed=', JSON.stringify(removed.entry.id), 'file=', JSON.stringify(saved.entries.map((entry) => [entry.text, entry.status])));
 });
 
 // 2 ---------------------------------------------------------------------------
@@ -351,12 +376,21 @@ test('2. 语音转写 → 候选；assigned 取决于已确认说话人；普通
   assert.equal(proper.speakerId, null);
 
   const listed = await host.list();
+  assert.equal(listed.ok, true);
   assert.deepEqual(listed.entries, [], 'nothing is auto-confirmed');
-  // The unassigned area is for candidates with NO confirmed identity; the assigned-but-unconfirmed
-  // correction is visible in `lexicon.candidates` (above) but is not a personal word either.
+  // Every pending candidate is visible in the list: the unassigned area keeps ordinary transcript
+  // candidates, and the assigned-but-unconfirmed correction is included with `assigned:true`
+  // instead of being reachable only through `lexicon.candidates`.
   assert.deepEqual(
     listed.unassigned.map((entry) => [entry.text, entry.assigned, entry.speakerId]).sort(),
-    [['Seirein', false, null], ['林晚', false, null]].sort(),
+    [['Seirein', false, null], ['林晚', false, null], ['向晚', true, 'spk-1']].sort(),
+  );
+  const assignedRow = listed.unassigned.find((entry) => entry.text === '向晚');
+  assert.equal(assignedRow.assigned, true, 'an assigned candidate is marked assigned in the visible list');
+  assert.equal(assignedRow.speakerId, 'spk-1');
+  assert.deepEqual(
+    listed.candidates.map((entry) => [entry.text, entry.assigned, entry.speakerId]).sort(),
+    [['Seirein', false, null], ['林晚', false, null], ['向晚', true, 'spk-1']].sort(),
   );
   assert.deepEqual(
     (await host.latestCandidates()).map((entry) => [entry.text, entry.assigned, entry.speakerId]).sort(),
@@ -369,7 +403,7 @@ test('2. 语音转写 → 候选；assigned 取决于已确认说话人；普通
   assert.deepEqual(Object.keys(assignedEvent.payload).sort(), ['assigned', 'id', 'kind']);
   assert.equal(assignedEvent.payload.kind, 'correction');
 
-  console.log('[2] correction=', JSON.stringify([correction.text, correction.assigned, correction.speakerId]), 'anonymous=', JSON.stringify([anonymous.text, anonymous.assigned, anonymous.speakerId]), 'proper=', JSON.stringify([proper.text, proper.assigned, proper.speakerId]), 'entries=', listed.entries.length, 'unassigned=', JSON.stringify(listed.unassigned.map((entry) => entry.text)), 'candidates=', JSON.stringify((await host.latestCandidates()).map((entry) => [entry.text, entry.assigned, entry.speakerId])));
+  console.log('[2] ok=', listed.ok, 'correction=', JSON.stringify([correction.text, correction.assigned, correction.speakerId]), 'anonymous=', JSON.stringify([anonymous.text, anonymous.assigned, anonymous.speakerId]), 'proper=', JSON.stringify([proper.text, proper.assigned, proper.speakerId]), 'entries=', listed.entries.length, 'unassigned=', JSON.stringify(listed.unassigned.map((entry) => [entry.text, entry.assigned])), 'candidates=', JSON.stringify((await host.latestCandidates()).map((entry) => [entry.text, entry.assigned, entry.speakerId])));
 });
 
 // 3 ---------------------------------------------------------------------------
@@ -383,7 +417,7 @@ test('3. 事实纠正（不是周五是周六）不入库，也不创建 lexicon
   host.say('不是3个，是4个', { speakerId: 'spk-1', speakerConfirmed: true });
   await tick(120);
 
-  assert.deepEqual(await host.list(), { entries: [], unassigned: [] });
+  assert.deepEqual(await host.list(), { ok: true, entries: [], unassigned: [], candidates: [] });
   assert.deepEqual(await host.latestCandidates(), []);
   assert.equal(await fileExists(join(root, 'data', 'lexicon.json')), false, 'no candidate means no lexicon file');
   // The transcript itself is still logged (it was delivered); what must not exist is any lexicon
@@ -431,7 +465,62 @@ test('4. 重启（同一 root 的第二个 Host 挂载）后条目仍在', async
 
 // 5 ---------------------------------------------------------------------------
 
-test('5. 回归：候选/纠正语义、confirmed 提示形状、六个动作已注册', async () => {
+test('5. status.lexicon：voice.selfSpeakerId 权威优先，其次声纹影子 match，否则 null', async (t) => {
+  const root = await newRoot();
+  const host = await mount(root);
+  t.after(async () => { await host.close(); await cleanupRoot(root); });
+
+  const writeVoice = async (voice) => {
+    const file = join(root, 'data', 'settings.json');
+    const saved = JSON.parse(await readFile(file, 'utf8'));
+    await writeFile(file, `${JSON.stringify({ ...saved, voice }, null, 2)}\n`);
+  };
+
+  let status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: null, source: null },
+    'no registration and no matched shadow -> no guessed identity');
+
+  // An explicit `voice.selfSpeakerId` (the user or a later voiceprint registration writes it).
+  await writeVoice({ chunking: false, selfSpeakerId: 'spk-self' });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: 'spk-self', source: 'setting' });
+  assert.equal(status.lexicon.speakerId, 'spk-self');
+
+  await writeVoice({ chunking: false });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: null, source: null },
+    'clearing the setting falls back: no matched shadow means null');
+
+  // The shadow is only a fallback: a `match` verdict supplies its speakerId, `unsure` does not.
+  assert.equal(typeof state.onEvent, 'function', 'the hearing session exposes onEvent');
+  state.onEvent('speaker.shadow', { decision: 'match', score: 0.91, speakerId: 'spk-shadow' });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: 'spk-shadow', source: 'shadow' });
+
+  // An explicit registration always wins over the shadow.
+  await writeVoice({ chunking: false, selfSpeakerId: 'spk-self' });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: 'spk-self', source: 'setting' });
+
+  // Blank / non-string registrations are not an identity and fall back to the shadow (or null).
+  await writeVoice({ chunking: false, selfSpeakerId: '   ' });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: 'spk-shadow', source: 'shadow' },
+    'a blank registration does not shadow the fallback');
+
+  state.onEvent('speaker.shadow', { decision: 'unsure', score: 0.4, speakerId: 'spk-shadow' });
+  status = await host.status();
+  assert.deepEqual(status.lexicon, { speakerId: null, source: null },
+    'an unsure verdict is not an identity');
+
+  console.log('[5] setting=', JSON.stringify({ speakerId: 'spk-self', source: 'setting' }),
+    'shadow=', JSON.stringify({ speakerId: 'spk-shadow', source: 'shadow' }),
+    'none=', JSON.stringify({ speakerId: null, source: null }));
+});
+
+// 6 ---------------------------------------------------------------------------
+
+test('6. 回归：候选/纠正语义、confirmed 提示形状、六个动作已注册', async () => {
   for (const action of [
     'lexicon.list', 'lexicon.candidates', 'lexicon.confirm',
     'lexicon.edit', 'lexicon.reject', 'lexicon.remove',
@@ -464,5 +553,5 @@ test('5. 回归：候选/纠正语义、confirmed 提示形状、六个动作已
   assert.equal(applyCorrection('小满今天很开心', hints[0]).changed, false, 'no global replacement');
   assert.equal(applyCorrection('GPT4 是模型', hints[1]).reason, 'context-required');
 
-  console.log('[5] actions=', 6, 'fact-candidate=', 0, 'form=', JSON.stringify([formCandidate.text, formCandidate.assigned, formCandidate.wrongForms]), 'hints=', JSON.stringify(hints.map((hint) => [hint.kind, hint.replaceable])));
+  console.log('[6] actions=', 6, 'fact-candidate=', 0, 'form=', JSON.stringify([formCandidate.text, formCandidate.assigned, formCandidate.wrongForms]), 'hints=', JSON.stringify(hints.map((hint) => [hint.kind, hint.replaceable])));
 });
