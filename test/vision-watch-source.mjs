@@ -544,23 +544,27 @@ test('⑦ OBS 自启：source=desktop 不否决自启，status.running 与实际
       vision: { mode: 'watch', scene: '' },
     },
   });
-  let status;
-  for (let i = 0; i < 100; i += 1) {
-    status = await app.status();
-    if (status.vision.obsRunning === true && status.autostart.obs.running === true) break;
-    await sleep(20);
+  // Readiness is the boot pass's own `dependency.acquire` line, not the cached `obsRunning`
+  // flag: the dependency probe (and the status route's fire-and-forget scene refresh) flips that
+  // flag before `log.emit` appends the event, so a status poll can observe `true` one tick
+  // before the line exists and must not be used as the completion signal.
+  const bootDeadline = Date.now() + 2_000;
+  let acquire;
+  while (acquire === undefined && Date.now() < bootDeadline) {
+    acquire = (await app.events()).find((event) => (
+      event.type === 'dependency.acquire' && event.payload?.target === 'obs'
+    ));
+    if (acquire === undefined) await sleep(20);
   }
+  assert.ok(acquire !== undefined, 'boot acquired the OBS dependency');
+  assert.equal(acquire.payload.running, true, 'the dependency is running, not skipped');
+
+  const status = await app.status();
   assert.equal(status.vision.source, 'desktop', 'OBS autostart is not vetoed by the desktop source');
   assert.equal(status.vision.obsRunning, true, 'status.vision reports the OBS process as running');
   assert.equal(status.autostart.obs.running, true, 'status.autostart.obs.running agrees with the probe');
   const vision = (await app.call('assistant_vision', { action: 'status' })).value;
   assert.equal(vision.obsRunning, true);
-
-  const acquire = (await app.events()).find((event) => (
-    event.type === 'dependency.acquire' && event.payload?.target === 'obs'
-  ));
-  assert.ok(acquire !== undefined, 'boot acquired the OBS dependency');
-  assert.equal(acquire.payload.running, true, 'the dependency is running, not skipped');
 });
 
 test('⑧ assistant_see 仍是单次取景：交付图像但不建立持续采集', async (t) => {
