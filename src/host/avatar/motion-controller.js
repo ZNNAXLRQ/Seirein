@@ -595,11 +595,13 @@ const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
 /**
  * Preset decision observability (read-only). `config.presetDebugEvents` only gates the EVENTS —
  * the projection counters below are always maintained. Selection decisions stay at one per class
- * per second; a commit is per acknowledged SEND, so 250 ms keeps every acknowledgement visible
- * without letting a 30 Hz tick flood the log. The ring buffer still caps the total.
+ * per second. A commit is throttled to one per second, but never silently dropped: the first and
+ * the last acknowledgement of each action are always written (the middle ones are merged into the
+ * last), because each commit payload already carries the action's cumulative merge window
+ * (`firstAt`/`lastAt`/`firstValue`/`lastValue`).
  */
 const PRESET_DEBUG_THROTTLE_MS = 1000;
-const PRESET_COMMIT_THROTTLE_MS = 250;
+const PRESET_COMMIT_THROTTLE_MS = 1000;
 /** Closed vocabulary of "why no preset ran" (`status.live2d.runtime.motion.presets.skips`). */
 const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
 
@@ -1889,8 +1891,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    * Record ONE preset decision for diagnosis. The projection counters and `last*` values are
    * updated for every decision, so they stay truthful even with `config.presetDebugEvents:false`;
    * the debug EVENT itself (`state.events` + the host log sink) is throttled to one per class per
-   * second (commit evidence: one per 250 ms). Nothing here is read back by selection, the pose or
-   * the transport.
+   * second. Commits keep their own per-action trail (first + last, see `noteCommitEvent`).
+   * Nothing here is read back by selection, the pose or the transport.
    */
   function notePresetDebugEvent(type, payload = {}, at = null) {
     const debug = state.presets.debug;
@@ -1915,14 +1917,26 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (typeof payload.event === 'string') debug.byAction.lastEvent = payload.event;
     }
     if (debug.enabled !== true) return false;
+    if (type === 'avatar.preset.commit') return noteCommitEvent(payload, now);
     const last = debug.lastEmitAt[type];
-    // A commit is evidence of one acknowledged SEND, not of a slow decision: 250 ms keeps an
-    // action's whole acknowledgement trail; select/skip keep the 1 s decision budget. `EVENTS_MAX`
-    // still caps the total buffer.
-    const throttle = type === 'avatar.preset.commit'
-      ? PRESET_COMMIT_THROTTLE_MS : PRESET_DEBUG_THROTTLE_MS;
-    if (Number.isFinite(last) && now - last < throttle) return false;
+    // Select/skip keep the 1 s decision budget; a start opens the next action's commit trail.
+    if (Number.isFinite(last) && now - last < PRESET_DEBUG_THROTTLE_MS) return false;
     debug.lastEmitAt[type] = now;
+    writePresetDebugEvent(type, payload);
+    return true;
+  }
+
+  /**
+   * One action's commit trail: `{actionId, pending, timer, lastEmitAt}`. The first acknowledged
+   * send is written at once, the middle ones are coalesced inside the 1 s window (the newest
+   * replaces the older ones), and the trail's last one is written when the action changes or 1 s
+   * after the last acknowledgement. Each commit payload is already the cumulative merge window of
+   * its action, so first + last keep the evidence and drop the per-250 ms flood.
+   */
+  let commitTrail = null;
+
+  /** Write one already-throttled debug event to the ring buffer and the host log sink. */
+  function writePresetDebugEvent(type, payload) {
     recordEvent(type, payload);
     if (typeof cfg.debugEvent === 'function') {
       try {
@@ -1931,7 +1945,51 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         // Diagnostics must never break a tick.
       }
     }
+  }
+
+  /** Write the newest acknowledged commit a throttled action left pending, if any. */
+  function flushCommitTrail() {
+    const trail = commitTrail;
+    if (trail === null) return false;
+    if (trail.timer !== null) {
+      clearTimeout(trail.timer);
+      trail.timer = null;
+    }
+    const pending = trail.pending;
+    trail.pending = null;
+    if (pending === null || state.presets.debug.enabled !== true) return false;
+    trail.lastEmitAt = Number.isFinite(pending.lastAt) ? pending.lastAt : trail.lastEmitAt;
+    state.presets.debug.lastEmitAt['avatar.preset.commit'] = trail.lastEmitAt;
+    writePresetDebugEvent('avatar.preset.commit', pending);
     return true;
+  }
+
+  /** Apply the 1 s per-action commit throttle, keeping the first and last acknowledgement. */
+  function noteCommitEvent(payload, now) {
+    const actionId = payload.actionId ?? null;
+    if (commitTrail === null || commitTrail.actionId !== actionId) {
+      // A new action: the previous one's last acknowledgement must still arrive, then this first.
+      flushCommitTrail();
+      commitTrail = { actionId, pending: null, timer: null, lastEmitAt: now };
+      state.presets.debug.lastEmitAt['avatar.preset.commit'] = now;
+      writePresetDebugEvent('avatar.preset.commit', payload);
+      return true;
+    }
+    if (commitTrail.pending === null && now - commitTrail.lastEmitAt >= PRESET_COMMIT_THROTTLE_MS) {
+      // Sparse acknowledgements (>= 1 s apart) are written immediately, at most one per second.
+      commitTrail.lastEmitAt = now;
+      state.presets.debug.lastEmitAt['avatar.preset.commit'] = now;
+      writePresetDebugEvent('avatar.preset.commit', payload);
+      return true;
+    }
+    commitTrail.pending = payload;
+    if (commitTrail.timer !== null) clearTimeout(commitTrail.timer);
+    commitTrail.timer = setTimeout(() => {
+      if (commitTrail !== null) commitTrail.timer = null;
+      flushCommitTrail();
+    }, PRESET_COMMIT_THROTTLE_MS);
+    commitTrail.timer?.unref?.();
+    return false;
   }
 
   /** Most specific `skip.reason` for a selection/executor hold (closed vocabulary, spec order). */

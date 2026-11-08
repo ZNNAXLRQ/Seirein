@@ -74,6 +74,13 @@ const DIAGNOSTICS_KEEP = 20;
 export const INFO_THROTTLE_MS = 60_000;
 /** `info` lines that report a failure are never coalesced: a failure must stay on disk verbatim. */
 const INFO_FAILURE_PATTERN = /(?:fail(?:ed|ure)?|error|timed?\s*out|timeout|unavailable)/iu;
+/**
+ * `spout.alpha.sample` is receiver evidence, not a per-second heartbeat: a steady transparent
+ * verdict writes one line per window (30 s), a verdict change is written at once, and any
+ * non-transparent sample (opaque/partial/unknown — the anomalies worth locating) is never
+ * throttled. The sampling itself and `snapshot().alphaSample` stay at the renderer's 1 Hz.
+ */
+export const ALPHA_SAMPLE_LOG_INTERVAL_MS = 30_000;
 
 const VERSION_TIMEOUT_MS = 3000;
 const CREATED_TOLERANCE_MS = 1000;
@@ -192,6 +199,8 @@ export class SpoutLayer {
    *   VTS, so the display window keeps its own drag/resize edit mode instead.
    * @param {number} [options.infoThrottleMs] - same-message `info` window (default 60 s); tests use
    *   a short window to observe the coalesced count without waiting a minute.
+   * @param {number} [options.alphaSampleIntervalMs] - steady transparent alpha sample window
+   *   (default 30 s); a verdict change or a non-transparent sample is always recorded at once.
    * @param {'spout'|'wpf'} [options.backend] - the backend this instance belongs to, as reported by
    *   `snapshot().backend`. Defaults to `spout`; a WPF instance is only ever constructed with an
    *   explicit `backend`, so status can never claim one backend while the other is running.
@@ -208,6 +217,7 @@ export class SpoutLayer {
     spawnProcess = spawn,
     vtsWindow = null,
     infoThrottleMs = INFO_THROTTLE_MS,
+    alphaSampleIntervalMs = ALPHA_SAMPLE_LOG_INTERVAL_MS,
     backend = 'spout',
     vtsHideRetryDelays = VTS_HIDE_RETRY_DELAYS_MS,
     timers = null,
@@ -360,6 +370,17 @@ export class SpoutLayer {
     this.infoThrottleMs = Number.isFinite(throttleMs) && throttleMs >= 0 ? throttleMs : INFO_THROTTLE_MS;
     this.infoThrottle = new Map();
     this.infoThrottled = 0;
+    /**
+     * `spout.alpha.sample` write gate: the receiver keeps sampling at 1 Hz, but a steady verdict
+     * only reaches the event log once per `alphaSampleIntervalMs`. A verdict change or a
+     * non-transparent sample (opaque/partial/unknown) is always written immediately.
+     */
+    const alphaInterval = Number(alphaSampleIntervalMs);
+    this.alphaSampleIntervalMs = Number.isFinite(alphaInterval) && alphaInterval >= 0
+      ? alphaInterval
+      : ALPHA_SAMPLE_LOG_INTERVAL_MS;
+    this.alphaSampleLastVerdict = null;
+    this.alphaSampleLastEmitAt = 0;
   }
 
   /**
@@ -2694,7 +2715,16 @@ export class SpoutLayer {
         height: Math.max(0, Math.round(Number(payload?.height) || 0)),
         at: Date.now(),
       };
-      void this.emitEvent('spout.alpha.sample', { ...this.alphaSample });
+      // The snapshot always carries the newest sample; the event log only needs the transitions
+      // plus a slow heartbeat, because 1 Hz of identical `transparent` lines proved nothing new.
+      const verdict = this.alphaSample.verdict;
+      const changed = verdict !== this.alphaSampleLastVerdict;
+      const anomaly = verdict !== 'transparent';
+      if (changed || anomaly || this.alphaSample.at - this.alphaSampleLastEmitAt >= this.alphaSampleIntervalMs) {
+        this.alphaSampleLastVerdict = verdict;
+        this.alphaSampleLastEmitAt = this.alphaSample.at;
+        void this.emitEvent('spout.alpha.sample', { ...this.alphaSample });
+      }
       return;
     }
 

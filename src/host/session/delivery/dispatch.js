@@ -229,17 +229,76 @@ async function switchObservedSession({ session, cwd, scopePath, getService, setS
 }
 
 /**
+ * One aggregate line per foreign session per window replaces the per-event `sandbox.skipped`
+ * flood: a directory this plugin can never own would otherwise write one cwd-mismatch line for
+ * every committed session event (a DSH coding session produced ~37.8 k lines in 7.5 h). Five
+ * minutes keeps the count and reason auditable instead of dropping the event silently.
+ */
+export const SANDBOX_SKIP_SUMMARY_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * The mismatch that is known noise: both directories are readable and the session's own
+ * directory is simply not this plugin's scope. An unknown session directory (`cwd-unknown`,
+ * resolved by the switch itself) or an unknown scope is a real anomaly and keeps its per-event
+ * `sandbox.skipped` record.
+ */
+function isForeignScopeMismatch(sessionCwd, scopePath) {
+  return sessionCwd.length > 0 && scopePath.length > 0 && !sameDirectory(sessionCwd, scopePath);
+}
+
+/**
  * Observe committed session events so an already existing session (for example one opened by
  * typing in the GUI) is switched on its first event instead of waiting for a voice delivery.
  * Ownership always comes from the live session (its header cwd, then the working-directory
  * service); the event payload is never consulted. `scopePathOf` is read per event so runtime
  * scope changes are honoured.
+ *
+ * A foreign session is filtered **at this entry**: the switch could only report `cwd-mismatch`,
+ * so the observer aggregates it instead of scheduling a write per event. One
+ * `sandbox.skipped.summary {sessionId, count, reason, windowMs}` is written per session per window.
  * @param {{ctx: object, cwdOf: Function, scopePathOf: Function, getService: Function,
- *   setSandboxMode?: Function|null, log?: object|null}} options
+ *   setSandboxMode?: Function|null, log?: object|null, summaryWindowMs?: number}} options
  * @returns the unsubscribe function, or null when the context cannot listen.
  */
-export function observeSessionSandbox({ ctx, cwdOf, scopePathOf, getService, setSandboxMode = null, log = null }) {
+export function observeSessionSandbox({
+  ctx,
+  cwdOf,
+  scopePathOf,
+  getService,
+  setSandboxMode = null,
+  log = null,
+  summaryWindowMs = SANDBOX_SKIP_SUMMARY_WINDOW_MS,
+}) {
   if (typeof ctx?.on !== 'function') return null;
+  const configured = Number(summaryWindowMs);
+  const windowMs = Number.isFinite(configured) && configured >= 0
+    ? Math.round(configured)
+    : SANDBOX_SKIP_SUMMARY_WINDOW_MS;
+  /** Windows belong to this observer: a summary is flushed before its unsubscribe returns. */
+  const windows = new Map();
+  const flushWindow = (sessionId) => {
+    const entry = windows.get(sessionId);
+    if (entry === undefined) return;
+    windows.delete(sessionId);
+    if (entry.timer !== null) clearTimeout(entry.timer);
+    void emitSandboxLog(entry.log, 'sandbox.skipped.summary', {
+      sessionId,
+      count: entry.count,
+      reason: 'cwd-mismatch',
+      windowMs,
+    });
+  };
+  const noteForeignSkip = (sessionId, sink) => {
+    let entry = windows.get(sessionId);
+    if (entry === undefined) {
+      entry = { count: 0, log: sink, timer: null };
+      entry.timer = setTimeout(() => flushWindow(sessionId), windowMs);
+      entry.timer?.unref?.();
+      windows.set(sessionId, entry);
+    }
+    entry.log = sink;
+    entry.count += 1;
+  };
   const off = ctx.on('session/event', (session) => {
     let cwd = '';
     let scopePath = '';
@@ -250,10 +309,21 @@ export function observeSessionSandbox({ ctx, cwdOf, scopePathOf, getService, set
     } catch {
       return;
     }
+    // Same ownership source the switch would use, so the filter can never disagree with it.
+    const sessionCwd = sessionDirectory(session, getService);
+    if (isForeignScopeMismatch(sessionCwd, scopePath)) {
+      noteForeignSkip(String(session?.id ?? ''), log);
+      return;
+    }
     // Never append from inside the dispatch: schedule past it instead.
     void switchObservedSession({ session, cwd, scopePath, getService, setSandboxMode, log }).catch(() => {});
   });
-  return typeof off === 'function' ? off : null;
+  if (typeof off !== 'function') return null;
+  return () => {
+    // Nothing aggregated by this observer may be lost when it is disposed.
+    for (const sessionId of [...windows.keys()]) flushWindow(sessionId);
+    off();
+  };
 }
 
 /** Build the user message shape the Harness rides into an agent's inbox. */

@@ -428,9 +428,9 @@ test('session/event observation ignores the request directory and uses the sessi
 
   assert.equal(app.state.calls.length, 0);
   assert.ok(!app.types().includes('sandbox.switched'));
-  assert.deepEqual(app.events.map((event) => event.payload), [
-    { reason: 'cwd-mismatch', sessionCwd: elsewhere, scopePath: SCOPE },
-  ]);
+  // The observer-entry pre-filter drops the known-foreign mismatch instead of writing one
+  // `sandbox.skipped` per event; the aggregate summary is covered by `event-log-noise.mjs`.
+  assert.deepEqual(app.events, [], 'a foreign session writes no per-event sandbox.skipped line');
 });
 
 // ---- observe path: append is deferred past the event dispatch ------------------------------

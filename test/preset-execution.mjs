@@ -667,27 +667,30 @@ test('16. commit 幅度证据：peak/firstValue/lastValue/spanMs 与最终发送
     for (const entry of frame?.entries ?? []) if (entry.channel) sent.set(entry.channel, entry.value);
     sentByAt.set(at, sent);
   }
+  // The 1 s commit throttle writes the first acknowledgement at once and flushes the newest one
+  // after the window; the runtime is idle here, so this wait is what releases the trailing row.
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_100));
 
   const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
-  assert.ok(commits.length >= 2, `several acknowledgements are evidence: ${commits.length}`);
+  assert.equal(commits.length, 2, `first + last acknowledgement of the action: ${commits.length}`);
   const commit = commits.at(-1);
   assert.equal(commit.presetId, started.presetId);
   assert.equal(typeof commit.peak, 'number');
   assert.equal(typeof commit.spanMs, 'number');
   assert.equal(commit.lastValue !== null && typeof commit.lastValue === 'object', true);
   assert.equal(commit.firstValue !== null && typeof commit.firstValue === 'object', true);
+  assert.ok(commit.commitCount > commits[0].commitCount, 'the trailing row is a later acknowledgement');
 
   // The evidence must be the acknowledged values, not a recomputed physical quantity.
-  const sent = sentByAt.get(commit.at);
-  assert.ok(sent !== undefined, `a frame was sent at the commit time ${commit.at}`);
+  const sent = sentByAt.get(commit.lastAt);
+  assert.ok(sent !== undefined, `a frame was sent at the acknowledged time ${commit.lastAt}`);
   for (const channel of commit.committed) {
     assert.equal(commit.lastValue[channel], sent.get(channel),
       `lastValue equals the final sent value: ${channel}`);
     assert.ok(Number.isFinite(commit.firstValue[channel]), `firstValue is finite: ${channel}`);
   }
   assert.equal(commit.peak, Math.max(...Object.values(commit.lastValue).map(Math.abs)));
-  assert.equal(commit.spanMs, commit.at - commits[0].at, 'span = first ack -> last ack');
-  assert.ok(commit.spanMs >= 750, `the trail spans several acknowledgements: ${commit.spanMs}`);
+  assert.equal(commit.spanMs, commit.lastAt - commits[0].lastAt, 'span = first ack -> last ack');
 
   // The same observability reaches the host log sink.
   assert.ok(logs.some((row) => row.message === 'avatar.preset.start'), 'start is logged too');
@@ -760,20 +763,26 @@ test('18. answer-start 空候选：skip 带 reasons 与 state，可区分 state-
     'the two empty-candidate causes are distinguishable');
 });
 
-test('19. commit 单独 250ms 节流：同一秒 4 次提交 = 4 条（旧实现只有 1 条）', async () => {
+test('19. commit 节流 1 s：同一动作 1 s 内 4 次提交 = 首条 + 末条（末条必到）', async () => {
   const { runtime, tick } = await makeTransportRuntime();
   const started = startIdleTilt(runtime);
   assert.ok(started !== null);
   runtime.takeEvents();
 
   for (const at of [0, 250, 500, 750]) await tick(at);
-  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
-  assert.equal(commits.length, 4, `four acknowledgements 250 ms apart are four events: ${commits.length}`);
-  for (let index = 1; index < commits.length; index += 1) {
-    assert.ok(commits[index].at - commits[index - 1].at >= 250,
-      `commit throttle: ${commits[index - 1].at} -> ${commits[index].at}`);
-  }
-  assert.ok(commits.every((event) => event.presetId === started.presetId));
+  const inside = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(inside.length, 1, 'only the first acknowledgement is written inside the window');
+  assert.equal(inside[0].commitCount, 1);
+  const acknowledged = runtime.snapshot().motion.presets.debug.byAction.lastCommitCount;
+  assert.ok(acknowledged > 1, `the other acknowledgements happened: ${acknowledged}`);
+
+  // The window closes: the newest suppressed acknowledgement is written, never dropped.
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_100));
+  const trailing = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(trailing.length, 1, 'exactly one trailing row closes the action');
+  assert.ok(trailing[0].commitCount > inside[0].commitCount,
+    `the last acknowledgement arrives: ${inside[0].commitCount} -> ${trailing[0].commitCount}`);
+  assert.ok(trailing.every((event) => event.presetId === started.presetId));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -817,7 +826,7 @@ test('20. select→start 关联：select 带 selectionId，start 沿用并分配
   assert.equal(start.event, 'idle');
 });
 
-test('21. 同一动作多条 commit 按 actionId 归并：commitCount 递增，firstAt/lastAt 成窗口', async () => {
+test('21. 同一动作多条 commit 按 actionId 归并：首条 + 末条，firstAt/lastAt 成窗口', async () => {
   const { runtime, tick } = await makeTransportRuntime();
   const started = startIdleTilt(runtime);
   assert.ok(started !== null);
@@ -825,24 +834,33 @@ test('21. 同一动作多条 commit 按 actionId 归并：commitCount 递增，f
   runtime.takeEvents();
 
   for (const at of [0, 250, 500, 750]) await tick(at);
-  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
-  assert.equal(commits.length, 4, `four acknowledgements: ${commits.length}`);
+  const inside = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(inside.length, 1, 'the window keeps only the first acknowledgement');
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_100));
+  const trailing = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(trailing.length, 1, 'the newest acknowledgement closes the action');
+  const commits = [...inside, ...trailing];
   assert.ok(commits.every((event) => event.actionId === started.actionId),
     'every ack of one action carries the same actionId');
   assert.ok(commits.every((event) => event.selectionId === started.selectionId));
-  assert.deepEqual(commits.map((event) => event.commitCount), [1, 2, 3, 4],
-    'commitCount is the merge counter for this action');
-  assert.ok(commits.every((event) => event.firstAt === commits[0].at),
+  assert.equal(commits[0].commitCount, 1, 'commitCount is the merge counter for this action');
+  assert.ok(commits[1].commitCount > 1,
+    `the trailing row is a later acknowledgement: ${commits[1].commitCount}`);
+  assert.ok(commits.every((event) => event.firstAt === commits[0].lastAt),
     'firstAt stays the first acknowledgement of the action');
-  assert.deepEqual(commits.map((event) => event.lastAt), commits.map((event) => event.at),
-    'lastAt is the acknowledgement being reported');
+  assert.deepEqual(
+    commits.map((event) => event.spanMs),
+    commits.map((event) => event.lastAt - event.firstAt),
+    'each row reports its own acknowledgement window',
+  );
+  assert.equal(commits[0].lastAt, commits[0].at, 'the first row is written at its acknowledgement');
+  assert.equal(commits[1].firstAt, commits[0].firstAt, 'the trailing row keeps the same window start');
 
   const byAction = runtime.snapshot().motion.presets.debug.byAction;
-  assert.deepEqual(byAction, {
-    lastActionId: started.actionId,
-    lastCommitCount: 4,
-    lastEvent: 'idle',
-  }, 'the status projection merges the same action without keeping history');
+  assert.equal(byAction.lastActionId, started.actionId);
+  assert.equal(byAction.lastEvent, 'idle');
+  assert.ok(byAction.lastCommitCount > 1,
+    `the status projection counts every acknowledgement: ${byAction.lastCommitCount}`);
 });
 
 test('22. idle 动作的 commit 带 event=idle；对话边界动作带自己的 event', async () => {
