@@ -271,8 +271,8 @@ export function userMessage(text) {
  *
  * `title` is the deterministic day stamp (`2026-11-04 周三`). It is pinned through the
  * session-title service, whose `rename()` appends a `session/title` event with the `user`
- * source. Without that, DSH titles a session after its first message — here the rollover digest —
- * and the model-backed title provider then replaces it with a summary of that text.
+ * source. Without that, DSH titles a session after its first message — the user's first
+ * utterance — and the model-backed title provider replaces it with a summary of that text.
  *
  * A session whose **own** cwd equals `scopePath` is the plugin's own assistant session: it is
  * moved to DSH `danger-full-access` once, through the official `setSandboxMode(session, mode)`
@@ -317,7 +317,7 @@ export async function ensureSession({
       const renamed = service.rename(session, desiredTitle);
       return { title: String(renamed?.title ?? desiredTitle), titleChanged: true, titleError: '' };
     } catch (error) {
-      // Never fail the turn over a cosmetic title: the digest and the utterance still go out.
+      // Never fail the turn over a cosmetic title: the utterance still goes out.
       return { title: currentTitle, titleChanged: false, titleError: error?.message ?? String(error) };
     }
   };
@@ -862,11 +862,11 @@ function sessionBaselineSeq(ctx, sessionId) {
  *
  * Two binding modes:
  *  - identity mode (`deliveryMessageId`): the wait binds to the turn that logs the delivered
- *    `user/message` with that id. A digest turn sent before the request is therefore skipped,
- *    because its user message has a different id.
- *  - legacy mode (no id): the continuity digest is isolated by skipping the new session's first
- *    turn (`skipDigestTurn`), since `index.js` only sends the digest when it creates the session;
- *    later turns are accepted by turn number.
+ *    `user/message` with that id. Any other turn (a resume replay, another lane's turn) is
+ *    therefore skipped, because its user message has a different id.
+ *  - legacy mode (no id): the first `turn/start` after the delivery baseline is accepted by
+ *    turn number. There is no separate digest turn to skip any more: the day background is
+ *    injected into the delivered request itself (see `session/conversation/rollover-digest.js`).
  *
  * Only one listener may consume a session at a time; an overlapping call resolves immediately
  * with `{ok:false, error:"session-listener-busy", status:"busy"}`.
@@ -906,7 +906,6 @@ export function awaitSessionResult({
   timeoutMs = 180_000,
   baselineSeq,
   deliveryMessageId,
-  skipDigestTurn = true,
   signal,
   onAck,
   onAssistantText,
@@ -944,7 +943,6 @@ export function awaitSessionResult({
   let pendingTools = 0;
   let targetTurn = null;
   let currentTurn = null;
-  let digestSkipped = false;
   let turnStarted = false;
   let settled = false;
   let off;
@@ -1224,15 +1222,11 @@ export function awaitSessionResult({
       if (event.type === 'turn/start') {
         currentTurn = turn;
         // Probe only: a turn start observed before binding belongs to this delivery's turn in
-        // the identity lane (the digest's own turn start shares the same type name anyway).
+        // the identity lane (an earlier replay turn start shares the same type name anyway).
         if (targetTurn === null) probeTypes.add('turn/start');
         if (identityMode || targetTurn !== null) return;
-        // Legacy binding: a new session's first turn is the continuity digest that `index.js`
-        // injects before the actual request, so it must not become the answer.
-        if (skipDigestTurn && !digestSkipped && turn === 1) {
-          digestSkipped = true;
-          return;
-        }
+        // Legacy binding: no delivery id exists, so the first turn after the baseline is this
+        // delivery's answer. Nothing else is sent into a session before its request.
         targetTurn = turn;
         turnStarted = true;
         last = '';
@@ -1243,8 +1237,8 @@ export function awaitSessionResult({
       }
       if (event.type === 'user/message') {
         if (!identityMode) return;
-        // Bind by message identity: the digest's user message has a different id, so its
-        // assistant text and turn/end are never accepted here.
+        // Bind by message identity: any other user message (a resume replay, another lane) has a
+        // different id, so its assistant text and turn/end are never accepted here.
         if (userMessageId(event) !== deliveryMessageId) return;
         const ownerTurn = currentTurn !== null ? currentTurn : turn;
         if (ownerTurn === null || targetTurn !== null) return;
@@ -1321,7 +1315,7 @@ export function awaitSessionResult({
         return;
       }
       if (event.type !== 'turn/end') return;
-      // A turn that never became the delivery's turn (replay, digest, or another lane) is ignored.
+      // A turn that never became the delivery's turn (replay, another lane) is ignored.
       if (!turnStarted) return;
       if (turn !== null && targetTurn !== null && turn !== targetTurn) return;
       if (last.length > 0 || identityMode) {

@@ -465,6 +465,9 @@ import { ACTIONS as profileActions, createProfileSettingsActions } from './profi
 import { createSettingsRouter } from './runtime/http/actions.js';
 import { createVoiceContextObserver } from './session/events/voice-context.js';
 import { createConversationPreStep } from './session/conversation/pre-step.js';
+// The public export surface is frozen by `test/host-api.mjs`; this lane is internal wiring only
+// and is imported directly from its module (tests included).
+import { createRolloverDigest, ROLLOVER_DIGEST_MAX_CHARS } from './session/conversation/rollover-digest.js';
 import { createProfileActivityObserver } from './profile/events.js';
 import { createSpeechTurnObserver } from './speech/events.js';
 export {
@@ -747,7 +750,11 @@ const VOICE_BUSY_LINE = '上一条还在处理，等处理完请再说一次。'
  * Deliver one voice request into a session. When another waiter already owns the session the
  * wait resolves immediately as busy; sending anyway would queue the text behind the previous
  * turn and speak that turn's answer as if it belonged to this utterance. In that case the
- * request is refused without consuming anything (no followup, digest included).
+ * request is refused without consuming anything (no followup).
+ *
+ * Exactly ONE followup is sent: the request itself. The day's background is not a message any
+ * more — it reaches the target session's first request through the pre-step lane
+ * (`rollover-digest.js`), so the user's turn starts immediately.
  * Returns true when the request was handed to the agent.
  */
 export async function deliverVoiceRequest({
@@ -755,7 +762,6 @@ export async function deliverVoiceRequest({
   session,
   sessionId,
   request,
-  digestMessage = null,
   log,
   speakLine,
   onInjected,
@@ -766,7 +772,6 @@ export async function deliverVoiceRequest({
     return false;
   }
   try {
-    if (session.created === true && digestMessage !== null) session.agent.followup(digestMessage);
     session.agent.followup(request);
   } catch (error) {
     // Delivery failed: release the waiter we were handed. Otherwise it owns the session until
@@ -988,8 +993,9 @@ export function cancelSpeech(speechId, reason = 'explicit') {
 
 /**
  * The `voice.session.ready` payload: one glance at the event log answers whether the persona,
- * the fixed-memory layer and the day digest actually reached the voice session, and how many
- * memory records it is working with.
+ * the fixed-memory layer and the day digest are ready for the voice session, and how many
+ * memory records it is working with. `digestInjected` means today's digest exists, so the
+ * session's first request will carry it (injected at `agent/pre-step`, not as a turn).
  * @param {{sessionId?: string, title?: string, cwd?: string, personaText?: string,
  *          fixedMemory?: Array<object>, digest?: string, memoryRecords?: number}} state
  */
@@ -5240,8 +5246,10 @@ export function apply(ctx, config) {
   ctx.effect(() => () => clearTimeout(memoryBootTimer));
 
   // ---- daily session rollover -------------------------------------------
-  // At 04:00 the companion starts a fresh day: the web UI opens a new dated session and types a
-  // continuity digest into it (fixed constraints + yesterday + the 02:00–04:00 tail).
+  // At 04:00 the companion starts a fresh day: the digest (fixed constraints + yesterday + the
+  // 02:00–04:00 tail) is GENERATED here in the background and stored in settings. It is not sent
+  // as a message and never opens a turn: the target assistant session's first request carries it
+  // through `agent/pre-step` (see `session/conversation/rollover-digest.js`).
   const ROLLOVER_HOUR = Number(config?.sessionRolloverHour ?? 4);
   let pendingRollover = runtime.pendingRollover ?? null;
   /** The same stamp as `dayStampFor`, bound to this instance's 04:00 rollover hour. */
@@ -5267,7 +5275,9 @@ export function apply(ctx, config) {
       minImportance: 30,
       limit: 8,
     });
-    // DSH derives a session title from its first user message, so lead with the date.
+    // Lead with the date: the stored digest is also rendered by hand (`rollover.force`) and the
+    // date makes it self-describing. The old "first message titles the session" reason is gone:
+    // `ensureSession` pins the day-stamp title through the session-title service.
     const stamp = dayStamp().title;
     const lines = [`【${stamp}】以下内容作为长期约束与背景，不需要逐条复述。`];
     if (fixed.length > 0) {
@@ -5290,8 +5300,8 @@ export function apply(ctx, config) {
     const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     if (readMemoryState().lastRollover === today) return;
     const digest = buildRolloverDigest();
-    // Continuity only: the digest rides in the system prompt. Creating the dated session is the
-    // background voice lane's job (first utterance of the day), so the UI is not asked to do it.
+    // Background generation only. The dated session is created by the voice lane's first utterance
+    // and its first request reads this value; no session is opened and no message is delivered here.
     writeSettings({ dayDigest: { date: today, digest } });
     pendingRollover = null;
     runtime.pendingRollover = null;
@@ -5305,6 +5315,47 @@ export function apply(ctx, config) {
   rolloverTimer.unref?.();
   ctx.effect(() => () => clearInterval(rolloverTimer));
   void checkRollover();
+
+  // The day digest rides the target assistant session's first request, not a turn of its own.
+  // Dedupe survives a plugin reload: keys are the rollover bookkeeping file's own lines, one per
+  // (session, day), so a resumed session never receives the same digest twice.
+  const digestInjectedKeys = new Set((() => {
+    try {
+      const state = readMemoryState();
+      return Array.isArray(state.digestInjected)
+        ? state.digestInjected.filter((key) => typeof key === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  })());
+  const rememberDigestInjected = (key) => {
+    if (typeof key === 'string' && key.length > 0) digestInjectedKeys.add(key);
+    // Never block the request on bookkeeping: the in-memory key already dedupes this process.
+    setImmediate(() => {
+      try {
+        const state = readMemoryState();
+        writeMemoryStateFile({ ...state, digestInjected: [...digestInjectedKeys].slice(-64) });
+      } catch {
+        /* dedupe bookkeeping only */
+      }
+    });
+  };
+  const rolloverDigest = createRolloverDigest({
+    log,
+    // Read-only: generation stays in `checkRollover`/`rollover.force`, never in the request path.
+    readDayDigest: () => {
+      const day = readSettings().dayDigest;
+      return day !== null && typeof day === 'object' ? day : null;
+    },
+    today: dayStamp,
+    // The only target is today's dated assistant session; subagents are refused by `isSubagent`.
+    isTarget: (sessionId) => sessionId === voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId,
+    isSubagent: isSubagentAgent,
+    injected: digestInjectedKeys,
+    onInjected: rememberDigestInjected,
+    maxChars: ROLLOVER_DIGEST_MAX_CHARS,
+  });
 
   // Nonverbal perception cue: experimental and off unless `voice.nonverbalCue` is explicitly true.
   // The five-minute window is a validity cap, not a mood, and chat never renews it.
@@ -5516,8 +5567,11 @@ export function apply(ctx, config) {
     // only the first step of the turn that follows a continuation delivery, and its source kind is
     // the isolation marker every memory/ack/typed lane already excludes, so it is never recorded
     // as the user's own speech. The base decision (including a `reject`) is returned untouched.
+    // The same lane appends the rollover day digest to the target session's first request; that
+    // lane is read-only and deduped, so it can add no turn and no second copy.
     ctx.effect(() => ctx.on('agent/pre-step', createConversationPreStep({
-    get responseGroups() { return responseGroups; }
+    get responseGroups() { return responseGroups; },
+    get rolloverDigest() { return rolloverDigest; }
   })));
     // Same turn boundary the recorder uses: a finished turn releases its dedup key.
     ctx.effect(() => ctx.on('session/event', (session, event) => {
@@ -9460,22 +9514,9 @@ export function apply(ctx, config) {
     );
     // No `assistant:memory-fixed` section any more (2026-11-06): importance never grants
     // every-turn residency. The fixed-memory resources below are the only resident layer.
-    // Day continuity: yesterday's context rides in the system prompt, so it applies to every
-    // session opened today without creating or injecting into sessions.
-    scope.effect(() =>
-      scope.systemPrompt.section({
-        name: 'assistant:day-context',
-        order: 255,
-        text: scopedText(() => {
-          const day = readSettings().dayDigest;
-          if (!day || typeof day.digest !== 'string') return '';
-          const today = new Date();
-          const stamp = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
-          if (day.date !== stamp) return '';
-          return day.digest;
-        }),
-      }),
-    );
+    // Day continuity is no longer a system-prompt section: it is injected into the target
+    // assistant session's first request at `agent/pre-step` (see `rollover-digest.js`), once per
+    // (session, day), so it never reaches a subagent and never opens a turn of its own.
     scope.effect(() =>
       scope.systemPrompt.section({
         name: 'assistant:memory-usage',
@@ -10540,7 +10581,7 @@ export function apply(ctx, config) {
 
   /** Last logged `voice.session.ready` payload per session id: a plain resume is not re-logged. */
   const voiceReadySeen = new Map();
-  /** Today's continuity digest exactly as the `assistant:day-context` prompt section renders it. */
+  /** Today's stored continuity digest; the pre-step lane injects exactly this text. */
   const todaysDigest = () => {
     const day = readSettings().dayDigest;
     if (day === undefined || day === null || day.date !== dayStamp().date) return '';
@@ -11559,22 +11600,16 @@ export function apply(ctx, config) {
       });
       turnOwnership.capture();
       activeVoiceTurn = turnOwnership;
-      // The day's first utterance is the new-session marker: a date-stamped continuity note opens
-      // the session (that becomes its title), then the spoken line follows as its own turn.
-      // The busy check runs first, so a refused utterance never sends the digest either.
-      const digestMessage = session.created === true ? userMessage(buildRolloverDigest()) : null;
-      // Register both deliveries before the followup: the turn that this request opens is a voice
-      // turn, so the typed round-end trigger must never speak its answer a second time.
+      // Exactly one followup: the user's request opens the session's first turn itself. The day's
+      // continuity background is injected into that same first request by the pre-step lane, so
+      // no digest turn exists and nothing needs to be skipped or registered separately.
+      // The busy check runs first, so a refused utterance sends nothing.
       typedVoice.noteDelivery({ requestId: request.id, inputSource: 'voice', sessionId });
-      if (digestMessage !== null) {
-        typedVoice.noteDelivery({ requestId: digestMessage.id, inputSource: 'voice', sessionId });
-      }
       delivered = await deliverVoiceRequest({
         resultPromise,
         session,
         sessionId,
         request,
-        digestMessage,
         log,
         speakLine,
         onInjected: (info) => {

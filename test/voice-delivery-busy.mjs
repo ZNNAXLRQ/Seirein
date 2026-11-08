@@ -102,8 +102,6 @@ test('a) a busy delivery never calls followup, logs the refusal and speaks no re
     session: target,
     sessionId,
     request: userMessage('request-b', '第二个请求'),
-    // A new session normally sends its digest first; a refused delivery must not send it either.
-    digestMessage: userMessage('digest-1', '今天也请多关照'),
     log,
     speakLine: async (line, subtitle = '') => {
       spoken.push({ line, subtitle });
@@ -159,7 +157,7 @@ test('a) a busy delivery never calls followup, logs the refusal and speaks no re
   assert.equal(fake.listenerCount, 0, 'the winner removed its listener');
 });
 
-test('b) a free session still delivers the digest first, then the request', async () => {
+test('b) a free session delivers exactly one followup: the request itself', async () => {
   const sessionId = 'voice-busy-free';
   const fake = fakeCtx();
   const promise = awaitSessionResult({
@@ -179,14 +177,15 @@ test('b) a free session still delivers the digest first, then the request', asyn
     session: target,
     sessionId,
     request,
-    digestMessage: userMessage('digest-2', '今天的摘要'),
     log,
     speakLine: async (line) => spoken.push(line),
   });
 
   assert.equal(delivered, true);
-  assert.equal(target.followups.length, 2, 'digest then request');
-  assert.equal(target.followups[1], request);
+  // The day background is no longer a message: it rides the request at `agent/pre-step`, so a
+  // newly created session opens its first turn with the user's own request.
+  assert.equal(target.followups.length, 1, 'the request is the only followup');
+  assert.equal(target.followups[0], request);
   assert.equal(log.events.filter((entry) => entry.type === 'voice.delivery.busy').length, 0);
   assert.equal(spoken.length, 0);
 

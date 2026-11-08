@@ -216,7 +216,7 @@ async function mount(t, { callNames = [], voice = false } = {}) {
           });
           fire('turn/end', { turn: turnId, reason: { kind: 'completed' } });
         })().catch(() => {});
-        // The digest is a separate followup on a fresh session; tests never count it as a turn.
+        // No background message is sent any more: the request is the session's first turn.
         return text;
       },
     };
@@ -450,7 +450,7 @@ test('3. call 模式未寻址语音 → 不投递、无新轮次、记 voice.cal
   // The merge window is 10 ms; give the (never scheduled) delivery a real chance to happen.
   await new Promise((resolve) => setTimeout(resolve, 120));
   assert.deepEqual(app.voiceDeliveries(), [], 'no request reaches the agent');
-  assert.equal(app.deliveries.length, 0, 'not even the new-session digest was sent');
+  assert.equal(app.deliveries.length, 0, 'nothing at all was sent into the session');
   assert.equal((await app.callMode({ action: 'status' })).mode, 'call', 'a miss never exits call mode');
   console.log(`[3] delivered=0 turn=0 event=${JSON.stringify(unaddressed)}`);
 });

@@ -436,10 +436,11 @@ test('1) a real voice round joins voice.injected to its turn, delivery message a
   });
   const round = await runVoiceRound(app, '月光下的散步你还记得吗');
 
-  // The session was created by this mount, so turn 1 is the continuity digest and the utterance
-  // is turn 2: a fixed 1 would be the wrong turn, which is exactly what this join must not do.
+  // The session is created by this mount, but there is no digest turn any more: the day
+  // background rides the request's own pre-step, so the utterance is turn 1. A fixed 1 is the
+  // right turn here, and the join below must still carry it verbatim.
   const request = state.followups.at(-1);
-  assert.equal(round.injected.turn, 2, 'injected carries the loop turn that the request opened');
+  assert.equal(round.injected.turn, 1, 'injected carries the loop turn that the request opened');
   assert.equal(round.injected.deliveryMessageId, request.id, 'deliveryMessageId is the delivered request id');
 
   // The same turn's C2 recall, not the voice lane's old fixed {hits:0, injected:false}.
@@ -462,7 +463,7 @@ test('1) a real voice round joins voice.injected to its turn, delivery message a
   const secondRecall = app.rows('memory.recall')
     .map((entry) => entry.payload)
     .find((payload) => payload.turn === secondInjected.turn);
-  assert.equal(secondInjected.turn, 3, 'the second round is its own turn (2 is not reused)');
+  assert.equal(secondInjected.turn, 2, 'the second round is its own turn (1 is not reused)');
   assert.ok(secondRecall !== undefined, 'the second turn logged its own memory.recall');
   assert.equal(secondRecall.hits, 0, 'the unrelated question matched nothing');
   assert.equal(secondInjected.memoryHits, 0, 'a real recall with no hit is 0, not round 1\'s 4');
@@ -482,17 +483,17 @@ test('2) voice.reply, voice.first-sentence, voice.latency and the stream probe c
   const round = await runVoiceRound(app, '帮我看看明天的天气');
   const request = state.followups.at(-1);
 
-  assert.equal(round.reply.turn, 2, 'voice.reply.turn');
+  assert.equal(round.reply.turn, 1, 'voice.reply.turn');
   assert.equal(round.reply.sessionId, round.injected.sessionId, 'voice.reply.sessionId');
   assert.equal(round.reply.deliveryMessageId, request.id, 'voice.reply.deliveryMessageId');
-  assert.equal(round.firstSentence.turn, 2, 'voice.first-sentence.turn');
-  assert.equal(round.latency.turn, 2, 'voice.latency.turn');
-  assert.equal(round.probe.turn, 2, 'voice.stream.probe.turn');
-  assert.equal(round.injected.turn, 2, 'and the injected row agrees');
+  assert.equal(round.firstSentence.turn, 1, 'voice.first-sentence.turn');
+  assert.equal(round.latency.turn, 1, 'voice.latency.turn');
+  assert.equal(round.probe.turn, 1, 'voice.stream.probe.turn');
+  assert.equal(round.injected.turn, 1, 'and the injected row agrees');
   // The same round: every join key points at one turn.
   assert.deepEqual(
     new Set([round.injected.turn, round.reply.turn, round.firstSentence.turn, round.latency.turn, round.probe.turn]),
-    new Set([2]),
+    new Set([1]),
   );
 
   console.log(`[2] reply turn=${round.reply.turn} first-sentence turn=${round.firstSentence.turn} `
@@ -526,7 +527,7 @@ test('4) voice.injected keeps memoryHits/memoryInjected null when no recall was 
   const round = await runVoiceRound(app, '记忆关闭时也不该编造命中数');
 
   assert.equal(round.recalls.length, 0, 'the memory lane is off, so nothing recalled');
-  assert.equal(round.injected.turn, 2, 'the turn join key still exists');
+  assert.equal(round.injected.turn, 1, 'the turn join key still exists');
   assert.equal(round.injected.deliveryMessageId, state.followups.at(-1).id);
   assert.equal(round.injected.memoryHits, null, 'no observed recall -> null, not 0');
   assert.equal(round.injected.memoryInjected, null, 'no observed recall -> null, not false');
@@ -540,7 +541,8 @@ test('4) voice.injected keeps memoryHits/memoryInjected null when no recall was 
 
 test('5) a turn learned during the recall wait is published together with that turn\'s hits', async (t) => {
   const app = await mount(t, {
-    startTurn: 6, // the digest is turn 6, the delivered utterance is turn 7
+    // There is no digest turn before the request: the delivered request is turn 6 itself.
+    startTurn: 6,
     deferEventsMs: 120, // the join's wait starts while `stage.turn` is still null
     seeds: [
       '我很喜欢月光下的散步，昨晚也是',
@@ -556,7 +558,7 @@ test('5) a turn learned during the recall wait is published together with that t
   // waiting, and the hits of that same turn (not a stale-null row next to fresh hits).
   assert.ok(state.turnStartedAt - state.deliveryAt >= 100,
     'the loop acknowledged the turn only after the recall wait had begun');
-  assert.equal(round.injected.turn, 7, 'the turn learned during the wait is published');
+  assert.equal(round.injected.turn, 6, 'the turn learned during the wait is published');
   const recall = round.recalls.find((payload) => payload.turn === round.injected.turn);
   assert.ok(recall !== undefined, 'the same turn logged a memory.recall');
   assert.equal(recall.hits, 4);
@@ -584,13 +586,13 @@ test('6) an unknown turn keeps turn/memoryHits null instead of borrowing another
   });
   app.say('月光下的散步你还记得吗');
   await untilEvents(() => app.rows('voice.injected').length === 1, 'voice.injected (unknown turn)');
-  // The recall exists under turn 7; an emit with no observed turn must not use it.
-  await untilEvents(() => app.rows('memory.recall').some((entry) => entry.payload.turn === 7), 'turn 7 recall');
+  // The recall exists under turn 6; an emit with no observed turn must not use it.
+  await untilEvents(() => app.rows('memory.recall').some((entry) => entry.payload.turn === 6), 'turn 6 recall');
   await untilEvents(() => app.rows('voice.latency').length === 1, 'voice.latency (unknown turn)');
 
   const injected = app.rows('voice.injected')[0].payload;
-  const recall = app.rows('memory.recall').map((entry) => entry.payload).find((payload) => payload.turn === 7);
-  assert.equal(recall.hits, 4, 'a turn 7 recall with four hits was observed during the wait');
+  const recall = app.rows('memory.recall').map((entry) => entry.payload).find((payload) => payload.turn === 6);
+  assert.equal(recall.hits, 4, 'a turn 6 recall with four hits was observed during the wait');
   assert.equal(injected.turn, null, 'the turn the wait could not observe stays null');
   assert.equal(injected.memoryHits, null, 'another turn\'s hits are never mixed into a null turn');
   assert.equal(injected.memoryInjected, null, 'another turn\'s injected flag is never mixed in');

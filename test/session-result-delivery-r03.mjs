@@ -4,8 +4,8 @@
  *
  * The fake feed follows the real Harness event shape: `turn/start` opens a turn, the
  * `user/message` event carries the delivered message under `data` (with its `id`), then the
- * assistant output and `turn/end` belong to that same turn. A new session first runs a
- * standalone continuity-digest turn, exactly like `index.js` does.
+ * assistant output and `turn/end` belong to that same turn. A standalone background turn (the
+ * legacy digest shape) may precede the delivery turn and must never supply its answer.
  *
  * Run: node --test test/session-result-delivery-r03.mjs
  */
@@ -61,7 +61,7 @@ test('a) a digest turn before the delivery turn never supplies the answer', asyn
     outcome = value;
   });
 
-  // New session: the host first sends its continuity digest as its own turn.
+  // A legacy background turn may still precede the delivery turn.
   emit(session(sessionId), { type: 'turn/start', seq: 10, data: { turn: 1 } });
   emit(session(sessionId), {
     type: 'user/message',

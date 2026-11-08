@@ -321,7 +321,7 @@ async function mountVoiceRound(t, {
     return agent;
   };
   services.set('agentLoop', {
-    // The session already exists: no rollover digest, so each followup is exactly one turn.
+    // The session already exists, so each followup is exactly one turn.
     async resume(_ownerCtx, options) {
       const id = options.resumeSessionId;
       if (!agents.has(id)) agents.set(id, makeAgent(id));

@@ -47,7 +47,9 @@ export function createSessionSettingsActions(services) {
         return { ok: true, rollover: services.pendingRollover };
       }
       case 'rollover.force': {
-        // Rebuild today's continuity digest on demand (it rides in the system prompt only).
+        // Rebuild today's continuity digest on demand. This only writes the stored value: the
+        // target assistant session's first request reads it at `agent/pre-step`, so no turn is
+        // opened here and no message is delivered to any session.
         const day = (0, services.dayStamp)();
         const digest = (0, services.buildRolloverDigest)();
         (0, services.writeSettings)({ dayDigest: { date: day.date, digest } });
