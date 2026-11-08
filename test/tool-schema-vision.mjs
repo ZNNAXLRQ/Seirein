@@ -90,10 +90,16 @@ test('assistant_vision status output matches its declared schema', async (t) => 
   assert.ok(tool !== undefined, 'assistant_vision is registered');
   const schema = tool.output.schema;
   assert.ok(Object.hasOwn(schema.properties, 'lastShot'), 'the output schema declares lastShot');
+  for (const field of ['source', 'capturing', 'lastCaptureAt', 'obsRunning']) {
+    assert.ok(Object.hasOwn(schema.properties, field), `the output schema declares ${field}`);
+  }
 
   const value = await tool.execute({ action: 'status' }, {});
   assert.equal(value.ok, true, 'status succeeds');
   assert.ok(Object.hasOwn(value, 'lastShot'), 'status returns lastShot');
+  assert.ok(value.source === 'desktop' || value.source === 'obs', 'status names the view source');
+  assert.equal(value.capturing, false, 'no continuous capture at mount');
+  assert.equal(value.lastCaptureAt, null);
   validate(schema, value);
 
   // No capture yet: null must satisfy the same declaration.

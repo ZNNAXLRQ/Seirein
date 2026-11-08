@@ -380,6 +380,11 @@ test('② 进隐私：旧截图与故事板不再交付，在途采集被取消'
 
   const privacy = await app.action({ action: 'vision.mode', mode: 'privacy' });
   assert.equal(privacy.ok, true, privacy.error);
+  assert.equal(
+    state.obsRequests.some((entry) => entry.type === 'SetCurrentProgramScene'),
+    false,
+    'privacy is a plugin-side lock and never switches an OBS scene',
+  );
   const cleared = await app.status();
   assert.equal(cleared.perception.lastVision, null, 'the old observation is no longer delivered');
   assert.equal(cleared.vision.lastShot, null);

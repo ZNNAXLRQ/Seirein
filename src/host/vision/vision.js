@@ -1,13 +1,26 @@
 /**
- * Vision mode state machine.
+ * Vision state machine.
  *
- * Three modes, per the user's spec:
- *   privacy  — OBS is switched to the privacy scene (black). Agents may enter, never leave.
- *   scene    — agents switch OBS scenes to "take a look" at one app, even when it is in the
- *              background; frames come from the OBS virtual camera.
- *   watch    — long-context viewing (movies, books, games) via ffmpeg ddagrab, never OBS.
+ * Modes, per the user's spec:
+ *   privacy  — a plugin-side capture lock: both sources stop, in-flight captures are cancelled and
+ *              every agent capture is refused. It never switches an OBS scene; only the user can
+ *              leave it, and the previous source/scene is restored on the way out.
+ *   watch    — the desktop source (ffmpeg ddagrab / storyboards); never requires OBS.
+ *   scene    — the OBS source: continuously watch one selected scene through the virtual camera,
+ *              even when that app is in the background.
+ *
+ * `source` is the model-facing spelling of the non-privacy modes: watch → desktop, scene → obs.
  */
 export const VISION_MODES = ['privacy', 'scene', 'watch'];
+
+/** The two watch sources share one capture capability. */
+export const VISION_SOURCES = ['desktop', 'obs'];
+
+/** Map a non-privacy mode onto its source. Privacy reports the source it will restore. */
+export function sourceOfMode(mode, fallback = 'watch') {
+  const value = mode === 'privacy' ? fallback : mode;
+  return value === 'scene' ? 'obs' : 'desktop';
+}
 
 export class VisionMode {
   constructor({ initial = 'watch', scene = '' } = {}) {

@@ -7,14 +7,60 @@ export const ACTIONS = Object.freeze([
   'vision.mode',
   'vision.scenes',
   'vision.snapshot',
+  'vision.watch.start',
+  'vision.watch.stop',
 ]);
 
 export function createVisionSettingsActions(services) {
   const handler = async (body) => {
     switch (body.action) {
       case 'watch.stop':
-        await (0, services.invalidateVision)();
-        return { ok: true };
+        await (0, services.stopWatch)('settings-watch-stop');
+        return { ok: true, virtualCam: services.virtualCamOn };
+      case 'vision.watch.start': {
+        if (services.vision.mode === 'privacy') {
+          return { ok: false, locked: true, error: '隐私模式已开启：需要用户手动退出隐私后才能开始观看' };
+        }
+        const opened = await (0, services.ensureComponent)('vision', 'vision.watch');
+        if (!opened.ok) return { ok: false, code: 'FEATURE_DISABLED', feature: 'vision', error: opened.error ?? '视觉组件无法启用' };
+        const requested = body.source === 'obs' ? 'obs' : body.source === 'desktop' ? 'desktop' : '';
+        if (requested !== '') {
+          const target = requested === 'obs' ? 'scene' : 'watch';
+          const switched = await (0, services.applyVisionMode)(
+            target,
+            requested === 'obs' ? String(body.scene ?? '') : '',
+            { by: 'user' },
+          );
+          if (!switched.ok) return { ...switched, virtualCam: services.virtualCamOn };
+        }
+        await (0, services.ensureVisionModeDependencies)(services.vision.mode, 'vision.watch.start');
+        try {
+          const session = await (0, services.startWatcher)((0, services.visionToken)());
+          return {
+            ok: true,
+            running: true,
+            capturing: true,
+            engine: session.engine,
+            source: services.vision.mode === 'scene' ? 'obs' : 'desktop',
+            scene: services.vision.scene,
+            virtualCam: services.virtualCamOn,
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            running: false,
+            capturing: false,
+            source: services.vision.mode === 'scene' ? 'obs' : 'desktop',
+            scene: services.vision.scene,
+            virtualCam: services.virtualCamOn,
+            error: error?.message ?? String(error),
+          };
+        }
+      }
+      case 'vision.watch.stop': {
+        await (0, services.stopWatch)('settings');
+        return { ok: true, running: false, capturing: false, virtualCam: services.virtualCamOn };
+      }
       case 'privacy.toggle': {
         const target = services.vision.mode === 'privacy' ? 'watch' : 'privacy';
         const opened = await (0, services.ensureComponent)('vision', 'vision.privacy');

@@ -3356,79 +3356,94 @@ window.__ModuleLoader__.load({
         })(),
 
         (() => {
-          // 视觉三模式：按钮/下拉的选中态完全由 status.vision 推导（agent 切模式后 3 秒内自动变）。
+          // 两种观看来源共用一套采集能力：桌面（ffmpeg ddagrab）与 OBS 场景（虚拟摄像头）。
+          // 隐私是插件侧锁：停两种来源、清空预览，但不再切 OBS 隐私场景。
           const vm = status.vision ?? {};
           const mode = vm.mode ?? 'watch';
           const locked = vm.locked === true || mode === 'privacy';
+          const source = vm.source ?? (mode === 'scene' ? 'obs' : 'desktop');
           const scenes = vm.scenes ?? [];
-          const privacyScene = vm.privacyScene ?? '隐私';
+          const capturing = vm.capturing === true;
+          const busyNow = busy !== '';
           const visionHotkey = (status.hotkeys ?? []).find((entry) => entry.action === 'vision')?.combo ?? 'Ctrl+Alt+V';
-          const modeLabel = mode === 'privacy'
+          const lastCaptureAt = Number(vm.lastCaptureAt) || 0;
+          const lastCaptureText = lastCaptureAt > 0 ? new Date(lastCaptureAt).toLocaleTimeString() : '—';
+          const sourceLabel = source === 'obs' ? `OBS 场景「${vm.scene || '未指定'}」` : '桌面';
+          const modeLabel = locked
             ? '隐私模式（锁定）'
-            : mode === 'scene'
-              ? `场景模式 ·「${vm.scene || '未指定'}」`
-              : '观看模式';
-          // No local state: the select value is the agent's actual source, so agent-side changes show up.
-          // The list itself is always the same: screen + every OBS scene + privacy.
-          const sourceValue = locked ? '__privacy__' : (mode === 'scene' ? vm.scene : '__screen__');
+            : capturing
+              ? `持续观看 · ${sourceLabel}`
+              : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
+          // No local state: the select value is the source the Host actually has.
+          const sourceValue = source === 'obs' ? (vm.scene || '__obs__') : '__desktop__';
           return card(
             '视觉与隐私',
             h('div', { style: styles.row },
-              h('span', { style: styles.label }, '当前视觉模式'),
+              h('span', { style: styles.label }, '当前视觉来源'),
               h('span', {
                 style: {
                   ...styles.badge,
                   ...(locked
                     ? { borderColor: DANGER, color: DANGER, fontWeight: 600 }
-                    : mode === 'scene'
+                    : source === 'obs'
                       ? { borderColor: ACCENT, color: ACCENT, fontWeight: 600 }
                       : {}),
                 },
               }, modeLabel),
             ),
-            line('视觉来源', locked
-              ? `${privacyScene}（OBS 隐私场景，黑屏）`
-              : mode === 'scene'
-                ? `OBS 场景「${vm.scene || '未指定'}」（虚拟摄像头）`
+            line('观看来源', locked
+              ? '已暂停（桌面与 OBS 采集均已停止）'
+              : source === 'obs'
+                ? `${sourceLabel}（虚拟摄像头）`
                 : '桌面（ffmpeg ddagrab，不经 OBS）'),
+            line('持续观看', capturing
+              ? `采集中 · 最近取景 ${lastCaptureText}`
+              : vm.lastCaptureAt ? `未启动 · 最近取景 ${lastCaptureText}` : '未启动'),
             line('虚拟摄像头', vm.virtualCam
-              ? `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
-              : '已停止（取景时按需启动）'),
+              ? capturing ? '运行中（持续观看占用）' : `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
+              : '已停止（取景时按需启动；用户自启的不会关闭）'),
+            line('OBS 进程', vm.obsRunning ? '运行中' : '未运行 / 未连接'),
             line('OBS 场景', status.obsScene || '未连接 / 未知'),
             h('div', { style: styles.field },
-              h('span', { style: styles.value }, '切换视觉来源'),
+              h('span', { style: styles.value }, '选择观看来源'),
               h('div', { style: { display: 'flex', gap: 8 } },
                 h('select', {
                   style: styles.input,
                   value: sourceValue,
-                  disabled: busy !== '' || locked,
+                  disabled: busyNow || locked,
                   onChange: (event) => {
                     const value = event.target.value;
-                    if (value === '__screen__') void act({ action: 'vision.mode', mode: 'watch' }, 'vision');
-                    else if (value === '__privacy__') void act({ action: 'vision.mode', mode: 'privacy' }, 'vision');
+                    if (value === '__desktop__') void act({ action: 'vision.mode', mode: 'watch' }, 'vision');
                     else void act({ action: 'vision.mode', mode: 'scene', scene: value }, 'vision');
                   },
                 },
-                  h('option', { value: '__screen__' }, '屏幕（观看模式）'),
-                  scenes
-                    .filter((name) => name !== privacyScene)
-                    .map((name) => h('option', { key: name, value: name }, name)),
-                  !locked && mode === 'scene' && vm.scene && vm.scene !== privacyScene && !scenes.includes(vm.scene)
+                  h('option', { value: '__desktop__' }, '桌面（屏幕）'),
+                  scenes.map((name) => h('option', { key: name, value: name }, name)),
+                  !locked && source === 'obs' && vm.scene && !scenes.includes(vm.scene)
                     ? h('option', { key: '__current', value: vm.scene }, `${vm.scene}（当前）`)
                     : null,
-                  h('option', { value: '__privacy__' }, `${privacyScene}（隐私模式）`),
                 ),
                 h('button', {
                   style: styles.btn,
-                  disabled: busy !== '',
+                  disabled: busyNow,
                   onClick: () => act({ action: 'vision.scenes' }, 'vision-scenes'),
-                }, '刷新'),
+                }, '刷新场景'),
               ),
             ),
             h('div', { style: styles.row },
               h('button', {
-                style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
-                disabled: busy !== '',
+                style: { ...(capturing ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
+                disabled: busyNow || locked,
+                onClick: async () => {
+                  const result = capturing
+                    ? await act({ action: 'vision.watch.stop' }, 'vision-watch')
+                    : await act({ action: 'vision.watch.start', source, scene: vm.scene || '' }, 'vision-watch');
+                  if (result.ok) show(capturing ? '已停止持续观看' : '已开始持续观看');
+                },
+              }, capturing ? '停止持续观看' : '启动持续观看'),
+              h('button', {
+                style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
+                disabled: busyNow,
                 onClick: async () => {
                   const result = await act({ action: 'vision.snapshot' }, 'snapshot');
                   if (result.ok) show('已截图，可在 cache/screens 查看');
@@ -3436,14 +3451,14 @@ window.__ModuleLoader__.load({
               }, '截图测试'),
               h('button', {
                 // Escape hatch: never gate this on the vision feature, or privacy could trap the user.
-                style: { ...(locked ? styles.btnActive : styles.btnPrimary), ...(busy !== '' ? styles.off : {}) },
-                disabled: busy !== '',
+                style: { ...(locked ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
+                disabled: busyNow,
                 onClick: () => act({ action: 'privacy.toggle' }, 'privacy'),
               }, locked ? '退出隐私模式' : '切换隐私模式'),
             ),
             vm.lastShot
               ? h('div', { style: { marginTop: 8 } },
-                  h('span', { style: styles.value }, `最近取景：${vm.lastShot.source === 'scene' ? `场景「${vm.lastShot.scene || '—'}」` : '桌面'} · ${vm.lastShot.width}×${vm.lastShot.height}`),
+                  h('span', { style: styles.value }, `最近取景：${vm.lastShot.source === 'scene' ? `OBS 场景「${vm.lastShot.scene || '—'}」` : '桌面'} · ${vm.lastShot.width}×${vm.lastShot.height}`),
                   h('img', {
                     src: `/assistant/shot?path=${encodeURIComponent(vm.lastShot.file)}&t=${vm.lastShot.ts}`,
                     alt: '最近取景',
@@ -3455,13 +3470,13 @@ window.__ModuleLoader__.load({
                 )
               : h('div', { style: styles.hint }, '还没有取景；点「截图测试」拍一张。'),
             h('div', { style: styles.hint }, locked
-              ? `隐私模式已锁定：agent 不能切出、不能截图（会提示需要用户手动退出）；你可以按 ${visionHotkey} 或点上面的按钮退出。`
-              : mode === 'scene'
-                ? '场景模式：下拉框直接改 agent 的视觉来源（前后台无关）；虚拟摄像头按需启动，空闲 60 秒自动停止；选「隐私」会切到隐私模式。'
-                : '观看模式：ffmpeg ddagrab 采桌面，适合电影/读书/游戏这类长时任务；可随时切场景或隐私。'),
+              ? `隐私模式已锁定：桌面与 OBS 采集均已停止，agent 不能截图或切出；你可以按 ${visionHotkey} 或点上面的按钮退出。`
+              : source === 'obs'
+                ? 'OBS 场景观看：持续采集选定场景，按需把变化帧打包成一张故事板交付；切换场景会清空旧帧并重新采集。'
+                : '桌面观看：ffmpeg ddagrab 持续采集桌面，不依赖 OBS；可随时切换来源或隐私。'),
             h('div', { style: styles.hint }, feature('vision')
-              ? '视觉 ↔ OBS：场景/隐私模式需要时会启动 OBS；观看模式直接截桌面，不会为截图拉起 OBS。'
-              : '「视觉」组件当前关闭：点截图或切换模式会先启用组件；观看模式不会因此启动 OBS。'),
+              ? '视觉 ↔ OBS：选择 OBS 来源时按需启动 OBS；虚拟摄像头只按归属释放（插件启动的会停，用户自己启动的保留）。'
+              : '「视觉」组件当前关闭：点截图或启动观看会先启用组件；桌面观看不会因此启动 OBS。'),
           );
         })(),
 

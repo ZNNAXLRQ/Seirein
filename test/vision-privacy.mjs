@@ -14,7 +14,7 @@ const deferred = () => {
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
 };
-const state = { capture: null, start: null, obsGate: null, calls: [], starts: 0, stops: 0 };
+const state = { capture: null, start: null, obsGate: null, calls: [], starts: 0, stops: 0, sceneSwitches: [] };
 globalThis.__visionPrivacyTest = state;
 const sightUrl = new URL('../src/host/vision/sight.js', import.meta.url).href;
 const obsUrl = new URL('../src/host/vision/obs.js', import.meta.url).href;
@@ -45,11 +45,15 @@ const hooks = registerHooks({
     if (url === obsUrl) return {
       format: 'module', shortCircuit: true,
       source: `export async function connectObs() { return {
-        async request(type) {
+        async request(type, data) {
           const s = globalThis.__visionPrivacyTest;
           if (type === 'GetSceneList') {
             if (s.obsGate) await s.obsGate.promise;
             return { currentProgramSceneName: 'Main', scenes: [{ sceneName: 'Main' }, { sceneName: '隐私' }] };
+          }
+          if (type === 'SetCurrentProgramScene') {
+            s.sceneSwitches.push(String(data?.sceneName ?? ''));
+            return {};
           }
           return { outputActive: true };
         }, close() {},
@@ -70,6 +74,7 @@ async function fixture(t) {
   state.obsGate = null;
   state.calls = [];
   state.starts = state.stops = 0;
+  state.sceneSwitches = [];
   const root = await mkdtemp(join(tmpdir(), 'dsh-vision-privacy-'));
   const tools = new Map();
   const routes = new Map();
@@ -151,6 +156,7 @@ test('normal desktop capture, preview, and clearing on privacy', async (t) => {
   assert.equal((await app.route(`/assistant/shot?path=${encodeURIComponent(shot.file)}`)).status, 200);
   assert.equal((await app.call('assistant_vision', { action: 'status' })).lastShot.file, shot.file);
   assert.equal((await app.action({ action: 'vision.mode', mode: 'privacy' })).ok, true);
+  assert.deepEqual(state.sceneSwitches, [], 'privacy never switches an OBS privacy scene');
   assert.equal((await app.call('assistant_vision', { action: 'status' })).lastShot, null);
   assert.equal((await app.route(`/assistant/shot?path=${encodeURIComponent(shot.file)}`)).status, 403);
   await app.empty();

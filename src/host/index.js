@@ -5885,7 +5885,6 @@ export function apply(ctx, config) {
       const component = AUTOSTART_COMPONENT[target];
       if (!features.enabled(component)) continue;
       if (saved[target].enabled !== true) continue;
-      if (target === 'obs' && vision.mode === 'watch') continue;
       if (target === 'gptsovits' && gptSovitsSettings().enabled !== true) continue;
       results.push(await startCompanion(target));
     }
@@ -6576,7 +6575,7 @@ export function apply(ctx, config) {
   register({
     name: 'assistant_see',
     description:
-      'Capture what the agent can currently see and attach the PNG to the result, so you can look at it directly. In watch mode it uses ffmpeg ddagrab on the desktop; in scene mode it reads the OBS virtual camera (the selected scene); in privacy mode it refuses. When the call fails, do not describe the screen from memory.',
+      'Take one look and attach the PNG to the result, so you can look at it directly. With the desktop source it uses ffmpeg ddagrab on the screen; with the OBS source it reads the selected scene through the virtual camera. In privacy mode it refuses. When the call fails, do not describe the screen from memory.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -7196,7 +7195,7 @@ export function apply(ctx, config) {
       let client;
       try {
         if (args.action === 'set' && vision.mode === 'privacy') {
-          throw new Error('隐私模式已开启：需要用户手动退出隐私场景后才能切换 OBS 场景');
+          throw new Error('隐私模式已开启：需要用户手动退出隐私后才能切换 OBS 场景');
         }
         client = await connectObs({ port, password });
         const list = await client.request('GetSceneList');
@@ -7209,16 +7208,9 @@ export function apply(ctx, config) {
           if (vision.mode === 'privacy' || visionChanging) throw new Error('隐私或视觉模式切换中：OBS 场景切换被拒绝');
           if (typeof args.scene !== 'string' || args.scene.length === 0) throw new Error('action=set 需要 scene');
           if (!scenes.includes(args.scene)) throw new Error(`场景不存在：${args.scene}`);
-          // Switching to the privacy scene here is still entering privacy: the lock must
-          // apply from that moment on, so route through the mode machine instead of raw OBS.
-          if (args.scene === privacySceneName()) {
-            client.close();
-            client = undefined;
-            const entered = await applyVisionMode('privacy', '', { by: 'agent' });
-            if (!entered.ok) throw new Error(entered.error);
-            return { ok: true, action: 'set', current: args.scene, scenes };
-          }
           if (vision.mode === 'scene') {
+            // A scene change is a new capture generation: clear old frames/storyboards and let a
+            // running OBS watch resume on the new scene.
             const result = await applyVisionMode('scene', args.scene, { by: 'agent' });
             if (!result.ok) throw new Error(result.error);
           } else {
@@ -7241,16 +7233,21 @@ export function apply(ctx, config) {
   register({
     name: 'assistant_vision',
     description:
-      'Read or switch the vision mode. watch = the desktop (screen capture); scene = look at one OBS scene through the virtual camera, even when that app is in the background (OBS starts on demand, the camera idles off after 60 s); privacy = the OBS privacy scene and every agent capture is refused. In privacy the agent cannot switch out — only the user can, by hotkey or the settings page.',
+      'Read or switch the view source. source=desktop watches the screen; source=obs watches one OBS scene through the virtual camera (OBS starts on demand; the camera idles off after 60 s when nothing is continuously watched). privacy is a user-only capture lock: it stops both sources and refuses every agent capture; it no longer switches an OBS scene. mode=watch/scene is kept as an alias of the two sources.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         action: { type: 'string', enum: ['status', 'set'] },
-        mode: { type: 'string', enum: VISION_MODES, description: 'Target mode; required for action=set.' },
+        source: {
+          type: 'string',
+          enum: ['desktop', 'obs'],
+          description: 'View source for action=set: desktop (screen) or obs (selected scene).',
+        },
+        mode: { type: 'string', enum: VISION_MODES, description: 'Legacy alias of source; required for action=set when source is omitted.' },
         scene: {
           type: 'string',
-          description: 'OBS scene name for mode=scene; defaults to the scene already selected.',
+          description: 'OBS scene name for source=obs; defaults to the scene already selected.',
         },
       },
       required: ['action'],
@@ -7262,8 +7259,12 @@ export function apply(ctx, config) {
         properties: {
           ok: { type: 'boolean' },
           mode: { type: 'string' },
+          source: { type: 'string' },
           scene: { type: 'string' },
           locked: { type: 'boolean' },
+          capturing: { type: 'boolean' },
+          lastCaptureAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          obsRunning: { type: 'boolean' },
           virtualCam: { type: 'boolean' },
           idleSeconds: { type: 'integer' },
           privacyScene: { type: 'string' },
@@ -7308,16 +7309,25 @@ export function apply(ctx, config) {
         {
           type: 'text',
           text: value.ok
-            ? `Vision ${args.action}: ${value.mode}${value.scene ? ` (${value.scene})` : ''}${
+            ? `Vision ${args.action}: ${value.source ?? value.mode}${value.scene ? ` (${value.scene})` : ''}${
                 value.locked ? ' [locked]' : ''
-              }${value.virtualCam ? ' · virtual cam on' : ''}${value.warning ? ` — ${value.warning}` : ''}${
+              }${value.capturing ? ' · capturing' : ''}${value.obsRunning ? ' · OBS running' : ''}${
+                value.virtualCam ? ' · virtual cam on' : ''
+              }${value.warning ? ` — ${value.warning}` : ''}${
                 value.lastShot?.stale === true && value.lastShot.hint ? ` — ${value.lastShot.hint}` : ''
               }`
             : `Vision ${args.action} failed: ${value.error}`,
         },
       ],
     },
-    execute: tools.executeVision,
+    execute: async (args, exec) => {
+      // `source` is the first-class spelling; map it onto the mode machine the rest of the Host
+      // already uses, so both tool callers and the settings card share one transition path.
+      const mapped = args.source === 'desktop'
+        ? { ...args, mode: 'watch' }
+        : args.source === 'obs' ? { ...args, mode: 'scene' } : args;
+      return tools.executeVision(mapped, exec);
+    },
   });
 
   register({
@@ -7442,6 +7452,20 @@ export function apply(ctx, config) {
     initial: runtime.vision?.mode ?? 'watch',
     scene: runtime.vision?.scene ?? '',
   });
+  /**
+   * The source/scene to restore when the user leaves privacy. Privacy is a plugin-side capture
+   * lock only: it never changes the OBS program scene, so the previous source and scene survive
+   * the lock and are re-established (and re-captured) on the way out.
+   */
+  let visionReturn = {
+    mode: runtime.vision?.returnMode === 'scene' || runtime.vision?.returnMode === 'watch'
+      ? runtime.vision.returnMode
+      : (runtime.vision?.scene ? 'scene' : 'watch'),
+    scene: typeof runtime.vision?.returnScene === 'string'
+      ? runtime.vision.returnScene
+      : (typeof runtime.vision?.scene === 'string' ? runtime.vision.scene : ''),
+    capturing: runtime.vision?.returnCapturing === true,
+  };
   const privacySceneName = () => (typeof config?.privacyScene === 'string' ? config.privacyScene : '隐私');
   const virtualCamDevice = () =>
     typeof config?.virtualCamera === 'string' && config.virtualCamera.length > 0
@@ -7545,7 +7569,6 @@ export function apply(ctx, config) {
   let virtualCamStartedAt = 0;
   let sceneIdleTimer = null;
   let sceneIdleUntil = 0;
-  let lastProgramScene = '';
   let obsScenes = [];
   let obsScenesAt = 0;
   let obsSceneRefreshing = false;
@@ -7553,22 +7576,40 @@ export function apply(ctx, config) {
 
   const persistVision = () => {
     const snapshot = vision.snapshot();
-    writeSettings({ vision: { mode: snapshot.mode, scene: snapshot.scene } });
+    writeSettings({
+      vision: {
+        mode: snapshot.mode,
+        scene: snapshot.scene,
+        returnMode: visionReturn.mode,
+        returnScene: visionReturn.scene,
+        returnCapturing: visionReturn.capturing === true,
+      },
+    });
   };
 
-  const visionStatus = () => ({
-    mode: vision.mode,
-    locked: vision.mode === 'privacy',
-    scene: vision.scene,
-    virtualCam: virtualCamOn,
-    idleSeconds: sceneIdleTimer === null ? 0 : Math.max(0, Math.round((sceneIdleUntil - Date.now()) / 1000)),
-    scenes: obsScenes,
-    privacyScene: privacySceneName(),
-    device: virtualCamDevice(),
-    // The card sees age/stale/hint, not just a raw path: a preview older than the freshness
-    // window must not present itself as the current desktop.
-    lastShot: currentVisionView(),
-  });
+  const visionStatus = () => {
+    // While privacy is on, `vision.mode` is the lock, not the source: report the source the user
+    // will get back so the card can still label it honestly.
+    const sourceMode = vision.mode === 'privacy' ? visionReturn.mode : vision.mode;
+    const capturedAt = lastVision === null ? null : Number(lastVision.capturedAt ?? lastVision.at);
+    return {
+      mode: vision.mode,
+      locked: vision.mode === 'privacy',
+      source: sourceMode === 'scene' ? 'obs' : 'desktop',
+      scene: vision.scene,
+      capturing: watcher !== null,
+      lastCaptureAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : null,
+      obsRunning: autostartRunning.obs === true,
+      virtualCam: virtualCamOn,
+      idleSeconds: sceneIdleTimer === null ? 0 : Math.max(0, Math.round((sceneIdleUntil - Date.now()) / 1000)),
+      scenes: obsScenes,
+      privacyScene: privacySceneName(),
+      device: virtualCamDevice(),
+      // The card sees age/stale/hint, not just a raw path: a preview older than the freshness
+      // window must not present itself as the current desktop.
+      lastShot: currentVisionView(),
+    };
+  };
 
   /** One short-lived OBS connection per operation, matching the rest of the plugin. */
   const withObs = async (fn) => {
@@ -7584,7 +7625,12 @@ export function apply(ctx, config) {
     if (obsSceneRefreshing) return obsScenes;
     obsSceneRefreshing = true;
     try {
-      if (!(await probePort('127.0.0.1', obsOptions().port, timeoutMs))) return obsScenes;
+      if (!(await probePort('127.0.0.1', obsOptions().port, timeoutMs))) {
+        // The cached process flag must not outlive a probe that proves OBS is gone.
+        autostartRunning.obs = false;
+        return obsScenes;
+      }
+      autostartRunning.obs = true;
       obsScenes = await withObs(async (client) => {
         const list = await client.request('GetSceneList');
         lastObsScene = String(list.currentProgramSceneName ?? '');
@@ -7601,7 +7647,10 @@ export function apply(ctx, config) {
 
   /** Start OBS itself on demand; scene mode is useless without it. */
   const ensureObsRunning = async ({ timeoutMs = 15000 } = {}) => {
-    if (await probePort('127.0.0.1', obsOptions().port, 400)) return true;
+    if (await probePort('127.0.0.1', obsOptions().port, 400)) {
+      autostartRunning.obs = true;
+      return true;
+    }
     if (obsStarting !== null) return obsStarting;
     shutdown.assertOpen('启动 OBS');
     const executable = findObs(config);
@@ -7614,6 +7663,8 @@ export function apply(ctx, config) {
         stdio: 'ignore',
       });
       child.unref();
+      // The process exists even before its WebSocket answers: status must say so.
+      autostartRunning.obs = true;
       // OBS may belong to the user; only a process we spawned here is recorded as ours to close.
       trackOwnedExternal('obs', child, executable);
       await log.emit('obs.autostart', { path: executable });
@@ -7623,7 +7674,10 @@ export function apply(ctx, config) {
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       throw new Error('OBS 已启动但 WebSocket 未就绪：请在 OBS 的「工具 → WebSocket 服务器设置」里开启');
-    })().finally(() => {
+    })().catch((error) => {
+      autostartRunning.obs = false;
+      throw error;
+    }).finally(() => {
       obsStarting = null;
     });
     return obsStarting;
@@ -7643,6 +7697,7 @@ export function apply(ctx, config) {
     });
 
   const startVirtualCam = async (assertCurrent = () => {}) => {
+    let startedNow = false;
     await withObs(async (client) => {
       assertCurrent();
       const state = await client.request('GetVirtualCamStatus');
@@ -7651,6 +7706,7 @@ export function apply(ctx, config) {
         await client.request('StartVirtualCam');
         virtualCamStartedAt = Date.now();
         virtualCamOwned = true;
+        startedNow = true;
       }
     });
     virtualCamOn = true;
@@ -7660,14 +7716,20 @@ export function apply(ctx, config) {
       await stopVirtualCam('invalidated');
       throw error;
     }
+    return startedNow;
   };
 
-  const stopVirtualCam = async (reason) => {
+  /** Clear the one idle timer; capturing (or a stop) must leave no delayed camera shutdown. */
+  const clearSceneIdle = () => {
     if (sceneIdleTimer !== null) {
       clearTimeout(sceneIdleTimer);
       sceneIdleTimer = null;
     }
     sceneIdleUntil = 0;
+  };
+
+  const stopVirtualCam = async (reason) => {
+    clearSceneIdle();
     if (!virtualCamOn) return false;
     // A camera the user had already started belongs to their stream; only release our mark.
     if (!virtualCamOwned) {
@@ -7689,7 +7751,10 @@ export function apply(ctx, config) {
   };
 
   const touchSceneIdle = () => {
-    if (sceneIdleTimer !== null) clearTimeout(sceneIdleTimer);
+    clearSceneIdle();
+    // A live storyboard owns the camera: the scene-mode idle shutdown must never stop the
+    // capture that is currently feeding it. It is re-armed when that watch stops.
+    if (watcher !== null) return;
     sceneIdleUntil = Date.now() + sceneIdleMs();
     sceneIdleTimer = setTimeout(() => {
       sceneIdleTimer = null;
@@ -7706,40 +7771,33 @@ export function apply(ctx, config) {
     assertCurrent();
     // Recheck the real OBS status even when our cache says active, through the same guarded
     // startup path. If privacy wins during StartVirtualCam, that path releases our late start.
-    await startVirtualCam(assertCurrent);
-    const settleMs = 1500 - (Date.now() - virtualCamStartedAt);
-    if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+    const startedNow = await startVirtualCam(assertCurrent);
+    // Only a camera we just started needs the settle window; a user-owned stream is already live.
+    if (startedNow) {
+      const settleMs = 1500 - (Date.now() - virtualCamStartedAt);
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+    }
     assertCurrent();
     touchSceneIdle();
   };
 
   const enterPrivacy = async (by, assertCurrent) => {
+    // Privacy is a plugin-side capture lock, not an OBS scene: release only the resources this
+    // plugin owns and leave the user's program scene exactly as it is.
     await stopVirtualCam('privacy');
     assertCurrent();
-    let warning = '';
-    try {
-      const { current } = await switchObsScene(privacySceneName());
-      assertCurrent();
-      if (current !== privacySceneName()) lastProgramScene = current;
-    } catch (error) {
-      // Without OBS the screen cannot be blacked out, but captures are still refused below.
-      warning = error?.message ?? String(error);
-    }
-    assertCurrent();
-    await log.emit('vision.mode', { mode: 'privacy', by, to: privacySceneName(), warning });
-    return { to: privacySceneName(), warning };
+    await log.emit('vision.mode', { mode: 'privacy', by, warning: '' });
+    return { to: '', warning: '' };
   };
 
   const enterScene = async (sceneName, by, assertCurrent) => {
     const name = String(sceneName ?? '').trim() || vision.scene;
     if (name.length === 0) throw new Error('场景模式需要指定 OBS 场景名');
-    if (name === privacySceneName()) return enterPrivacy(by, assertCurrent);
 
     await ensureObsRunning();
     assertCurrent();
-    const { current } = await switchObsScene(name);
+    await switchObsScene(name);
     assertCurrent();
-    if (current !== name) lastProgramScene = current;
     await startVirtualCam(assertCurrent);
     assertCurrent();
     vision.userSet('scene', name);
@@ -7750,32 +7808,29 @@ export function apply(ctx, config) {
   };
 
   const enterWatch = async (by, assertCurrent) => {
-    let warning = '';
-    let to = '';
-    // Leaving scene or privacy should put OBS back on the program scene the user had before.
-    if (vision.mode !== 'watch' && lastProgramScene.length > 0) {
-      try {
-        await switchObsScene(lastProgramScene);
-        assertCurrent();
-        to = lastProgramScene;
-      } catch (error) {
-        warning = error?.message ?? String(error);
-      }
-    }
+    // Desktop watching never touches OBS scenes; release only a camera this plugin started.
     await stopVirtualCam('watch');
     assertCurrent();
     vision.userSet('watch');
     persistVision();
-    await log.emit('vision.mode', { mode: 'watch', by, to, warning });
-    return { to, warning };
+    await log.emit('vision.mode', { mode: 'watch', by });
+    return { to: '', warning: '' };
   };
 
   /**
    * Apply a mode with its side effects. `by: 'agent'` honours the privacy lock; `by: 'user'`
    * is the hotkey and settings page, which are the only ways out of privacy.
+   *
+   * Privacy never touches the OBS program scene. On the way out the remembered source/scene is
+   * restored (the hotkey always asks for "watch"), and a capture that was running before privacy
+   * is started again in the new generation.
    */
   const applyVisionMode = async (mode, scene = '', { by = 'agent' } = {}) => {
-    if (mode === 'scene' && (String(scene ?? '').trim() || vision.scene) === privacySceneName()) mode = 'privacy';
+    const leavingPrivacy = vision.mode === 'privacy' && mode !== 'privacy';
+    if (leavingPrivacy && by === 'user') {
+      mode = visionReturn.mode;
+      scene = visionReturn.scene;
+    }
     if (!VISION_MODES.includes(mode)) {
       return { ok: false, ...vision.snapshot(), error: `未知视觉模式：${String(mode)}` };
     }
@@ -7783,12 +7838,17 @@ export function apply(ctx, config) {
       return {
         ok: false,
         ...vision.snapshot(),
-        error: '隐私模式已开启：需要用户手动退出隐私场景（快捷键或设置页的隐私切换按钮）',
+        error: '隐私模式已开启：需要用户手动退出隐私（快捷键或设置页的隐私切换按钮）',
       };
     }
     if (mode === 'scene' && !(String(scene ?? '').trim() || vision.scene)) {
       return { ok: false, ...vision.snapshot(), error: '场景模式需要指定 OBS 场景名' };
     }
+    // Read capture intent before invalidateVision() stops the watcher.
+    const wasCapturing = watcher !== null;
+    const captureIntent = leavingPrivacy && by === 'user'
+      ? wasCapturing || visionReturn.capturing === true
+      : wasCapturing;
     // Privacy is a resource close for motion: close the gate synchronously, before any OBS I/O,
     // so no staged old-generation frame can drain while the switch is in flight.
     if (mode === 'privacy') lockAvatarMotion('privacy');
@@ -7797,6 +7857,9 @@ export function apply(ctx, config) {
     // must not unlock privacy on completion; all its commits also check this request id.
     visionChanging = true;
     if (mode === 'privacy') {
+      if (vision.mode !== 'privacy') {
+        visionReturn = { mode: vision.mode, scene: vision.scene, capturing: wasCapturing };
+      }
       vision.userSet('privacy');
     }
     const cleanup = invalidateVision();
@@ -7806,6 +7869,7 @@ export function apply(ctx, config) {
     const assertCurrent = () => {
       if (visionDisposed || request !== visionModeRequest) throw new Error('视觉模式切换已被后续请求取代');
     };
+    let resumeAfter = false;
     const operation = visionModeQueue.then(async () => {
       try {
         await cleanup;
@@ -7818,6 +7882,12 @@ export function apply(ctx, config) {
         // Restored from privacy: reopen the gate, then republish only a genuinely verified look.
         const released = mode === 'privacy' ? null : unlockAvatarMotion('privacy');
         if (released !== null) refreshAvatarAttention();
+        if (mode !== 'privacy') {
+          // The source/scene just committed is the new "previous" for the next privacy lock.
+          visionReturn = { mode, scene: vision.scene, capturing: false };
+          persistVision();
+          resumeAfter = captureIntent;
+        }
         return { ok: true, ...vision.snapshot(), to: result.to, warning: result.warning ?? '' };
       } catch (error) {
         return { ok: false, ...vision.snapshot(), error: error?.message ?? String(error) };
@@ -7826,7 +7896,21 @@ export function apply(ctx, config) {
       }
     });
     visionModeQueue = operation.then(() => {}, () => {});
-    return operation;
+    const settled = await operation;
+    if (settled.ok === true && resumeAfter) {
+      try {
+        await startWatcher(visionToken());
+      } catch (error) {
+        // A failed resume must not turn a successful source switch into an error; the card can
+        // still start the watch explicitly and status.capturing stays false.
+        if (!visionDisposed && !visionChanging && vision.mode !== 'privacy') {
+          settled.warning = [settled.warning, `持续观看恢复失败：${error?.message ?? String(error)}`]
+            .filter((part) => typeof part === 'string' && part.length > 0)
+            .join('；');
+        }
+      }
+    }
+    return settled;
   };
 
   /**
@@ -8190,30 +8274,20 @@ export function apply(ctx, config) {
     };
   };
 
-  /** Reassert the persisted privacy scene on boot, best-effort and only when OBS is up. */
-  if (vision.mode === 'privacy') {
-    const bootTimer = setTimeout(() => {
-      void (async () => {
-        if (!(await probePort('127.0.0.1', obsOptions().port, 400))) return;
-        try {
-          const { current } = await switchObsScene(privacySceneName());
-          if (current !== privacySceneName()) lastProgramScene = current;
-          await log.emit('vision.mode', { mode: 'privacy', by: 'boot' });
-        } catch (error) {
-          await log.emit('vision.warn', { mode: 'privacy', error: error?.message ?? String(error) });
-        }
-      })();
-    }, 5000);
-    bootTimer.unref?.();
-    ctx.effect(() => () => clearTimeout(bootTimer));
-  }
+  // Privacy persists as a plugin-side capture lock only: booting into privacy touches no OBS
+  // scene and starts no capture. The persisted return source/scene is restored when the user
+  // leaves privacy.
 
   /** One-shot boot probe so the settings card can show the scene without polling OBS. */
   {
     const sceneProbeTimer = setTimeout(() => {
       void (async () => {
         try {
-          if (!(await probePort('127.0.0.1', obsOptions().port, 400))) return;
+          if (!(await probePort('127.0.0.1', obsOptions().port, 400))) {
+            autostartRunning.obs = false;
+            return;
+          }
+          autostartRunning.obs = true;
           lastObsScene = await withObs(async (client) => {
             const list = await client.request('GetSceneList');
             return String(list.currentProgramSceneName ?? '');
@@ -8257,6 +8331,8 @@ export function apply(ctx, config) {
         });
         assertVisionToken(token);
         watcher = session;
+        // A running storyboard owns the camera: the scene-mode idle shutdown must not stop it.
+        clearSceneIdle();
         await log.emit('vision.watch', { engine: session.engine, source: session.sourceKind });
         assertVisionToken(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
@@ -8276,10 +8352,18 @@ export function apply(ctx, config) {
     }
   };
 
+  /** Stop continuous capture and release only a virtual camera this plugin owns. */
+  const stopWatch = async (reason = 'watch-stop') => {
+    await invalidateVision();
+    await stopVirtualCam(reason);
+    await log.emit('vision.watch', { stopped: true, reason });
+    return { ok: true, running: false, capturing: false };
+  };
+
   register({
     name: 'assistant_watch',
     description:
-      'Watch the screen continuously and take change-gated storyboards: start capture, take the current sheet (4-8 changed frames packed into one image), stop. Requires ffmpeg; reports a clear error when it is missing.',
+      'Watch one source continuously and take change-gated storyboards. The source is whichever the vision source is set to: the desktop, or one selected OBS scene read through the virtual camera. start begins capture, take returns the current sheet (4-8 changed frames packed into one real image) and attaches that image, stop releases capture and only a virtual camera this plugin started. Requires ffmpeg for the selected source; reports a clear error when it is missing.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -8304,22 +8388,44 @@ export function apply(ctx, config) {
           width: { type: 'integer' },
           height: { type: 'integer' },
           framesInSheet: { type: 'integer' },
+          mode: { type: 'string' },
+          source: { type: 'string' },
+          scene: { type: 'string' },
+          attachmentId: { type: 'string' },
+          attachment: { oneOf: [{ type: 'object' }, { type: 'null' }] },
+          scaled: { type: 'boolean' },
+          createdAt: { type: 'integer' },
+          at: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          capturedAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          observedAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          ageMs: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          stale: { type: 'boolean' },
+          current: { type: 'boolean' },
+          hint: { type: 'string' },
+          reason: { type: 'string' },
           error: { type: 'string' },
         },
         required: ['ok', 'running', 'engine', 'frames', 'sheets', 'ready', 'file', 'bytes'],
       },
-      render: (_args, value) => [
-        {
+      render: (_args, value) => {
+        const blocks = [{
           type: 'text',
           text: value.ok
             ? value.ready
-              ? `Storyboard (${value.framesInSheet} frames) -> ${value.file}`
+              ? `Storyboard (${value.framesInSheet} frames, ${value.source ?? 'desktop'}${value.scene ? `「${value.scene}」` : ''})`
+                + ` -> ${value.file}`
               : `Watching via ${value.engine}: ${value.frames} frames, ${value.sheets} sheet(s) taken.`
             : `Watch failed: ${value.error}`,
-        },
-      ],
+        }];
+        // The storyboard is real pixels. Without this block the model only sees a path string,
+        // so it must be handed over through the same attachment/image contract as assistant_see.
+        if (value.ok === true && value.attachment !== null && value.attachment !== undefined) {
+          blocks.push({ type: 'image', attachment: value.attachment });
+        }
+        return blocks;
+      },
     },
-    async execute(args) {
+    async execute(args, exec) {
       const base = {
         running: watcher !== null,
         engine: watcher?.engine ?? '',
@@ -8333,7 +8439,7 @@ export function apply(ctx, config) {
       if ((args.action === 'start' || args.action === 'take') && vision.mode === 'privacy') {
         perceptionStat('rejected');
         perceptionEvent('perception.rejected', { reason: '隐私模式已开启', stage: `watch-${args.action}` });
-        return { ...base, ok: false, error: '隐私模式已开启：需要用户手动退出隐私场景' };
+        return { ...base, ok: false, error: '隐私模式已开启：需要用户手动退出隐私' };
       }
 
       if (args.action === 'start') {
@@ -8348,7 +8454,11 @@ export function apply(ctx, config) {
           await assertProgramScene(token);
           const session = await startWatcher(token);
           assertVisionToken(token);
-          return { ...base, ok: true, running: true, engine: session.engine };
+          return {
+            ...base, ok: true, running: true, engine: session.engine,
+            source: token.mode === 'scene' ? 'obs' : 'desktop',
+            scene: token.mode === 'scene' ? token.scene : '',
+          };
         } catch (error) {
           const reason = error?.message ?? String(error);
           if (visionDisposed || visionChanging || vision.mode === 'privacy') {
@@ -8362,14 +8472,20 @@ export function apply(ctx, config) {
       }
 
       if (args.action === 'stop') {
-        await invalidateVision();
-        await log.emit('vision.watch', { stopped: true });
+        await stopWatch('agent-stop');
         return { ...base, ok: true, running: false };
       }
 
       if (args.action === 'status') {
         const stats = watcher?.stats() ?? { frames: 0, sheets: 0, engine: '' };
-        return { ...base, ok: true, frames: stats.frames, sheets: stats.sheets, engine: stats.engine };
+        // In privacy the lock replaces the mode; report the source/scene the user will get back.
+        const statusMode = vision.mode === 'privacy' ? visionReturn.mode : vision.mode;
+        const statusScene = vision.mode === 'privacy' ? visionReturn.scene : vision.scene;
+        return {
+          ...base, ok: true, frames: stats.frames, sheets: stats.sheets, engine: stats.engine,
+          source: statusMode === 'scene' ? 'obs' : 'desktop',
+          scene: statusMode === 'scene' ? statusScene : '',
+        };
       }
 
       if (watcher === null) return { ...base, ok: false, error: '未开始采集（先执行 action=start）' };
@@ -8383,7 +8499,6 @@ export function apply(ctx, config) {
         assertVisionToken(token);
         await assertProgramScene(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
-        if (token.mode === 'scene') touchSceneIdle();
         const stats = session.stats();
         if (sheet === null) {
           return {
@@ -8404,18 +8519,38 @@ export function apply(ctx, config) {
         assertVisionToken(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
         visionFiles.set(sheet.file, token.generation);
+        // The sheet is the newest observation too: status.lastCaptureAt and the preview card
+        // follow the same stored record as a one-shot look.
+        const capturedAt = Number(sheet.capturedAt ?? sheet.at) || Date.now();
+        lastVision = {
+          file: sheet.file, source: token.mode,
+          ...(token.mode === 'scene' ? { scene: token.scene } : { engine: stats.engine }),
+          ts: Date.now(), width: sheet.width, height: sheet.height,
+          capturedAt, at: capturedAt, observedAt: capturedAt,
+          generation: token.generation,
+        };
+        lastVisionStaleRecorded = false;
+        // Hand the model the actual storyboard image, not only its path. This is the same
+        // image/attachment delivery contract assistant_see uses; one sheet per take, never frames.
+        const delivered = await deliverSight(sheet, token, exec);
+        if (delivered.ok !== true) {
+          return {
+            ...base, ok: false, running: true, engine: stats.engine,
+            frames: stats.frames, sheets: stats.sheets, ready: false,
+            error: delivered.reason,
+          };
+        }
         return {
+          ...delivered,
           ok: true,
           running: true,
           engine: stats.engine,
           frames: stats.frames,
           sheets: stats.sheets,
           ready: true,
-          file: sheet.file,
-          bytes: sheet.bytes,
-          width: sheet.width,
-          height: sheet.height,
           framesInSheet: sheet.frames,
+          source: token.mode === 'scene' ? 'obs' : 'desktop',
+          scene: token.mode === 'scene' ? token.scene : '',
         };
       } catch (error) {
         const reason = error?.message ?? String(error);
@@ -8426,6 +8561,7 @@ export function apply(ctx, config) {
           perceptionStat('failed');
         }
         await discardVisionFile(sheet?.file);
+        if (sheet?.file && lastVision?.file === sheet.file) lastVision = null;
         return { ...base, ok: false, error: reason };
       }
     },
@@ -12785,7 +12921,12 @@ export function apply(ctx, config) {
 
   const dependencyRegistry = createDependencyRegistry();
   dependencyRegistry.register('obs', {
-    probe: () => probePort('127.0.0.1', obsOptions().port, 400),
+    probe: async () => {
+      const reachable = await probePort('127.0.0.1', obsOptions().port, 400);
+      // Reusing an already-running OBS must still make status.autostart/vision.obsRunning true.
+      autostartRunning.obs = reachable;
+      return reachable;
+    },
     // Installed-but-unconfigured still counts: OBS is the one service scene mode cannot fake.
     configured: () => autostartSettings().obs.path.trim().length > 0 || findObs(config) !== null,
     start: async () => {
@@ -12793,7 +12934,11 @@ export function apply(ctx, config) {
       await ensureObsRunning();
       return { ok: true, started: !alreadyOwned, running: true, owned: ownedExternal.has('obs') };
     },
-    stop: () => closeOwnedExternal('obs', 'component-disabled'),
+    stop: async () => {
+      const result = await closeOwnedExternal('obs', 'component-disabled');
+      if (result?.closed === true) autostartRunning.obs = false;
+      return result;
+    },
   });
   dependencyRegistry.register('vts', {
     probe: () => probePort('127.0.0.1', Number(config?.vtsPort ?? 8001), 400),
@@ -12820,7 +12965,7 @@ export function apply(ctx, config) {
 
   /** Which external dependencies a component needs right now (never capture/OBS just because on). */
   const dependenciesOf = (id) => {
-    if (id === 'vision') return vision.mode === 'watch' ? [] : ['obs'];
+    if (id === 'vision') return ['obs'];
     if (id === 'voice') return gptSovitsSettings().enabled === true ? ['gptsovits'] : [];
     if (id === 'avatar') return ['vts'];
     return [];
@@ -12951,9 +13096,9 @@ export function apply(ctx, config) {
     if (ensured.ok) setContainerEnabled(id, true);
     return ensured;
   };
-  /** Scene/privacy need OBS; watch mode deliberately does not start it. */
+  /** Scene/obs sources need OBS; desktop watch and privacy deliberately do not start it. */
   const ensureVisionModeDependencies = async (mode, reason) => {
-    if (mode === 'watch') return [];
+    if (mode === 'watch' || mode === 'privacy') return [];
     applyComponentConfig('vision', true);
     return acquireComponentDependencies('vision', { reason });
   };
@@ -13114,8 +13259,11 @@ export function apply(ctx, config) {
     get ensureVisionModeDependencies() { return ensureVisionModeDependencies; },
     get invalidateVision() { return invalidateVision; },
     get refreshObsScenes() { return refreshObsScenes; },
+    get startWatcher() { return startWatcher; },
+    get stopWatch() { return stopWatch; },
     get virtualCamOn() { return virtualCamOn; },
-    get vision() { return vision; }
+    get vision() { return vision; },
+    get visionToken() { return visionToken; }
   }) },
 { actions: profileActions, handle: createProfileSettingsActions({
     get log() { return log; },
