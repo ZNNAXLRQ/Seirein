@@ -558,6 +558,120 @@ export function lowEvidenceVerdict(input = {}) {
 
 
 /**
+ * ---------------------------------------------------------------------------------------------
+ * Mic recheck shadow (`hearing.low-evidence.mic-shadow`): observation only.
+ *
+ * Real data: 25 low-evidence shadow rows — 22 on the loopback lane (BGM / animation audio, harmless)
+ * and 3 on the mic. One of the mic rows is 「还有。」 with `voicedRatio 0.31`, `rmsDb -22`,
+ * `peakDb -1`, arriving right after a human answer. That is what a **Silero miss on a short mic
+ * utterance** looks like: the energy meter clearly hears voice, the accurate pass decoded words, and
+ * the speech detector reported *zero* speech — so turning the low-evidence gate on from that row
+ * would drop a real answer.
+ *
+ * This block therefore only records the comparison — `mic` lane + `vadSpeechRatio === 0` + real
+ * energy (`> MIC_SHADOW_MIN_ENERGY_RATIO`) + non-empty text. Nothing here is read back into the
+ * delivery verdict; the shadow runs after it and records `delivered` as it already stands.
+ * A `null` VAD ratio (Silero not running) never counts as "0": an unmeasured detector is not a
+ * missed detection.
+ * ---------------------------------------------------------------------------------------------
+ */
+
+/** Energy the recheck needs before "Silero heard nothing" is worth recording at all. */
+export const MIC_SHADOW_MIN_ENERGY_RATIO = 0.15;
+
+/** Transcript carried into the row: long enough to recognize the sentence, short enough to log. */
+export const MIC_SHADOW_TEXT_MAX_CHARS = 40;
+
+/** One row per utterance id; the same normalized text inside this window is a count, not a row. */
+export const MIC_SHADOW_THROTTLE_MS = 10_000;
+
+
+/**
+ * Should this final be recorded as a possible Silero miss on the microphone?
+ *
+ * `micShadowVerdict` answers only that question; it never says the clip is (or is not) speech.
+ * Conditions, each with its own reason:
+ *  - `not-mic`: the capture lane is not the microphone (loopback/unknown rows are the harmless 22);
+ *  - `no-text`: nothing decodable, or punctuation only (no sentence to recheck);
+ *  - `no-vad`: Silero was not running — `null` is **not** read as a zero ratio;
+ *  - `vad-speech`: the detector did hear speech (`ratio !== 0`), so there is nothing missed;
+ *  - `low-energy`: the volume meter does not hear enough voice to call the clip a candidate;
+ *  - `mic-low-evidence`: all four hold — record the row.
+ *
+ * @param {{source?: string|null, text?: string, vadSpeechRatio?: number|null,
+ *          energyVoicedRatio?: number|null}} [input]
+ * @returns {{shadow: false, reason: string}|{shadow: true, reason: 'mic-low-evidence'}}
+ */
+export function micShadowVerdict(input = {}) {
+  const source = typeof input?.source === 'string' ? input.source : '';
+  if (source !== 'mic') return { shadow: false, reason: 'not-mic' };
+  const text = typeof input?.text === 'string' ? input.text : '';
+  if (shadowTextKey(text) === '') return { shadow: false, reason: 'no-text' };
+  const vad = Number.isFinite(input?.vadSpeechRatio) ? Number(input.vadSpeechRatio) : null;
+  // Silero not running: the ratio is unmeasured, never "0". Recording it would invent a miss.
+  if (vad === null) return { shadow: false, reason: 'no-vad' };
+  if (vad !== 0) return { shadow: false, reason: 'vad-speech' };
+  const energy = Number.isFinite(input?.energyVoicedRatio) ? Number(input.energyVoicedRatio) : null;
+  if (energy === null || energy <= MIC_SHADOW_MIN_ENERGY_RATIO) return { shadow: false, reason: 'low-energy' };
+  return { shadow: true, reason: 'mic-low-evidence' };
+}
+
+
+/**
+ * Transcript for a shadow row, cut to `maxChars` **characters** (code points, so one CJK character
+ * counts once). The row keeps the full `textChars` next to it, so a truncated row still says how
+ * long the original was.
+ */
+export function truncateShadowText(text, maxChars = MIC_SHADOW_TEXT_MAX_CHARS) {
+  const chars = [...(typeof text === 'string' ? text : '')];
+  const limit = Number.isFinite(maxChars) && maxChars > 0
+    ? Math.floor(maxChars)
+    : MIC_SHADOW_TEXT_MAX_CHARS;
+  return chars.length <= limit ? chars.join('') : chars.slice(0, limit).join('');
+}
+
+
+/**
+ * Admission log for `hearing.low-evidence.mic-shadow`: one row per **utterance id**, and one row per
+ * normalized text (`shadowTextKey`, so tags/punctuation/spacing/case are ignored) inside `windowMs`.
+ * It is a log throttle only — it never sees or touches delivery.
+ *
+ * @param {{windowMs?: number}} [options]
+ * @returns {{admit: (input: {utteranceId?: number|string|null, at?: number, textKey?: string}) =>
+ *   {write: boolean, duplicate: boolean, count: number}}}
+ */
+export function createMicShadowLog({ windowMs = MIC_SHADOW_THROTTLE_MS } = {}) {
+  /** Ids already judged (a delivered final can never produce a second row for itself). */
+  const seen = new Set();
+  /** Rows inside the throttle window: `{ at, text, count }`. */
+  const rows = [];
+  return {
+    admit({ utteranceId = null, at = Date.now(), textKey = '' } = {}) {
+      if (utteranceId !== null && utteranceId !== undefined) {
+        const id = String(utteranceId);
+        if (seen.has(id)) return { write: false, duplicate: true, count: 0 };
+        seen.add(id);
+        // Bounded, oldest first (Set keeps insertion order): this list only dedupes utterance ids.
+        if (seen.size > 512) seen.delete(seen.values().next().value);
+      }
+      const now = Number.isFinite(at) ? at : Date.now();
+      for (let index = rows.length - 1; index >= 0; index -= 1) {
+        if (now - rows[index].at >= windowMs) rows.splice(index, 1);
+      }
+      const known = rows.find((row) => row.text === textKey);
+      if (known !== undefined) {
+        known.count += 1;
+        return { write: false, duplicate: false, count: known.count };
+      }
+      rows.push({ at: now, text: textKey, count: 0 });
+      if (rows.length > 64) rows.shift();
+      return { write: true, duplicate: false, count: 0 };
+    },
+  };
+}
+
+
+/**
  * The suspects recorded for one final judgment. Each is a hypothesis for the follow-up comparison,
  * never a filter: an empty list means "nothing suspicious here", and the text is delivered exactly
  * as before either way.

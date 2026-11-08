@@ -113,6 +113,10 @@ import {
   voicedMetrics,
   wouldDropVerdict,
   lowEvidenceVerdict,
+  micShadowVerdict,
+  createMicShadowLog,
+  truncateShadowText,
+  isProtectedShortAnswer,
   echoGate,
   noiseSuspects,
   onlineOfflineAgree,
@@ -1207,6 +1211,70 @@ export function startHearing({
       /* a diagnostic row must never break capture or delivery */
     }
   };
+  /** Admission log for the mic recheck rows: a log throttle only, never a delivery input. */
+  const micShadowLog = createMicShadowLog();
+  /**
+   * Mic recheck rows (`hearing.low-evidence.mic-shadow`): one row per possible **Silero miss** on
+   * the microphone, written *after* the delivery verdict and never read back by it.
+   *
+   * Why it exists: of 25 real low-evidence rows, 22 came from the loopback lane (BGM / animation
+   * audio — harmless) and 3 from the mic. One of those, 「还有。」, carried `energyVoicedRatio 0.31`,
+   * `rmsDb -22`, `peakDb -1` and arrived right after a human answer: the energy meter clearly heard
+   * voice and the accurate pass decoded words while Silero reported zero speech. That is the shape
+   * of a detector miss on a short mic utterance, so enabling the low-evidence gate on such rows
+   * would drop a real answer. This row is the comparison data for that decision.
+   *
+   * Payload: `{ utteranceId, durationMs, rmsDb, peakDb, energyVoicedRatio, vadSpeechRatio,
+   * textChars, text, whitelisted, delivered }`.
+   *  - `text` is cut to the row limit (40 characters); `textChars` keeps the full length.
+   *  - `whitelisted` marks a protected short answer (好/不/停/OK…) — recorded, never filtered here.
+   *  - `delivered` is the verdict already made above: the row observes it, it does not decide it.
+   *  - a `null` `vadSpeechRatio` (Silero not running) writes nothing — an unmeasured detector is
+   *    never read as "0 missed".
+   * Throttle: one row per utterance id, and the same text inside `MIC_SHADOW_THROTTLE_MS` writes
+   * one `hearing.low-evidence.mic-shadow.suppressed { count }` instead of a second full row.
+   */
+  const noteMicShadow = (snapshot, outcome, delivered) => {
+    try {
+      // Same contract as the other judgment shadows: the synchronous fallback keeps its log empty.
+      if (!asrWorkerRequested) return;
+      const verdict = micShadowVerdict({
+        source: inputSource,
+        text: outcome.text,
+        vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
+        energyVoicedRatio: snapshot.voicedRatio,
+      });
+      if (verdict.shadow !== true) return;
+      const admission = micShadowLog.admit({
+        utteranceId: snapshot.id,
+        at: Date.now(),
+        textKey: shadowTextKey(outcome.text),
+      });
+      if (admission.write !== true) {
+        if (admission.duplicate !== true) {
+          onEvent?.('hearing.low-evidence.mic-shadow.suppressed', {
+            level: 'debug', count: admission.count,
+          });
+        }
+        return;
+      }
+      onEvent?.('hearing.low-evidence.mic-shadow', {
+        level: 'debug',
+        utteranceId: snapshot.id,
+        durationMs: snapshot.durationMs,
+        rmsDb: snapshot.rmsDb,
+        peakDb: snapshot.peakDb,
+        energyVoicedRatio: snapshot.voicedRatio,
+        vadSpeechRatio: snapshot.vadSpeechRatio ?? 0,
+        textChars: [...outcome.text].length,
+        text: truncateShadowText(outcome.text),
+        whitelisted: isProtectedShortAnswer(outcome.text),
+        delivered,
+      });
+    } catch {
+      /* a diagnostic row must never break capture or delivery */
+    }
+  };
   /**
    * Diagnosis clips (opt-in, `voice.audioRetention`): queue this final's own PCM when the verdict
    * names a hypothesis worth listening to. Called *after* the delivery verdict and before the drop
@@ -1700,6 +1768,9 @@ export function startHearing({
     const delivered = candidate && echo?.drop !== true && !lowDrop;
     noteNoiseShadow(snapshot, outcome, delivered);
     noteLowEvidence(snapshot, outcome, lowEvidence, delivered);
+    // Observation only, after the verdict is final: does Silero disagree with the energy meter on
+    // the microphone lane? Recorded so a low-evidence gate is never opened on a detector miss.
+    noteMicShadow(snapshot, outcome, delivered);
     // Diagnosis clip (opt-in): a suspicious final keeps its audio for a short while. The verdict
     // above is already final; this call never changes it and never waits for the store.
     noteRetention(snapshot, outcome, { delivered, echo, lowEvidence });
