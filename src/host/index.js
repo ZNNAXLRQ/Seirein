@@ -9928,18 +9928,101 @@ export function apply(ctx, config) {
   });
   ctx.effect(() => () => dialogueSummary.stop());
 
+  // ---- prompt stability ------------------------------------------------------
+  // The DeepSeek route sets `systemPromptUpdate: 'in-history'`: a changed section text appends a
+  // COMPLETE system-prompt copy to the history (for prefix caching) and the old copy stays billed
+  // until compaction. Continuous observation therefore cannot be a section — it changes every
+  // utterance. It is registered as runtime context instead, which the loop stores as a replaced,
+  // sourced user-role snapshot. Stable sections stay sections. This tracker fingerprints this
+  // plugin's section text once per assembly so `assistant.prompt.stable {changed:false}` is
+  // observable (`assistant.context.refreshed` reports the dynamic half). Debug events are throttled.
+  const promptStabilityThrottleMs = Math.max(0, Number(config?.promptStabilityThrottleMs ?? 30_000));
+  const promptStability = (() => {
+    const sections = new Map();
+    const contextText = new Map();
+    const emittedAt = new Map();
+    let lastFingerprint = '';
+    const emit = (type, payload) => { void log.emit(type, payload).catch(() => {}); };
+    const allow = (key) => {
+      const now = Date.now();
+      const previous = emittedAt.get(key);
+      if (previous !== undefined && now - previous < promptStabilityThrottleMs) return false;
+      emittedAt.set(key, now);
+      return true;
+    };
+    const settle = () => {
+      // `assistant:resources` (9000) is the last section this plugin registers, so its provider is
+      // the end of one assembly. Code-unit ordering keeps the fingerprint identical on every machine.
+      const fingerprint = createHash('sha1')
+        .update([...sections]
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+          .map(([name, text]) => `${name}\u0000${text.length}\u0000${text}`)
+          .join('\u0001'))
+        .digest('hex');
+      const changed = fingerprint !== lastFingerprint;
+      lastFingerprint = fingerprint;
+      sections.clear();
+      if (changed) {
+        if (allow('prompt:changed')) emit('assistant.prompt.changed', { changed: true, fingerprint });
+      } else if (allow('prompt:stable')) {
+        emit('assistant.prompt.stable', { changed: false, fingerprint });
+      }
+    };
+    return {
+      section(name, text, final = false) {
+        return (context) => {
+          const value = typeof text === 'function' ? text(context) : text;
+          sections.set(name, value);
+          if (final) settle();
+          return value;
+        };
+      },
+      context(name, text) {
+        return (context) => {
+          const value = typeof text === 'function' ? text(context) : text;
+          const previous = contextText.get(name);
+          contextText.set(name, value);
+          if (previous !== value && allow(`context:${name}`)) {
+            emit('assistant.context.refreshed', { name, chars: value.length, active: value.length > 0 });
+          }
+          // Fallback end-of-assembly: `assistant:resources` normally settled already; if another
+          // scoped layer shadowed it, settle here so the diagnostics still cover this assembly.
+          if (sections.size > 0) settle();
+          return value;
+        };
+      },
+    };
+  })();
+
   const registerPromptSections = (scope) => {
+    const registerSection = (declaration, final = false) => scope.systemPrompt.section({
+      ...declaration,
+      text: promptStability.section(declaration.name, declaration.text, final),
+    });
+    // Runtime context, not a section: the snapshot is replaced each step, so a changing
+    // observation never appends a system-prompt copy. An empty text yields no snapshot. The
+    // section fallback only keeps legacy/Host-double mounts (no `context()`) from throwing.
+    const registerContext = (declaration) => {
+      const text = promptStability.context(declaration.name, declaration.text);
+      if (typeof scope.systemPrompt.context === 'function') {
+        return scope.systemPrompt.context({ ...declaration, text });
+      }
+      return scope.systemPrompt.section({
+        ...declaration,
+        text: promptStability.section(declaration.name, text),
+      });
+    };
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:persona',
         order: 100,
         text: scopedText(() => persona.render()),
       }),
     );
-    // Nonverbal cue, right after the persona: a temporary observation block for THIS prompt only.
+    // Nonverbal cue, right after the persona: a temporary observation for THIS step only.
     // It is never a user message and never enters the session history; expiry/no-cue renders empty.
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerContext({
         name: 'assistant:nonverbal',
         order: 105,
         text: scopedText(() => nonverbalCue.render()),
@@ -9949,7 +10032,7 @@ export function apply(ctx, config) {
     // the same text hearing exposes as `dialogueSnapshot().renderText`; an empty buffer renders ''
     // so nothing is injected. It is a pure read — a due summary only STARTS in the background.
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerContext({
         name: 'assistant:dialogue',
         order: DIALOGUE_INJECTION_ORDER,
         text: scopedText(() => (features.enabled('hearing') ? dialogueSummary.render() : '')),
@@ -9958,7 +10041,7 @@ export function apply(ctx, config) {
     // The compiled library replaces the persona text on the next request after a compile; while
     // no snapshot exists this section is empty and the persona section above is the fallback.
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:profile',
         order: 150,
         text: scopedText(() => {
@@ -9972,28 +10055,28 @@ export function apply(ctx, config) {
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:memory-convention',
         order: 200,
         text: scopedText(MEMORY_CONVENTION),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:hearing',
         order: 300,
         text: scopedText(HEARING_CONVENTION),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:languages',
         order: 310,
         text: scopedText(renderLanguageConvention),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:voice-output',
         order: 320,
         text: scopedText(VOICE_OUTPUT_CONVENTION),
@@ -10002,7 +10085,7 @@ export function apply(ctx, config) {
     // Functional expression rule, independent of the persona text: the persona section above is
     // never rewritten, and this section only adds the "say each conclusion once" convention.
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:expression',
         order: 330,
         text: scopedText(EXPRESSION_CONVENTION),
@@ -10014,28 +10097,28 @@ export function apply(ctx, config) {
     // assistant session's first request at `agent/pre-step` (see `rollover-digest.js`), once per
     // (session, day), so it never reaches a subagent and never opens a turn of its own.
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:memory-usage',
         order: 260,
         text: scopedText(() => (features.enabled('memory') ? MEMORY_USAGE : '')),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:task-dispatch',
         order: 270,
         text: scopedText(TASK_DISPATCH),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:tool-selection',
         order: 275,
         text: scopedText(TOOL_SELECTION),
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:ambient',
         order: 350,
         // Only present while the ambient component is on: a disabled feature should not
@@ -10044,11 +10127,11 @@ export function apply(ctx, config) {
       }),
     );
     scope.effect(() =>
-      scope.systemPrompt.section({
+      registerSection({
         name: 'assistant:resources',
         order: 9000,
         text: scopedText(() => renderResources()),
-      }),
+      }, true),
     );
   };
   if (typeof ctx.inject === 'function') ctx.inject(['systemPrompt'], registerPromptSections);
