@@ -130,7 +130,7 @@ export function createRuntimeSettingsActions(services) {
       }
       case 'diagnostics.query': {
         // Read-only, bounded, whitelisted probes. Disabled by default; see diagnosticsEnabled().
-        return services.diagnostics.query({ probe: body.probe, limit: body.limit });
+        return services.diagnostics.query({ probe: body.probe, limit: body.limit, includePhases: body.includePhases === true });
       }
   }
 };
