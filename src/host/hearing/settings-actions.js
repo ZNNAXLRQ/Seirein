@@ -10,6 +10,13 @@ export const ACTIONS = Object.freeze([
   'audio.retention.list',
   'audio.retention.delete',
   'audio.retention.export',
+  /** Personal lexicon: candidates come from conversation, only an explicit confirm makes a word. */
+  'lexicon.list',
+  'lexicon.candidates',
+  'lexicon.confirm',
+  'lexicon.edit',
+  'lexicon.reject',
+  'lexicon.remove',
   'hearing.threshold',
   'hearing.device',
   'hearing.devices.refresh',
@@ -33,6 +40,17 @@ export function createHearingSettingsActions(services) {
     ok: false,
     code: 'AUDIO_RETENTION_UNAVAILABLE',
     error: '音频诊断保留尚未接线：需要 Host 提供 retention 存储',
+  });
+  /**
+   * The personal lexicon store the Host owns (one per plugin root). Every action here is a thin
+   * pass-through: the store decides speaker-required/ambiguous/tombstone rules, and nothing is
+   * auto-confirmed by listing or by a candidate arriving from a transcript.
+   */
+  const lexiconStore = () => services.lexiconStore ?? null;
+  const LEXICON_UNAVAILABLE = Object.freeze({
+    ok: false,
+    code: 'LEXICON_UNAVAILABLE',
+    error: '个人语言库尚未接线：需要 Host 提供 lexicon 存储',
   });
   const handler = async (body) => {
     switch (body.action) {
@@ -108,6 +126,68 @@ export function createHearingSettingsActions(services) {
         const id = String(body.id ?? '');
         if (id === '') return { ok: false, error: '需要 id' };
         return store.exportPath(id);
+      }
+      case 'lexicon.list': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        // Confirmed words only; everything not yet confirmed stays in the unassigned area.
+        return { entries: store.listConfirmed(), unassigned: store.listUnassigned() };
+      }
+      case 'lexicon.candidates': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        return { candidates: store.listCandidates() };
+      }
+      case 'lexicon.confirm': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        const result = store.confirm({
+          text: body.text ?? '',
+          id: body.id,
+          speakerId: body.speakerId,
+          canonical: body.canonical,
+          context: body.context,
+        });
+        if (result.ok) {
+          await services.log.emit('lexicon.confirmed', {
+            id: result.entry?.id ?? '',
+            kind: result.entry?.kind ?? '',
+            assigned: result.entry?.assigned === true,
+          });
+        }
+        return result;
+      }
+      case 'lexicon.edit': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        const result = store.edit({
+          id: body.id,
+          canonical: body.canonical,
+          wrongForms: body.wrongForms,
+          context: body.context,
+        });
+        if (result.ok) {
+          await services.log.emit('lexicon.edited', {
+            id: result.entry?.id ?? '',
+            kind: result.entry?.kind ?? '',
+          });
+        }
+        return result;
+      }
+      case 'lexicon.reject':
+      case 'lexicon.remove': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        const result = body.action === 'lexicon.reject'
+          ? store.reject({ text: body.text ?? '', id: body.id })
+          : store.remove({ text: body.text ?? '', id: body.id });
+        if (result.ok) {
+          await services.log.emit(
+            body.action === 'lexicon.reject' ? 'lexicon.rejected' : 'lexicon.removed',
+            { id: result.entry?.id ?? '' },
+          );
+        }
+        return result;
       }
       case 'hearing.threshold': {
         // Noise floor in dB: anything quieter than this counts as silence. Lower = more sensitive.

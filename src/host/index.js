@@ -420,6 +420,8 @@ import {
   speechTextResidualSink,
 } from './speech/format.js';
 export { feedMarkdownSentences } from './speech/format.js';
+import { extractLexiconCandidates, parseExplicitCorrection } from './speech/lexicon-candidates.js';
+import { createLexiconStore } from './speech/lexicon-store.js';
 import {
   resolveVoicePrefetchDepth,
   SPOKEN_VERSION_TIMEOUT_MS,
@@ -1214,6 +1216,10 @@ export function apply(ctx, config) {
     file: join(root, 'data', 'motion-presets.json'),
     log,
   });
+  // 个人语言库：`<root>/data/lexicon.json`。启动时读一次（缺文件时读取不会创建文件），
+  // 之后每次动作/合并都重新读盘。这里不确认任何词；只有用户的 lexicon.confirm 动作才算数。
+  const lexiconStore = createLexiconStore({ root, log });
+  lexiconStore.list();
   /**
    * A5: the one `voice.speechMaxChars` value every speaking lane reads. The runtime setting wins;
    * the plugin config is the fallback; `undefined` keeps `resolveSpeechBudget`'s 1200 default
@@ -10176,8 +10182,61 @@ export function apply(ctx, config) {
     // Latency anchors: silence endpoint -> final text, and when that final became available.
     endpointAt: 0,
     asrMs: 0,
+    // Speaker identity for the personal-lexicon lane only. A confirmed id can attribute an
+    // explicit form correction; it never turns an ordinary transcript into a confirmed word.
+    speakerId: null,
+    speakerConfirmed: false,
   });
   let mergeMeta = emptyMergeMeta();
+  // ---- personal lexicon: conversation → candidates (never a rewrite) -----------------
+  // A delivered transcript only ever becomes a CANDIDATE; the rolling window lets the extractor
+  // reach its occurrence threshold across turns. A confirmed speaker id is attribution evidence
+  // for an explicit "不是甲，是乙" form correction, never for an ordinary proper noun.
+  const LEXICON_WINDOW = 40;
+  const lexiconUtterances = [];
+  const lexiconCorrections = [];
+  let lexiconSeq = 0;
+  const confirmedLexiconSpeaker = (meta) => (
+    meta?.speakerConfirmed === true && typeof meta?.speakerId === 'string' && meta.speakerId.trim().length > 0
+      ? meta.speakerId.trim()
+      : null
+  );
+  const noteLexiconTranscript = (text, meta = {}) => {
+    try {
+      const at = new Date().toISOString();
+      const id = `voice-${++lexiconSeq}`;
+      const parsed = parseExplicitCorrection(text);
+      if (parsed !== null) {
+        // A correction is its own lane: the sentence is not ordinary evidence, so the wrong form it
+        // names cannot become a proper-noun candidate just by being repeated.
+        if (parsed.ignored !== true) {
+          lexiconCorrections.push({ ...parsed, id, at, speakerId: confirmedLexiconSpeaker(meta) });
+          if (lexiconCorrections.length > LEXICON_WINDOW) lexiconCorrections.shift();
+        }
+      } else {
+        lexiconUtterances.push({ id, text, at, source: 'mic' });
+        if (lexiconUtterances.length > LEXICON_WINDOW) lexiconUtterances.shift();
+      }
+      const before = new Set(lexiconStore.list().map((entry) => entry.id));
+      const merged = lexiconStore.mergeCandidates(extractLexiconCandidates({
+        utterances: lexiconUtterances,
+        corrections: lexiconCorrections,
+        now: at,
+      }));
+      if (merged.added <= 0) return;
+      for (const entry of lexiconStore.list()) {
+        if (before.has(entry.id)) continue;
+        void log.emit('lexicon.candidate.added', {
+          id: entry.id, kind: entry.kind, assigned: entry.assigned,
+        }).catch(() => {});
+      }
+    } catch (error) {
+      // Observation must never break delivery: a broken lexicon file is reported, never rethrown.
+      void log.emit('lexicon.candidate.failed', {
+        error: error?.message ?? String(error),
+      }).catch(() => {});
+    }
+  };
   /**
    * Legacy composer queue. Voice no longer fills it: every utterance goes to the dated session
    * (see `voiceSessionTarget`). Kept so older client bundles keep getting a well-formed answer.
@@ -10410,6 +10469,9 @@ export function apply(ctx, config) {
           transcriptAt,
         });
       }
+      // Candidate extraction is observation only: `delivered`/`refined` are already fixed above
+      // and this never awaits or rewrites them. Nothing here confirms a word.
+      noteLexiconTranscript(refined, meta);
     }
   };
 
@@ -12746,6 +12808,13 @@ export function apply(ctx, config) {
     }
     // Logical OR across the held finals: one unverified joint makes the merged text unverified.
     Object.assign(mergeMeta, mergeJoinFallback(mergeMeta, meta.joinFallback === true));
+    // Personal lexicon evidence only: a confirmed speaker id travels with this utterance. Capture
+    // does not supply one today, so a transcript stays unassigned unless the event explicitly does.
+    const speaker = confirmedLexiconSpeaker(meta);
+    if (speaker !== null) {
+      mergeMeta.speakerId = speaker;
+      mergeMeta.speakerConfirmed = true;
+    }
     if (mergeTimer !== null) clearTimeout(mergeTimer);
     mergeTimer = setTimeout(flushMerged, MERGE_WINDOW_MS);
     mergeTimer.unref?.();
@@ -13144,6 +13213,9 @@ export function apply(ctx, config) {
                 truncations: event.truncations,
                 maxUtteranceSec: event.maxUtteranceSec,
                 endpointAt: event.endpointAt,
+                // Personal-lexicon attribution only; capture leaves these unset today.
+                speakerId: event.speakerId,
+                speakerConfirmed: event.speakerConfirmed === true,
               });
             }
             // 台词缓冲门禁：正常投递 accepted:true；组件关闭/停止中到达的片段仍照常投递，
@@ -14118,6 +14190,7 @@ export function apply(ctx, config) {
     get hearing() { return hearing; },
     get hearingAutostart() { return hearingAutostart; },
     get isLoopbackName() { return isLoopbackName; },
+    get lexiconStore() { return lexiconStore; },
     get log() { return log; },
     get openContainer() { return openContainer; },
     get retentionStore() { return audioRetention; },

@@ -163,6 +163,7 @@ function clockInstant(clock) {
  *   reject: (options: object) => {ok: boolean, entry?: object, reason?: string},
  *   remove: (options: object) => {ok: boolean, entry?: object, reason?: string},
  *   list: () => object[],
+ *   listCandidates: () => object[],
  *   listUnassigned: () => object[],
  *   listConfirmed: () => object[],
  * }>}
@@ -440,6 +441,11 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     reject,
     remove,
     list,
+    /** Pending candidates from the conversation lane, including assigned-but-unconfirmed ones. */
+    listCandidates: () => {
+      const state = read();
+      return decorate(state, listCandidates(state));
+    },
     listUnassigned: () => {
       const state = read();
       return decorate(state, listUnassigned(state));
@@ -449,4 +455,39 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       return decorate(state, listEntries(state));
     },
   });
+}
+
+/**
+ * Confirmed entries as recognition post-processing HINTS. This is data only: `wrongForms` are the
+ * misrecognised forms and `canonical` the spelling the user confirmed, but nothing here rewrites a
+ * transcript. A `correction` row is applicable only where its stored `context` still matches
+ * (`replaceable`), so the caller must use `applyCorrection` rather than a whole-text replacement.
+ *
+ * @param {object[]} entries `listConfirmed()` output (or any confirmed entry views)
+ * @returns {Array<{id: string, kind: 'proper-noun'|'correction', canonical: string,
+ *   wrongForms: string[], context: {before: string, after: string}|null, replaceable: boolean}>}
+ */
+export function lexiconHints(entries = []) {
+  const list = Array.isArray(entries) ? entries : [];
+  return list
+    .filter((entry) => entry !== null && typeof entry === 'object' && entry.status === 'confirmed')
+    .map((entry) => {
+      const canonical = typeof entry.canonical === 'string' && entry.canonical.length > 0
+        ? entry.canonical
+        : (typeof entry.text === 'string' ? entry.text : '');
+      const wrongForms = Array.isArray(entry.wrongForms) ? [...entry.wrongForms] : [];
+      const context = entry.context ?? null;
+      const kind = entry.kind === 'correction' ? 'correction' : 'proper-noun';
+      return {
+        id: typeof entry.id === 'string' ? entry.id : '',
+        kind,
+        canonical,
+        wrongForms,
+        context,
+        // Only a correction WITH a stored context is a replacement rule; everything else is a
+        // recognizer hint, never a global find/replace.
+        replaceable: kind === 'correction' && context !== null && wrongForms.length > 0 && canonical.length > 0,
+      };
+    })
+    .filter((hint) => hint.canonical.length > 0 && hint.wrongForms.length > 0);
 }
