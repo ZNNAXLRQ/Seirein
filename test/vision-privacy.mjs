@@ -163,6 +163,36 @@ test('normal desktop capture, preview, and clearing on privacy', async (t) => {
   assert.equal((await app.call('assistant_vision', { action: 'set', mode: 'watch' })).ok, false);
 });
 
+test('leaving privacy restores the previous source/scene and resumes capture', async (t) => {
+  const app = await fixture(t);
+  state.capture = ({ dir }) => app.makeShot(dir);
+  state.start = async () => fakeSession();
+
+  const scene = await app.action({ action: 'vision.mode', mode: 'scene', scene: 'Main' });
+  assert.equal(scene.ok, true, scene.error);
+  assert.equal((await app.call('assistant_watch', { action: 'start' })).ok, true);
+  assert.equal(state.starts, 1, 'one continuous watch before privacy');
+
+  const privacy = await app.action({ action: 'privacy.toggle' });
+  assert.equal(privacy.ok, true, privacy.error);
+  assert.equal(state.stops, 1, 'privacy stopped the running capture');
+  const during = await app.call('assistant_watch', { action: 'status' });
+  assert.equal(during.running, false);
+  assert.equal(during.source, 'obs', 'privacy reports the source it will restore');
+  assert.equal(during.scene, 'Main', 'privacy reports the scene it will restore');
+
+  const exit = await app.action({ action: 'privacy.toggle' });
+  assert.equal(exit.ok, true, exit.error);
+  assert.equal(exit.mode, 'scene', 'the previous source comes back on exit');
+  assert.equal(exit.scene, 'Main');
+  const after = await app.call('assistant_watch', { action: 'status' });
+  assert.equal(after.running, true, 'capture resumes after privacy');
+  assert.equal(after.source, 'obs');
+  assert.equal(after.scene, 'Main');
+  assert.equal(state.starts, 2, 'capture restarted once for the restored source');
+  await app.call('assistant_watch', { action: 'stop' });
+});
+
 test('privacy locks immediately while OBS is still pending; late capture is deleted', async (t) => {
   const app = await fixture(t);
   const started = deferred();

@@ -2462,8 +2462,10 @@ export function apply(ctx, config) {
   /** First successful avatar connect already built the persona style (later reconnects use the tick). */
   let avatarStyleBooted = false;
   /**
-   * Why the continuous output gate is closed. A reason is released only by its own recovery, so
-   * privacy and a dropped socket can overlap without one of them silently reopening the writer.
+   * Why the continuous output gate is closed (component close, disconnect, model switch). A
+   * reason is released only by its own recovery, so two of them can overlap without one silently
+   * reopening the writer. Privacy is deliberately NOT a reason here: it locks capture
+   * (screen/OBS delivery), never the avatar's motion.
    */
   const avatarMotionLocks = new Set();
   /** How many verified attention targets were really published (a test can assert zero). */
@@ -2507,8 +2509,8 @@ export function apply(ctx, config) {
     return current.setAttention(target, { verified: true, source: 'vision' });
   };
   /** Hard gate: old frames stop NOW (no fade/drain) and the reason is recorded once per lock. */
-  const lockAvatarMotion = (reason = 'privacy') => {
-    const name = String(reason || 'privacy');
+  const lockAvatarMotion = (reason = 'unspecified') => {
+    const name = String(reason || 'unspecified');
     if (avatarMotionLocks.has(name)) return null;
     avatarMotionLocks.add(name);
     const current = avatarRuntime;
@@ -2525,8 +2527,8 @@ export function apply(ctx, config) {
     return result;
   };
   /** Release one reason; writes resume only when nothing else still holds the gate. */
-  const unlockAvatarMotion = (reason = 'privacy') => {
-    if (!avatarMotionLocks.delete(String(reason || 'privacy'))) return null;
+  const unlockAvatarMotion = (reason = 'unspecified') => {
+    if (!avatarMotionLocks.delete(String(reason || 'unspecified'))) return null;
     if (avatarMotionLocks.size > 0) return null;
     const current = avatarRuntime;
     if (current === null) return null;
@@ -2731,13 +2733,8 @@ export function apply(ctx, config) {
     // the user's overrides come from data/motion-presets.json (the selector's own shape).
     avatarRuntime.setPresetExecution(config?.presetExecution !== false);
     avatarRuntime.setPresetOverrides(motionPresetStore.read());
-    // A privacy scene active before this runtime existed must hold it too: a new generation is
-    // never a way to write into a private state.
-    if (vision.mode === 'privacy') {
-      avatarMotionLocks.add('privacy');
-      const gated = avatarRuntime.lock('privacy');
-      void log.emit('avatar.motion.locked', { reason: 'privacy', epoch: gated?.epoch ?? 0 }).catch(() => {});
-    }
+    // Privacy deliberately does NOT gate motion: it closes capture only, so a runtime created
+    // while privacy is on still runs presets and idle. Nothing is added to the lock set here.
     // A rebuilt runtime inherits the host's current activity instead of starting from idle.
     if (playback !== null) avatarRuntime.setStatus('speaking', 'playback.active');
     else if (hearing !== null) avatarRuntime.setStatus('listening', 'hearing.active');
@@ -2753,7 +2750,7 @@ export function apply(ctx, config) {
       if (mouth.length > 0) current.setMouthInput(mouth);
       // A runtime created after discovery (or a model switch) learns the verified set here.
       if (runtime.avatarMotion !== undefined) await applyAvatarChannelMappings(runtime.avatarMotion);
-      // The new socket recovers the gate a previous drop closed; privacy keeps it closed.
+      // The new socket recovers the gate a previous drop closed. Privacy holds no motion gate.
       unlockAvatarMotion('disconnect');
       refreshAvatarAttention();
       // First avatar connect: build the persona style NOW (background, no await) instead of
@@ -2777,11 +2774,9 @@ export function apply(ctx, config) {
     } catch (error) {
       void log.emit('avatar.runtime.dispose.failed', { reason, error: error?.message ?? String(error) }).catch(() => {});
     }
-    // A disposed generation cannot hold a gate. Privacy is a scene state, so it outlives the
-    // runtime and still holds the next one that gets created while the scene is private.
-    for (const lockReason of [...avatarMotionLocks]) {
-      if (lockReason !== 'privacy') avatarMotionLocks.delete(lockReason);
-    }
+    // A disposed generation cannot hold a gate. Privacy is not a motion lock anymore, so every
+    // reason still in the set belongs to the disposed runtime and is dropped with it.
+    avatarMotionLocks.clear();
     void log.emit('avatar.runtime.dispose', {
       reason,
       alreadyDisposed: result?.alreadyDisposed === true,
@@ -2872,7 +2867,7 @@ export function apply(ctx, config) {
       idleSource: snap.idleSource ?? 'none',
       /**
        * Continuous output: whether the opt-in 30 Hz pump is on, its output generation, the hard
-       * gate (privacy/disconnect/component/model) and the attention actually published.
+       * gate (component/disconnect/model) and the attention actually published.
        */
       motion: {
         writes: snap.motion?.writes === true,
@@ -8012,9 +8007,8 @@ export function apply(ctx, config) {
     const captureIntent = leavingPrivacy && by === 'user'
       ? wasCapturing || visionReturn.capturing === true
       : wasCapturing;
-    // Privacy is a resource close for motion: close the gate synchronously, before any OBS I/O,
-    // so no staged old-generation frame can drain while the switch is in flight.
-    if (mode === 'privacy') lockAvatarMotion('privacy');
+    // Privacy is a CAPTURE lock only: it must not close the motion gate, so presets and idle keep
+    // running while the screen/OBS frame is invalidated below. Other reasons stay untouched.
     const request = ++visionModeRequest;
     // Lock synchronously, BEFORE OBS I/O or queued transitions. An older pending transition
     // must not unlock privacy on completion; all its commits also check this request id.
@@ -8042,9 +8036,8 @@ export function apply(ctx, config) {
           : mode === 'scene' ? await enterScene(scene, by, assertCurrent)
             : await enterWatch(by, assertCurrent);
         assertCurrent();
-        // Restored from privacy: reopen the gate, then republish only a genuinely verified look.
-        const released = mode === 'privacy' ? null : unlockAvatarMotion('privacy');
-        if (released !== null) refreshAvatarAttention();
+        // Privacy never closed the motion gate, so leaving it restores source/scene and capture
+        // only: there is no motion lock to release, and no stale attention can be republished.
         if (mode !== 'privacy') {
           // The source/scene just committed is the new "previous" for the next privacy lock.
           visionReturn = { mode, scene: vision.scene, capturing: false };

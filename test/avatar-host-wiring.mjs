@@ -225,6 +225,10 @@ async function createFakeVts({
         });
       }
     },
+    /** Drop every live socket without closing the listener (the Host must see a dead link). */
+    dropConnections() {
+      for (const socket of wss.clients) socket.terminate();
+    },
     async close() {
       for (const socket of wss.clients) socket.terminate();
       await new Promise((done) => wss.close(() => server.close(() => done())));
@@ -606,6 +610,10 @@ test('disabling the avatar component disposes the runtime', async (t) => {
     events.some((event) => event.type === 'avatar.runtime.dispose' && event.payload?.reason === 'component-disabled'),
     'the dispose reason is recorded',
   );
+  assert.ok(
+    events.some((event) => event.type === 'avatar.motion.locked' && event.payload?.reason === 'component-disabled'),
+    'the component close still closes the motion gate',
+  );
   console.log(
     `[avatar] disabled → disposed=${status.live2d.runtime.disposed} connected=${status.live2d.runtime.connected}`
     + ` timerActive=${status.live2d.runtime.timerActive} framesAfterDispose=${fake.frames.length - before}`,
@@ -842,10 +850,8 @@ async function startMotionHost({ injectDelayMs = 0 } = {}) {
   return { fake, host };
 }
 
-test('entering privacy locks the motion gate once and drops the late frame as stale', async (t) => {
-  // The fake holds every parameter frame unanswered for 2 s: VTS's own reply timeout (400 ms)
-  // settles it while the gate is already closed, which is exactly the "old generation" case.
-  const { fake, host } = await startMotionHost({ injectDelayMs: 2000 });
+test('entering privacy locks capture only: the motion gate stays open and idle writes continue', async (t) => {
+  const { fake, host } = await startMotionHost();
   t.after(async () => {
     host.dispose();
     await fake.close();
@@ -853,50 +859,39 @@ test('entering privacy locks the motion gate once and drops the late frame as st
   const before = (await host.status()).live2d.runtime;
   assert.equal(before.motion.writes, true, 'the default output path is the 30 Hz controller');
   assert.equal(before.motion.source, 'controller');
+  assert.equal(before.motion.locked, false, 'the gate starts open');
 
-  // Hold one idle frame in flight, then enter privacy while it is still unanswered. Waiting for
-  // a NEW frame (not "any frame") matters: earlier idle frames may already have settled.
   const framesBefore = fake.frames.length;
   assert.equal(await waitFor(() => fake.frames.length > framesBefore, 3000), true, 'an idle frame reached VTS');
   const privacy = await host.callRoute('/assistant/action', { body: { action: 'privacy.toggle' } });
   assert.equal(privacy.ok, true, `entering privacy succeeds (${privacy.error ?? privacy.warning ?? ''})`);
   assert.equal(privacy.mode, 'privacy');
 
+  // Capture is what privacy locks: the source is locked and nothing is being captured.
+  const lockedVision = (await host.status()).vision;
+  assert.equal(lockedVision.locked, true, 'privacy still locks the vision source');
+  assert.equal(lockedVision.capturing, false);
+
+  // Motion is NOT locked by privacy: no gate reason, no avatar.motion.locked event.
+  const atEntry = fake.frames.length;
+  const during = (await host.status()).live2d.runtime;
+  assert.equal(during.motion.locked, false, 'privacy does not close the motion gate');
+  assert.equal(during.motion.lockReason, '', 'no privacy motion lock reason exists');
   assert.equal(
-    await waitFor(async () => (await host.status()).live2d?.runtime?.motion?.locked === true, 2000),
+    await waitFor(() => fake.frames.length > atEntry, 3000),
     true,
-    'the runtime reports the output gate as locked',
-  );
-  assert.equal(
-    await waitFor(async () => (await host.events()).some((event) => event.type === 'avatar.motion.locked'), 2000),
-    true,
-    'avatar.motion.locked is recorded',
+    'idle parameter frames keep flowing while privacy is on',
   );
   const lockEvents = (await host.events()).filter((event) => event.type === 'avatar.motion.locked');
-  assert.equal(lockEvents.length, 1, `avatar.motion.locked is recorded once (${lockEvents.length})`);
-  assert.equal(lockEvents[0].payload?.reason, 'privacy');
-  const locked = (await host.status()).live2d.runtime;
-  assert.equal(locked.motion.lockReason, 'privacy');
-  assert.ok(locked.motionEpoch >= 1, `the lock bumps the output generation (${locked.motionEpoch})`);
-
-  // The frame that was already in flight settles after the lock: it must be counted as stale.
-  assert.equal(
-    await waitFor(async () => (await host.status()).live2d?.runtime?.motion?.stale >= 1, 2500),
-    true,
-    'the frame settling after the lock is counted as stale',
-  );
-  const framesAtLock = fake.frames.length;
-  await sleep(500);
-  assert.equal(fake.frames.length, framesAtLock, 'no new parameter frame is written after the lock');
+  assert.deepEqual(lockEvents, [], 'privacy records no avatar.motion.locked event');
   const final = (await host.status()).live2d.runtime;
   console.log(
-    `[lock] lockEvents=${lockEvents.length} reason=${lockEvents[0].payload?.reason}`
-    + ` stale=${final.motion.stale} motionEpoch=${final.motionEpoch}`
-    + ` framesAfterLock=${fake.frames.length - framesAtLock}`,
+    `[privacy] visionLocked=${lockedVision.locked} motionLocked=${final.motion.locked}`
+    + ` lockReason=${JSON.stringify(final.motion.lockReason)} framesDuringPrivacy=${fake.frames.length - atEntry}`,
   );
 });
 
-test('leaving privacy unlocks the gate and idle writes resume', async (t) => {
+test('leaving privacy does not unlock a motion gate that was never closed; idle keeps flowing', async (t) => {
   const { fake, host } = await startMotionHost();
   t.after(async () => {
     host.dispose();
@@ -906,40 +901,62 @@ test('leaving privacy unlocks the gate and idle writes resume', async (t) => {
   const entered = await host.callRoute('/assistant/action', { body: { action: 'privacy.toggle' } });
   assert.equal(entered.ok, true);
   assert.equal(entered.mode, 'privacy');
+  const framesAtEntry = fake.frames.length;
   assert.equal(
-    await waitFor(async () => (await host.status()).live2d?.runtime?.motion?.locked === true, 2000),
+    await waitFor(() => fake.frames.length > framesAtEntry, 3000),
     true,
-    'privacy closes the gate before the restore step',
+    'privacy never pauses idle writes',
   );
-  const framesAtLock = fake.frames.length;
-  await sleep(250);
-  assert.equal(fake.frames.length, framesAtLock, 'a locked runtime writes nothing while private');
+  const during = (await host.status()).live2d.runtime;
+  assert.equal(during.motion.locked, false, 'the runtime was not locked while private');
+  assert.equal(during.motion.lockReason, '');
 
   const restore = await host.callRoute('/assistant/action', { body: { action: 'privacy.toggle' } });
   assert.equal(restore.ok, true);
   assert.equal(restore.mode, 'watch');
+  const after = (await host.status()).live2d.runtime;
+  assert.equal(after.motion.locked, false, 'there is no privacy motion lock to release');
+  assert.equal(after.motion.lockReason, '');
+  const framesAtExit = fake.frames.length;
   assert.equal(
-    await waitFor(async () => (await host.status()).live2d?.runtime?.motion?.locked === false, 2000),
+    await waitFor(() => fake.frames.length > framesAtExit, 3000),
     true,
-    'leaving privacy unlocks the output gate',
+    'idle frames continue after exit',
   );
-  assert.equal(
-    await waitFor(async () => (await host.events()).some((event) => event.type === 'avatar.motion.unlocked'), 2000),
-    true,
-    'avatar.motion.unlocked is recorded',
-  );
-  const unlockEvents = (await host.events()).filter((event) => event.type === 'avatar.motion.unlocked');
-  assert.ok(unlockEvents.length >= 1, 'avatar.motion.unlocked is recorded');
-  assert.equal(
-    await waitFor(() => fake.frames.length > framesAtLock, 3000),
-    true,
-    'idle frames are written again after unlock',
-  );
-  const final = (await host.status()).live2d.runtime;
+  const privacyLocks = (await host.events()).filter((event) => (
+    event.type === 'avatar.motion.locked' || event.type === 'avatar.motion.unlocked'
+  ));
+  assert.deepEqual(privacyLocks, [], 'neither lock nor unlock is recorded for privacy');
   console.log(
-    `[unlock] unlockEvents=${unlockEvents.length} locked=${final.motion.locked}`
-    + ` framesAfterUnlock=${fake.frames.length - framesAtLock} motionEpoch=${final.motionEpoch}`,
+    `[privacy-exit] locked=${after.motion.locked} lockReason=${JSON.stringify(after.motion.lockReason)}`
+    + ` framesAfterExit=${fake.frames.length - framesAtExit}`,
   );
+});
+
+test('a dropped VTS socket still closes the motion gate as disconnect', async (t) => {
+  const { fake, host } = await startMotionHost();
+  t.after(async () => {
+    host.dispose();
+    await fake.close();
+  });
+
+  const framesBefore = fake.frames.length;
+  assert.equal(await waitFor(() => fake.frames.length > framesBefore, 3000), true, 'idle is writing');
+
+  fake.dropConnections();
+  const locked = await waitFor(async () => {
+    const motion = (await host.status()).live2d?.runtime?.motion;
+    return motion?.locked === true && motion?.lockReason === 'disconnect';
+  }, 3000);
+  assert.equal(locked, true, 'the dead socket closes the gate as disconnect');
+  const lockEvents = (await host.events()).filter((event) => event.type === 'avatar.motion.locked');
+  assert.equal(lockEvents.at(-1)?.payload?.reason, 'disconnect', 'the disconnect lock is recorded');
+
+  const framesAfterLock = fake.frames.length;
+  await sleep(300);
+  assert.equal(fake.frames.length, framesAfterLock, 'a disconnected runtime writes nothing');
+  console.log(`[disconnect] lockEvents=${lockEvents.length} reason=${lockEvents.at(-1)?.payload?.reason}`
+    + ` framesAfterLock=${fake.frames.length - framesAfterLock}`);
 });
 
 test('without a verified gaze channel setAttention is never called, even with a vision position', async (t) => {
