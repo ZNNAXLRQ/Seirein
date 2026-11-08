@@ -3337,6 +3337,195 @@ window.__ModuleLoader__.load({
       return compaction.requiresRestart === true ? `${text} · 需重启或执行恢复` : text;
     };
 
+    // ---- 最近一轮时间线（turn.timeline + pipeline.timeline，只读投影） --------------------
+    // 两个 probe 都只取白名单字段；一次读取 = 每个 probe 恰好一个请求（宿主 action 一次只接受
+    // 一个 probe），没有重试、没有定时器。缺字段一律 null，界面显示「—」，绝不补 0。
+    const DIAGNOSTICS_TIMELINE_LIMIT = 5;
+    const DIAGNOSTICS_TIMELINE_KINDS = ['self-speech', 'self-wait', 'perception', 'work'];
+    const DIAGNOSTICS_TIMELINE_EMPTY = '暂无时间线（尚未产生或未重启）';
+    const DIAGNOSTICS_WARN = '#b8860b';
+    /** 受控拒绝码 -> 可读原因；未知码回落到宿主 reason。 */
+    const DIAGNOSTICS_TIMELINE_REASON = {
+      disabled: '诊断通道未启用',
+      'invalid-probe': '探针不可用',
+      'read-failed': '读取事件日志失败',
+    };
+
+    /** turn.timeline 行 -> 投影；counts / overlaps / toolKinds 整块缺失时保持 null。 */    const diagnosticsTimelineOf = (value) => {
+      const object = diagnosticsObject(value);
+      if (object === null) return null;
+      const counts = diagnosticsObject(object.counts) ?? {};
+      const overlaps = diagnosticsObject(object.overlaps) ?? {};
+      const kinds = diagnosticsObject(object.toolKinds) ?? {};
+      return {
+        turn: diagnosticsNumber(object.turn, object.acceptTurn),
+        status: diagnosticsText(object.status),
+        modelRounds: diagnosticsNumber(counts.modelRounds),
+        toolKinds: {
+          'self-speech': diagnosticsNumber(kinds['self-speech']),
+          'self-wait': diagnosticsNumber(kinds['self-wait']),
+          perception: diagnosticsNumber(kinds.perception),
+          work: diagnosticsNumber(kinds.work),
+        },
+        toolWallMs: diagnosticsNumber(overlaps.toolWallMs),
+        residualMs: diagnosticsNumber(object.residualMs),
+      };
+    };
+
+    /** pipeline.timeline 行 -> 投影；只保留合并展示需要的计时字段。 */
+    const diagnosticsPipelineTimelineOf = (value) => {
+      const object = diagnosticsObject(value);
+      if (object === null) return null;
+      return {
+        turn: diagnosticsNumber(object.turn),
+        totalMs: diagnosticsNumber(object.totalMs),
+        asrMs: diagnosticsNumber(object.asrMs),
+        injectToAckMs: diagnosticsNumber(object.injectToAckMs),
+        ackToFirstTextMs: diagnosticsNumber(object.ackToFirstTextMs),
+        bodyReadyMs: diagnosticsNumber(object.bodyReadyMs),
+        firstAudioMs: diagnosticsNumber(object.firstAudioMs),
+      };
+    };
+
+    /** 按轮次合并两份时间线：同一轮取一条，只在一侧出现的行保留并把另一侧字段留 null。 */
+    function mergeDiagnosticsTimeline(turnRows, pipelineRows) {
+      const rows = [];
+      const byTurn = new Map();
+      for (const entry of turnRows) {
+        const row = {
+          turn: entry.turn,
+          status: entry.status,
+          modelRounds: entry.modelRounds,
+          toolKinds: entry.toolKinds,
+          toolWallMs: entry.toolWallMs,
+          residualMs: entry.residualMs,
+          totalMs: null,
+          firstAudioMs: null,
+          hasTurn: true,
+          hasPipeline: false,
+        };
+        if (row.turn !== null && !byTurn.has(row.turn)) byTurn.set(row.turn, row);
+        rows.push(row);
+      }
+      for (const entry of pipelineRows) {
+        const match = entry.turn === null ? undefined : byTurn.get(entry.turn);
+        if (match !== undefined) {
+          match.totalMs = entry.totalMs;
+          match.firstAudioMs = entry.firstAudioMs;
+          match.hasPipeline = true;
+          continue;
+        }
+        rows.push({
+          turn: entry.turn,
+          status: '',
+          modelRounds: null,
+          toolKinds: null,
+          toolWallMs: null,
+          residualMs: null,
+          totalMs: entry.totalMs,
+          firstAudioMs: entry.firstAudioMs,
+          hasTurn: false,
+          hasPipeline: true,
+        });
+      }
+      return rows.sort((left, right) => {
+        if (left.turn === null && right.turn === null) return 0;
+        if (left.turn === null) return 1;
+        if (right.turn === null) return -1;
+        return right.turn - left.turn;
+      });
+    }
+
+    /** 单个 probe：一次请求、一个硬超时；失败只返回 `{rows:[], error}`，不向调用方抛出。 */
+    async function readDiagnosticsTimelineProbe(post, probe, limit = DIAGNOSTICS_TIMELINE_LIMIT) {
+      if (typeof post !== 'function') return { rows: [], error: '时间线读取接口不可用' };
+      try {
+        const result = await post(
+          { action: 'diagnostics.query', probe, limit },
+          DIAGNOSTICS_READ_TIMEOUT_MS,
+        );
+        const object = diagnosticsObject(result);
+        if (object === null) return { rows: [], error: '返回格式异常' };
+        if (object.ok !== true) {
+          const reason = diagnosticsText(object.reason, object.error);
+          const mapped = DIAGNOSTICS_TIMELINE_REASON[reason] ?? reason;
+          return { rows: [], error: mapped === '' ? '查询失败' : mapped };
+        }
+        return { rows: Array.isArray(object.rows) ? object.rows : [], error: '' };
+      } catch (cause) {
+        return { rows: [], error: cause && cause.message ? String(cause.message) : String(cause) };
+      }
+    }
+
+    /**
+     * 一次刷新读取两个 probe 各一次（共两个请求），合并成按轮次倒序的行；没有任何轮询。
+     * `post` 与 `runSettingsAction` 同签名 `(body, timeoutMs) => Promise<object>`。
+     */
+    async function readDiagnosticsTimelines(post, limit = DIAGNOSTICS_TIMELINE_LIMIT) {
+      const at = Date.now();
+      const [turn, pipeline] = await Promise.all([
+        readDiagnosticsTimelineProbe(post, 'turn.timeline', limit),
+        readDiagnosticsTimelineProbe(post, 'pipeline.timeline', limit),
+      ]);
+      const turnRows = turn.rows.map(diagnosticsTimelineOf).filter((row) => row !== null);
+      const pipelineRows = pipeline.rows
+        .map(diagnosticsPipelineTimelineOf).filter((row) => row !== null);
+      const error = [...new Set(
+        [turn.error, pipeline.error].filter((text) => text !== ''),
+      )].join('；');
+      return {
+        at,
+        ok: error === '',
+        error,
+        turn: turnRows,
+        pipeline: pipelineRows,
+        rows: mergeDiagnosticsTimeline(turnRows, pipelineRows),
+      };
+    }
+
+    const diagnosticsTimelineNumberText = (value, unit = '') => (
+      value === null || value === undefined ? '—' : `${value}${unit}`
+    );
+
+    const diagnosticsTimelineToolText = (toolKinds) => {
+      const kinds = diagnosticsObject(toolKinds);
+      if (kinds === null) return '—';
+      return DIAGNOSTICS_TIMELINE_KINDS.map((kind) => (
+        `${kind} ${diagnosticsTimelineNumberText(diagnosticsNumber(kinds[kind]))}`
+      )).join(' · ');
+    };
+
+    /**
+     * 报告里的时间线摘要（纯投影）：只有轮次 / 状态 / 计数 / 耗时，绝不含 phases、路径或文本；
+     * 即使调用方塞进额外字段也不会被带进报告。
+     */
+    const diagnosticsTimelineReportOf = (timeline) => {
+      const object = diagnosticsObject(timeline);
+      const rows = Array.isArray(object?.rows) ? object.rows : [];
+      return {
+        error: reportField(object?.error),
+        rows: rows.slice(0, DIAGNOSTICS_TIMELINE_LIMIT).map((row) => {
+          const entry = diagnosticsObject(row) ?? {};
+          const kinds = diagnosticsObject(entry.toolKinds) ?? {};
+          return {
+            turn: diagnosticsNumber(entry.turn),
+            status: reportField(entry.status),
+            modelRounds: diagnosticsNumber(entry.modelRounds),
+            toolKinds: {
+              'self-speech': diagnosticsNumber(kinds['self-speech']),
+              'self-wait': diagnosticsNumber(kinds['self-wait']),
+              perception: diagnosticsNumber(kinds.perception),
+              work: diagnosticsNumber(kinds.work),
+            },
+            toolWallMs: diagnosticsNumber(entry.toolWallMs),
+            totalMs: diagnosticsNumber(entry.totalMs),
+            firstAudioMs: diagnosticsNumber(entry.firstAudioMs),
+            residualMs: diagnosticsNumber(entry.residualMs),
+          };
+        }),
+      };
+    };
+
     // ---- P2 报告脱敏：本机界面照旧显示原文，只有「复制诊断报告」走这里 ----------------------
     // 听觉/TTS 会把 ffmpeg 原始错误（如 `failed to open C:\Users\<name>\voice.wav`）留在
     // lastError 里。这些自由文本可以出现在本机界面，但绝不能进入可复制的报告。
@@ -3403,7 +3592,9 @@ window.__ModuleLoader__.load({
      */
     function diagnosticsReportOf(
       status,
-      { clientVersion = '', localRestart = null, at = Date.now(), readError = '' } = {},
+      {
+        clientVersion = '', localRestart = null, at = Date.now(), readError = '', timeline = null,
+      } = {},
     ) {
       const view = diagnosticsView(status, localRestart);
       const report = {
@@ -3470,6 +3661,7 @@ window.__ModuleLoader__.load({
             threshold: view.compaction.pressure.threshold,
           },
         },
+        timeline: diagnosticsTimelineReportOf(timeline),
       };
       return JSON.stringify(report, null, 2);
     }
@@ -3524,7 +3716,9 @@ window.__ModuleLoader__.load({
     }
 
     /** 设置页「关于 / 诊断」卡片：纯展示，所有写入都经 handlers。 */
-    function diagnosticsSection(h, { data, clientVersion, restart, busy, onRefresh, onCopy }) {
+    function diagnosticsSection(h, {
+      data, clientVersion, restart, busy, onRefresh, onCopy, recover = null,
+    }) {
       const status = diagnosticsObject(data?.status);
       const view = diagnosticsView(status, restart);
       const loading = data === null || data === undefined || data.loading === true;
@@ -3541,6 +3735,11 @@ window.__ModuleLoader__.load({
       const rowDanger = (label, text, danger) => h('div', { style: styles.row },
         h('span', { style: styles.label }, label),
         h('span', { style: danger ? { ...styles.value, color: DANGER } : styles.value }, value(text)));
+      /** 同一行结构，value 在 warn 时标黄（恢复后容量仍不健康）。 */
+      const rowWarn = (label, text, warn) => h('div', { style: styles.row },
+        h('span', { style: styles.label }, label),
+        h('span', { style: warn ? { ...styles.value, color: DIAGNOSTICS_WARN } : styles.value },
+          value(text)));
       const group = (title, rows) => h('div', { style: { marginTop: 10 } },
         h('div', { style: { ...styles.label, fontWeight: 600 } }, title),
         ...rows);
@@ -3550,6 +3749,17 @@ window.__ModuleLoader__.load({
         : '不可用';
       // 有数据但 enabled 不为 true 才算「不可用」；整块缺失沿用分区占位，不额外标红。
       const compactionDanger = view.compaction.available === true && view.compaction.enabled !== true;
+      // 恢复结果里的 stillNearLimit / recommendation / compressionEffective：只展示，不触发动作。
+      const recoverView = diagnosticsObject(recover);
+      const recoverWarnings = Array.isArray(recoverView?.warnings)
+        ? recoverView.warnings.filter((text) => typeof text === 'string' && text.trim() !== '')
+        : [];
+      const recoverCapacityWarn = recoverWarnings.length > 0;
+      const recoverCapacity = recoverView === null
+        ? '尚未恢复'
+        : recoverCapacityWarn
+          ? recoverWarnings.join(' · ')
+          : recoverView.compressionEffective === true ? '压缩有效，容量正常' : '不可用';
 
       return h('div', { style: styles.card, 'data-seirein-diagnostics': 'client' },
         h('div', { style: styles.title }, '诊断（客户端）'),
@@ -3594,6 +3804,7 @@ window.__ModuleLoader__.load({
           row('上下文压力', diagnosticsCompactionPressureText(view.compaction)),
           row('装配（registered / mounted / active / running）',
             diagnosticsCompactionAssemblyText(view.compaction)),
+          rowWarn('恢复后容量', recoverCapacity, recoverCapacityWarn),
           view.compaction.requiresRestart === true && view.compaction.note !== ''
             ? h('div', { style: styles.hint }, `恢复说明：${view.compaction.note}`)
             : null,
@@ -3623,6 +3834,62 @@ window.__ModuleLoader__.load({
           row('音频保留', missing ? '不可用' : diagnosticsLibraryText(view.libraries.retention)),
         ]),
       );
+    }
+
+    /**
+     * 「最近一轮时间线」卡片：跟随诊断卡的打开/刷新读取，自己不带按钮、不轮询、不自动动作。
+     * 无数据 / 失败 / 缺字段都只降级成一行提示或「—」，绝不猜测数值。
+     */
+    function timelineSection(h, { data } = {}) {
+      const timeline = diagnosticsObject(data);
+      const loading = data === null || data === undefined || timeline?.loading === true;
+      const rows = Array.isArray(timeline?.rows) ? timeline.rows : [];
+      const error = diagnosticsText(timeline?.error);
+      const updated = diagnosticsNumber(timeline?.at);
+      const show = (value, unit = '') => diagnosticsTimelineNumberText(
+        diagnosticsNumber(value), unit,
+      );
+      const turnBlock = (row, index) => {
+        const entry = diagnosticsObject(row) ?? {};
+        const turn = diagnosticsNumber(entry.turn);
+        const status = diagnosticsText(entry.status);
+        const modelRounds = diagnosticsNumber(entry.modelRounds);
+        return h('div', {
+          key: `${turn === null ? 'unknown' : turn}-${index}`,
+          style: { marginTop: 8, borderTop: '1px solid #e5e7eb' },
+          'data-seirein-timeline-row': turn === null ? '' : String(turn),
+        },
+          h('div', { style: styles.row },
+            h('span', { style: styles.label }, `轮次 ${turn === null ? '—' : turn}`),
+            h('span', { style: styles.value },
+              `状态 ${status === '' ? '—' : status}`
+              + ` · 模型 ${modelRounds === null ? '—' : modelRounds} 轮`
+              + ` · 工具 ${diagnosticsTimelineToolText(entry.toolKinds)}`)),
+          h('div', { style: styles.row },
+            h('span', { style: styles.label }, '耗时'),
+            h('span', { style: styles.value },
+              `toolWallMs ${show(entry.toolWallMs, 'ms')}`
+              + ` · 总时长 ${show(entry.totalMs, 'ms')}`
+              + ` · 首音 ${show(entry.firstAudioMs, 'ms')}`
+              + ` · 残差 ${show(entry.residualMs, 'ms')}`)));
+      };
+      return h('div', { style: styles.card, 'data-seirein-timeline': 'turn' },
+        h('div', { style: styles.title }, '最近一轮时间线'),
+        h('div', { style: styles.hint },
+          '只在打开设置页或点「刷新」时读取一次 turn.timeline / pipeline.timeline；'
+          + '不轮询，也不自动新建会话或压缩。'),
+        loading ? h('div', { style: styles.hint }, '正在读取时间线…') : null,
+        error === ''
+          ? null
+          : h('div', { style: { ...styles.hint, color: DANGER } }, `时间线读取失败：${error}`),
+        !loading && rows.length === 0 && error === ''
+          ? h('div', { style: styles.hint }, DIAGNOSTICS_TIMELINE_EMPTY)
+          : null,
+        loading ? null : rows.map(turnBlock),
+        updated === null
+          ? null
+          : h('div', { style: styles.mono },
+            `上次读取：${new Date(updated).toLocaleTimeString('zh-CN', { hour12: false })}`));
     }
 
     // ---- 设置页：存放位置 / 恢复语音会话 ------------------------------------------------
@@ -3853,6 +4120,40 @@ window.__ModuleLoader__.load({
       typeof value === 'number' && Number.isFinite(value) ? value : null
     );
 
+    // ---- 恢复结果的容量建议：只展示，绝不自动滚动、自动压缩或自动新建会话 -------------------
+    const RECOVER_WARN = '#b8860b';
+    const RECOVER_CAPACITY_TEXT = {
+      STILL_NEAR_LIMIT: '压缩后仍接近上限',
+      NEW_SESSION: '建议新建会话+交接摘要',
+      MANUAL_COMPACT: '建议手动再压缩一次',
+      INEFFECTIVE: '本次压缩未明显释放容量',
+    };
+    const RECOVER_RECOMMENDATION_TEXT = {
+      'new-session': RECOVER_CAPACITY_TEXT.NEW_SESSION,
+      'manual-compact': RECOVER_CAPACITY_TEXT.MANUAL_COMPACT,
+    };
+    const recoverFlag = (raw) => (raw === true ? true : raw === false ? false : null);
+
+    /**
+     * voice.session.recover 的 stillNearLimit / compressionEffective / recommendation ->
+     * 规范化三字段 + 黄字提示。未知 recommendation 原样保留，不猜测含义。
+     */
+    function recoverCapacityOf(value) {
+      const object = settingsObject(value);
+      if (object === null) {
+        return { stillNearLimit: null, compressionEffective: null, recommendation: '', warnings: [] };
+      }
+      const stillNearLimit = recoverFlag(object.stillNearLimit);
+      const compressionEffective = recoverFlag(object.compressionEffective);
+      const recommendation = settingsText(object.recommendation);
+      const warnings = [];
+      if (stillNearLimit === true) warnings.push(RECOVER_CAPACITY_TEXT.STILL_NEAR_LIMIT);
+      const recommended = RECOVER_RECOMMENDATION_TEXT[recommendation];
+      if (recommended !== undefined) warnings.push(recommended);
+      if (compressionEffective === false) warnings.push(RECOVER_CAPACITY_TEXT.INEFFECTIVE);
+      return { stillNearLimit, compressionEffective, recommendation, warnings };
+    }
+
     /** 成功展示 before→after / freed / mounted；失败只展示受控文案 + 原因码。 */
     function recoverSessionOutcome(result) {
       const object = settingsObject(result);
@@ -3860,9 +4161,11 @@ window.__ModuleLoader__.load({
         return {
           ok: false, danger: true, code: 'NO_RESPONSE', sessionId: '', mounted: null,
           before: null, after: null, freed: null, compacted: null,
+          ...recoverCapacityOf(null),
           message: recoverCodeText('NO_RESPONSE'), detail: '',
         };
       }
+      const capacity = recoverCapacityOf(object);
       const code = settingsText(object.code);
       const sessionId = settingsText(object.sessionId);
       if (object.ok === true) {
@@ -3875,6 +4178,7 @@ window.__ModuleLoader__.load({
         const show = (value) => (value === null ? '—' : String(value));
         return {
           ok: true, danger: false, code: '', sessionId, mounted, before, after, freed, compacted,
+          ...capacity,
           message: `已恢复${sessionId === '' ? '' : ` ${sessionId}`}：`
             + `${show(before)} → ${show(after)} token，释放 ${show(freed)}`,
           detail: `preset ${mounted ? '已挂载' : '未挂载'} · `
@@ -3893,6 +4197,7 @@ window.__ModuleLoader__.load({
         after: null,
         freed: null,
         compacted: false,
+        ...capacity,
         message: friendly !== '' ? friendly : (reason !== '' ? reason : '恢复失败'),
         detail: code === '' ? '' : `原因码：${code}`,
       };
@@ -4030,7 +4335,12 @@ window.__ModuleLoader__.load({
               outcome.message,
               typeof outcome.detail === 'string' && outcome.detail !== ''
                 ? h('span', { style: styles.mono }, ` · ${outcome.detail}`)
-                : null));
+                : null),
+        outcome === null || outcome === undefined
+          || !Array.isArray(outcome.warnings) || outcome.warnings.length === 0
+          ? null
+          : h('div', { style: { ...styles.hint, color: RECOVER_WARN } },
+            outcome.warnings.join(' · ')));
     }
 
     function Panel() {
@@ -4098,6 +4408,8 @@ window.__ModuleLoader__.load({
       const [lexiconPending, setLexiconPending] = useState(null);
       // 客户端诊断：打开设置页时读一次 /assistant/status；之后只由「刷新」再读，不新增轮询。
       const [diagnostics, setDiagnostics] = useState(null);
+      // 最近一轮时间线：与诊断同一次打开/刷新读取（每个 probe 一次），不额外轮询。
+      const [timeline, setTimeline] = useState(null);
 
       // 声纹登记：一次读取的结果 + 最近一次显式动作的提示（不自动确认、不自动拒绝）。
       const [speakerEnroll, setSpeakerEnroll] = useState(null);
@@ -4178,8 +4490,21 @@ window.__ModuleLoader__.load({
       );
 
       /**
+       * 最近一轮时间线：一次读取 = turn.timeline / pipeline.timeline 各一个请求（宿主 action 一次
+       * 只接受一个 probe），没有重试、没有定时器；失败只变成卡片里的一行原因。
+       */
+      const loadTimeline = useCallback(async () => {
+        setTimeline((current) => ({ ...(current ?? {}), loading: true, error: '' }));
+        const read = await readDiagnosticsTimelines(
+          (body, timeoutMs) => runSettingsAction(body, { timeoutMs }),
+        );
+        setTimeline({ ...read, loading: false });
+      }, []);
+
+      /**
        * 客户端诊断：一次面板打开只读一次 /assistant/status，之后只由「刷新」再读。
        * 失败时保留上一次成功的数据并显示错误；首次失败则各分区显示「不可用」。
+       * 时间线跟随同一次读取，不额外增加轮询或第二个入口。
        */
       const loadDiagnostics = useCallback(async () => {
         setDiagnostics((current) => ({
@@ -4188,27 +4513,28 @@ window.__ModuleLoader__.load({
           loading: true,
           at: current?.at ?? 0,
         }));
-        const result = await loadDiagnosticsStatus();
+        const [result] = await Promise.all([loadDiagnosticsStatus(), loadTimeline()]);
         setDiagnostics((current) => ({
           status: result.status ?? current?.status ?? null,
           error: result.error,
           loading: false,
           at: result.at,
         }));
-      }, []);
+      }, [loadTimeline]);
 
       const copyDiagnostics = useCallback(async () => {
         const text = diagnosticsReportOf(diagnostics?.status ?? null, {
           clientVersion: CLIENT_VERSION,
           localRestart: lastRestart,
           readError: diagnostics?.error ?? '',
+          timeline,
         });
         const result = await copyDiagnosticsReport(
           text,
           typeof navigator === 'undefined' ? null : navigator.clipboard,
         );
         show(result.ok ? '诊断报告已复制' : `复制失败：${result.error}`);
-      }, [diagnostics, lastRestart, show]);
+      }, [diagnostics, lastRestart, show, timeline]);
 
       // ---- 声纹登记（客户端）handlers -----------------------------------------------------
       // 一次挂载读一次 list + shadow；之后只有「刷新」或一次显式动作成功后再读。没有定时器。
@@ -5206,9 +5532,12 @@ window.__ModuleLoader__.load({
           clientVersion: CLIENT_VERSION,
           restart: lastRestart,
           busy: busy !== '',
+          recover: recoverOutcome,
           onRefresh: () => void loadDiagnostics(),
           onCopy: () => void copyDiagnostics(),
         }),
+
+        timelineSection(h, { data: timeline }),
 
         recoverSessionSection(h, {
           confirm: recoverConfirm,
