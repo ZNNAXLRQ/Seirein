@@ -34,7 +34,151 @@ window.__ModuleLoader__.load({
       overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 3000 },
       dialog: { width: 520, maxWidth: '92vw', maxHeight: '86vh', overflow: 'auto', background: '#fff', color: '#111827', borderRadius: 12, padding: 18, border: `1px solid ${BORDER}`, boxShadow: '0 16px 48px rgba(0,0,0,0.25)' },
       toast: { position: 'fixed', right: 24, bottom: 24, zIndex: 4000, display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderRadius: 10, background: '#fff', color: '#111827', border: `1px solid ${BORDER}`, boxShadow: '0 8px 28px rgba(0,0,0,0.22)', fontSize: 13 },
+      // 设置页布局：分区卡片 / 子容器 / 分隔线 / 对齐。只决定长什么样，不携带状态也不发请求。
+      section: { display: 'flex', flexDirection: 'column', gap: 10 },
+      sectionHeading: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', padding: '2px 2px 0' },
+      sectionTitle: { fontSize: 13, fontWeight: 700, color: '#374151', letterSpacing: 0.2 },
+      sectionHint: { fontSize: 12, color: MUTED },
+      sectionBody: { display: 'flex', flexDirection: 'column', gap: 12 },
+      sectionCard: { border: `1px solid ${BORDER}`, borderRadius: 12, padding: 14, background: '#fff' },
+      sectionCardTitle: { fontSize: 14, fontWeight: 600, marginBottom: 10, color: '#111827' },
+      sectionSummary: { cursor: 'pointer', marginBottom: 0 },
+      group: {
+        border: '1px solid #e6eaf0',
+        borderRadius: 10,
+        padding: '10px 12px',
+        background: '#f6f8fa',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+      },
+      groupTitleRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginBottom: 2 },
+      groupTitle: { fontSize: 13, fontWeight: 600, color: '#111827' },
+      divider: { borderTop: '1px solid #e5e9ef', margin: '10px 0 2px' },
+      // 同一行里的 label 固定宽度、控件区可伸缩、操作列右对齐。
+      fieldRow: { display: 'flex', alignItems: 'center', gap: 12, padding: '4px 0' },
+      fieldLabel: { flex: '0 0 132px', fontSize: 13, color: '#111827' },
+      fieldControls: { display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 0', minWidth: 0, flexWrap: 'wrap' },
+      actionRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end', padding: '4px 0' },
     };
+
+    // ---- 设置页布局：分区 / 子容器 / 分隔线（纯布局函数，无状态、无请求、无轮询） --------------
+    /**
+     * 设置页信息架构：常用在上，记忆与人设居中，诊断与维护在下，低频配置折叠。
+     * 数组顺序就是渲染顺序；`collapsed` 的分区用 <details> 默认收折。
+     */
+    const SETTINGS_SECTIONS = Object.freeze([
+      {
+        id: 'common',
+        title: '一、常用',
+        hint: '语音、形象、视觉与字幕：每天都会调整的部分。',
+      },
+      {
+        id: 'memory',
+        title: '二、记忆与人设',
+        hint: '她记得什么、如何称呼你：人设、固定记忆、词库与声纹。',
+      },
+      {
+        id: 'diagnostics',
+        title: '三、诊断与维护',
+        hint: '只在排查问题时打开：读取都不轮询，写入都要显式点击。',
+      },
+      {
+        id: 'advanced',
+        title: '四、高级（低频配置）',
+        hint: '组件总控、外部程序与快捷键：改完很少再动。',
+        collapsed: true,
+      },
+    ]);
+
+    const SETTINGS_SECTION_IDS = SETTINGS_SECTIONS.map((section) => section.id);
+
+    /** 一个块 = 一张分区卡片；未知分区落到「高级」，绝不静默丢块。 */
+    function settingsBlock(section, node) {
+      return { section, node };
+    }
+
+    /** 分区卡片：白底、圆角、标题；子容器之间自动插一条分隔线。 */
+    function settingsCard(h, id, title, ...children) {
+      const body = children.flat(Infinity).filter((child) => child !== null && child !== undefined);
+      const parts = [];
+      body.forEach((child, index) => {
+        if (index > 0) parts.push(settingsDivider(h, `${id}-${index}`));
+        parts.push(child);
+      });
+      return h('div', { 'data-settings-card': id, style: styles.sectionCard },
+        h('div', { style: styles.sectionCardTitle }, title),
+        ...parts);
+    }
+
+    /**
+     * 子容器：圆角矩形 + 很浅的灰底（#f6f8fa）。只做视觉分组：不挂状态、不发请求、
+     * 不改变子控件的顺序与行为；嵌套最多两层（分区卡片 → 子容器）。
+     */
+    function settingsGroup(h, id, title, ...children) {
+      const body = children.flat(Infinity).filter((child) => child !== null && child !== undefined);
+      return h('div', { 'data-settings-group': id, style: styles.group },
+        typeof title === 'string' && title !== ''
+          ? h('div', { style: styles.groupTitle }, title)
+          : null,
+        ...body);
+    }
+
+    /** 子容器之间的分隔线。 */
+    function settingsDivider(h, id) {
+      return h('div', { 'data-settings-divider': id, role: 'separator', style: styles.divider });
+    }
+
+    /** 一行「label + 控件」：label 固定宽度，控件区吸收剩余宽度，同一行垂直居中对齐。 */
+    function settingsField(h, label, ...controls) {
+      return h('div', { 'data-settings-field': label, style: styles.fieldRow },
+        h('span', { style: styles.fieldLabel }, label),
+        h('div', { style: styles.fieldControls }, ...controls));
+    }
+
+    /** 操作列：按钮排在同一行，统一高度并右对齐（主操作在左，次操作靠右）。 */
+    function settingsActions(h, ...buttons) {
+      return h('div', { 'data-settings-actions': 'true', style: styles.actionRow }, ...buttons);
+    }
+
+    /**
+     * 按 SETTINGS_SECTIONS 的固定顺序把块分组：同一分区的卡片共用一个分区标题与一个纵向容器；
+     * 常用分区永远在诊断分区之前，`collapsed` 分区包在 <details> 里。纯函数，便于测试顺序。
+     */
+    function groupSettingsBlocks(h, blocks) {
+      const bySection = new Map(SETTINGS_SECTION_IDS.map((id) => [id, []]));
+      for (const block of Array.isArray(blocks) ? blocks : []) {
+        if (block === null || block === undefined) continue;
+        const id = SETTINGS_SECTION_IDS.includes(block.section) ? block.section : 'advanced';
+        for (const node of Array.isArray(block.node) ? block.node.flat(Infinity) : [block.node]) {
+          if (node !== null && node !== undefined) bySection.get(id).push(node);
+        }
+      }
+      return SETTINGS_SECTIONS
+        .filter((section) => bySection.get(section.id).length > 0)
+        .map((section) => {
+          const heading = h('span', { 'data-settings-heading': section.id, style: styles.sectionHeading },
+            h('span', { style: styles.sectionTitle }, section.title),
+            section.hint ? h('span', { style: styles.sectionHint }, section.hint) : null);
+          const body = h('div', { 'data-settings-body': section.id, style: styles.sectionBody },
+            ...bySection.get(section.id));
+          const collapsed = section.collapsed === true;
+          return h('div', {
+            key: section.id,
+            'data-settings-section': section.id,
+            style: styles.section,
+          },
+            collapsed
+              ? h('details', {
+                  'data-settings-collapsed': 'true',
+                  style: styles.section,
+                },
+                  h('summary', { style: styles.sectionSummary }, heading),
+                  body)
+              : heading,
+            collapsed ? null : body);
+        });
+    }
 
     /** The global hotkeys the host ships; anything else in status is ignored. */
     const HOTKEY_ACTIONS = ['mic', 'vision', 'layerEdit', 'ambient'];
@@ -1198,8 +1342,8 @@ window.__ModuleLoader__.load({
         }),
       );
 
-      return h('div', { 'data-profile-card': true, style: styles.card },
-        h('div', { 'data-profile-title': true, style: styles.title },
+      return h('div', { 'data-profile-card': true, 'data-settings-card': 'persona', style: styles.sectionCard },
+        h('div', { 'data-profile-title': true, style: styles.sectionCardTitle },
           `人设库 · ${used}/${cap}`,
           trialActive ? h('span', { 'data-profile-trial-badge': true, style: styles.badge }, '试用中') : null),
         line('容量', `${used} / ${cap} 条（${pct}%）`),
@@ -1736,8 +1880,8 @@ window.__ModuleLoader__.load({
         ),
         h('div', { style: styles.hint }, `同一时间只允许一个透明层在运行；切换模式会先停旧后端并确认退出，再启动新后端。${probeNote}`),
       );
-      return h('div', { style: { marginTop: 12, paddingTop: 10, borderTop: `1px solid ${BORDER}` } },
-        h('div', { style: styles.label }, '透明化'),
+      return h('div', { 'data-settings-group': 'display-layer', style: styles.group },
+        h('div', { style: styles.groupTitle }, '显示层（透明化）'),
         h('div', { style: styles.row }, modeButton('wpf', 'WPF'), modeButton('spout', 'Spout')),
         !spoutReady && backend === 'wpf'
           ? h('div', { style: styles.hint }, `Spout 模式不可用：${spoutReason}`)
@@ -2070,9 +2214,9 @@ window.__ModuleLoader__.load({
         onChange: (event) => onChange(event.target.value),
       }, options.map(option => h('option', { key: option.value, value: option.value }, option.label)));
 
-      return h('div', { style: { marginTop: 10 } },
-        h('div', { style: styles.row },
-          h('span', { style: styles.label }, `动作预设（${visible.length} / ${items.length}）`),
+      return h('div', { 'data-settings-group': 'motion', style: styles.group },
+        h('div', { style: styles.groupTitleRow },
+          h('span', { style: styles.groupTitle }, `动作预设（${visible.length} / ${items.length}）`),
           h('button', { style: styles.btn, disabled: busy !== '', onClick: handlers.refresh }, '刷新'),
         ),
         h('div', { style: styles.hint }, '影响概率，不绕过硬约束：优先级 100 也不保证选中。内置动作的“删除”= 本地隐藏/禁用，可恢复。'),
@@ -2164,9 +2308,9 @@ window.__ModuleLoader__.load({
                 disabled: stopped,
                 onClick: () => void onAskDelete(item.id),
               }, '删除')));
-      return h('div', { style: styles.field },
-        h('div', { style: styles.row },
-          h('span', { style: styles.value }, '音频保留（诊断）'),
+      return h('div', { 'data-settings-group': 'retention', style: styles.group },
+        h('div', { style: styles.groupTitleRow },
+          h('span', { style: styles.groupTitle }, '音频保留（诊断）'),
           h('button', {
             style: { ...(enabled ? styles.btnActive : styles.btn), ...(stopped ? styles.off : {}) },
             disabled: stopped,
@@ -2607,9 +2751,9 @@ window.__ModuleLoader__.load({
             }, partial ? '关闭' : '取消')),
         ));
 
-      return h('div', { style: styles.field },
-        h('div', { style: styles.row },
-          h('span', { style: styles.value }, '个人语言库'),
+      return h('div', { 'data-settings-group': 'lexicon', style: styles.group },
+        h('div', { style: styles.groupTitleRow },
+          h('span', { style: styles.groupTitle }, '个人语言库'),
           h('button', { style: styles.btn, disabled: stopped, onClick: handlers.refresh }, '刷新')),
         h('div', { style: styles.hint }, '普通转写先进「未归属候选」；确认并绑定本人声纹后才算个人词库，只影响之后的识别与替换。'),
         selfId === ''
@@ -2973,8 +3117,8 @@ window.__ModuleLoader__.load({
       const countsText = view.shadow.available
         ? `匹配 ${counts.match} · 不匹配 ${counts.mismatch} · 不确定 ${counts.unsure}`
         : '不可用';
-      return h('div', { style: styles.card, 'data-seirein-speaker-enroll': 'client' },
-        h('div', { style: styles.title }, '声纹'),
+      return h('div', { style: styles.group, 'data-settings-group': 'speaker-enroll', 'data-seirein-speaker-enroll': 'client' },
+        h('div', { style: styles.groupTitle }, '声纹'),
         h('div', { style: styles.hint },
           '先登记本人声纹，影子只观测：不自动确认、不自动拒绝，判定不参与拒收、打断或投递。'),
         h('div', { style: styles.row },
@@ -3817,8 +3961,8 @@ window.__ModuleLoader__.load({
           ? recoverWarnings.join(' · ')
           : recoverView.compressionEffective === true ? '压缩有效，容量正常' : '不可用';
 
-      return h('div', { style: styles.card, 'data-seirein-diagnostics': 'client' },
-        h('div', { style: styles.title }, '诊断（客户端）'),
+      return h('div', { style: styles.group, 'data-settings-group': 'client-diagnostics', 'data-seirein-diagnostics': 'client' },
+        h('div', { style: styles.groupTitle }, '诊断（客户端）'),
         h('div', { style: styles.hint },
           '打开时读取一次 /assistant/status，不新增轮询；只显示状态摘要，不含对话文本或音频。'),
         h('div', { style: styles.row },
@@ -3929,8 +4073,8 @@ window.__ModuleLoader__.load({
               + ` · 首音 ${show(entry.firstAudioMs, 'ms')}`
               + ` · 残差 ${show(entry.residualMs, 'ms')}`)));
       };
-      return h('div', { style: styles.card, 'data-seirein-timeline': 'turn' },
-        h('div', { style: styles.title }, '最近一轮时间线'),
+      return h('div', { style: styles.group, 'data-settings-group': 'timeline', 'data-seirein-timeline': 'turn' },
+        h('div', { style: styles.groupTitle }, '最近一轮时间线'),
         h('div', { style: styles.hint },
           '只在打开设置页或点「刷新」时读取一次 turn.timeline / pipeline.timeline；'
           + '不轮询，也不自动新建会话或压缩。'),
@@ -4286,8 +4430,8 @@ window.__ModuleLoader__.load({
       const dialogError = open ? settingsText(dialog.error) : '';
       const locked = busy === true;
       const saveDisabled = locked || draft.trim() === '';
-      return h('div', { style: styles.card, 'data-seirein-root': 'instance' },
-        h('div', { style: styles.title }, '存放位置'),
+      return h('div', { style: styles.group, 'data-settings-group': 'instance-root', 'data-seirein-root': 'instance' },
+        h('div', { style: styles.groupTitle }, '存放位置'),
         h('div', { style: styles.row },
           h('span', { style: styles.label }, '当前存放位置'),
           h('span', { style: { ...styles.mono, wordBreak: 'break-all' } }, root === '' ? '不可用' : root)),
@@ -4357,8 +4501,8 @@ window.__ModuleLoader__.load({
       const { confirm, busy, outcome } = props;
       const armed = confirm === true;
       const locked = busy === true;
-      return h('div', { style: styles.card, 'data-seirein-recover': 'voice-session' },
-        h('div', { style: styles.title }, '恢复语音会话（诊断）'),
+      return h('div', { style: styles.group, 'data-settings-group': 'recover', 'data-seirein-recover': 'voice-session' },
+        h('div', { style: styles.groupTitle }, '恢复语音会话（诊断）'),
         h('div', { style: styles.hint },
           '手动重装配压缩 preset 并先压缩一次；不会自动调用，也不会轮询。历史不会被删除。'),
         armed
@@ -5526,517 +5670,785 @@ window.__ModuleLoader__.load({
 
       const dialog = h(React.Fragment, null, editorDialog, archiveDialog);
 
-      return h(
-        'div',
-        { style: styles.wrap },
-        toast.length > 0
-          ? h('div', { style: styles.toast },
-              h('span', null, toast),
+      // ---- 设置页信息架构：常用 → 记忆与人设 → 诊断与维护 → 高级（折叠） ------------------
+      // 只重排布局：块与块之间的动作、参数、状态字段和默认值都保持原样。
+      const settingsBlocks = [
+        settingsBlock('common', settingsCard(h, 'voice', '语音与听觉',
+          settingsGroup(h, 'mic', '麦克风与门限',
+            line('麦克风', hearingOn
+              ? `监听中 · ${status.hearing.device} · ${status.hearing.rmsDb} dB`
+              : `未启动${status.hearing?.deferred?.reason ? `（${status.hearing.deferred.reason}）` : ''}`),
+            hearingThresholdRow(h, {
+              draft: thresholdDraft,
+              saved: Number(status.hearing?.thresholdDb ?? -50),
+              busy,
+              onDraft: setThresholdDraft,
+              onSave: async (db) => {
+                const result = await act({ action: 'hearing.threshold', db }, 'threshold');
+                if (result.ok && result.restarted) show('已生效（新实例）');
+                else if (result.ok) show('已保存（采集未运行）');
+                else show(result.message ?? result.error ?? '保存失败');
+              },
+            }),
+            (() => {
+              // `deviceList` marks replay endpoints (Stereo Mix / virtual cable); an older status
+              // payload only carries names, so those fall back to "selectable".
+              const rows = Array.isArray(status.deviceList) && status.deviceList.length > 0
+                ? status.deviceList
+                : (status.devices ?? []).map((name) => ({ name, loopback: false }));
+              const names = rows.map((row) => row.name);
+              const selected = status.selectedDevice ?? '';
+              const hasLoopback = rows.some((row) => row.loopback === true);
+              return h('div', { style: styles.field },
+                settingsField(h, '输入设备',
+                  h('select', {
+                    style: styles.input,
+                    value: selected,
+                    disabled: hearingOn || busy !== '',
+                    onChange: (event) => act({ action: 'hearing.device', device: event.target.value }),
+                  },
+                    rows.length === 0
+                      ? h('option', { value: '' }, '（未检测到设备）')
+                      : rows.map((row) => h('option', {
+                          key: row.name,
+                          value: row.name,
+                          disabled: row.loopback === true,
+                          title: row.loopback ? '回环输入不可作为麦克风' : undefined,
+                        }, row.loopback ? `${row.name}（回环输入，不可选）` : row.name)),
+                    selected && !names.includes(selected)
+                      ? h('option', { value: selected }, `${selected}（当前）`)
+                      : null,
+                  ),
+                  h('button', {
+                    style: styles.btn,
+                    disabled: busy !== '',
+                    onClick: () => act({ action: 'hearing.devices.refresh' }),
+                  }, '刷新')),
+                hasLoopback
+                  ? h('div', { style: styles.hint }, '回环输入不可作为麦克风：置灰的「立体声混音」「CABLE Output」等设备只能用于环境声音。')
+                  : null,
+              );
+            })(),
+            settingsActions(h,
               h('button', {
-                style: { background: 'transparent', border: 'none', color: '#111827', cursor: 'pointer', fontSize: 15 },
-                onClick: () => setToast(''), 'aria-label': 'close',
-              }, '×'))
-          : null,
-        dialog,
-
-        status.firstRun
-          ? card(
-            '首次使用：请先选择存放位置',
-            h('div', { style: styles.hint },
-              `当前数据会写到 ${status.root ?? '默认目录'}。选一个你自己的位置后，数据会放在 <所选目录>\\Seirein 下；保存后需重启 DSH 生效，不会自动重启，也不会自动迁移已有数据。`),
+                style: { ...(hearingOn ? styles.btnActive : styles.btnPrimary), ...(hearingOn || busy !== '' ? styles.off : {}) },
+                disabled: hearingOn || busy !== '',
+                onClick: () => act({ action: 'hearing.start' }),
+              }, '测试麦克风'),
+              h('button', {
+                style: { ...styles.btn, ...(!hearingOn || busy !== '' ? styles.off : {}) },
+                disabled: !hearingOn || busy !== '',
+                onClick: () => act({ action: 'hearing.stop' }),
+              }, '停止'),
+            ),
+            h('div', { style: styles.hint }, '点「测试麦克风」开始采集，看上面电平是否随说话跳动；说完停顿约 1.2 秒出终稿。'),
+            h('div', { style: styles.hint }, feature('hearing')
+              ? '关闭「听觉」组件会先停麦并关闭相关开关。'
+              : '「听觉」组件当前关闭：点上面的按钮会先启用组件，再开始采集。'),
             h('div', { style: styles.row },
+              h('span', { style: styles.value }, '开机自动监听（默认关闭；只授权，不在打开组件时立即录音）'),
               h('button', {
-                style: { ...styles.btnPrimary, ...(rootBusy ? styles.off : {}) },
-                disabled: rootBusy,
-                onClick: openRootDialog,
-              }, '选择存放位置'),
-              h('button', {
-                style: { ...styles.btn, ...(rootBusy ? styles.off : {}) },
-                disabled: rootBusy,
-                onClick: () => void applyDefaultRoot(),
-              }, '使用默认位置'),
-            ),
-          )
-          : null,
-
-        instanceRootSection(h, {
-          status,
-          fallbackRoot: status.root ?? '',
-          dialog: rootDialog,
-          notice: rootNotice,
-          busy: rootBusy,
-          onOpen: openRootDialog,
-          onDraft: (value) => setRootDialog((current) => (current === null
-            ? current
-            : { ...current, draft: value, error: '' })),
-          onPick: () => void pickRootIntoDialog(),
-          onCancel: closeRootDialog,
-          onSave: () => void saveRootDialog(),
-        }),
-
-        card(
-          'Seirein',
-          line('客户端 / 服务端', `v${CLIENT_VERSION} / v${status.version}`),
-          line('根目录', status.root ?? '—'),
-          line('运行时长', `${Math.max(1, Math.round(status.uptimeMs / 60000))} 分钟`),
-          line('人设与画像', `${status.personaChars} 字符`),
-          line('固定记忆', `${resources.length} 条`),
-        ),
-
-        diagnosticsSection(h, {
-          data: diagnostics,
-          clientVersion: CLIENT_VERSION,
-          restart: lastRestart,
-          busy: busy !== '',
-          recover: recoverOutcome,
-          onRefresh: () => void loadDiagnostics(),
-          onCopy: () => void copyDiagnostics(),
-        }),
-
-        timelineSection(h, { data: timeline }),
-
-        recoverSessionSection(h, {
-          confirm: recoverConfirm,
-          busy: recoverBusy,
-          outcome: recoverOutcome,
-          onAsk: askRecoverSession,
-          onCancel: cancelRecoverSession,
-          onConfirm: () => void confirmRecoverSession(),
-        }),
-
-        card(
-          '作用域',
-          h('div', { style: styles.row },
-            h('span', { style: styles.label }, '只在指定工作区生效'),
-            h('button', {
-              style: { ...(scopeOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-              disabled: busy !== '',
-              onClick: () => void act({ action: 'scope.set', enabled: !scopeOn }, 'scope'),
-            }, scopeOn ? '已启用' : '已关闭')),
-          h('div', { style: styles.field },
-            h('span', { style: styles.label }, '工作区路径'),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-              h('span', { style: { ...styles.mono, flex: 1, wordBreak: 'break-all' } }, scopePath.length > 0 ? scopePath : '—'),
-              h('button', {
-                style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                style: { ...(status.hearing?.autoListen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
                 disabled: busy !== '',
-                onClick: async () => {
-                  const uiWorkspace = window.__seireinCtx?.get?.('uiWorkspace');
-                  if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== 'function') {
-                    show('目录选择器不可用');
-                    return;
-                  }
-                  const picked = await uiWorkspace.pickDirectory();
-                  if (picked === null || picked === undefined || picked === '') return;
-                  const result = await act({ action: 'scope.set', path: picked }, 'scope-path');
-                  if (result.ok) show('作用域路径已保存');
-                },
-              }, '选择目录'),
-            ),
+                onClick: () => act({ action: 'hearing.autoListen', enabled: status.hearing?.autoListen !== true }, 'hearing-autoListen'),
+              }, status.hearing?.autoListen ? '已开启' : '已关闭')),
           ),
-          h('div', { style: styles.hint }, '默认启用。启用后人设/记忆只注入 Seirein 工作区，其它工作区（如默认工作区）调用记忆、人设、prompt 预览工具会被作用域挡下。'),
-        ),
-
-        card(
-          '工作区权限',
-          h('div', { style: styles.hint }, '助手会话使用 DSH 完全访问模式（危险）；其他工作区的新会话仍由 DSH 默认策略管理。'),
-          h('div', { style: styles.hint }, '不再使用插件目录授权：插件不再检查、授权或验证目录 ACL，启动时也不会自动授权。'),
-          h('details', { style: styles.hint },
-            h('summary', { style: styles.value }, '诊断信息'),
-            h('div', {}, '切换发生在助手会话创建或恢复时，事件：sandbox.switched / sandbox.already-full / sandbox.switch-unavailable。'),
-            h('div', {}, '升级后已存在的助手会话会在下次恢复时切换；验证 PTY 需重启 DSH 后新建或恢复一次助手会话。')),
-        ),
-
-        card(
-          '听觉',
-          line('麦克风', hearingOn
-            ? `监听中 · ${status.hearing.device} · ${status.hearing.rmsDb} dB`
-            : `未启动${status.hearing?.deferred?.reason ? `（${status.hearing.deferred.reason}）` : ''}`),
-          hearingThresholdRow(h, {
-            draft: thresholdDraft,
-            saved: Number(status.hearing?.thresholdDb ?? -50),
-            busy,
-            onDraft: setThresholdDraft,
-            onSave: async (db) => {
-              const result = await act({ action: 'hearing.threshold', db }, 'threshold');
-              if (result.ok && result.restarted) show('已生效（新实例）');
-              else if (result.ok) show('已保存（采集未运行）');
-              else show(result.message ?? result.error ?? '保存失败');
-            },
-          }),
-          callModeSection(h, {
-            status,
-            busy,
-            act,
-            draft: callNameDraft,
-            onDraft: setCallNameDraft,
-            onShow: show,
-          }),
+          settingsGroup(h, 'call-mode', '通话模式',
+            callModeSection(h, {
+              status,
+              busy,
+              act,
+              draft: callNameDraft,
+              onDraft: setCallNameDraft,
+              onShow: show,
+            }),
+          ),
           (() => {
-            // `deviceList` marks replay endpoints (Stereo Mix / virtual cable); an older status
-            // payload only carries names, so those fall back to "selectable".
-            const rows = Array.isArray(status.deviceList) && status.deviceList.length > 0
-              ? status.deviceList
-              : (status.devices ?? []).map((name) => ({ name, loopback: false }));
-            const names = rows.map((row) => row.name);
-            const selected = status.selectedDevice ?? '';
-            const hasLoopback = rows.some((row) => row.loopback === true);
-            return h('div', { style: styles.field },
-              h('span', { style: styles.value }, '输入设备'),
-              h('div', { style: { display: 'flex', gap: 8 } },
+            // 语种：语音与字幕分开配置，来源是 /assistant/status 的 langs。
+            const langOptions = [['zh', '中文'], ['ja', '日语'], ['en', '英语'], ['ko', '韩语'], ['yue', '粤语']];
+            const langRow = (label, key) => settingsField(h, label,
+              h('select', {
+                style: { ...styles.input, width: 140 },
+                value: langs[key] ?? 'zh',
+                disabled: busy !== '',
+                onChange: (event) => act({ action: 'langs.set', [key]: event.target.value }, `langs:${key}`),
+              }, langOptions.map(([value, text]) => h('option', { key: value, value }, text))));
+            return settingsGroup(h, 'language', '语种（语音 / 字幕）',
+              langRow('语音语种', 'speech'),
+              langRow('字幕语种', 'subtitle'),
+              h('div', { style: styles.hint }, langs.speech === langs.subtitle
+                ? '两者一致：按普通文本输出即可，不必为了字幕调用工具。'
+                : '两者不同：agent 会把语音文本放进 text、字幕文本放进 subtitle 调用 assistant_say。'),
+            );
+          })(),
+          settingsGroup(h, 'tts', '语音合成与候音',
+            h('div', { style: { ...styles.hint, marginTop: 0, marginBottom: 6 } }, '更好的音色：支持 GPT-SoVITS 可运行模型'),
+            h('div', { style: styles.row },
+              h('span', { style: styles.label }, '语音播报'),
+              h('button', {
+                style: { ...(status.tts?.playbackEnabled !== false ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                disabled: busy !== '',
+                onClick: () => act({ action: 'voice.playback', enabled: status.tts?.playbackEnabled === false }, 'voice-playback'),
+              }, status.tts?.playbackEnabled !== false ? '已开启' : '已关闭')),
+            h('div', { style: styles.hint }, '「语音合成」是父组件：关闭它会先停播报，再关 GPT 音色并释放插件启动的 GPT-SoVITS；只关 GPT 音色不会关闭播报或组件。'),
+            ackDelayRow(h, {
+              draft: ackDelayDraft,
+              saved: Number(status.voiceAckDelayMs ?? 3000),
+              busy,
+              onDraft: setAckDelayDraft,
+              onSave: async (ms) => {
+                const result = await act({ action: 'voice.ack.delay', ms }, 'ack-delay');
+                if (result.ok) show(`候音等待已设为 ${result.ackDelayMs} ms`);
+                return result;
+              },
+              onInvalid: (message) => show(message),
+            }),
+            h('div', { style: styles.row },
+              h('span', { style: styles.label }, '使用 GPT-SoVITS 音色'),
+              h('button', {
+                style: { ...(gptSovits.enabled ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                disabled: busy !== '',
+                onClick: () => act({ action: 'tts.config', enabled: !gptSovits.enabled }, 'tts-enabled'),
+              }, gptSovits.enabled ? '已开启' : '已关闭')),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, 'API 地址'),
+              h('input', {
+                style: styles.input,
+                value: ttsValue('apiBase'),
+                placeholder: 'http://127.0.0.1:9880',
+                onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), apiBase: event.target.value }),
+                onBlur: () => void commitTtsField('apiBase'),
+              })),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, '参考音频路径'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                h('input', {
+                  style: { ...styles.input, flex: 1 },
+                  value: ttsValue('refAudioPath'),
+                  placeholder: 'D:\\voice\\reference.wav',
+                  onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), refAudioPath: event.target.value }),
+                  onBlur: () => void commitTtsField('refAudioPath'),
+                }),
+                h('button', {
+                  style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                  disabled: busy !== '',
+                  onClick: () => void pickRefAudio(),
+                }, '浏览…'))),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, '参考文本'),
+              h('input', {
+                style: styles.input,
+                value: ttsValue('promptText'),
+                placeholder: '参考音频里说的那句话',
+                onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), promptText: event.target.value }),
+                onBlur: () => void commitTtsField('promptText'),
+              })),
+            ttsLangRow('textLang', '输出语种（text_lang）'),
+            ttsLangRow('promptLang', '参考语种（prompt_lang）'),
+            h('div', { style: styles.hint }, ttsDiag),
+            h('div', { style: styles.label }, '模型（可选）'),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, 'GPT 模型（GPT_weights）'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                h('input', {
+                  style: { ...styles.input, flex: 1 },
+                  value: ttsModelValue('gptModelPath'),
+                  placeholder: 'D:\\GPT-SoVITS\\GPT_weights\\myvoice.ckpt',
+                  onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), gptModelPath: event.target.value }),
+                  onBlur: () => void commitTtsModel('gptModelPath'),
+                }),
+                h('button', {
+                  style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                  disabled: busy !== '',
+                  onClick: () => void pickTtsModel('gptModelPath'),
+                }, '浏览…'))),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, 'SoVITS 模型（SoVITS_weights）'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                h('input', {
+                  style: { ...styles.input, flex: 1 },
+                  value: ttsModelValue('sovitsModelPath'),
+                  placeholder: 'D:\\GPT-SoVITS\\SoVITS_weights\\myvoice.pth',
+                  onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), sovitsModelPath: event.target.value }),
+                  onBlur: () => void commitTtsModel('sovitsModelPath'),
+                }),
+                h('button', {
+                  style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                  disabled: busy !== '',
+                  onClick: () => void pickTtsModel('sovitsModelPath'),
+                }, '浏览…'))),
+            h('div', { style: styles.field },
+              h('span', { style: styles.value }, '应用模型'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+                h('button', {
+                  style: { ...styles.btnPrimary, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                  disabled: busy !== '',
+                  onClick: () => void applyModels(),
+                }, busy === 'tts-apply' ? '加载中…' : '应用模型'),
+                h('span', {
+                  style: { ...styles.value, ...(applyState.dangerous ? { color: DANGER } : {}) },
+                }, applyState.text))),
+            h('div', { style: styles.hint }, '会先等待当前句结束，最多 3 秒；超时后将打断播报。'),
+            h('div', { style: styles.hint }, '留空则用参考音频零样本推理；填好路径后点「应用模型」加载，接口不可用时只保存路径（需在 GPT-SoVITS 端加载）。'),
+            h('div', { style: styles.row },
+              h('a', {
+                href: 'https://github.com/RVC-Boss/GPT-SoVITS',
+                target: '_blank',
+                rel: 'noreferrer',
+                style: { ...styles.btn, textDecoration: 'none', display: 'inline-block' },
+              }, '官方使用说明'),
+              // 链接后续替换：先用 B 站搜索结果占位，等有确定的教程地址再换成直链。
+              h('a', {
+                href: 'https://search.bilibili.com/all?keyword=GPT-SoVITS%20%E8%AE%AD%E7%BB%83',
+                target: '_blank',
+                rel: 'noreferrer',
+                style: { ...styles.btn, textDecoration: 'none', display: 'inline-block' },
+              }, 'B站教程')),
+          ),
+          (() => {
+            // 环境声音：系统音频单独走一条 ASR，只进上下文，不触发回复。
+            const loopbacks = status.loopbackDevices ?? [];
+            const ambientOn = status.ambient?.running === true;
+            const deferred = status.ambient?.deferred;
+            const deferredSuffix = deferred?.reason ? `（${deferred.reason}）` : '';
+            const missing = loopbacks.length === 0;
+            return settingsGroup(h, 'ambient', '环境声音（系统音频）',
+              line('状态', ambientOn ? `采集中 · ${status.ambient.device}` : `未启动${deferredSuffix}`),
+              ambientRecentRow(h, {
+                recent: status.ambient?.recent ?? [],
+                expanded: expandedAmbient,
+                onToggle: setExpandedAmbient,
+              }),
+              settingsField(h, '回环设备',
                 h('select', {
                   style: styles.input,
-                  value: selected,
-                  disabled: hearingOn || busy !== '',
-                  onChange: (event) => act({ action: 'hearing.device', device: event.target.value }),
+                  value: loopbacks[0] ?? '',
+                  disabled: ambientOn || busy !== '' || missing,
+                  onChange: (event) => act({ action: 'ambient.start', device: event.target.value }),
                 },
-                  rows.length === 0
-                    ? h('option', { value: '' }, '（未检测到设备）')
-                    : rows.map((row) => h('option', {
-                        key: row.name,
-                        value: row.name,
-                        disabled: row.loopback === true,
-                        title: row.loopback ? '回环输入不可作为麦克风' : undefined,
-                      }, row.loopback ? `${row.name}（回环输入，不可选）` : row.name)),
-                  selected && !names.includes(selected)
-                    ? h('option', { value: selected }, `${selected}（当前）`)
-                    : null,
+                  missing
+                    ? h('option', { value: '' }, '（未检测到回环设备）')
+                    : loopbacks.map((device) => h('option', { key: device, value: device }, device)),
+                )),
+              settingsActions(h,
+                h('button', {
+                  style: { ...(ambientOn ? styles.btnActive : styles.btnPrimary), ...(ambientOn || busy !== '' || missing ? styles.off : {}) },
+                  disabled: ambientOn || busy !== '' || missing,
+                  onClick: () => act({ action: 'ambient.start' }),
+                }, '开始采集'),
+                h('button', {
+                  style: { ...styles.btn, ...(!ambientOn || busy !== '' ? styles.off : {}) },
+                  disabled: !ambientOn || busy !== '',
+                  onClick: () => act({ action: 'ambient.stop' }),
+                }, '停止'),
+              ),
+              h('div', { style: styles.hint }, feature('ambient')
+                ? '关闭「环境声音」组件会先停回环采集，再关开关。'
+                : '「环境声音」组件当前关闭：点「开始采集」会先启用组件，再开始采集。'),
+              h('div', { style: styles.row },
+                h('span', { style: styles.value }, '开机自动采集（默认关闭；只授权，不在打开组件时立即采集）'),
+                h('button', {
+                  style: { ...(status.ambient?.autoListen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'ambient.autoListen', enabled: status.ambient?.autoListen !== true }, 'ambient-autoListen'),
+                }, status.ambient?.autoListen ? '已开启' : '已关闭')),
+              h('div', { style: styles.hint }, missing
+                ? '需要虚拟声卡：装 VB-Cable 后会出现「CABLE Output」；或在声音设置里启用「立体声混音」。'
+                : '电脑声音只作为上下文，不会触发回复。OBS 里把「监视设备」设为 CABLE Input 即可接入。'),
+            );
+          })(),
+        )),
+        settingsBlock('common', settingsCard(h, 'avatar', '形象与动作',
+          (() => {
+            // 形象：VTS 连接、模型、热键、表情。
+            const l = status.live2d ?? {};
+            const ready = l.ready === true;
+            const socketOpen = l.socketOpen === true;
+            const hotkeys = l.hotkeys ?? [];
+            const expressions = l.expressions ?? [];
+            return [
+              settingsGroup(h, 'vts', 'VTS 连接与表情',
+                line('VTS', ready
+                  ? `已连接 · ${l.model || '未知模型'}`
+                  : socketOpen
+                    ? 'WebSocket 已打开，但认证未完成（未就绪）'
+                    : '未连接（VTube Studio 需开启 API 8001）'),
+                (() => {
+                  // 订阅状态单独一行：服务器拒绝订阅时连接仍可用，用提示色把原因显示出来；
+                  // 订阅成功时只显示状态，不再显示 subscriptionError。
+                  const subscribed = l.eventsSubscribed === true;
+                  const subscriptionError = String(l.subscriptionError ?? '');
+                  const failed = !subscribed && ready && subscriptionError.length > 0;
+                  return h('div', { style: styles.row },
+                    h('span', { style: styles.label }, '订阅'),
+                    h('span', {
+                      style: failed ? { fontSize: 13, color: DANGER } : styles.value,
+                    }, subscribed
+                      ? 'ModelLoadedEvent 已订阅'
+                      : failed
+                        ? `失败：${subscriptionError}`
+                        : ready
+                          ? '未订阅'
+                          : '—'),
+                  );
+                })(),
+                line('热键', hotkeys.length > 0 ? `${hotkeys.length} 个` : '—'),
+                h('div', { style: styles.row },
+                  h('button', {
+                    style: styles.btn,
+                    disabled: busy !== '',
+                    onClick: () => act({ action: 'live2d.connect' }, 'live2d'),
+                  }, ready ? '重新连接' : '连接 VTS'),
+                  // 唯一的测试入口：触发当前模型的第一个热键，验证 VTS 连接与热键通道。
+                  h('button', {
+                    style: { ...styles.btn, ...(busy !== '' || hotkeys.length === 0 ? styles.off : {}) },
+                    disabled: busy !== '' || hotkeys.length === 0,
+                    // 无可触发热键时按钮置灰；只用 title 给原因，不占卡片版面。
+                    title: hotkeys.length === 0 ? '无可用热键' : undefined,
+                    onClick: async () => {
+                      const result = await act({ action: 'live2d.hotkey', name: hotkeys[0] }, 'live2d');
+                      if (result.ok) show(`已触发：${result.name ?? hotkeys[0]}`);
+                    },
+                  }, '测试连接'),
                 ),
+                expressions.length > 0
+                  ? h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', margin: '6px 0' } },
+                      expressions.map((name) => h('button', {
+                        key: name,
+                        style: styles.btn,
+                        disabled: busy !== '',
+                        onClick: () => act({ action: 'live2d.expression', name }, 'live2d'),
+                      }, `表情：${name}`)))
+                  : null,
+                h('div', { style: styles.hint }, '说话时自动口型；点「测试连接」触发当前模型的第一个热键。'),
+                (() => {
+                  // 能力发现：VTS 注入的是输入参数。这里把两个问题分开显示：
+                  //   可注入 = 这个名字存在于 InputParameterListRequest，值能发出去；
+                  //   已验证 = 有证据它确实驱动该部位（用户显式映射，或模型参数列表里有对应目标）。
+                  const caps = l.capabilities ?? null;
+                  const groups = [
+                    { label: '视线', channels: ['gazeX', 'gazeY'] },
+                    { label: '头', channels: ['headX', 'headY', 'headZ'] },
+                    { label: '眼', channels: ['eyeOpenL', 'eyeOpenR'] },
+                    { label: '眉', channels: ['browL', 'browR'] },
+                    { label: '口', channels: ['mouth'] },
+                    { label: '身体', channels: ['bodyX', 'breath'] },
+                  ];
+                  const inputs = caps?.inputs ?? {};
+                  const injectableSet = new Set(Array.isArray(caps?.mapped) ? caps.mapped : []);
+                  const verifiedSet = new Set(Array.isArray(caps?.verified) ? caps.verified : []);
+                  const nameOf = (channel) => inputs[channel]?.inputName ?? inputs[channel]?.name ?? channel;
+                  // 每个通道单独一行；两栏并排各占一半，窄屏（flexWrap）自动换行堆叠；
+                  // 通道较多（>6）时该栏限制高度并滚动，避免卡片无限变高。
+                  const rowsOf = (set) => groups.flatMap((group) => group.channels
+                    .filter((channel) => set.has(channel))
+                    .map((channel) => ({ key: channel, group: group.label, name: nameOf(channel) })));
+                  const columnOf = (label, rows, emptyText) => h('div', {
+                    style: { flex: '1 1 0', minWidth: 220, minHeight: 0 },
+                  },
+                    h('div', { style: styles.label }, `${label}（${rows.length}）`),
+                    rows.length > 0
+                      ? h('div', {
+                          style: {
+                            marginTop: 4,
+                            paddingLeft: 2,
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 2,
+                            ...(rows.length > 6 ? { maxHeight: 160, overflowY: 'auto' } : {}),
+                          },
+                        }, rows.map((row) => h('div', { key: row.key, style: styles.value },
+                          h('span', { style: { marginRight: 6 } }, '·'),
+                          `${row.group} ${row.name}`)))
+                      : h('div', { style: styles.hint }, emptyText),
+                  );
+                  const discovered = caps !== null && caps.discovered === true;
+                  const injectableRows = rowsOf(injectableSet);
+                  const verifiedRows = rowsOf(verifiedSet);
+                  const transport = l.transport ?? {};
+                  const hz = Number(transport.computedHz ?? 0);
+                  const dropped = Number(transport.dropped ?? 0);
+                  const sent = Number(transport.sent ?? 0);
+                  return h('div', { style: { marginTop: 10 } },
+                    h('div', {
+                      style: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 12, marginTop: 8 },
+                    },
+                      discovered
+                        ? columnOf('可注入', injectableRows, '无（名字匹配只是候选）')
+                        : h('div', { style: { flex: '1 1 0', minWidth: 220 } },
+                            h('div', { style: styles.label }, '可注入'),
+                            h('div', { style: styles.hint }, '尚未探测')),
+                      discovered ? columnOf('已验证', verifiedRows, '无（名字匹配只是候选）') : null,
+                    ),
+                    h('div', { style: styles.hint }, `实时帧：${hz.toFixed(1)} Hz · 已发 ${sent} · 丢弃 ${dropped}${caps?.live === false ? '（VTS 离线，显示上次结果）' : ''}`),
+                    h('div', { style: styles.row },
+                      h('button', {
+                        style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
+                        disabled: busy !== '',
+                        onClick: async () => {
+                          const result = await act({ action: 'avatar.capabilities.refresh' }, 'avatar-capabilities');
+                          if (result.ok) {
+                            const injectable = Array.isArray(result.mapped) ? result.mapped.length : 0;
+                            const verified = Array.isArray(result.verified) ? result.verified.length : 0;
+                            show(`已探测 ${injectable} 个可注入通道，${verified} 个已验证`);
+                          }
+                        },
+                      }, '重新探测'),
+                      h('span', { style: styles.hint }, caps?.error ? `探测失败：${caps.error}` : ''),
+                    ),
+                    h('div', { style: styles.hint }, '「可注入」只说明值能发出去；「已验证」才说明有证据它驱动该部位。模型是否响应取决于 VTS 内的参数映射。'),
+                  );
+                })(),
+              ),
+              settingsGroup(h, 'layer', '桌面悬浮与编辑',
+                (() => {
+                  const backendLayer = status.layer ?? {};
+                  const layer = {
+                    running: backendLayer.running === true,
+                    editMode: backendLayer.editMode === true,
+                    adjusting: backendLayer.editMode === true,
+                    geometry: backendLayer.backend === 'spout'
+                      ? null
+                      : status.avatarLayer?.geometry,
+                  };
+                  const geo = layer.geometry;
+                  return h('div', { style: { marginTop: 8 } },
+                    line('桌面悬浮', layer.running
+                      ? `${layer.editMode ? '编辑中（可拖动/滚轮缩放）' : '运行中'} · ${geo ? `${geo.width}×${geo.height} @ ${geo.left},${geo.top}` : ''}`
+                      : '未启动'),
+                    h('div', { style: styles.row },
+                      h('button', {
+                        style: layer.adjusting ? styles.btnActive : styles.btnPrimary,
+                        disabled: busy !== '',
+                        onClick: () => act({
+                          action: layer.adjusting ? 'layer.edit.exit' : 'layer.edit.enter',
+                        }, 'avatarLayer'),
+                      }, layer.adjusting ? '完成编辑' : '编辑模式'),
+                    ),
+                    h('div', { style: styles.hint }, layer.adjusting
+                      ? 'VTS 窗口已回到屏幕：像普通窗口一样拖动/拉边框；点「完成编辑」保存并恢复悬浮。'
+                      : layer.running
+                        ? '悬浮中；按钮与 Ctrl+Alt+E 都会停止当前显示层，调出 VTS 编辑；完成后在原位置恢复显示。'
+                        : '先开启桌面悬浮，再点「编辑模式」或按 Ctrl+Alt+E 调整。'),
+                  );
+                })(),
+              ),
+              (() => {
+                // 透明化（原「Spout（实验）」位置）：WPF / Spout 单层互斥。模式来自
+                // status.layer.backend（缺省 wpf），下方只渲染当前后端自己的设置。
+                const lay = status.layer ?? {};
+                const tp = status.transparent ?? {};
+                const sp = lay.spout ?? l.spoutLayer ?? {};
+                const draft = layerDraft ?? {
+                  left: tp.left ?? 1600,
+                  top: tp.top ?? 300,
+                  width: tp.width ?? 420,
+                  height: tp.height ?? 760,
+                };
+                const draftPath = String(spoutDraft ?? sp.electronExecutable ?? '').trim();
+                return layerSettingsBody(h, {
+                  layer: lay,
+                  spout: sp,
+                  transparent: tp,
+                  busy,
+                  spoutDraft,
+                  draft,
+                }, {
+                  // 切换由宿主串行执行：可用性检查 → 停旧后端并确认退出 → 启新后端。
+                  switchBackend: (backend) => {
+                    void act({ action: 'layer.backend', backend, electronExecutable: draftPath }, 'layer-backend');
+                  },
+                  setField: (key, value) => setLayerDraft({ ...draft, [key]: value }),
+                  setSpoutDraft,
+                  pickSpout: () => pickSpoutPath(act, setSpoutDraft),
+                  // 「保存」: the same `spoutLayer.status` action both write the typed path and re-probe;
+                  // `act` refreshes the status so the Spout button flips as soon as the path is valid.
+                  saveSpoutPath: async () => {
+                    const result = await act({ action: 'spoutLayer.status', electronExecutable: draftPath }, 'spout-path');
+                    const probe = result.probe ?? {};
+                    if (probe.ok) show(`Spout 路径已保存 · Electron ${probe.version || '可用'}`);
+                    else show(`路径已保存，校验失败：${probe.code || probe.message || '未知错误'}`);
+                  },
+                  probeSpout: async () => {
+                    const result = await act({ action: 'spoutLayer.status', electronExecutable: draftPath }, 'spout-probe');
+                    const probe = result.probe ?? {};
+                    if (probe.ok) show(`Electron ${probe.version || '可用'} · 校验通过`);
+                    else show(`检测失败：${probe.code || probe.message || '未知错误'}`);
+                  },
+                  startSpout: async () => {
+                    const result = await act({ action: 'spoutLayer.start', electronExecutable: draftPath }, 'spoutLayer');
+                    if (result.ok) show('显示层已启动，等待首帧上报');
+                  },
+                  stopSpout: () => act({ action: 'spoutLayer.stop' }, 'spoutLayer'),
+                  startWpf: () => act({
+                    action: 'transparent.start',
+                    left: Number(draft.left),
+                    top: Number(draft.top),
+                    width: Number(draft.width),
+                    height: Number(draft.height),
+                  }, 'transparent'),
+                  stopWpf: () => act({ action: 'transparent.stop' }, 'transparent'),
+                });
+              })(),
+              motionPresetSection(h, {
+                data: motionPresets,
+                query: motionQuery,
+                filters: motionFilters,
+                drafts: motionDrafts,
+                busy,
+              }, {
+                setQuery: setMotionQuery,
+                setFilter: (key, value) => setMotionFilters((current) => ({ ...current, [key]: value })),
+                setDraft: (key, value) => setMotionDrafts((current) => {
+                  const next = { ...current };
+                  if (value === null) delete next[key];
+                  else next[key] = value;
+                  return next;
+                }),
+                override: overrideMotionPreset,
+                reset: resetMotionPresets,
+                refresh: () => { void loadMotionPresets(); },
+              }),
+            ];
+          })(),
+        )),
+        settingsBlock('common', settingsCard(h, 'vision', '视觉与感知',
+          (() => {
+            // 两种观看来源共用一套采集能力：桌面（ffmpeg ddagrab）与 OBS 场景（虚拟摄像头）。
+            // 隐私是插件侧锁：停两种来源、清空预览，但不再切 OBS 隐私场景。
+            const vm = status.vision ?? {};
+            const mode = vm.mode ?? 'watch';
+            const locked = vm.locked === true || mode === 'privacy';
+            const source = vm.source ?? (mode === 'scene' ? 'obs' : 'desktop');
+            const scenes = vm.scenes ?? [];
+            const capturing = vm.capturing === true;
+            const busyNow = busy !== '';
+            const visionHotkey = (status.hotkeys ?? []).find((entry) => entry.action === 'vision')?.combo ?? 'Ctrl+Alt+V';
+            const lastCaptureAt = Number(vm.lastCaptureAt) || 0;
+            const lastCaptureText = lastCaptureAt > 0 ? new Date(lastCaptureAt).toLocaleTimeString() : '—';
+            const sourceLabel = source === 'obs' ? `OBS 场景「${vm.scene || '未指定'}」` : '桌面';
+            const modeLabel = locked
+              ? '隐私模式（锁定）'
+              : capturing
+                ? `持续观看 · ${sourceLabel}`
+                : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
+            // No local state: the select value is the source the Host actually has.
+            const sourceValue = source === 'obs' ? (vm.scene || '__obs__') : '__desktop__';
+            return settingsGroup(h, 'vision', '观看来源与隐私',
+              h('div', { style: styles.row },
+                h('span', { style: styles.label }, '当前视觉来源'),
+                h('span', {
+                  style: {
+                    ...styles.badge,
+                    ...(locked
+                      ? { borderColor: DANGER, color: DANGER, fontWeight: 600 }
+                      : source === 'obs'
+                        ? { borderColor: ACCENT, color: ACCENT, fontWeight: 600 }
+                        : {}),
+                  },
+                }, modeLabel),
+              ),
+              line('观看来源', locked
+                ? '已暂停（桌面与 OBS 采集均已停止）'
+                : source === 'obs'
+                  ? `${sourceLabel}（虚拟摄像头）`
+                  : '桌面（ffmpeg ddagrab，不经 OBS）'),
+              line('持续观看', capturing
+                ? `采集中 · 最近取景 ${lastCaptureText}`
+                : vm.lastCaptureAt ? `未启动 · 最近取景 ${lastCaptureText}` : '未启动'),
+              line('虚拟摄像头', vm.virtualCam
+                ? capturing ? '运行中（持续观看占用）' : `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
+                : '已停止（取景时按需启动；用户自启的不会关闭）'),
+              line('OBS 进程', vm.obsRunning ? '运行中' : '未运行 / 未连接'),
+              line('OBS 场景', status.obsScene || '未连接 / 未知'),
+              h('div', { style: styles.field },
+                h('span', { style: styles.value }, '选择观看来源'),
+                h('div', { style: { display: 'flex', gap: 8 } },
+                  h('select', {
+                    style: styles.input,
+                    value: sourceValue,
+                    disabled: busyNow || locked,
+                    onChange: (event) => {
+                      const value = event.target.value;
+                      if (value === '__desktop__') void act({ action: 'vision.mode', mode: 'watch' }, 'vision');
+                      else void act({ action: 'vision.mode', mode: 'scene', scene: value }, 'vision');
+                    },
+                  },
+                    h('option', { value: '__desktop__' }, '桌面（屏幕）'),
+                    scenes.map((name) => h('option', { key: name, value: name }, name)),
+                    !locked && source === 'obs' && vm.scene && !scenes.includes(vm.scene)
+                      ? h('option', { key: '__current', value: vm.scene }, `${vm.scene}（当前）`)
+                      : null,
+                  ),
+                  h('button', {
+                    style: styles.btn,
+                    disabled: busyNow,
+                    onClick: () => act({ action: 'vision.scenes' }, 'vision-scenes'),
+                  }, '刷新场景'),
+                ),
+              ),
+              settingsActions(h,
+                h('button', {
+                  style: { ...(capturing ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow || locked,
+                  onClick: async () => {
+                    const result = capturing
+                      ? await act({ action: 'vision.watch.stop' }, 'vision-watch')
+                      : await act({ action: 'vision.watch.start', source, scene: vm.scene || '' }, 'vision-watch');
+                    if (result.ok) show(capturing ? '已停止持续观看' : '已开始持续观看');
+                  },
+                }, capturing ? '停止持续观看' : '启动持续观看'),
+                h('button', {
+                  style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow,
+                  onClick: async () => {
+                    const result = await act({ action: 'vision.snapshot' }, 'snapshot');
+                    if (result.ok) show('已截图，可在 cache/screens 查看');
+                  },
+                }, '截图测试'),
+                h('button', {
+                  // Escape hatch: never gate this on the vision feature, or privacy could trap the user.
+                  style: { ...(locked ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow,
+                  onClick: () => act({ action: 'privacy.toggle' }, 'privacy'),
+                }, locked ? '退出隐私模式' : '切换隐私模式'),
+              ),
+              vm.lastShot
+                ? h('div', { style: { marginTop: 8 } },
+                    h('span', { style: styles.value }, `最近取景：${vm.lastShot.source === 'scene' ? `OBS 场景「${vm.lastShot.scene || '—'}」` : '桌面'} · ${vm.lastShot.width}×${vm.lastShot.height}`),
+                    h('img', {
+                      src: `/assistant/shot?path=${encodeURIComponent(vm.lastShot.file)}&t=${vm.lastShot.ts}`,
+                      alt: '最近取景',
+                      style: {
+                        display: 'block', marginTop: 6, maxWidth: '100%', maxHeight: 200,
+                        borderRadius: 8, border: `1px solid ${BORDER}`, background: '#000',
+                      },
+                    }),
+                  )
+                : h('div', { style: styles.hint }, '还没有取景；点「截图测试」拍一张。'),
+              h('div', { style: styles.hint }, locked
+                ? `隐私模式已锁定：桌面与 OBS 采集均已停止，agent 不能截图或切出；你可以按 ${visionHotkey} 或点上面的按钮退出。`
+                : source === 'obs'
+                  ? 'OBS 场景观看：持续采集选定场景，按需把变化帧打包成一张故事板交付；切换场景会清空旧帧并重新采集。'
+                  : '桌面观看：ffmpeg ddagrab 持续采集桌面，不依赖 OBS；可随时切换来源或隐私。'),
+              h('div', { style: styles.hint }, feature('vision')
+                ? '视觉 ↔ OBS：选择 OBS 来源时按需启动 OBS；虚拟摄像头只按归属释放（插件启动的会停，用户自己启动的保留）。'
+                : '「视觉」组件当前关闭：点截图或启动观看会先启用组件；桌面观看不会因此启动 OBS。'),
+            );
+          })(),
+        )),
+        settingsBlock('common', settingsCard(h, 'subtitle', '字幕',
+          (() => {
+            // 字幕：区域拖选 / 气泡跟随 VTS + 字体字号 + 对比色。
+            const sub = status.subtitle ?? {};
+            const region = sub.region;
+            const bubble = sub.mode === 'bubble';
+            const layerRunning = status.avatarLayer?.running === true;
+            // 字体：下拉框只列本机已安装的字体族；当前值不在列表里时补一个「当前」选项。
+            const fonts = Array.isArray(sub.availableFonts) ? sub.availableFonts : [];
+            const currentFont = typeof sub.font === 'string' && sub.font.trim().length > 0
+              ? sub.font.trim()
+              : 'Microsoft YaHei UI';
+            const currentFontListed = fonts.includes(currentFont);
+            const canEnable = bubble ? layerRunning : region !== null && region !== undefined;
+            const subtitleOn = feature('subtitle') && sub.enabled === true;
+            const blockReason = bubble
+              ? (layerRunning ? '' : '气泡模式需要先「放到桌面」，否则没有可依附的窗口')
+              : (canEnable ? '' : '区域模式需要先拖选一个区域');
+            return settingsGroup(h, 'subtitle', '字幕显示',
+              line('状态', subtitleOn ? (sub.running ? '显示中' : '已启用') : '未启用'),
+              line('模式', bubble ? '气泡 · 跟随悬浮窗' : '区域 · 固定位置'),
+              settingsActions(h,
+                h('button', {
+                  style: bubble ? styles.btn : styles.btnActive,
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'subtitle.config', mode: 'region' }, 'subtitle-mode'),
+                }, '区域模式'),
+                h('button', {
+                  style: bubble ? styles.btnActive : styles.btn,
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'subtitle.config', mode: 'bubble' }, 'subtitle-mode'),
+                }, '气泡模式'),
+              ),
+              h('div', { style: styles.hint }, subtitleOn ? '' : '字幕当前关闭：点模式或「启用字幕」会先启用字幕组件，再切换/打开容器。'),
+              settingsActions(h,
+                h('button', {
+                  style: { ...(subtitleOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'subtitle.config', enabled: !sub.enabled }),
+                }, sub.enabled ? '停用字幕' : '启用字幕'),
                 h('button', {
                   style: styles.btn,
                   disabled: busy !== '',
-                  onClick: () => act({ action: 'hearing.devices.refresh' }),
-                }, '刷新'),
+                  onClick: () => act({ action: 'subtitle.preview' }),
+                }, '预览'),
               ),
-              hasLoopback
-                ? h('div', { style: styles.hint }, '回环输入不可作为麦克风：置灰的「立体声混音」「CABLE Output」等设备只能用于环境声音。')
-                : null,
+              h('div', { style: styles.hint }, blockReason),
+              bubble
+                ? h('div', { style: styles.hint },
+                    `气泡宽度跟随悬浮窗（${status.avatarLayer?.geometry?.width ?? '—'} px），高度随字数增长，字号按窗口高度等比缩放；不使用字体/字号/区域设置。`)
+                : h('div', null,
+                    h('div', { style: styles.row },
+                      h('button', {
+                        style: styles.btn,
+                        disabled: busy !== '',
+                        onClick: async () => {
+                          const result = await act({ action: 'subtitle.select' }, 'subtitle.select');
+                          if (result.ok) show('区域已保存');
+                        },
+                      }, '选择区域'),
+                      h('span', { style: styles.value }, region ? `${region.x}, ${region.y} · ${region.w}×${region.h}` : '未选择'),
+                    ),
+                    h('div', { style: styles.field },
+                      settingsField(h, '字体',
+                        h('select', {
+                          style: styles.input,
+                          value: currentFont,
+                          disabled: busy !== '',
+                          onChange: (event) => {
+                            if (event.target.value.length > 0) {
+                              void act({ action: 'subtitle.config', font: event.target.value });
+                            }
+                          },
+                        },
+                          currentFontListed ? null : h('option', { value: currentFont }, `（当前：${currentFont}）`),
+                          fonts.map((name) => h('option', { key: name, value: name }, name)),
+                        ),
+                        h('button', {
+                          style: styles.btn,
+                          disabled: busy !== '',
+                          title: '重新读取本机已安装的字体',
+                          onClick: () => act({ action: 'subtitle.fonts.refresh' }),
+                        }, '刷新字体列表')),
+                      h('div', { style: styles.hint }, fonts.length === 0
+                        ? '正在读取本机已安装字体…'
+                        : `本机已安装 ${fonts.length} 个字体族${sub.truncatedFonts === true ? '（仅列出前 1000 个）' : ''}`),
+                    ),
+                    h('div', { style: styles.field },
+                      settingsField(h, '字号上限',
+                        h('input', {
+                          style: { ...styles.input, width: 80 },
+                          type: 'number',
+                          min: 12,
+                          max: 96,
+                          value: sizeMaxDraft ?? String(sub.sizeMax ?? 32),
+                          onChange: (event) => setSizeMaxDraft(event.target.value),
+                          onBlur: async (event) => {
+                            const value = Number.parseInt(event.target.value, 10);
+                            if (Number.isFinite(value)) await act({ action: 'subtitle.config', sizeMax: value });
+                            // 保存成功或失败都丢弃草稿：成功回显新值，失败回显旧值，不留脏数据。
+                            setSizeMaxDraft(null);
+                          },
+                        })),
+                    ),
+                  ),
+              h('div', { style: styles.hint }, feature('subtitle')
+                ? '区域模式：拖选后启用；气泡模式：锚在悬浮窗左上角，气泡色取自模型区域，文字取对比色。关闭「字幕」组件会先隐藏字幕，再连同区域/显示开关一起置为关。'
+                : '字幕组件当前关闭：上面的按钮仍可点，会先启用「字幕显示」组件，再执行字幕动作。'),
             );
           })(),
-          h('div', { style: styles.row },
-            h('button', {
-              style: { ...(hearingOn ? styles.btnActive : styles.btnPrimary), ...(hearingOn || busy !== '' ? styles.off : {}) },
-              disabled: hearingOn || busy !== '',
-              onClick: () => act({ action: 'hearing.start' }),
-            }, '测试麦克风'),
-            h('button', {
-              style: { ...styles.btn, ...(!hearingOn || busy !== '' ? styles.off : {}) },
-              disabled: !hearingOn || busy !== '',
-              onClick: () => act({ action: 'hearing.stop' }),
-            }, '停止'),
-          ),
-          h('div', { style: styles.hint }, '点「测试麦克风」开始采集，看上面电平是否随说话跳动；说完停顿约 1.2 秒出终稿。'),
-          h('div', { style: styles.hint }, feature('hearing')
-            ? '关闭「听觉」组件会先停麦并关闭相关开关。'
-            : '「听觉」组件当前关闭：点上面的按钮会先启用组件，再开始采集。'),
-          h('div', { style: styles.row },
-            h('span', { style: styles.value }, '开机自动监听（默认关闭；只授权，不在打开组件时立即录音）'),
-            h('button', {
-              style: { ...(status.hearing?.autoListen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-              disabled: busy !== '',
-              onClick: () => act({ action: 'hearing.autoListen', enabled: status.hearing?.autoListen !== true }, 'hearing-autoListen'),
-            }, status.hearing?.autoListen ? '已开启' : '已关闭')),
-          speakerShadowRow(h, { status, busy, act }),
-          retentionSection(h, {
-            status,
-            data: retentionData,
-            busy,
-            preview: retentionPreview,
-            confirm: retentionConfirm,
-            onToggle: (enabled) => void toggleRetention(enabled),
-            onPreview: (id) => void previewRetention(id),
-            onAskDelete: (id) => setRetentionConfirm(String(id)),
-            onDelete: (id) => void deleteRetention(id),
-            onCancel: () => setRetentionConfirm(''),
-            onDeleteAll: () => void deleteRetention('all'),
-          }),
-          lexiconSection(h, {
-            data: lexiconData,
-            busy,
-            dialog: lexiconDialog,
-            pending: lexiconPending,
-            speakerId: lexiconSpeakerId(status),
-          }, {
-            refresh: () => void loadLexicon(),
-            openConfirm: openLexiconConfirm,
-            openEdit: openLexiconEdit,
-            closeDialog: (dialog) => void closeLexiconDialog(dialog),
-            changeDialog: changeLexiconDialog,
-            removeWrongForm: removeLexiconWrongForm,
-            saveDialog: (dialog, speakerId) => void saveLexiconDialog(dialog, speakerId),
-            retrySave: (dialog) => void retryLexiconSave(dialog),
-            askIgnore: (id) => setLexiconPending({ kind: 'ignore', id: String(id) }),
-            ignore: (id) => void ignoreLexicon(id),
-            askRemove: (id) => setLexiconPending({ kind: 'remove', id: String(id) }),
-            remove: (id) => void removeLexicon(id),
-            cancelWrite: () => setLexiconPending(null),
-          }),
-        ),
-
-        speakerEnrollSection(h, {
-          data: speakerEnroll,
-          busy: busy !== '',
-          notice: speakerEnrollNotice,
-          onRefresh: () => void loadSpeakerEnroll(),
-          onRecord: startSpeakerEnroll,
-          onConfirm: (speakerId) => void runSpeakerEnroll('confirm', speakerId),
-          onReject: (speakerId) => void runSpeakerEnroll('reject', speakerId),
-          onRemove: (speakerId) => void runSpeakerEnroll('remove', speakerId),
-          onCopy: () => void copySpeakerEnroll(),
-        }),
-
-        (() => {
-          // 语种：语音与字幕分开配置，来源是 /assistant/status 的 langs。
-          const langOptions = [['zh', '中文'], ['ja', '日语'], ['en', '英语'], ['ko', '韩语'], ['yue', '粤语']];
-          const langRow = (label, key) => h('div', { style: styles.row },
-            h('span', { style: styles.label }, label),
-            h('select', {
-              style: { ...styles.input, width: 140 },
-              value: langs[key] ?? 'zh',
-              disabled: busy !== '',
-              onChange: (event) => act({ action: 'langs.set', [key]: event.target.value }, `langs:${key}`),
-            }, langOptions.map(([value, text]) => h('option', { key: value, value }, text))),
-          );
-          return card(
-            '语种',
-            langRow('语音语种', 'speech'),
-            langRow('字幕语种', 'subtitle'),
-            h('div', { style: styles.hint }, langs.speech === langs.subtitle
-              ? '两者一致：按普通文本输出即可，不必为了字幕调用工具。'
-              : '两者不同：agent 会把语音文本放进 text、字幕文本放进 subtitle 调用 assistant_say。'),
-          );
-        })(),
-
-        card(
-          '语音合成',
-          h('div', { style: { ...styles.hint, marginTop: 0, marginBottom: 6 } }, '更好的音色：支持 GPT-SoVITS 可运行模型'),
-          h('div', { style: styles.row },
-            h('span', { style: styles.label }, '语音播报'),
-            h('button', {
-              style: { ...(status.tts?.playbackEnabled !== false ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-              disabled: busy !== '',
-              onClick: () => act({ action: 'voice.playback', enabled: status.tts?.playbackEnabled === false }, 'voice-playback'),
-            }, status.tts?.playbackEnabled !== false ? '已开启' : '已关闭')),
-          h('div', { style: styles.hint }, '「语音合成」是父组件：关闭它会先停播报，再关 GPT 音色并释放插件启动的 GPT-SoVITS；只关 GPT 音色不会关闭播报或组件。'),
-          ackDelayRow(h, {
-            draft: ackDelayDraft,
-            saved: Number(status.voiceAckDelayMs ?? 3000),
-            busy,
-            onDraft: setAckDelayDraft,
-            onSave: async (ms) => {
-              const result = await act({ action: 'voice.ack.delay', ms }, 'ack-delay');
-              if (result.ok) show(`候音等待已设为 ${result.ackDelayMs} ms`);
-              return result;
-            },
-            onInvalid: (message) => show(message),
-          }),
-          h('div', { style: styles.row },
-            h('span', { style: styles.label }, '使用 GPT-SoVITS 音色'),
-            h('button', {
-              style: { ...(gptSovits.enabled ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-              disabled: busy !== '',
-              onClick: () => act({ action: 'tts.config', enabled: !gptSovits.enabled }, 'tts-enabled'),
-            }, gptSovits.enabled ? '已开启' : '已关闭')),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, 'API 地址'),
-            h('input', {
-              style: styles.input,
-              value: ttsValue('apiBase'),
-              placeholder: 'http://127.0.0.1:9880',
-              onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), apiBase: event.target.value }),
-              onBlur: () => void commitTtsField('apiBase'),
-            })),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, '参考音频路径'),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-              h('input', {
-                style: { ...styles.input, flex: 1 },
-                value: ttsValue('refAudioPath'),
-                placeholder: 'D:\\voice\\reference.wav',
-                onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), refAudioPath: event.target.value }),
-                onBlur: () => void commitTtsField('refAudioPath'),
-              }),
-              h('button', {
-                style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
-                disabled: busy !== '',
-                onClick: () => void pickRefAudio(),
-              }, '浏览…'))),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, '参考文本'),
-            h('input', {
-              style: styles.input,
-              value: ttsValue('promptText'),
-              placeholder: '参考音频里说的那句话',
-              onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), promptText: event.target.value }),
-              onBlur: () => void commitTtsField('promptText'),
-            })),
-          ttsLangRow('textLang', '输出语种（text_lang）'),
-          ttsLangRow('promptLang', '参考语种（prompt_lang）'),
-          h('div', { style: styles.hint }, ttsDiag),
-          h('div', { style: styles.label }, '模型（可选）'),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, 'GPT 模型（GPT_weights）'),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-              h('input', {
-                style: { ...styles.input, flex: 1 },
-                value: ttsModelValue('gptModelPath'),
-                placeholder: 'D:\\GPT-SoVITS\\GPT_weights\\myvoice.ckpt',
-                onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), gptModelPath: event.target.value }),
-                onBlur: () => void commitTtsModel('gptModelPath'),
-              }),
-              h('button', {
-                style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
-                disabled: busy !== '',
-                onClick: () => void pickTtsModel('gptModelPath'),
-              }, '浏览…'))),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, 'SoVITS 模型（SoVITS_weights）'),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-              h('input', {
-                style: { ...styles.input, flex: 1 },
-                value: ttsModelValue('sovitsModelPath'),
-                placeholder: 'D:\\GPT-SoVITS\\SoVITS_weights\\myvoice.pth',
-                onChange: (event) => setTtsDraft({ ...(ttsDraft ?? {}), sovitsModelPath: event.target.value }),
-                onBlur: () => void commitTtsModel('sovitsModelPath'),
-              }),
-              h('button', {
-                style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
-                disabled: busy !== '',
-                onClick: () => void pickTtsModel('sovitsModelPath'),
-              }, '浏览…'))),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, '应用模型'),
-            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
-              h('button', {
-                style: { ...styles.btnPrimary, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
-                disabled: busy !== '',
-                onClick: () => void applyModels(),
-              }, busy === 'tts-apply' ? '加载中…' : '应用模型'),
-              h('span', {
-                style: { ...styles.value, ...(applyState.dangerous ? { color: DANGER } : {}) },
-              }, applyState.text))),
-          h('div', { style: styles.hint }, '会先等待当前句结束，最多 3 秒；超时后将打断播报。'),
-          h('div', { style: styles.hint }, '留空则用参考音频零样本推理；填好路径后点「应用模型」加载，接口不可用时只保存路径（需在 GPT-SoVITS 端加载）。'),
-          h('div', { style: styles.row },
-            h('a', {
-              href: 'https://github.com/RVC-Boss/GPT-SoVITS',
-              target: '_blank',
-              rel: 'noreferrer',
-              style: { ...styles.btn, textDecoration: 'none', display: 'inline-block' },
-            }, '官方使用说明'),
-            // 链接后续替换：先用 B 站搜索结果占位，等有确定的教程地址再换成直链。
-            h('a', {
-              href: 'https://search.bilibili.com/all?keyword=GPT-SoVITS%20%E8%AE%AD%E7%BB%83',
-              target: '_blank',
-              rel: 'noreferrer',
-              style: { ...styles.btn, textDecoration: 'none', display: 'inline-block' },
-            }, 'B站教程')),
-        ),
-
-        (() => {
-          // 环境声音：系统音频单独走一条 ASR，只进上下文，不触发回复。
-          const loopbacks = status.loopbackDevices ?? [];
-          const ambientOn = status.ambient?.running === true;
-          const deferred = status.ambient?.deferred;
-          const deferredSuffix = deferred?.reason ? `（${deferred.reason}）` : '';
-          const missing = loopbacks.length === 0;
-          return card(
-            '环境声音',
-            line('状态', ambientOn ? `采集中 · ${status.ambient.device}` : `未启动${deferredSuffix}`),
-            ambientRecentRow(h, {
-              recent: status.ambient?.recent ?? [],
-              expanded: expandedAmbient,
-              onToggle: setExpandedAmbient,
-            }),
-            h('div', { style: styles.field },
-              h('span', { style: styles.value }, '回环设备'),
-              h('select', {
-                style: styles.input,
-                value: loopbacks[0] ?? '',
-                disabled: ambientOn || busy !== '' || missing,
-                onChange: (event) => act({ action: 'ambient.start', device: event.target.value }),
-              },
-                missing
-                  ? h('option', { value: '' }, '（未检测到回环设备）')
-                  : loopbacks.map((device) => h('option', { key: device, value: device }, device)),
-              ),
-            ),
-            h('div', { style: styles.row },
-              h('button', {
-                style: { ...(ambientOn ? styles.btnActive : styles.btnPrimary), ...(ambientOn || busy !== '' || missing ? styles.off : {}) },
-                disabled: ambientOn || busy !== '' || missing,
-                onClick: () => act({ action: 'ambient.start' }),
-              }, '开始采集'),
-              h('button', {
-                style: { ...styles.btn, ...(!ambientOn || busy !== '' ? styles.off : {}) },
-                disabled: !ambientOn || busy !== '',
-                onClick: () => act({ action: 'ambient.stop' }),
-              }, '停止'),
-            ),
-            h('div', { style: styles.hint }, feature('ambient')
-              ? '关闭「环境声音」组件会先停回环采集，再关开关。'
-              : '「环境声音」组件当前关闭：点「开始采集」会先启用组件，再开始采集。'),
-            h('div', { style: styles.row },
-              h('span', { style: styles.value }, '开机自动采集（默认关闭；只授权，不在打开组件时立即采集）'),
-              h('button', {
-                style: { ...(status.ambient?.autoListen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-                disabled: busy !== '',
-                onClick: () => act({ action: 'ambient.autoListen', enabled: status.ambient?.autoListen !== true }, 'ambient-autoListen'),
-              }, status.ambient?.autoListen ? '已开启' : '已关闭')),
-            h('div', { style: styles.hint }, missing
-              ? '需要虚拟声卡：装 VB-Cable 后会出现「CABLE Output」；或在声音设置里启用「立体声混音」。'
-              : '电脑声音只作为上下文，不会触发回复。OBS 里把「监视设备」设为 CABLE Input 即可接入。'),
-          );
-        })(),
-
-        (() => {
-          // 记忆：容量条 + 清晰度分布 + 归档管理（归档不进检索，可手动删）。
-          const mem = status.memory ?? {};
-          const usage = mem.usage ?? { records: 0, capacity: 5000, ratio: 0, archived: 0 };
-          const clarity = mem.clarity ?? {};
-          const auto = mem.auto ?? { enabled: true, minChars: 1, maxChars: 400, includeReply: true };
-          const pct = Math.round((usage.ratio ?? 0) * 100);
-          const barColor = pct >= 90 ? '#dc2626' : pct >= 60 ? '#d98324' : '#2f9e44';
-          return card(
-            '记忆',
-            line('容量', `${usage.records} / ${usage.capacity} 条（${pct}%）`),
-            h('div', { style: { height: 8, background: '#e5e7eb', borderRadius: 4, overflow: 'hidden', margin: '4px 0 8px' } },
-              h('div', { style: { height: '100%', width: `${Math.min(100, pct)}%`, background: barColor } }),
-            ),
-            line('清晰度', `清晰 ${clarity.vivid ?? 0} · 清楚 ${clarity.clear ?? 0} · 模糊 ${clarity.fuzzy ?? 0} · 印象 ${clarity.trace ?? 0}`),
-            line('自动记忆', auto.enabled === false
-              ? '关（只保留手动提炼）'
-              : `开（≥${auto.minChars ?? 1} 字全量入库，展示单条 ≤${auto.maxChars ?? 400} 字，${auto.includeReply === false ? '只记用户原话' : '原话与回复都记'}）`),
-            line('归档', `${usage.archived ?? 0} 条（不参与检索，可手动删除）`),
-            h('div', { style: styles.row },
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'memory.auto', auto: { enabled: auto.enabled === false } }),
-              }, auto.enabled === false ? '开启自动记忆' : '关闭自动记忆'),
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'memory.maintain' }),
-              }, '记忆整理'),
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'memory.compact' }),
-              }, '遗忘归档'),
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: async () => {
-                  await loadArchive();
-                  setArchiveOpen(true);
-                },
-              }, '查看归档'),
-            ),
-          );
-        })(),
-
-        (() => {
+        )),
+        settingsBlock('memory', (() => {
           // 人设库：记忆卡片的子容器，位置紧随记忆卡片之后。用户只编辑两段文本，分类由宿主拆分填写。
           // 「分类管理」：列表在展开时加载；改名/合并/删除后刷新列表，act() 已顺带刷新容量。
           const categoryList = async () => {
@@ -6340,601 +6752,230 @@ window.__ModuleLoader__.load({
             discardTrial: () => void discardProfileQuizTrial(),
             closeQuiz: closeProfileQuiz,
           });
-        })(),
-
-        (() => {
-          // 两种观看来源共用一套采集能力：桌面（ffmpeg ddagrab）与 OBS 场景（虚拟摄像头）。
-          // 隐私是插件侧锁：停两种来源、清空预览，但不再切 OBS 隐私场景。
-          const vm = status.vision ?? {};
-          const mode = vm.mode ?? 'watch';
-          const locked = vm.locked === true || mode === 'privacy';
-          const source = vm.source ?? (mode === 'scene' ? 'obs' : 'desktop');
-          const scenes = vm.scenes ?? [];
-          const capturing = vm.capturing === true;
-          const busyNow = busy !== '';
-          const visionHotkey = (status.hotkeys ?? []).find((entry) => entry.action === 'vision')?.combo ?? 'Ctrl+Alt+V';
-          const lastCaptureAt = Number(vm.lastCaptureAt) || 0;
-          const lastCaptureText = lastCaptureAt > 0 ? new Date(lastCaptureAt).toLocaleTimeString() : '—';
-          const sourceLabel = source === 'obs' ? `OBS 场景「${vm.scene || '未指定'}」` : '桌面';
-          const modeLabel = locked
-            ? '隐私模式（锁定）'
-            : capturing
-              ? `持续观看 · ${sourceLabel}`
-              : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
-          // No local state: the select value is the source the Host actually has.
-          const sourceValue = source === 'obs' ? (vm.scene || '__obs__') : '__desktop__';
-          return card(
-            '视觉与隐私',
+        })()),
+        settingsBlock('memory', settingsCard(h, 'memory-people', '记忆与人设',
+          settingsGroup(h, 'resources', '固定记忆',
             h('div', { style: styles.row },
-              h('span', { style: styles.label }, '当前视觉来源'),
-              h('span', {
-                style: {
-                  ...styles.badge,
-                  ...(locked
-                    ? { borderColor: DANGER, color: DANGER, fontWeight: 600 }
-                    : source === 'obs'
-                      ? { borderColor: ACCENT, color: ACCENT, fontWeight: 600 }
-                      : {}),
-                },
-              }, modeLabel),
-            ),
-            line('观看来源', locked
-              ? '已暂停（桌面与 OBS 采集均已停止）'
-              : source === 'obs'
-                ? `${sourceLabel}（虚拟摄像头）`
-                : '桌面（ffmpeg ddagrab，不经 OBS）'),
-            line('持续观看', capturing
-              ? `采集中 · 最近取景 ${lastCaptureText}`
-              : vm.lastCaptureAt ? `未启动 · 最近取景 ${lastCaptureText}` : '未启动'),
-            line('虚拟摄像头', vm.virtualCam
-              ? capturing ? '运行中（持续观看占用）' : `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
-              : '已停止（取景时按需启动；用户自启的不会关闭）'),
-            line('OBS 进程', vm.obsRunning ? '运行中' : '未运行 / 未连接'),
-            line('OBS 场景', status.obsScene || '未连接 / 未知'),
-            h('div', { style: styles.field },
-              h('span', { style: styles.value }, '选择观看来源'),
-              h('div', { style: { display: 'flex', gap: 8 } },
-                h('select', {
-                  style: styles.input,
-                  value: sourceValue,
-                  disabled: busyNow || locked,
-                  onChange: (event) => {
-                    const value = event.target.value;
-                    if (value === '__desktop__') void act({ action: 'vision.mode', mode: 'watch' }, 'vision');
-                    else void act({ action: 'vision.mode', mode: 'scene', scene: value }, 'vision');
-                  },
-                },
-                  h('option', { value: '__desktop__' }, '桌面（屏幕）'),
-                  scenes.map((name) => h('option', { key: name, value: name }, name)),
-                  !locked && source === 'obs' && vm.scene && !scenes.includes(vm.scene)
-                    ? h('option', { key: '__current', value: vm.scene }, `${vm.scene}（当前）`)
-                    : null,
-                ),
-                h('button', {
-                  style: styles.btn,
-                  disabled: busyNow,
-                  onClick: () => act({ action: 'vision.scenes' }, 'vision-scenes'),
-                }, '刷新场景'),
-              ),
-            ),
-            h('div', { style: styles.row },
-              h('button', {
-                style: { ...(capturing ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
-                disabled: busyNow || locked,
-                onClick: async () => {
-                  const result = capturing
-                    ? await act({ action: 'vision.watch.stop' }, 'vision-watch')
-                    : await act({ action: 'vision.watch.start', source, scene: vm.scene || '' }, 'vision-watch');
-                  if (result.ok) show(capturing ? '已停止持续观看' : '已开始持续观看');
-                },
-              }, capturing ? '停止持续观看' : '启动持续观看'),
-              h('button', {
-                style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
-                disabled: busyNow,
-                onClick: async () => {
-                  const result = await act({ action: 'vision.snapshot' }, 'snapshot');
-                  if (result.ok) show('已截图，可在 cache/screens 查看');
-                },
-              }, '截图测试'),
-              h('button', {
-                // Escape hatch: never gate this on the vision feature, or privacy could trap the user.
-                style: { ...(locked ? styles.btnActive : styles.btnPrimary), ...(busyNow ? styles.off : {}) },
-                disabled: busyNow,
-                onClick: () => act({ action: 'privacy.toggle' }, 'privacy'),
-              }, locked ? '退出隐私模式' : '切换隐私模式'),
-            ),
-            vm.lastShot
-              ? h('div', { style: { marginTop: 8 } },
-                  h('span', { style: styles.value }, `最近取景：${vm.lastShot.source === 'scene' ? `OBS 场景「${vm.lastShot.scene || '—'}」` : '桌面'} · ${vm.lastShot.width}×${vm.lastShot.height}`),
-                  h('img', {
-                    src: `/assistant/shot?path=${encodeURIComponent(vm.lastShot.file)}&t=${vm.lastShot.ts}`,
-                    alt: '最近取景',
-                    style: {
-                      display: 'block', marginTop: 6, maxWidth: '100%', maxHeight: 200,
-                      borderRadius: 8, border: `1px solid ${BORDER}`, background: '#000',
-                    },
-                  }),
-                )
-              : h('div', { style: styles.hint }, '还没有取景；点「截图测试」拍一张。'),
-            h('div', { style: styles.hint }, locked
-              ? `隐私模式已锁定：桌面与 OBS 采集均已停止，agent 不能截图或切出；你可以按 ${visionHotkey} 或点上面的按钮退出。`
-              : source === 'obs'
-                ? 'OBS 场景观看：持续采集选定场景，按需把变化帧打包成一张故事板交付；切换场景会清空旧帧并重新采集。'
-                : '桌面观看：ffmpeg ddagrab 持续采集桌面，不依赖 OBS；可随时切换来源或隐私。'),
-            h('div', { style: styles.hint }, feature('vision')
-              ? '视觉 ↔ OBS：选择 OBS 来源时按需启动 OBS；虚拟摄像头只按归属释放（插件启动的会停，用户自己启动的保留）。'
-              : '「视觉」组件当前关闭：点截图或启动观看会先启用组件；桌面观看不会因此启动 OBS。'),
-          );
-        })(),
-
-        (() => {
-          // 形象：VTS 连接、模型、热键、表情。
-          const l = status.live2d ?? {};
-          const ready = l.ready === true;
-          const socketOpen = l.socketOpen === true;
-          const hotkeys = l.hotkeys ?? [];
-          const expressions = l.expressions ?? [];
-          return card(
-            '形象',
-            line('VTS', ready
-              ? `已连接 · ${l.model || '未知模型'}`
-              : socketOpen
-                ? 'WebSocket 已打开，但认证未完成（未就绪）'
-                : '未连接（VTube Studio 需开启 API 8001）'),
-            (() => {
-              // 订阅状态单独一行：服务器拒绝订阅时连接仍可用，用提示色把原因显示出来；
-              // 订阅成功时只显示状态，不再显示 subscriptionError。
-              const subscribed = l.eventsSubscribed === true;
-              const subscriptionError = String(l.subscriptionError ?? '');
-              const failed = !subscribed && ready && subscriptionError.length > 0;
-              return h('div', { style: styles.row },
-                h('span', { style: styles.label }, '订阅'),
-                h('span', {
-                  style: failed ? { fontSize: 13, color: DANGER } : styles.value,
-                }, subscribed
-                  ? 'ModelLoadedEvent 已订阅'
-                  : failed
-                    ? `失败：${subscriptionError}`
-                    : ready
-                      ? '未订阅'
-                      : '—'),
-              );
-            })(),
-            line('热键', hotkeys.length > 0 ? `${hotkeys.length} 个` : '—'),
-            h('div', { style: styles.row },
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'live2d.connect' }, 'live2d'),
-              }, ready ? '重新连接' : '连接 VTS'),
-              // 唯一的测试入口：触发当前模型的第一个热键，验证 VTS 连接与热键通道。
-              h('button', {
-                style: { ...styles.btn, ...(busy !== '' || hotkeys.length === 0 ? styles.off : {}) },
-                disabled: busy !== '' || hotkeys.length === 0,
-                // 无可触发热键时按钮置灰；只用 title 给原因，不占卡片版面。
-                title: hotkeys.length === 0 ? '无可用热键' : undefined,
-                onClick: async () => {
-                  const result = await act({ action: 'live2d.hotkey', name: hotkeys[0] }, 'live2d');
-                  if (result.ok) show(`已触发：${result.name ?? hotkeys[0]}`);
-                },
-              }, '测试连接'),
-            ),
-            expressions.length > 0
-              ? h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', margin: '6px 0' } },
-                  expressions.map((name) => h('button', {
-                    key: name,
-                    style: styles.btn,
-                    disabled: busy !== '',
-                    onClick: () => act({ action: 'live2d.expression', name }, 'live2d'),
-                  }, `表情：${name}`)))
-              : null,
-            h('div', { style: styles.hint }, '说话时自动口型；点「测试连接」触发当前模型的第一个热键。'),
-            (() => {
-              // 能力发现：VTS 注入的是输入参数。这里把两个问题分开显示：
-              //   可注入 = 这个名字存在于 InputParameterListRequest，值能发出去；
-              //   已验证 = 有证据它确实驱动该部位（用户显式映射，或模型参数列表里有对应目标）。
-              const caps = l.capabilities ?? null;
-              const groups = [
-                { label: '视线', channels: ['gazeX', 'gazeY'] },
-                { label: '头', channels: ['headX', 'headY', 'headZ'] },
-                { label: '眼', channels: ['eyeOpenL', 'eyeOpenR'] },
-                { label: '眉', channels: ['browL', 'browR'] },
-                { label: '口', channels: ['mouth'] },
-                { label: '身体', channels: ['bodyX', 'breath'] },
-              ];
-              const inputs = caps?.inputs ?? {};
-              const injectableSet = new Set(Array.isArray(caps?.mapped) ? caps.mapped : []);
-              const verifiedSet = new Set(Array.isArray(caps?.verified) ? caps.verified : []);
-              const nameOf = (channel) => inputs[channel]?.inputName ?? inputs[channel]?.name ?? channel;
-              // 每个通道单独一行；两栏并排各占一半，窄屏（flexWrap）自动换行堆叠；
-              // 通道较多（>6）时该栏限制高度并滚动，避免卡片无限变高。
-              const rowsOf = (set) => groups.flatMap((group) => group.channels
-                .filter((channel) => set.has(channel))
-                .map((channel) => ({ key: channel, group: group.label, name: nameOf(channel) })));
-              const columnOf = (label, rows, emptyText) => h('div', {
-                style: { flex: '1 1 0', minWidth: 220, minHeight: 0 },
-              },
-                h('div', { style: styles.label }, `${label}（${rows.length}）`),
-                rows.length > 0
-                  ? h('div', {
-                      style: {
-                        marginTop: 4,
-                        paddingLeft: 2,
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 2,
-                        ...(rows.length > 6 ? { maxHeight: 160, overflowY: 'auto' } : {}),
-                      },
-                    }, rows.map((row) => h('div', { key: row.key, style: styles.value },
-                      h('span', { style: { marginRight: 6 } }, '·'),
-                      `${row.group} ${row.name}`)))
-                  : h('div', { style: styles.hint }, emptyText),
-              );
-              const discovered = caps !== null && caps.discovered === true;
-              const injectableRows = rowsOf(injectableSet);
-              const verifiedRows = rowsOf(verifiedSet);
-              const transport = l.transport ?? {};
-              const hz = Number(transport.computedHz ?? 0);
-              const dropped = Number(transport.dropped ?? 0);
-              const sent = Number(transport.sent ?? 0);
-              return h('div', { style: { marginTop: 10 } },
-                h('div', {
-                  style: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 12, marginTop: 8 },
-                },
-                  discovered
-                    ? columnOf('可注入', injectableRows, '无（名字匹配只是候选）')
-                    : h('div', { style: { flex: '1 1 0', minWidth: 220 } },
-                        h('div', { style: styles.label }, '可注入'),
-                        h('div', { style: styles.hint }, '尚未探测')),
-                  discovered ? columnOf('已验证', verifiedRows, '无（名字匹配只是候选）') : null,
-                ),
-                h('div', { style: styles.hint }, `实时帧：${hz.toFixed(1)} Hz · 已发 ${sent} · 丢弃 ${dropped}${caps?.live === false ? '（VTS 离线，显示上次结果）' : ''}`),
-                h('div', { style: styles.row },
-                  h('button', {
-                    style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
-                    disabled: busy !== '',
-                    onClick: async () => {
-                      const result = await act({ action: 'avatar.capabilities.refresh' }, 'avatar-capabilities');
-                      if (result.ok) {
-                        const injectable = Array.isArray(result.mapped) ? result.mapped.length : 0;
-                        const verified = Array.isArray(result.verified) ? result.verified.length : 0;
-                        show(`已探测 ${injectable} 个可注入通道，${verified} 个已验证`);
-                      }
-                    },
-                  }, '重新探测'),
-                  h('span', { style: styles.hint }, caps?.error ? `探测失败：${caps.error}` : ''),
-                ),
-                h('div', { style: styles.hint }, '「可注入」只说明值能发出去；「已验证」才说明有证据它驱动该部位。模型是否响应取决于 VTS 内的参数映射。'),
-              );
-            })(),
-            (() => {
-              const backendLayer = status.layer ?? {};
-              const layer = {
-                running: backendLayer.running === true,
-                editMode: backendLayer.editMode === true,
-                adjusting: backendLayer.editMode === true,
-                geometry: backendLayer.backend === 'spout'
-                  ? null
-                  : status.avatarLayer?.geometry,
-              };
-              const geo = layer.geometry;
-              return h('div', { style: { marginTop: 8 } },
-                line('桌面悬浮', layer.running
-                  ? `${layer.editMode ? '编辑中（可拖动/滚轮缩放）' : '运行中'} · ${geo ? `${geo.width}×${geo.height} @ ${geo.left},${geo.top}` : ''}`
-                  : '未启动'),
-                h('div', { style: styles.row },
-                  h('button', {
-                    style: layer.adjusting ? styles.btnActive : styles.btnPrimary,
-                    disabled: busy !== '',
-                    onClick: () => act({
-                      action: layer.adjusting ? 'layer.edit.exit' : 'layer.edit.enter',
-                    }, 'avatarLayer'),
-                  }, layer.adjusting ? '完成编辑' : '编辑模式'),
-                ),
-                h('div', { style: styles.hint }, layer.adjusting
-                  ? 'VTS 窗口已回到屏幕：像普通窗口一样拖动/拉边框；点「完成编辑」保存并恢复悬浮。'
-                  : layer.running
-                    ? '悬浮中；按钮与 Ctrl+Alt+E 都会停止当前显示层，调出 VTS 编辑；完成后在原位置恢复显示。'
-                    : '先开启桌面悬浮，再点「编辑模式」或按 Ctrl+Alt+E 调整。'),
-              );
-            })(),
-            (() => {
-              // 透明化（原「Spout（实验）」位置）：WPF / Spout 单层互斥。模式来自
-              // status.layer.backend（缺省 wpf），下方只渲染当前后端自己的设置。
-              const lay = status.layer ?? {};
-              const tp = status.transparent ?? {};
-              const sp = lay.spout ?? l.spoutLayer ?? {};
-              const draft = layerDraft ?? {
-                left: tp.left ?? 1600,
-                top: tp.top ?? 300,
-                width: tp.width ?? 420,
-                height: tp.height ?? 760,
-              };
-              const draftPath = String(spoutDraft ?? sp.electronExecutable ?? '').trim();
-              return layerSettingsBody(h, {
-                layer: lay,
-                spout: sp,
-                transparent: tp,
-                busy,
-                spoutDraft,
-                draft,
-              }, {
-                // 切换由宿主串行执行：可用性检查 → 停旧后端并确认退出 → 启新后端。
-                switchBackend: (backend) => {
-                  void act({ action: 'layer.backend', backend, electronExecutable: draftPath }, 'layer-backend');
-                },
-                setField: (key, value) => setLayerDraft({ ...draft, [key]: value }),
-                setSpoutDraft,
-                pickSpout: () => pickSpoutPath(act, setSpoutDraft),
-                // 「保存」: the same `spoutLayer.status` action both write the typed path and re-probe;
-                // `act` refreshes the status so the Spout button flips as soon as the path is valid.
-                saveSpoutPath: async () => {
-                  const result = await act({ action: 'spoutLayer.status', electronExecutable: draftPath }, 'spout-path');
-                  const probe = result.probe ?? {};
-                  if (probe.ok) show(`Spout 路径已保存 · Electron ${probe.version || '可用'}`);
-                  else show(`路径已保存，校验失败：${probe.code || probe.message || '未知错误'}`);
-                },
-                probeSpout: async () => {
-                  const result = await act({ action: 'spoutLayer.status', electronExecutable: draftPath }, 'spout-probe');
-                  const probe = result.probe ?? {};
-                  if (probe.ok) show(`Electron ${probe.version || '可用'} · 校验通过`);
-                  else show(`检测失败：${probe.code || probe.message || '未知错误'}`);
-                },
-                startSpout: async () => {
-                  const result = await act({ action: 'spoutLayer.start', electronExecutable: draftPath }, 'spoutLayer');
-                  if (result.ok) show('显示层已启动，等待首帧上报');
-                },
-                stopSpout: () => act({ action: 'spoutLayer.stop' }, 'spoutLayer'),
-                startWpf: () => act({
-                  action: 'transparent.start',
-                  left: Number(draft.left),
-                  top: Number(draft.top),
-                  width: Number(draft.width),
-                  height: Number(draft.height),
-                }, 'transparent'),
-                stopWpf: () => act({ action: 'transparent.stop' }, 'transparent'),
-              });
-            })(),
-            motionPresetSection(h, {
-              data: motionPresets,
-              query: motionQuery,
-              filters: motionFilters,
-              drafts: motionDrafts,
-              busy,
-            }, {
-              setQuery: setMotionQuery,
-              setFilter: (key, value) => setMotionFilters((current) => ({ ...current, [key]: value })),
-              setDraft: (key, value) => setMotionDrafts((current) => {
-                const next = { ...current };
-                if (value === null) delete next[key];
-                else next[key] = value;
-                return next;
-              }),
-              override: overrideMotionPreset,
-              reset: resetMotionPresets,
-              refresh: () => { void loadMotionPresets(); },
-            }),
-          );
-        })(),
-
-        (() => {
-          // 闲聊模式（快路）：只聊天、不接工具与感知，用于明确要"陪聊"的场合。
-          const fp = status.fastpath ?? {};
-          const ready = fp.available === true;
-          const on = fp.enabled === true;
-          return card(
-            '闲聊模式（可选）',
-            line('状态', on ? '已开启 · 不包含聊天外任何功能' : '未开启（默认走 agent）'),
-            line('模型', ready ? `${fp.provider}/${fp.model}` : 'DSH llm 服务不可用'),
-            line('历史', `${fp.turns ?? 0} 条消息`),
-            h('div', { style: styles.row },
-              h('button', {
-                style: { ...(on ? styles.btnActive : styles.btn), ...(busy !== '' || !ready ? styles.off : {}) },
-                disabled: busy !== '' || !ready,
-                onClick: () => {
-                  if (on) {
-                    void act({ action: 'feature.set', id: 'fastpath', enabled: false }, 'fastpath');
-                    setChatConfirm(false);
-                    return;
-                  }
-                  setChatConfirm(true);
-                },
-              }, on ? '关闭闲聊模式' : '开启闲聊模式'),
-              h('button', {
-                style: { ...(fastpathReviewOpen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-                disabled: busy !== '',
-                onClick: async () => {
-                  if (fastpathReviewOpen) {
-                    setFastpathReviewOpen(false);
-                    return;
-                  }
-                  setFastpathReviewOpen(true);
-                  await loadFastpathHistory();
-                },
-              }, fastpathReviewOpen ? '收起审阅' : '审阅对话'),
-            ),
-            chatConfirm
-              ? h('div', { style: { marginTop: 8, padding: 10, borderRadius: 8, background: '#fff7e6', border: '1px solid #d98324' } },
-                h('div', { style: { fontSize: 13, color: '#111827' } },
-                  '开启后她只会聊天：不调用工具、不看屏幕、不查长期记忆，语音也直接走这里而不进 agent。需要做事时请关掉。'),
-                h('div', { style: styles.row },
-                  h('button', {
-                    style: styles.btnPrimary,
-                    disabled: busy !== '',
-                    onClick: async () => {
-                      await act({ action: 'feature.set', id: 'fastpath', enabled: true }, 'fastpath');
-                      setChatConfirm(false);
-                    },
-                  }, '确认开启'),
-                  h('button', {
-                    style: styles.btn,
-                    disabled: busy !== '',
-                    onClick: () => setChatConfirm(false),
-                  }, '取消'),
-                ),
-              )
-              : null,
-            fastpathReviewOpen
-              ? fastpathReviewBody(h, {
-                  groups: fastpathGroups,
-                  filter: fastpathFilter,
-                  open: fastpathOpenGroups,
-                  expanded: fastpathExpanded,
-                  confirm: fastpathConfirm,
-                  busy: busy !== '',
-                  loading: busy === 'fastpath-history',
-                }, {
-                  setFilter: setFastpathFilter,
-                  toggleGroup: (domain) => setFastpathOpenGroups((current) => (current.includes(domain)
-                    ? current.filter((item) => item !== domain)
-                    : [...current, domain])),
-                  toggleText: (key) => setFastpathExpanded((current) => (current.includes(key)
-                    ? current.filter((item) => item !== key)
-                    : [...current, key])),
-                  requestClear: (domain) => setFastpathConfirm(domain),
-                  cancelClear: () => setFastpathConfirm(null),
-                  confirmClear: (domain) => { void clearFastpathDomain(domain); },
-                  refresh: () => { void loadFastpathHistory(); },
-                  close: () => {
-                    setFastpathReviewOpen(false);
-                    setFastpathConfirm(null);
-                  },
-                })
-              : null,
-            h('div', { style: styles.hint }, '平时保持关闭：语音默认走 agent，只有你主动打开时才切到纯聊天。'),
-          );
-        })(),
-
-        (() => {
-          // 字幕：区域拖选 / 气泡跟随 VTS + 字体字号 + 对比色。
-          const sub = status.subtitle ?? {};
-          const region = sub.region;
-          const bubble = sub.mode === 'bubble';
-          const layerRunning = status.avatarLayer?.running === true;
-          // 字体：下拉框只列本机已安装的字体族；当前值不在列表里时补一个「当前」选项。
-          const fonts = Array.isArray(sub.availableFonts) ? sub.availableFonts : [];
-          const currentFont = typeof sub.font === 'string' && sub.font.trim().length > 0
-            ? sub.font.trim()
-            : 'Microsoft YaHei UI';
-          const currentFontListed = fonts.includes(currentFont);
-          const canEnable = bubble ? layerRunning : region !== null && region !== undefined;
-          const subtitleOn = feature('subtitle') && sub.enabled === true;
-          const blockReason = bubble
-            ? (layerRunning ? '' : '气泡模式需要先「放到桌面」，否则没有可依附的窗口')
-            : (canEnable ? '' : '区域模式需要先拖选一个区域');
-          return card(
-            '字幕',
-            line('状态', subtitleOn ? (sub.running ? '显示中' : '已启用') : '未启用'),
-            line('模式', bubble ? '气泡 · 跟随悬浮窗' : '区域 · 固定位置'),
-            h('div', { style: styles.row },
-              h('button', {
-                style: bubble ? styles.btn : styles.btnActive,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'subtitle.config', mode: 'region' }, 'subtitle-mode'),
-              }, '区域模式'),
-              h('button', {
-                style: bubble ? styles.btnActive : styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'subtitle.config', mode: 'bubble' }, 'subtitle-mode'),
-              }, '气泡模式'),
-            ),
-            h('div', { style: styles.hint }, subtitleOn ? '' : '字幕当前关闭：点模式或「启用字幕」会先启用字幕组件，再切换/打开容器。'),
-            h('div', { style: styles.row },
-              h('button', {
-                style: { ...(subtitleOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-                disabled: busy !== '',
-                onClick: () => act({ action: 'subtitle.config', enabled: !sub.enabled }),
-              }, sub.enabled ? '停用字幕' : '启用字幕'),
-              h('button', {
-                style: styles.btn,
-                disabled: busy !== '',
-                onClick: () => act({ action: 'subtitle.preview' }),
-              }, '预览'),
-            ),
-            h('div', { style: styles.hint }, blockReason),
-            bubble
-              ? h('div', { style: styles.hint },
-                  `气泡宽度跟随悬浮窗（${status.avatarLayer?.geometry?.width ?? '—'} px），高度随字数增长，字号按窗口高度等比缩放；不使用字体/字号/区域设置。`)
-              : h('div', null,
-                  h('div', { style: styles.row },
-                    h('button', {
-                      style: styles.btn,
-                      disabled: busy !== '',
-                      onClick: async () => {
-                        const result = await act({ action: 'subtitle.select' }, 'subtitle.select');
-                        if (result.ok) show('区域已保存');
-                      },
-                    }, '选择区域'),
-                    h('span', { style: styles.value }, region ? `${region.x}, ${region.y} · ${region.w}×${region.h}` : '未选择'),
-                  ),
-                  h('div', { style: styles.field },
-                    h('span', { style: styles.label }, '字体'),
-                    h('div', { style: { display: 'flex', gap: 8 } },
-                      h('select', {
-                        style: styles.input,
-                        value: currentFont,
-                        disabled: busy !== '',
-                        onChange: (event) => {
-                          if (event.target.value.length > 0) {
-                            void act({ action: 'subtitle.config', font: event.target.value });
-                          }
-                        },
-                      },
-                        currentFontListed ? null : h('option', { value: currentFont }, `（当前：${currentFont}）`),
-                        fonts.map((name) => h('option', { key: name, value: name }, name)),
-                      ),
+              h('span', { style: styles.value }, `${resources.length} 条已保存`),
+              h('button', { style: styles.btnPrimary, onClick: () => openEditor(null) }, '＋ 新增固定记忆')),
+            h('div', { style: styles.hint }, '固定记忆：用户明确要求长期保留的内容，每轮注入上下文'),
+            h('div', { style: styles.hint }, '普通记忆：由对话自动沉淀，按相关性/重要性/时间召回'),
+            h('div', { style: styles.hint }, '说「记住……，以后一直这样」或「把这条固定下来」即可新增；说「删掉那条固定记忆」会先列出确认再删。只有你明确要求长期保留时才会写入固定记忆，普通偏好仍走自动记忆。'),
+            resources.length === 0
+              ? h('div', { style: styles.value }, '还没有固定记忆。')
+              : resources.map((resource) =>
+                  h('div', { key: resource.key, style: styles.row },
+                    h('span', { style: styles.label },
+                      resource.title || resource.key,
+                      resource.secret ? h('span', { style: styles.badge }, '加密') : null,
+                      h('span', { style: styles.mono }, `  ${resource.key}`)),
+                    h('span', { style: { display: 'flex', gap: 6 } },
                       h('button', {
                         style: styles.btn,
-                        disabled: busy !== '',
-                        title: '重新读取本机已安装的字体',
-                        onClick: () => act({ action: 'subtitle.fonts.refresh' }),
-                      }, '刷新字体列表'),
-                    ),
-                    h('div', { style: styles.hint }, fonts.length === 0
-                      ? '正在读取本机已安装字体…'
-                      : `本机已安装 ${fonts.length} 个字体族${sub.truncatedFonts === true ? '（仅列出前 1000 个）' : ''}`),
-                  ),
-                  h('div', { style: styles.field },
-                    h('span', { style: styles.label }, '字号上限'),
-                    h('input', {
-                      style: { ...styles.input, width: 80 },
-                      type: 'number',
-                      min: 12,
-                      max: 96,
-                      value: sizeMaxDraft ?? String(sub.sizeMax ?? 32),
-                      onChange: (event) => setSizeMaxDraft(event.target.value),
-                      onBlur: async (event) => {
-                        const value = Number.parseInt(event.target.value, 10);
-                        if (Number.isFinite(value)) await act({ action: 'subtitle.config', sizeMax: value });
-                        // 保存成功或失败都丢弃草稿：成功回显新值，失败回显旧值，不留脏数据。
-                        setSizeMaxDraft(null);
-                      },
-                    }),
-                  ),
-                ),
-            h('div', { style: styles.hint }, feature('subtitle')
-              ? '区域模式：拖选后启用；气泡模式：锚在悬浮窗左上角，气泡色取自模型区域，文字取对比色。关闭「字幕」组件会先隐藏字幕，再连同区域/显示开关一起置为关。'
-              : '字幕组件当前关闭：上面的按钮仍可点，会先启用「字幕显示」组件，再执行字幕动作。'),
-          );
-        })(),
-
-        card(
-          '语音延迟测量',
-          h('div', { style: styles.hint }, '只做测量，不改推理档位与播放逻辑；语音轮次仍使用 Harness 当前设置。'),
-          h('div', { style: styles.field },
-            line('延迟样本', `${latency.samples ?? 0} 条（近 ${(latency.recent ?? []).length} 条参与分位）`),
-            line('ASR（端点→终稿）p50 / p95', `${fmtMs(latency.p50?.asrMs)} / ${fmtMs(latency.p95?.asrMs)}`),
-            line('投递→首段文本 p50 / p95', `${fmtMs(latency.p50?.ackToFirstTextMs)} / ${fmtMs(latency.p95?.ackToFirstTextMs)}`),
-            line('首段文本→首句 p50 / p95', `${fmtMs(latency.p50?.firstTextToFirstSentenceMs)} / ${fmtMs(latency.p95?.firstTextToFirstSentenceMs)}`),
-            line('首句→首音频 p50 / p95', `${fmtMs(latency.p50?.firstSentenceToFirstAudioMs)} / ${fmtMs(latency.p95?.firstSentenceToFirstAudioMs)}`),
-            line('总延迟 p50 / p95', `${fmtMs(latency.p50?.totalMs)} / ${fmtMs(latency.p95?.totalMs)}`),
-            line('翻译', fmtTranslateLatency(latency)),
-            h('div', { style: styles.hint }, '总延迟 = 静音端点判定 → 第一个音频开始播放；含合并窗口、记忆召回、整轮等待与合成。'),
-            h('div', { style: styles.hint }, '翻译取最近一轮；「—」表示该轮没有翻译（同语言），不参与任何计费。'),
+                        onClick: async () => {
+                          const result = await act({ action: 'resource.get', key: resource.key, reveal: resource.secret === true }, 'resource-get');
+                          if (result.ok) openEditor(result.resource);
+                        },
+                      }, '修改'),
+                      h('button', {
+                        style: styles.btnDanger,
+                        onClick: async () => {
+                          if (window.confirm(`删除固定记忆「${resource.key}」？`)) {
+                            const result = await act({ action: 'resource.delete', key: resource.key }, 'resource-delete');
+                            if (result.ok) show('固定记忆已删除');
+                          }
+                        },
+                      }, '删除')))),
           ),
-        ),
-
-        card(
+          lexiconSection(h, {
+            data: lexiconData,
+            busy,
+            dialog: lexiconDialog,
+            pending: lexiconPending,
+            speakerId: lexiconSpeakerId(status),
+          }, {
+            refresh: () => void loadLexicon(),
+            openConfirm: openLexiconConfirm,
+            openEdit: openLexiconEdit,
+            closeDialog: (dialog) => void closeLexiconDialog(dialog),
+            changeDialog: changeLexiconDialog,
+            removeWrongForm: removeLexiconWrongForm,
+            saveDialog: (dialog, speakerId) => void saveLexiconDialog(dialog, speakerId),
+            retrySave: (dialog) => void retryLexiconSave(dialog),
+            askIgnore: (id) => setLexiconPending({ kind: 'ignore', id: String(id) }),
+            ignore: (id) => void ignoreLexicon(id),
+            askRemove: (id) => setLexiconPending({ kind: 'remove', id: String(id) }),
+            remove: (id) => void removeLexicon(id),
+            cancelWrite: () => setLexiconPending(null),
+          }),
+          speakerEnrollSection(h, {
+            data: speakerEnroll,
+            busy: busy !== '',
+            notice: speakerEnrollNotice,
+            onRefresh: () => void loadSpeakerEnroll(),
+            onRecord: startSpeakerEnroll,
+            onConfirm: (speakerId) => void runSpeakerEnroll('confirm', speakerId),
+            onReject: (speakerId) => void runSpeakerEnroll('reject', speakerId),
+            onRemove: (speakerId) => void runSpeakerEnroll('remove', speakerId),
+            onCopy: () => void copySpeakerEnroll(),
+          }),
+          settingsGroup(h, 'speaker-shadow', '',
+            speakerShadowRow(h, { status, busy, act }),
+          ),
+          settingsGroup(h, 'scope', '作用域（只注入本工作区）',
+            h('div', { style: styles.row },
+              h('span', { style: styles.label }, '只在指定工作区生效'),
+              h('button', {
+                style: { ...(scopeOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                disabled: busy !== '',
+                onClick: () => void act({ action: 'scope.set', enabled: !scopeOn }, 'scope'),
+              }, scopeOn ? '已启用' : '已关闭')),
+            h('div', { style: styles.field },
+              settingsField(h, '工作区路径',
+                h('span', { style: { ...styles.mono, flex: 1, wordBreak: 'break-all' } }, scopePath.length > 0 ? scopePath : '—'),
+                h('button', {
+                  style: { ...styles.btn, ...(busy !== '' ? styles.off : {}), whiteSpace: 'nowrap' },
+                  disabled: busy !== '',
+                  onClick: async () => {
+                    const uiWorkspace = window.__seireinCtx?.get?.('uiWorkspace');
+                    if (!uiWorkspace || typeof uiWorkspace.pickDirectory !== 'function') {
+                      show('目录选择器不可用');
+                      return;
+                    }
+                    const picked = await uiWorkspace.pickDirectory();
+                    if (picked === null || picked === undefined || picked === '') return;
+                    const result = await act({ action: 'scope.set', path: picked }, 'scope-path');
+                    if (result.ok) show('作用域路径已保存');
+                  },
+                }, '选择目录')),
+            ),
+            h('div', { style: styles.hint }, '默认启用。启用后人设/记忆只注入 Seirein 工作区，其它工作区（如默认工作区）调用记忆、人设、prompt 预览工具会被作用域挡下。'),
+          ),
+        )),
+        settingsBlock('diagnostics', settingsCard(h, 'diagnostics', '运行诊断',
+          diagnosticsSection(h, {
+            data: diagnostics,
+            clientVersion: CLIENT_VERSION,
+            restart: lastRestart,
+            busy: busy !== '',
+            recover: recoverOutcome,
+            onRefresh: () => void loadDiagnostics(),
+            onCopy: () => void copyDiagnostics(),
+          }),
+          timelineSection(h, { data: timeline }),
+          settingsGroup(h, 'latency', '语音延迟测量',
+            h('div', { style: styles.hint }, '只做测量，不改推理档位与播放逻辑；语音轮次仍使用 Harness 当前设置。'),
+            h('div', { style: styles.field },
+              line('延迟样本', `${latency.samples ?? 0} 条（近 ${(latency.recent ?? []).length} 条参与分位）`),
+              line('ASR（端点→终稿）p50 / p95', `${fmtMs(latency.p50?.asrMs)} / ${fmtMs(latency.p95?.asrMs)}`),
+              line('投递→首段文本 p50 / p95', `${fmtMs(latency.p50?.ackToFirstTextMs)} / ${fmtMs(latency.p95?.ackToFirstTextMs)}`),
+              line('首段文本→首句 p50 / p95', `${fmtMs(latency.p50?.firstTextToFirstSentenceMs)} / ${fmtMs(latency.p95?.firstTextToFirstSentenceMs)}`),
+              line('首句→首音频 p50 / p95', `${fmtMs(latency.p50?.firstSentenceToFirstAudioMs)} / ${fmtMs(latency.p95?.firstSentenceToFirstAudioMs)}`),
+              line('总延迟 p50 / p95', `${fmtMs(latency.p50?.totalMs)} / ${fmtMs(latency.p95?.totalMs)}`),
+              line('翻译', fmtTranslateLatency(latency)),
+              h('div', { style: styles.hint }, '总延迟 = 静音端点判定 → 第一个音频开始播放；含合并窗口、记忆召回、整轮等待与合成。'),
+              h('div', { style: styles.hint }, '翻译取最近一轮；「—」表示该轮没有翻译（同语言），不参与任何计费。'),
+            ),
+          ),
+        )),
+        settingsBlock('diagnostics', settingsCard(h, 'maintenance', '维护与恢复',
+          (() => {
+            // 记忆：容量条 + 清晰度分布 + 归档管理（归档不进检索，可手动删）。
+            const mem = status.memory ?? {};
+            const usage = mem.usage ?? { records: 0, capacity: 5000, ratio: 0, archived: 0 };
+            const clarity = mem.clarity ?? {};
+            const auto = mem.auto ?? { enabled: true, minChars: 1, maxChars: 400, includeReply: true };
+            const pct = Math.round((usage.ratio ?? 0) * 100);
+            const barColor = pct >= 90 ? '#dc2626' : pct >= 60 ? '#d98324' : '#2f9e44';
+            return settingsGroup(h, 'memory', '记忆容量与维护',
+              line('容量', `${usage.records} / ${usage.capacity} 条（${pct}%）`),
+              h('div', { style: { height: 8, background: '#e5e7eb', borderRadius: 4, overflow: 'hidden', margin: '4px 0 8px' } },
+                h('div', { style: { height: '100%', width: `${Math.min(100, pct)}%`, background: barColor } }),
+              ),
+              line('清晰度', `清晰 ${clarity.vivid ?? 0} · 清楚 ${clarity.clear ?? 0} · 模糊 ${clarity.fuzzy ?? 0} · 印象 ${clarity.trace ?? 0}`),
+              line('自动记忆', auto.enabled === false
+                ? '关（只保留手动提炼）'
+                : `开（≥${auto.minChars ?? 1} 字全量入库，展示单条 ≤${auto.maxChars ?? 400} 字，${auto.includeReply === false ? '只记用户原话' : '原话与回复都记'}）`),
+              line('归档', `${usage.archived ?? 0} 条（不参与检索，可手动删除）`),
+              settingsActions(h,
+                h('button', {
+                  style: styles.btn,
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'memory.auto', auto: { enabled: auto.enabled === false } }),
+                }, auto.enabled === false ? '开启自动记忆' : '关闭自动记忆'),
+                h('button', {
+                  style: styles.btn,
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'memory.maintain' }),
+                }, '记忆整理'),
+                h('button', {
+                  style: styles.btn,
+                  disabled: busy !== '',
+                  onClick: () => act({ action: 'memory.compact' }),
+                }, '遗忘归档'),
+                h('button', {
+                  style: styles.btn,
+                  disabled: busy !== '',
+                  onClick: async () => {
+                    await loadArchive();
+                    setArchiveOpen(true);
+                  },
+                }, '查看归档'),
+              ),
+            );
+          })(),
+          recoverSessionSection(h, {
+            confirm: recoverConfirm,
+            busy: recoverBusy,
+            outcome: recoverOutcome,
+            onAsk: askRecoverSession,
+            onCancel: cancelRecoverSession,
+            onConfirm: () => void confirmRecoverSession(),
+          }),
+          retentionSection(h, {
+            status,
+            data: retentionData,
+            busy,
+            preview: retentionPreview,
+            confirm: retentionConfirm,
+            onToggle: (enabled) => void toggleRetention(enabled),
+            onPreview: (id) => void previewRetention(id),
+            onAskDelete: (id) => setRetentionConfirm(String(id)),
+            onDelete: (id) => void deleteRetention(id),
+            onCancel: () => setRetentionConfirm(''),
+            onDeleteAll: () => void deleteRetention('all'),
+          }),
+        )),
+        settingsBlock('diagnostics', settingsCard(h, 'storage', '存放位置与关于',
+          instanceRootSection(h, {
+            status,
+            fallbackRoot: status.root ?? '',
+            dialog: rootDialog,
+            notice: rootNotice,
+            busy: rootBusy,
+            onOpen: openRootDialog,
+            onDraft: (value) => setRootDialog((current) => (current === null
+              ? current
+              : { ...current, draft: value, error: '' })),
+            onPick: () => void pickRootIntoDialog(),
+            onCancel: closeRootDialog,
+            onSave: () => void saveRootDialog(),
+          }),
+          settingsGroup(h, 'sandbox', '工作区权限（只读）',
+            h('div', { style: styles.hint }, '助手会话使用 DSH 完全访问模式（危险）；其他工作区的新会话仍由 DSH 默认策略管理。'),
+            h('div', { style: styles.hint }, '不再使用插件目录授权：插件不再检查、授权或验证目录 ACL，启动时也不会自动授权。'),
+            h('details', { style: styles.hint },
+              h('summary', { style: styles.value }, '诊断信息'),
+              h('div', {}, '切换发生在助手会话创建或恢复时，事件：sandbox.switched / sandbox.already-full / sandbox.switch-unavailable。'),
+              h('div', {}, '升级后已存在的助手会话会在下次恢复时切换；验证 PTY 需重启 DSH 后新建或恢复一次助手会话。')),
+          ),
+          settingsGroup(h, 'about', '关于',
+            line('客户端 / 服务端', `v${CLIENT_VERSION} / v${status.version}`),
+            line('运行时长', `${Math.max(1, Math.round(status.uptimeMs / 60000))} 分钟`),
+            line('人设与画像', `${status.personaChars} 字符`),
+          ),
+        )),
+        settingsBlock('advanced', card(
           '组件开关',
           (status.features ?? []).filter((entry) => entry.id !== 'fastpath').map((entry) =>
             h('div', { key: entry.id, style: styles.row },
@@ -6950,9 +6991,8 @@ window.__ModuleLoader__.load({
           h('div', { style: styles.hint }, '每个能力是独立组件的总控：关闭会先停资源再关容器/自启动；打开会连带打开容器开关（不会因此立刻开麦或截图）。'),
           h('div', { style: styles.hint }, '外部程序绑定：视觉 ↔ OBS；语音合成 ↔ GPT-SoVITS；形象 ↔ VTube Studio。字幕、听觉、环境声音没有外部程序。'),
           h('div', { style: styles.hint }, '子级开关（GPT 音色 / OBS 场景 / 形象后端）不等于组件开关：关子级不会关组件，关组件会连带关闭子级。'),
-        ),
-
-        card(
+        )),
+        settingsBlock('advanced', card(
           '连带启动',
           line('说明', '只在插件启动时尝试一次'),
           ...[
@@ -7039,9 +7079,8 @@ window.__ModuleLoader__.load({
           h('div', { style: styles.hint }, 'OBS 路径填 obs64.exe；VTS 可以直接填 steam://rungameid/1325860。路径为空时启动只记一条 autostart.failed，不报错也不阻塞。'),
           h('div', { style: styles.hint }, '绑定规则：组件关闭时这里的自启动/自动关闭都不生效，也不会代用户关闭；组件打开会恢复它们。DSH 退出时，只按插件自己记录的 PID 关闭插件启动的程序，用户手动启动的程序不动。'),
           h('div', { style: styles.hint }, '「浏览…」打开 Windows 文件对话框选择 exe；VTS 的 Steam 协议路径不能用文件对话框选中，取消对话框后直接在输入框里填 steam://rungameid/1325860 即可。'),
-        ),
-
-        card(
+        )),
+        settingsBlock('advanced', card(
           '全局快捷键',
           status.hotkeys
             .filter((entry) => HOTKEY_ACTIONS.includes(entry.action))
@@ -7071,42 +7110,131 @@ window.__ModuleLoader__.load({
           h('div', { style: styles.row },
             h('span', { style: styles.value }, '恢复默认四组'),
             h('button', { style: styles.btn, disabled: busy !== '', onClick: () => act({ action: 'hotkey.reset' }) }, '重置')),
-        ),
+        )),
+        settingsBlock('advanced', (() => {
+          // 闲聊模式（快路）：只聊天、不接工具与感知，用于明确要"陪聊"的场合。
+          const fp = status.fastpath ?? {};
+          const ready = fp.available === true;
+          const on = fp.enabled === true;
+          return card(
+            '闲聊模式（可选）',
+            line('状态', on ? '已开启 · 不包含聊天外任何功能' : '未开启（默认走 agent）'),
+            line('模型', ready ? `${fp.provider}/${fp.model}` : 'DSH llm 服务不可用'),
+            line('历史', `${fp.turns ?? 0} 条消息`),
+            h('div', { style: styles.row },
+              h('button', {
+                style: { ...(on ? styles.btnActive : styles.btn), ...(busy !== '' || !ready ? styles.off : {}) },
+                disabled: busy !== '' || !ready,
+                onClick: () => {
+                  if (on) {
+                    void act({ action: 'feature.set', id: 'fastpath', enabled: false }, 'fastpath');
+                    setChatConfirm(false);
+                    return;
+                  }
+                  setChatConfirm(true);
+                },
+              }, on ? '关闭闲聊模式' : '开启闲聊模式'),
+              h('button', {
+                style: { ...(fastpathReviewOpen ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                disabled: busy !== '',
+                onClick: async () => {
+                  if (fastpathReviewOpen) {
+                    setFastpathReviewOpen(false);
+                    return;
+                  }
+                  setFastpathReviewOpen(true);
+                  await loadFastpathHistory();
+                },
+              }, fastpathReviewOpen ? '收起审阅' : '审阅对话'),
+            ),
+            chatConfirm
+              ? h('div', { style: { marginTop: 8, padding: 10, borderRadius: 8, background: '#fff7e6', border: '1px solid #d98324' } },
+                h('div', { style: { fontSize: 13, color: '#111827' } },
+                  '开启后她只会聊天：不调用工具、不看屏幕、不查长期记忆，语音也直接走这里而不进 agent。需要做事时请关掉。'),
+                h('div', { style: styles.row },
+                  h('button', {
+                    style: styles.btnPrimary,
+                    disabled: busy !== '',
+                    onClick: async () => {
+                      await act({ action: 'feature.set', id: 'fastpath', enabled: true }, 'fastpath');
+                      setChatConfirm(false);
+                    },
+                  }, '确认开启'),
+                  h('button', {
+                    style: styles.btn,
+                    disabled: busy !== '',
+                    onClick: () => setChatConfirm(false),
+                  }, '取消'),
+                ),
+              )
+              : null,
+            fastpathReviewOpen
+              ? fastpathReviewBody(h, {
+                  groups: fastpathGroups,
+                  filter: fastpathFilter,
+                  open: fastpathOpenGroups,
+                  expanded: fastpathExpanded,
+                  confirm: fastpathConfirm,
+                  busy: busy !== '',
+                  loading: busy === 'fastpath-history',
+                }, {
+                  setFilter: setFastpathFilter,
+                  toggleGroup: (domain) => setFastpathOpenGroups((current) => (current.includes(domain)
+                    ? current.filter((item) => item !== domain)
+                    : [...current, domain])),
+                  toggleText: (key) => setFastpathExpanded((current) => (current.includes(key)
+                    ? current.filter((item) => item !== key)
+                    : [...current, key])),
+                  requestClear: (domain) => setFastpathConfirm(domain),
+                  cancelClear: () => setFastpathConfirm(null),
+                  confirmClear: (domain) => { void clearFastpathDomain(domain); },
+                  refresh: () => { void loadFastpathHistory(); },
+                  close: () => {
+                    setFastpathReviewOpen(false);
+                    setFastpathConfirm(null);
+                  },
+                })
+              : null,
+            h('div', { style: styles.hint }, '平时保持关闭：语音默认走 agent，只有你主动打开时才切到纯聊天。'),
+          );
+        })()),
+      ];
 
-        card(
-          '固定记忆',
-          h('div', { style: styles.row },
-            h('span', { style: styles.value }, `${resources.length} 条已保存`),
-            h('button', { style: styles.btnPrimary, onClick: () => openEditor(null) }, '＋ 新增固定记忆')),
-          h('div', { style: styles.hint }, '固定记忆：用户明确要求长期保留的内容，每轮注入上下文'),
-          h('div', { style: styles.hint }, '普通记忆：由对话自动沉淀，按相关性/重要性/时间召回'),
-          h('div', { style: styles.hint }, '说「记住……，以后一直这样」或「把这条固定下来」即可新增；说「删掉那条固定记忆」会先列出确认再删。只有你明确要求长期保留时才会写入固定记忆，普通偏好仍走自动记忆。'),
-          resources.length === 0
-            ? h('div', { style: styles.value }, '还没有固定记忆。')
-            : resources.map((resource) =>
-                h('div', { key: resource.key, style: styles.row },
-                  h('span', { style: styles.label },
-                    resource.title || resource.key,
-                    resource.secret ? h('span', { style: styles.badge }, '加密') : null,
-                    h('span', { style: styles.mono }, `  ${resource.key}`)),
-                  h('span', { style: { display: 'flex', gap: 6 } },
-                    h('button', {
-                      style: styles.btn,
-                      onClick: async () => {
-                        const result = await act({ action: 'resource.get', key: resource.key, reveal: resource.secret === true }, 'resource-get');
-                        if (result.ok) openEditor(result.resource);
-                      },
-                    }, '修改'),
-                    h('button', {
-                      style: styles.btnDanger,
-                      onClick: async () => {
-                        if (window.confirm(`删除固定记忆「${resource.key}」？`)) {
-                          const result = await act({ action: 'resource.delete', key: resource.key }, 'resource-delete');
-                          if (result.ok) show('固定记忆已删除');
-                        }
-                      },
-                    }, '删除')))),
-        ),
+      // ---- 渲染：外层 toast/dialog + 首次使用提示 + 四个分区 --------------------------------
+      return h(
+        'div',
+        { style: styles.wrap },
+        toast.length > 0
+          ? h('div', { style: styles.toast },
+              h('span', null, toast),
+              h('button', {
+                style: { background: 'transparent', border: 'none', color: '#111827', cursor: 'pointer', fontSize: 15 },
+                onClick: () => setToast(''), 'aria-label': 'close',
+              }, '×'))
+          : null,
+        dialog,
+
+        status.firstRun
+          ? card(
+            '首次使用：请先选择存放位置',
+            h('div', { style: styles.hint },
+              `当前数据会写到 ${status.root ?? '默认目录'}。选一个你自己的位置后，数据会放在 <所选目录>\\Seirein 下；保存后需重启 DSH 生效，不会自动重启，也不会自动迁移已有数据。`),
+            h('div', { style: styles.row },
+              h('button', {
+                style: { ...styles.btnPrimary, ...(rootBusy ? styles.off : {}) },
+                disabled: rootBusy,
+                onClick: openRootDialog,
+              }, '选择存放位置'),
+              h('button', {
+                style: { ...styles.btn, ...(rootBusy ? styles.off : {}) },
+                disabled: rootBusy,
+                onClick: () => void applyDefaultRoot(),
+              }, '使用默认位置'),
+            ),
+          )
+          : null,
+
+        groupSettingsBlocks(h, settingsBlocks),
       );
     }
 

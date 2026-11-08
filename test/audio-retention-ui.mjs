@@ -1,5 +1,5 @@
 /**
- * 「听觉 → 音频保留（诊断）」设置页回归。
+ * 「诊断与维护 → 音频保留（诊断）」设置页回归。
  *
  * The shipped `retentionSection` is extracted from client.js and evaluated with a recording `h`
  * (same pattern as `hearing-ui.mjs` / `speaker-host-wiring.mjs`): no DOM, no React, no host. It
@@ -10,7 +10,7 @@
  *   3. a row shows time / duration / reason / size, 试听 asks only for a path (no auto-play),
  *      and delete is a two-step confirmation (single and all);
  *   4. an unwired / failed action renders the host's error text and never throws;
- *   5. client.js mounts the section in the 听觉 card and talks to the four documented actions.
+ *   5. client.js mounts the section in 三、诊断与维护 and talks to the four documented actions.
  *
  * Run: node --test test/audio-retention-ui.mjs
  */
@@ -218,9 +218,15 @@ test('4. 错误分支：未接线 / 读取失败只显示文案，不崩溃', ()
   assert.ok(brokenText.some((text) => text.includes('unknown')), 'an unknown reason is still visible');
 });
 
-test('5. client.js 接线：听觉卡片挂载 + 四个动作 + 不自动播放', () => {
-  assert.match(clientSource, /speakerShadowRow\(h, \{ status, busy, act \}\),\s*retentionSection\(h, \{/u,
-    'the section is mounted right after the voiceprint row in the 听觉 card');
+test('5. client.js 接线：诊断卡片挂载 + 四个动作 + 不自动播放', () => {
+  assert.match(clientSource, /speakerShadowRow\(h, \{ status, busy, act \}\)/u,
+    'the voiceprint row stays mounted in 语音与听觉');
+  assert.match(clientSource, /retentionSection\(h, \{/u, '音频保留 is mounted in the settings page');
+  assert.ok(
+    clientSource.indexOf('speakerShadowRow(h, { status, busy, act })')
+      < clientSource.indexOf('retentionSection(h, {'),
+    '音频保留 stays inside 三、诊断与维护, below the voiceprint row',
+  );
   assert.match(clientSource, /const \[retentionData, setRetentionData\] = useState\(null\);/u);
   assert.match(clientSource, /action: 'audio\.retention\.list'/u);
   assert.match(clientSource, /action: 'voice\.audioRetention', enabled/u);
@@ -230,5 +236,5 @@ test('5. client.js 接线：听觉卡片挂载 + 四个动作 + 不自动播放'
     'export stores the path for display');
   assert.doesNotMatch(retentionSource, /new Audio\(/u, 'the card never constructs a player');
   assert.doesNotMatch(retentionSource, /\.play\(\)/u, 'the card never auto-plays the diagnostic clip');
-  console.log('[retention-ui 5] mountedIn=听觉 actions=list/toggle/delete/export autoPlay=no');
+  console.log('[retention-ui 5] mountedIn=诊断 actions=list/toggle/delete/export autoPlay=no');
 });

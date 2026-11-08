@@ -179,7 +179,7 @@ const boxes = (tree) => collect(tree, (node) => typeof node.props['data-profile-
 
 // ---- 1. title + capacity -------------------------------------------------------------------
 
-test('1. 渲染：标题含容量 used/cap，卡片仍在记忆卡片之后', () => {
+test('1. 渲染：标题含容量 used/cap，卡片位于记忆与人设分区', () => {
   const { tree } = render(fixtureProfile());
   const cards = collect(tree, (node) => node.props['data-profile-card'] === true);
   assert.equal(cards.length, 1, 'exactly one profile card');
@@ -189,11 +189,15 @@ test('1. 渲染：标题含容量 used/cap，卡片仍在记忆卡片之后', ()
   const capacityLine = linesOf(tree).find((node) => node.props.label === '容量');
   assert.equal(capacityLine?.props.value, '3 / 96 条（3%）');
 
-  const memoryAt = clientSource.indexOf("'记忆',");
   const profileAt = clientSource.indexOf('profileSettingsBody(h, {');
-  assert.ok(memoryAt > 0, 'the memory card title is present');
-  assert.ok(profileAt > memoryAt, `profile mount (${profileAt}) must follow the memory card (${memoryAt})`);
-  console.log(`1) title=${textOf(title)} mount=${profileAt}>memory=${memoryAt}`);
+  const profileBlockAt = clientSource.indexOf("settingsBlock('memory', (() => {");
+  const maintenanceAt = clientSource.indexOf("'记忆容量与维护'");
+  assert.ok(profileAt > 0, 'the profile mount is present');
+  assert.ok(profileBlockAt > 0 && profileBlockAt < profileAt,
+    `the profile card sits in 二、记忆与人设 (block ${profileBlockAt}, mount ${profileAt})`);
+  assert.ok(maintenanceAt > profileAt,
+    '人设在前、维护在后：记忆容量属于 三、诊断与维护');
+  console.log(`1) title=${textOf(title)} block=${profileBlockAt}<mount=${profileAt}<maintenance=${maintenanceAt}`);
 });
 
 // ---- 2. the two text boxes -----------------------------------------------------------------

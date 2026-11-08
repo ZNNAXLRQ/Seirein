@@ -119,7 +119,7 @@ test('the settings page has no usage/billing container left', async () => {
   // The rest of the settings page still renders: memory, profile and vision cards are present.
   assert.ok(client.includes('记忆'), 'memory card is still rendered');
   assert.ok(client.includes('人设库'), 'profile card is still rendered');
-  assert.ok(client.includes('视觉与隐私'), 'vision card is still rendered');
+  assert.ok(client.includes('视觉与感知'), 'vision card is still rendered');
 });
 
 test('the host keeps model context limits and drops the ledger wiring', async () => {

@@ -1,5 +1,5 @@
 /**
- * 「听觉」阈值输入框回归：保存后输入框必须回显新值，失败时回到旧值，重新打开设置页回显
+ * 「语音与听觉 → 麦克风与门限」阈值输入框回归：保存后输入框必须回显新值，失败时回到旧值，重新打开设置页回显
  * 持久化值。输入框是受控的（`value` 来自 settings 的已保存值 + 本地草稿），不是
  * `defaultValue` 那种只在首次渲染取值的不受控输入。
  *
@@ -161,7 +161,11 @@ const loadThresholdSave = () => {
   assert.ok(at > 0, 'the shipped threshold save is found in client.js');
   const anchor = clientSource.lastIndexOf('onSave: async (db) => {', at);
   assert.ok(anchor > 0, 'the threshold row onSave handler is found');
-  const end = clientSource.indexOf('\n            },', anchor);
+  // Find the closing `},` at the same indentation as `onSave`, so a layout change that re-indents
+  // the handler does not break the extraction.
+  const lineStart = clientSource.lastIndexOf('\n', anchor) + 1;
+  const indent = ' '.repeat(anchor - lineStart);
+  const end = clientSource.indexOf(`\n${indent}},`, at);
   assert.ok(end > anchor, 'the onSave handler body is bounded');
   const body = clientSource.slice(anchor + 'onSave: async (db) => {'.length, end);
   return new Function('act', 'show', `return async (db) => {${body}\n};`);

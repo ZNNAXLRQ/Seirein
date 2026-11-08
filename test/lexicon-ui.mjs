@@ -1,5 +1,5 @@
 /**
- * 「听觉 → 个人语言库」设置页回归。
+ * 「记忆与人设 → 个人语言库」设置页回归。
  *
  * 与 test/audio-retention-ui.mjs 同一套做法：从 client.js 抽出真正发货的
  * `lexiconSpeakerId` / `lexiconObservedForms` / `lexiconSaveBody` / `lexiconDialogOf` /
@@ -547,9 +547,9 @@ test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，�
 });
 
 // ---------------------------------------------------------------------------------------------
-// 6. client.js wiring + regressions: the section is mounted in 听觉 and uses lexicons actions
+// 6. client.js wiring + regressions: the section is mounted in 记忆与人设 and uses lexicon actions
 // ---------------------------------------------------------------------------------------------
-test('6. 接线检查：听觉卡片挂载、五个动作、speakerId 来自宿主状态', () => {
+test('6. 接线检查：设置页挂载、五个动作、speakerId 来自宿主状态', () => {
   assert.match(clientSource, /const \[lexiconData, setLexiconData\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconDialog, setLexiconDialog\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconPending, setLexiconPending\] = useState\(null\);/u);
@@ -564,9 +564,11 @@ test('6. 接线检查：听觉卡片挂载、五个动作、speakerId 来自宿�
     );
   }
 
-  const mountAt = clientSource.indexOf('          lexiconSection(h, {');
-  const retentionAt = clientSource.indexOf('          retentionSection(h, {');
-  assert.ok(retentionAt > 0 && mountAt > retentionAt, 'the section mounts right after 音频保留 in the 听觉 card');
+  const mount = /(\n\s+)lexiconSection\(h, \{/u.exec(clientSource);
+  const retentionMount = /(\n\s+)retentionSection\(h, \{/u.exec(clientSource);
+  assert.ok(mount !== null && retentionMount !== null, 'both sections are mounted in the settings page');
+  assert.ok(mount.index < retentionMount.index,
+    '个人语言库 stays in 二、记忆与人设, above 音频保留 in 三、诊断与维护');
   assert.ok(clientSource.indexOf('    function lexiconSection(') > clientSource.indexOf('    function retentionSection('));
 
   assert.doesNotMatch(lexiconBlockSource, /fetch\(/u, 'the lexicon block never fetches by itself');
@@ -601,7 +603,7 @@ test('6. 接线检查：听觉卡片挂载、五个动作、speakerId 来自宿�
   assert.doesNotMatch(clientSource.slice(retryFrom, retryTo), /saveLexiconDialog/u,
     'the retry never goes back through the two-step save');
 
-  console.log('[lexicon-ui 6] mounted=听觉 actions=5 listParser=ok|bare speakerId=status retry=edit-only');
+  console.log('[lexicon-ui 6] mounted=记忆与人设 actions=5 listParser=ok|bare speakerId=status retry=edit-only');
 });
 
 // ---------------------------------------------------------------------------------------------
