@@ -85,6 +85,25 @@ const RECONNECT_MAX_MS = 60_000;
 const AUTH_TRANSITION_LIMIT = 32;
 const AUTH_EVENT_LIMIT = 64;
 
+/**
+ * Failure kinds that need a deliberate user act in VTube Studio. They are the only ones for which
+ * status() reports `needsAuth:true` and `vts.auth.needs-user` is emitted. A transport failure is
+ * retryable but does NOT need the user to approve anything, so it must never claim that it does.
+ */
+const AUTH_NEEDS_USER_KINDS = new Set([
+  'token-invalid', 'token-revoked', 'token-rejected', 'grant-denied', 'grant-timeout',
+]);
+
+/** Stable vocabulary for `status().authError`; VTS's own sentence is never used as a code. */
+const classifyTokenRejection = (reason) => {
+  const text = String(reason ?? '').toLowerCase();
+  // VTS's standard sentence is "token is invalid or has been revoked by the user": prefer
+  // `token-invalid` for it, and use `token-revoked` only when revocation is the sole claim.
+  if (text.includes('invalid')) return 'token-invalid';
+  if (text.includes('revoked')) return 'token-revoked';
+  return 'token-rejected';
+};
+
 const normalizeName = (name) => String(name ?? '').trim().toLowerCase();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let tokenTempSeq = 0;
@@ -225,6 +244,8 @@ export class VtsClient {
     this.authenticated = false;
     this.ready = false;
     this.connectPromise = null;
+    /** In-flight explicit authorize(); repeated clicks share it instead of racing a second flow. */
+    this.authorizePromise = null;
     /** True while this connection is waiting for a token grant / AuthenticationRequest answer. */
     this.authPending = false;
     /** closeEpoch that owns `authPending`, so a cancelled flow settling late cannot clear a newer one. */
@@ -244,6 +265,18 @@ export class VtsClient {
       tokenPresent: false,
       /** A token VTS granted in this process was rejected; do not re-ask for another popup. */
       freshTokenRejected: false,
+      /** Epoch ms of the last completed authorization attempt (grant or auth), success or failure. */
+      lastAuthAt: 0,
+      /** Epoch ms of the last successful authentication; 0 means this process never authenticated. */
+      lastAuthSuccessAt: 0,
+      /** Machine-readable reason from the stable vocabulary; '' when the last attempt is not a failure. */
+      authError: '',
+      /** True only while an explicit user authorization is required (see AUTH_NEEDS_USER_KINDS). */
+      needsAuth: false,
+      /** Bumped on every recorded failure; authenticate() uses it to avoid overwriting a specific kind. */
+      failureSeq: 0,
+      /** Explicit authorize() calls accepted; repeated clicks are counted but never double-send. */
+      authorizeRequests: 0,
       transitions: [],
       events: [],
       pluginChanged: false,
@@ -525,10 +558,61 @@ export class VtsClient {
     this.emitAuthEvent('vts.auth.token', { ok: true, action: 'clear' });
   }
 
+  /**
+   * Record one classified authorization failure. `needsAuth` is true only for the kinds where the
+   * user has to act in VTS; `vts.auth.needs-user` fires once per failure episode (not per attempt),
+   * so the Host/UI can show one "需要重新授权" prompt instead of a notification per retry.
+   */
+  recordAuthFailure(kind, code = '') {
+    const next = String(kind || 'auth-failed');
+    const needsAuth = AUTH_NEEDS_USER_KINDS.has(next);
+    const wasNeeding = this.auth.needsAuth === true;
+    this.auth.authError = next;
+    this.auth.lastAuthAt = Date.now();
+    this.auth.failureSeq += 1;
+    this.auth.needsAuth = needsAuth;
+    if (needsAuth && wasNeeding !== true) {
+      this.emitAuthEvent('vts.auth.needs-user', {
+        authError: next,
+        code: String(code || ''),
+        retryable: true,
+      });
+    }
+  }
+
+  /** A successful authentication clears the whole needs-auth episode. */
+  clearAuthFailure() {
+    this.auth.needsAuth = false;
+    this.auth.authError = '';
+  }
+
+  /**
+   * Read-only authorization projection for `/assistant/status` and `status.live2d`. `needsAuth` is
+   * the user-facing answer ("VTS 需要你重新授权"), `authError` is the machine-readable reason, and
+   * `retryable` says whether an explicit `vts.authorize`/`retry()` can act right now. It never
+   * contains the token and never dials.
+   */
+  authStatus() {
+    const pending = this.authPending === true && this.authState === 'requesting-grant';
+    return {
+      state: this.authState,
+      authenticated: this.authenticated === true,
+      needsAuth: this.auth.needsAuth === true,
+      authError: this.auth.authError,
+      lastAuthAt: this.auth.lastAuthAt,
+      lastAuthSuccessAt: this.auth.lastAuthSuccessAt,
+      retryable: this.ready !== true && this.authState !== 'disconnected',
+      authorizePending: pending,
+      authorizeRequests: this.auth.authorizeRequests,
+      freshTokenRejected: this.auth.freshTokenRejected === true,
+    };
+  }
+
   /** Read-only auth projection for the Host: state/tokenPresent/pluginName/attempts/lastError. */
   status() {
     return {
       state: this.authState,
+      ...this.authStatus(),
       tokenPresent: this.auth.tokenPresent === true,
       pluginName: this.plugin.pluginName,
       pluginDeveloper: this.plugin.pluginDeveloper,
@@ -700,8 +784,95 @@ export class VtsClient {
     return this.startConnect({ reason: 'retry', force: true });
   }
 
+  /**
+   * Explicit user authorization (`vts.authorize` / 设置页「重新授权」按钮). This is the ONE path that
+   * may reset the "a fresh token was already rejected, do not pop the dialog again" block and the
+   * token-invalid waiting state. The old token is dropped first, so the AuthenticationTokenRequest
+   * that follows is a real re-authorization, not a replay of a token VTS already killed.
+   *
+   * Idempotent by construction: an in-flight connect is shared (never a second dialog), and a call
+   * while ready is a no-op success. Returns a result object instead of throwing, because the caller
+   * is a UI action that must always get `{ok, needsUserApproval, ...}` back.
+   */
+  authorize({ reason = 'user' } = {}) {
+    const why = typeof reason === 'string' && reason.length > 0 ? reason : 'user';
+    // Serialize explicit clicks: the second one receives the FIRST promise, so two rapid clicks can
+    // never race two token clears (which could overwrite the new token) or two dialogs.
+    if (this.authorizePromise !== null) {
+      this.auth.authorizeRequests += 1;
+      this.emitAuthEvent('vts.auth.authorize', { reason: why, from: this.authState, shared: true });
+      return this.authorizePromise;
+    }
+    const run = this.authorizeOnce(why).finally(() => {
+      if (this.authorizePromise === run) this.authorizePromise = null;
+    });
+    this.authorizePromise = run;
+    return run;
+  }
+
+  async authorizeOnce(why) {
+    this.auth.authorizeRequests += 1;
+    this.emitAuthEvent('vts.auth.authorize', { reason: why, from: this.authState });
+    if (this.ready) {
+      this.clearAuthFailure();
+      return { ...this.readyResult(), authorized: true, needsUserApproval: false, ...this.authStatus() };
+    }
+    if (this.connectPromise !== null) {
+      // Never send a second AuthenticationTokenRequest while one flow is already running.
+      const shared = this.connectPromise;
+      try {
+        const result = await shared;
+        return { ...result, authorized: true, needsUserApproval: false, shared: true, ...this.authStatus() };
+      } catch (error) {
+        return {
+          ok: false,
+          shared: true,
+          needsUserApproval: this.auth.needsAuth === true,
+          code: error?.code ?? 'AUTH_FAILED',
+          error: error?.message ?? String(error),
+          ...this.authStatus(),
+        };
+      }
+    }
+    // The explicit act clears the block + waiting state; a failure below starts a NEW episode.
+    // A token is only destroyed when it is already known bad (or the state says token-invalid): a
+    // re-authorize click while VTS is merely unreachable must not throw away a still-valid token.
+    const replaceToken = this.auth.needsAuth === true
+      || this.auth.freshTokenRejected === true
+      || this.authState === 'token-invalid';
+    this.auth.freshTokenRejected = false;
+    this.clearAuthFailure();
+    const attemptsBefore = this.auth.attempts;
+    try {
+      if (this.token.length > 0 && replaceToken) await this.clearToken();
+    } catch (error) {
+      this.recordAuthFailure('token-clear-failed', 'TOKEN_WRITE_FAILED');
+      return {
+        ok: false,
+        needsUserApproval: false,
+        code: 'TOKEN_WRITE_FAILED',
+        error: error?.message ?? String(error),
+        ...this.authStatus(),
+      };
+    }
+    try {
+      const result = await this.startConnect({ reason: 'authorize', force: true });
+      return { ...result, authorized: true, needsUserApproval: false, ...this.authStatus() };
+    } catch (error) {
+      return {
+        ok: false,
+        // A grant request actually reached VTS in this flow: the user may need to answer the popup.
+        needsUserApproval: this.auth.attempts > attemptsBefore,
+        code: error?.code ?? 'AUTH_FAILED',
+        error: error?.message ?? String(error),
+        ...this.authStatus(),
+      };
+    }
+  }
+
   async authenticate({ reason = 'connect' } = {}) {
     const epoch = this.closeEpoch;
+    const failureSeqAtEntry = this.auth.failureSeq;
     this.authPending = true;
     this.authPendingEpoch = epoch;
     this.authRenewed = false;
@@ -735,6 +906,7 @@ export class VtsClient {
           // A brand-new token refused by VTS is a failed authorization, not a user-revocable token:
           // keeping it out of token-invalid leaves an explicit connect() able to try again.
           this.auth.freshTokenRejected = true;
+          this.recordAuthFailure(classifyTokenRejection(first.reason), 'AUTH_FAILED');
           this.setAuthState('error', 'token-rejected-fresh');
           throw this.authFailure(first, 'AUTH_FAILED', { authorizationRequested: true });
         }
@@ -745,6 +917,7 @@ export class VtsClient {
         } catch (error) {
           this.assertCurrentEpoch(epoch);
           // A timeout / socket failure is not evidence the token is invalid.
+          this.recordAuthFailure('unreachable', error?.code ?? 'AUTH_FAILED');
           throw this.authFailure(error, 'AUTH_FAILED', { authorizationRequested: false });
         }
         this.assertCurrentEpoch(epoch);
@@ -752,6 +925,7 @@ export class VtsClient {
           // A token granted in this process that VTS already rejected must not trigger another
           // popup on every later connect: the user has to retry explicitly.
           if (this.auth.freshTokenRejected === true) {
+            this.recordAuthFailure(classifyTokenRejection(first.reason), 'AUTH_RETRY_FAILED');
             this.setAuthState('token-invalid', 'fresh-token-rejected');
             throw this.authFailure(first, 'AUTH_RETRY_FAILED', {
               previousReason: first.reason,
@@ -771,6 +945,10 @@ export class VtsClient {
           const retry = await this.attemptAuth();
           this.assertCurrentEpoch(epoch);
           if (retry.ok !== true) {
+            // The replacement token was granted by VTS in THIS process and still rejected: keep the
+            // same "do not pop the dialog again automatically" semantics as the first-install path.
+            this.auth.freshTokenRejected = true;
+            this.recordAuthFailure(classifyTokenRejection(retry.reason), 'AUTH_RETRY_FAILED');
             this.setAuthState('token-invalid', 'token-rejected');
             throw this.authFailure(retry, 'AUTH_RETRY_FAILED', {
               previousReason: first.reason,
@@ -816,13 +994,29 @@ export class VtsClient {
       this.ready = true;
       // The active token is accepted: a previous "fresh token rejected" episode is over.
       this.auth.freshTokenRejected = false;
+      this.auth.lastAuthAt = Date.now();
+      this.auth.lastAuthSuccessAt = this.auth.lastAuthAt;
+      this.clearAuthFailure();
       this.setAuthState('ready', 'authenticated');
+      this.emitAuthEvent('vts.auth.authorized', {
+        renewed: this.authRenewed === true,
+        explicit: reason === 'authorize',
+        authAt: this.auth.lastAuthSuccessAt,
+      });
       this.resetReconnect();
       return this.readyResult();
     } catch (error) {
       // A close() during this connect owns the final state; a late failure must not overwrite it.
       if (epoch === this.closeEpoch) {
         this.lastError = error?.message ?? String(error);
+        // Nothing above classified this failure yet (transport loss, subscription death, token
+        // write): record an honest but non-needs-auth kind instead of leaving authError stale.
+        if (this.auth.failureSeq === failureSeqAtEntry) {
+          this.recordAuthFailure(
+            error?.code === 'TOKEN_WRITE_FAILED' ? 'token-write-failed' : 'unreachable',
+            error?.code ?? 'AUTH_FAILED',
+          );
+        }
         if (this.authState === 'requesting-grant') {
           // A slow popup is not a failure: keep the state quiet and the socket for an explicit retry.
         } else if (this.authState === 'token-invalid') {
@@ -867,6 +1061,7 @@ export class VtsClient {
         error.cause = cause;
         this.lastError = error.message;
         // Timeout is an observation, not a reason to re-request: the state stays requesting-grant.
+        this.recordAuthFailure('grant-timeout', 'AWAITING_GRANT');
         this.emitAuthEvent('vts.auth.timeout', {
           attempt,
           state: this.authState,
@@ -877,6 +1072,7 @@ export class VtsClient {
       const error = new Error(`VTube Studio authorization request failed: ${cause?.message ?? String(cause)}`);
       error.code = 'GRANT_SOCKET_LOST';
       error.cause = cause;
+      this.recordAuthFailure('grant-unreachable', 'GRANT_SOCKET_LOST');
       this.setAuthState('error', 'grant-socket-lost');
       throw error;
     }
@@ -888,6 +1084,7 @@ export class VtsClient {
       this.assertCurrentEpoch(epoch);
       const error = new Error(cause?.message ?? String(cause));
       error.code = 'TOKEN_INVALID';
+      this.recordAuthFailure('grant-denied', 'TOKEN_INVALID');
       this.setAuthState('token-invalid', 'grant-denied');
       throw error;
     }
@@ -897,6 +1094,7 @@ export class VtsClient {
     if (token.length === 0) {
       const error = new Error('VTube Studio did not grant a token (the plugin grant was refused)');
       error.code = 'TOKEN_INVALID';
+      this.recordAuthFailure('grant-denied', 'TOKEN_INVALID');
       this.setAuthState('token-invalid', 'grant-denied');
       throw error;
     }
@@ -2003,6 +2201,7 @@ export class VtsClient {
     // connect() starts a fresh attempt instead of sharing the doomed promise. Its own late
     // settlement is epoch-checked and cannot clear the newer slot (see startConnect).
     this.connectPromise = null;
+    this.authorizePromise = null;
     this.authPending = false;
     this.eventsSubscribed = false;
     this.subscribedEvents = [];
@@ -2019,7 +2218,12 @@ export class VtsClient {
     this.frameEpoch += 1;
     this.failPending(new Error('VTube Studio connection closed'));
     this.clearReconnect('closed');
-    if (keepAuthState !== true) this.setAuthState('disconnected', 'closed');
+    if (keepAuthState !== true) {
+      // A deliberate close (component disabled / shutdown) ends the episode too; the failure paths
+      // pass keepAuthState:true so their needs-user state survives the socket teardown.
+      this.clearAuthFailure();
+      this.setAuthState('disconnected', 'closed');
+    }
     const socket = this.socket;
     this.socket = null;
     if (socket !== null) {

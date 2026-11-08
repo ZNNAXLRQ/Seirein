@@ -2697,6 +2697,12 @@ export function apply(ctx, config) {
         onEvent: (type, payload) => {
           void log?.emit?.(type, payload ?? {}).catch?.(() => {});
         },
+        // Only the two user-facing authorization events are logged: the state-machine debug stream
+        // (state/token/requested) stays in memory, and the legacy onEvent sequence is untouched.
+        onAuthEvent: (type, payload) => {
+          if (type !== 'vts.auth.needs-user' && type !== 'vts.auth.authorized') return;
+          void log?.emit?.(type, payload ?? {}).catch?.(() => {});
+        },
       });
     }
     return vts;
@@ -3904,6 +3910,47 @@ export function apply(ctx, config) {
     } catch (error) {
       return { ok: false, error: error?.message ?? String(error) };
     }
+  };
+
+  /**
+   * Authorization projections for `/assistant/status` (`live2d` plus the top-level `vtsAuth`).
+   * Reads the client only and never dials: the settings card shows the「重新授权」button when
+   * `needsAuth` is true, and `authError`/`retryable` explain why it is offered.
+   */
+  const vtsAuthStatus = () => (vts === null
+    ? {
+      state: 'disconnected',
+      authenticated: false,
+      needsAuth: false,
+      authError: '',
+      lastAuthAt: 0,
+      lastAuthSuccessAt: 0,
+      retryable: false,
+      authorizePending: false,
+      authorizeRequests: 0,
+      freshTokenRejected: false,
+    }
+    : vts.authStatus());
+
+  /**
+   * Explicit user re-authorization (`vts.authorize`). The client is idempotent and owns the single
+   * AuthenticationTokenRequest; this wrapper only adds the component gate and the action log.
+   */
+  const vtsAuthorize = async (body = {}) => {
+    const opened = await ensureComponent('avatar', 'vts.authorize');
+    if (!opened.ok) {
+      return { ok: false, code: 'FEATURE_DISABLED', feature: 'avatar', error: opened.error ?? '形象组件无法启用' };
+    }
+    const client = vtsClient();
+    const result = await client.authorize({ reason: typeof body?.reason === 'string' ? body.reason : 'user' });
+    await log.emit('vts.authorize', {
+      ok: result.ok === true,
+      needsUserApproval: result.needsUserApproval === true,
+      needsAuth: result.needsAuth === true,
+      authError: result.authError ?? '',
+      code: result.code ?? '',
+    }).catch(() => {});
+    return result;
   };
 
   // Auto-connect: VTube Studio may start (or restart) after us, so retry quietly every minute.
@@ -15050,8 +15097,14 @@ export function apply(ctx, config) {
    */
   const buildHearingStatus = async () => {
     const status = await buildStatus();
+    // VTS authorization needs-user is projected in BOTH places: `live2d` (where the existing card
+    // already reads connected/authenticated) and the dedicated `vtsAuth` block (the re-authorize
+    // button's contract). Reading it never dials VTS.
+    const vtsAuth = vtsAuthStatus();
     return {
       ...status,
+      live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
+      vtsAuth,
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
@@ -15582,6 +15635,7 @@ export function apply(ctx, config) {
     get vtsConnect() { return vtsConnect; },
     get writeSettings() { return writeSettings; }
   }) },
+{ actions: ['vts.authorize'], handle: async (body) => vtsAuthorize(body) },
 { actions: subtitleActions, handle: createSubtitleSettingsActions({
     get ensureComponent() { return ensureComponent; },
     get ensureSubtitle() { return ensureSubtitle; },
