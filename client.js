@@ -2690,6 +2690,45 @@ window.__ModuleLoader__.load({
     };
 
     /**
+     * status.voiceCompaction（宿主自动压缩 preset 的只读快照）：只取白名单字段。整块缺失时
+     * available=false，单个字段缺失时为 null / ''，界面与报告统一显示「不可用」，不抛异常。
+     */
+    const diagnosticsCompactionOf = (value) => {
+      const object = diagnosticsObject(value);
+      if (object === null) {
+        return {
+          available: false, presetId: '', status: '', source: '',
+          registered: null, enabled: null, reason: '', running: null, mounted: null, active: null,
+          requiresRestart: null, note: '', nearLimit: null,
+          pressure: { tokens: null, windowTokens: null, ratio: null, threshold: null },
+        };
+      }
+      const pressure = diagnosticsObject(object.pressure) ?? {};
+      const flag = (raw) => (raw === true ? true : raw === false ? false : null);
+      return {
+        available: true,
+        presetId: diagnosticsText(object.presetId),
+        status: diagnosticsText(object.status),
+        source: diagnosticsText(object.source),
+        registered: flag(object.registered),
+        enabled: flag(object.enabled),
+        reason: diagnosticsText(object.reason),
+        running: diagnosticsNumber(object.running),
+        mounted: diagnosticsNumber(object.mounted),
+        active: diagnosticsNumber(object.active),
+        requiresRestart: flag(object.requiresRestart),
+        note: diagnosticsText(object.note),
+        nearLimit: flag(object.nearLimit ?? object['near-limit']),
+        pressure: {
+          tokens: diagnosticsNumber(pressure.tokens),
+          windowTokens: diagnosticsNumber(pressure.windowTokens),
+          ratio: diagnosticsNumber(pressure.ratio),
+          threshold: diagnosticsNumber(pressure.threshold),
+        },
+      };
+    };
+
+    /**
      * 把一次 /assistant/status 投影成面板与报告共用的安全结构。只读取下面列出的白名单字段，
      * 因此 voiceAck.captionText/speechText、ambient.recent、voicePending 等文本永远不会进入报告。
      */
@@ -2828,6 +2867,7 @@ window.__ModuleLoader__.load({
           lastEvent: diagnosticsText(debug?.lastEvent, presets?.lastEvent),
         },
         libraries: { lexicon: library(lexicon), retention: library(retention) },
+        compaction: diagnosticsCompactionOf(root.voiceCompaction),
       };
     }
 
@@ -2854,6 +2894,45 @@ window.__ModuleLoader__.load({
       const enabled = library.enabled === true ? '已开启' : library.enabled === false ? '已关闭' : '开关不可用';
       const count = library.count === null ? '条目数不可用' : `${library.count} 条`;
       return `${enabled} · ${count}`;
+    };
+
+    // ---- 自动压缩（status.voiceCompaction）：状态 / 可用性 / 压力 / 装配四行 --------------------
+    const DIAGNOSTICS_COMPACTION_STATUS = {
+      registered: '已注册', reused: '复用', conflict: '冲突', failed: '失败',
+      unavailable: '不可用', idle: '未注册',
+    };
+
+    const diagnosticsCompactionStateText = (compaction) => {
+      if (compaction.available !== true) return '不可用';
+      const label = DIAGNOSTICS_COMPACTION_STATUS[compaction.status] ?? compaction.status;
+      if (label === '') return '不可用';
+      return compaction.source === '' ? label : `${label}（来源 ${compaction.source}）`;
+    };
+
+    /** enabled 才是功能答案：已注册不等于已装配；不可用时带上宿主给的 reason。 */
+    const diagnosticsCompactionUsableText = (compaction) => {
+      if (compaction.available !== true || compaction.enabled === null) return '不可用';
+      if (compaction.enabled === true) return '可用';
+      return compaction.reason === '' ? '不可用' : compaction.reason;
+    };
+
+    const diagnosticsCompactionPressureText = (compaction) => {
+      if (compaction.available !== true) return '不可用';
+      const { tokens, windowTokens, ratio } = compaction.pressure;
+      const near = compaction.nearLimit === true || (ratio !== null && ratio > 0.8);
+      const detail = tokens === null || windowTokens === null || ratio === null
+        ? '' : `${tokens}/${windowTokens} tokens · ${Math.round(ratio * 1000) / 10}%`;
+      if (detail === '') return near ? '接近上限' : '不可用';
+      return near ? `${detail} · 接近上限` : detail;
+    };
+
+    const diagnosticsCompactionAssemblyText = (compaction) => {
+      if (compaction.available !== true) return '不可用';
+      const mark = (raw) => (raw === true ? '是' : raw === false ? '否' : '—');
+      const count = (raw) => (raw === null ? '—' : raw);
+      const text = `registered ${mark(compaction.registered)} · mounted ${count(compaction.mounted)}`
+        + ` · active ${count(compaction.active)} · running ${count(compaction.running)}`;
+      return compaction.requiresRestart === true ? `${text} · 需重启或执行恢复` : text;
     };
 
     // ---- P2 报告脱敏：本机界面照旧显示原文，只有「复制诊断报告」走这里 ----------------------
@@ -2968,6 +3047,27 @@ window.__ModuleLoader__.load({
           lexicon: { ...view.libraries.lexicon },
           retention: { ...view.libraries.retention },
         },
+        compaction: {
+          available: view.compaction.available,
+          presetId: reportField(view.compaction.presetId),
+          status: reportField(view.compaction.status),
+          source: reportField(view.compaction.source),
+          registered: view.compaction.registered,
+          enabled: view.compaction.enabled,
+          reason: reportField(view.compaction.reason),
+          running: view.compaction.running,
+          mounted: view.compaction.mounted,
+          active: view.compaction.active,
+          requiresRestart: view.compaction.requiresRestart,
+          note: reportField(view.compaction.note),
+          nearLimit: view.compaction.nearLimit,
+          pressure: {
+            tokens: view.compaction.pressure.tokens,
+            windowTokens: view.compaction.pressure.windowTokens,
+            ratio: view.compaction.pressure.ratio,
+            threshold: view.compaction.pressure.threshold,
+          },
+        },
       };
       return JSON.stringify(report, null, 2);
     }
@@ -3035,6 +3135,10 @@ window.__ModuleLoader__.load({
       const row = (label, text) => h('div', { style: styles.row },
         h('span', { style: styles.label }, label),
         h('span', { style: styles.value }, value(text)));
+      /** 同一行结构，value 在 danger 时标红（自动压缩不可用）。 */
+      const rowDanger = (label, text, danger) => h('div', { style: styles.row },
+        h('span', { style: styles.label }, label),
+        h('span', { style: danger ? { ...styles.value, color: DANGER } : styles.value }, value(text)));
       const group = (title, rows) => h('div', { style: { marginTop: 10 } },
         h('div', { style: { ...styles.label, fontWeight: 600 } }, title),
         ...rows);
@@ -3042,6 +3146,8 @@ window.__ModuleLoader__.load({
       const motionCounts = view.motion.available
         ? `select ${view.motion.select ?? '—'} · skip ${view.motion.skip ?? '—'} · commit ${view.motion.commit ?? '—'}`
         : '不可用';
+      // 有数据但 enabled 不为 true 才算「不可用」；整块缺失沿用分区占位，不额外标红。
+      const compactionDanger = view.compaction.available === true && view.compaction.enabled !== true;
 
       return h('div', { style: styles.card, 'data-seirein-diagnostics': 'client' },
         h('div', { style: styles.title }, '诊断（客户端）'),
@@ -3079,6 +3185,16 @@ window.__ModuleLoader__.load({
           row('候音来源', sourceText(view.voice.ackSource)),
           row('候音命中', sourceText(view.voice.ackHit)),
           row('首音时间（最近一轮）', missing ? '不可用' : diagnosticsFirstAudibleText(view.voice)),
+        ]),
+        group('自动压缩', [
+          row('状态', diagnosticsCompactionStateText(view.compaction)),
+          rowDanger('是否可用', diagnosticsCompactionUsableText(view.compaction), compactionDanger),
+          row('上下文压力', diagnosticsCompactionPressureText(view.compaction)),
+          row('装配（registered / mounted / active / running）',
+            diagnosticsCompactionAssemblyText(view.compaction)),
+          view.compaction.requiresRestart === true && view.compaction.note !== ''
+            ? h('div', { style: styles.hint }, `恢复说明：${view.compaction.note}`)
+            : null,
         ]),
         group('视觉', [
           row('来源', missing ? '不可用' : view.vision.source),

@@ -1,15 +1,15 @@
 /**
- * P-111 客户端诊断通道（MVP）回归。
+ * P-111 客户端诊断通道（MVP）+ 自动压缩状态区回归。
  *
  * 从 client.js 抽出真正发货的 `diagnosticsSection` / `diagnosticsView` / `loadDiagnosticsStatus`
  * 等函数，用记录型 `h` 求值（与 hearing-ui / audio-retention-ui 相同的做法）：不需要 DOM、React
  * 或宿主。这里固定用户实际能看到、点到的东西：
- *   1. 五个分区在有数据 / 缺字段 / 读取失败时的渲染；
- *   2. 打开一次只发一个 `/assistant/status` 请求，渲染不会额外发请求；
- *   3. 复制的报告是纯文本 JSON，且不含转写/字幕/音频等用户内容；
- *   4. 复制报告脱敏：路径/URL/用户名换成占位符或摘要，受控码保留，界面仍显示原文；
- *   5. 「刷新」重新拉取一次，诊断代码里没有 setInterval；
- *   6. 回归：lexicon-ui、audio-retention-ui、hearing-ui、smoke。
+ *   1. 各状态渲染：自动压缩 registered / reused / conflict / failed + 既有五分区；
+ *   2. 上下文压力 tokens/windowTokens/ratio，ratio > 0.8 显示「接近上限」；
+ *   3. requiresRestart 时装配行显示「需重启或执行恢复」；
+ *   4. 复制的报告含自动压缩字段、受控码保留，路径/URL/会话 id 不进报告；
+ *   5. 缺字段 / 读取失败 / 超时 / 畸形字段一律「不可用」，不崩溃；
+ *   6. 回归：单次读取、手动刷新、无新增轮询，lexicon-ui / audio-retention-ui / hearing-ui / smoke。
  *
  * Run: node --test test/client-diagnostics.mjs
  */
@@ -77,6 +77,19 @@ const textsOf = (tree) => {
   return texts;
 };
 
+/** A diagnostic row is one div with two element children: label span, value span. */
+const rowOf = (tree, label) => {
+  const found = nodesOf(tree).find((node) => {
+    const elements = (node.children ?? []).filter((child) => child !== null && typeof child === 'object');
+    return elements.length >= 2 && (elements[0].children ?? [])[0] === label;
+  });
+  assert.ok(found !== undefined, `the section renders a «${label}» row`);
+  return found;
+};
+
+const rowValueOf = (tree, label) => rowOf(tree, label).children[1].children.join('');
+const rowColorOf = (tree, label) => rowOf(tree, label).children[1].props.style?.color ?? null;
+
 const buttonOf = (tree, label) => {
   const found = nodesOf(tree).find(
     (node) => node.type === 'button' && (node.children ?? []).some((child) => child === label),
@@ -84,6 +97,32 @@ const buttonOf = (tree, label) => {
   assert.ok(found !== undefined, `the section renders a «${label}» button`);
   return found;
 };
+
+/** `status.voiceCompaction` exactly as the host's `presetStatus()` reports it. */
+const compactionOf = (overrides = {}) => ({
+  presetId: 'seirein-voice-compaction',
+  status: 'registered',
+  source: 'registered',
+  registered: true,
+  enabled: true,
+  reason: '',
+  running: 1,
+  mounted: 1,
+  active: 1,
+  requiresRestart: false,
+  note: '',
+  nearLimit: false,
+  pressure: {
+    nearLimit: false,
+    sessionId: 'seirein-2026-11-09',
+    tokens: 40_000,
+    windowTokens: 128_000,
+    ratio: 0.313,
+    threshold: 0.8,
+    at: 1_700_000_000_000,
+  },
+  ...overrides,
+});
 
 const statusWithData = (overrides = {}) => ({
   version: '0.99.0',
@@ -148,9 +187,65 @@ const sectionOf = (api, status, extra = {}) => api.diagnosticsSection(h, {
   ...extra,
 });
 
-test('1. 五个分区：有数据 / 缺字段 / 读取失败都渲染，占位不崩溃', () => {
+test('1. 各状态渲染：自动压缩 registered / reused / conflict / failed 与既有五分区', () => {
   const api = loadDiagnostics();
+  const cases = [
+    {
+      id: 'registered',
+      compaction: compactionOf(),
+      state: '已注册（来源 registered）',
+      usable: '可用',
+      danger: false,
+    },
+    {
+      id: 'reused',
+      compaction: compactionOf({ status: 'reused', source: 'profile', registered: false }),
+      state: '复用（来源 profile）',
+      usable: '可用',
+      danger: false,
+    },
+    {
+      id: 'conflict',
+      compaction: compactionOf({
+        status: 'conflict',
+        source: 'profile',
+        registered: false,
+        enabled: false,
+        reason: '自动压缩不可用：同 ID preset 定义不兼容（多出 persona 行）',
+      }),
+      state: '冲突（来源 profile）',
+      usable: '自动压缩不可用：同 ID preset 定义不兼容',
+      danger: true,
+    },
+    {
+      id: 'failed',
+      compaction: compactionOf({
+        status: 'failed',
+        source: '',
+        registered: false,
+        enabled: false,
+        reason: '自动压缩不可用：preset 注册失败（agentPresets.register() is unavailable）',
+      }),
+      state: '失败',
+      usable: '自动压缩不可用：preset 注册失败',
+      danger: true,
+    },
+  ];
+  const observed = [];
+  for (const item of cases) {
+    const tree = sectionOf(api, statusWithData({ voiceCompaction: item.compaction }));
+    assert.ok(textsOf(tree).includes('自动压缩'), `${item.id}: the card has a 自动压缩 section`);
+    assert.equal(rowValueOf(tree, '状态'), item.state, `${item.id}: status label + source`);
+    assert.ok(rowValueOf(tree, '是否可用').includes(item.usable), `${item.id}: enabled is answered by reason`);
+    assert.equal(
+      rowColorOf(tree, '是否可用') === '#c92a2a',
+      item.danger,
+      `${item.id}: red only when enable is false`,
+    );
+    observed.push(`${item.id}=${rowValueOf(tree, '状态')}/${rowValueOf(tree, '是否可用').slice(0, 18)}`);
+  }
 
+  // 同一张卡片上既有的五个分区仍然按原样渲染（有数据时不丢失任何行）。
   const full = textsOf(sectionOf(api, statusWithData()));
   assert.ok(full.includes('诊断（客户端）'), 'the panel has its own title');
   assert.ok(full.some((text) => text.includes('v0.99.0 / v0.99.0')), 'client/server versions');
@@ -172,76 +267,130 @@ test('1. 五个分区：有数据 / 缺字段 / 读取失败都渲染，占位�
   assert.ok(full.some((text) => text.includes('no-candidate')), 'last skip reason');
   assert.ok(full.some((text) => text.includes('8 条')), 'lexicon count');
   assert.ok(full.some((text) => text.includes('2 条')), 'retention count');
-
-  // Missing every optional field: the panel renders placeholders instead of throwing.
-  const missing = textsOf(sectionOf(api, {}));
-  assert.ok(missing.filter((text) => text === '不可用').length >= 8, 'missing fields show 不可用');
-  assert.ok(missing.includes('诊断（客户端）'), 'the panel still renders with no status');
-  for (const title of ['概况', '语音', '视觉', '动作', '语言库 / 音频保留']) {
-    assert.ok(missing.includes(title), `missing data still renders the ${title} section`);
+  for (const title of ['概况', '语音', '自动压缩', '视觉', '动作', '语言库 / 音频保留']) {
+    assert.ok(full.includes(title), `the ${title} section renders`);
   }
-
-  // A failed read shows the error and still renders every section with placeholders.
-  const failed = textsOf(api.diagnosticsSection(h, {
-    data: { status: null, error: 'HTTP 500', loading: false, at: 0 },
-    clientVersion: '0.99.0', restart: null, busy: false, onRefresh: () => {}, onCopy: () => {},
-  }));
-  assert.ok(failed.some((text) => text.includes('诊断读取失败：HTTP 500')), 'the read error is visible');
-  assert.ok(failed.filter((text) => text === '不可用').length >= 8, 'failed read keeps placeholders');
-
-  // Loading is explicit and never claims a value.
-  const loading = textsOf(api.diagnosticsSection(h, {
-    data: { status: null, error: '', loading: true, at: 0 },
-    clientVersion: '0.99.0', restart: null, busy: false, onRefresh: () => {}, onCopy: () => {},
-  }));
-  assert.ok(loading.includes('正在读取诊断状态…'), 'loading hint');
-  assert.equal(buttonOf(api.diagnosticsSection(h, {
-    data: { status: null, error: '', loading: true, at: 0 },
-    clientVersion: '0.99.0', restart: null, busy: false, onRefresh: () => {}, onCopy: () => {},
-  }), '读取中…').props.disabled, true, 'refresh is disabled while loading');
+  console.log(`[1] ${observed.join(' ; ')}`);
 });
 
-test('2. 单次拉取：一个面板只发一个 /assistant/status 请求，渲染不再请求', async () => {
-  const calls = [];
-  const api = loadDiagnostics(async (url, init) => {
-    calls.push({ url, init });
-    return { ok: true, status: 200, json: async () => statusWithData() };
-  });
-
-  const result = await api.loadDiagnosticsStatus();
-  assert.equal(calls.length, 1, 'exactly one status request');
-  assert.equal(calls[0].url, '/assistant/status');
-  assert.equal(calls[0].init.cache, 'no-store');
-  assert.equal(result.error, '');
-  assert.equal(result.status.hearing.instanceId, 'h7-abcd');
-
-  // Rendering every section is pure: no second request, no matter how often it renders.
-  for (let index = 0; index < 5; index += 1) sectionOf(api, result.status);
-  assert.equal(calls.length, 1, 'rendering never fetches');
-
-  // A non-2xx answer and a timeout are returned as errors, never thrown at the caller.
-  const failed = await api.loadDiagnosticsStatus(async () => ({ ok: false, status: 503 }));
-  assert.equal(failed.status, null);
-  assert.equal(failed.error, 'HTTP 503');
-
-  const apiTimeout = loadDiagnostics();
-  const timingOut = await apiTimeout.loadDiagnosticsStatus((_url, init) => new Promise((_resolve, reject) => {
-    init.signal.addEventListener('abort', () => {
-      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
-    });
-  }), 10);
-  assert.equal(timingOut.status, null);
-  assert.equal(timingOut.error, '请求超时', 'a timeout is reported, not thrown');
-});
-
-test('3. 复制报告：纯文本 JSON，不含转写/字幕/音频等用户内容', async () => {
+test('2. 接近上限：tokens / windowTokens / ratio 与 ratio > 0.8 提示', () => {
   const api = loadDiagnostics();
-  const report = api.diagnosticsReportOf(statusWithData(), {
+  const pressureOf = (tokens, windowTokens, ratio, nearLimit = false) => compactionOf({
+    nearLimit,
+    pressure: { nearLimit, sessionId: 'seirein-2026-11-09', tokens, windowTokens, ratio, threshold: 0.8, at: 1 },
+  });
+  const pressureRow = (status) => rowValueOf(sectionOf(api, status), '上下文压力');
+
+  // 90%：数值 + 百分比 + 「接近上限」。
+  const hot = pressureRow(statusWithData({ voiceCompaction: pressureOf(115_200, 128_000, 0.9) }));
+  assert.equal(hot, '115200/128000 tokens · 90% · 接近上限');
+
+  // 50%：只报数值，不制造警告。
+  assert.equal(pressureRow(statusWithData({ voiceCompaction: pressureOf(64_000, 128_000, 0.5) })),
+    '64000/128000 tokens · 50%');
+
+  // 0.8 本身不算「超过」，0.81 才算。
+  assert.equal(pressureRow(statusWithData({ voiceCompaction: pressureOf(102_400, 128_000, 0.8) })),
+    '102400/128000 tokens · 80%');
+  assert.ok(pressureRow(statusWithData({ voiceCompaction: pressureOf(103_680, 128_000, 0.81) }))
+    .includes('接近上限'));
+
+  // 宿主 nearLimit=true 但数值缺失：仍提示接近上限；压力整块缺失：显示不可用。
+  const flagOnly = compactionOf({ nearLimit: true, pressure: { nearLimit: true } });
+  assert.equal(pressureRow(statusWithData({ voiceCompaction: flagOnly })), '接近上限');
+  assert.equal(pressureRow(statusWithData({ voiceCompaction: compactionOf({ pressure: null }) })), '不可用');
+
+  console.log(`[2] 90%=${hot} ; 50%=${pressureRow(statusWithData({ voiceCompaction: pressureOf(64_000, 128_000, 0.5) }))} ; flagOnly=接近上限`);
+});
+
+test('3. requiresRestart：装配行显示需重启或执行恢复', () => {
+  const api = loadDiagnostics();
+  const note = '需重启 DSH 或执行 voice.session.recover 重新装配';
+  const restarting = compactionOf({
+    status: 'reused',
+    source: 'profile',
+    registered: false,
+    enabled: false,
+    running: 1,
+    mounted: 0,
+    active: 0,
+    requiresRestart: true,
+    note,
+    reason: `自动压缩不可用：已运行的语音会话未装配（${note}）`,
+  });
+  const tree = sectionOf(api, statusWithData({ voiceCompaction: restarting }));
+  const assembly = rowValueOf(tree, '装配（registered / mounted / active / running）');
+  assert.equal(assembly, 'registered 否 · mounted 0 · active 0 · running 1 · 需重启或执行恢复');
+  assert.ok(textsOf(tree).includes(`恢复说明：${note}`), 'the host note spells out the recovery command');
+  assert.ok(rowValueOf(tree, '是否可用').includes('需重启'), 'the usable row points at the restart');
+  assert.equal(rowColorOf(tree, '是否可用'), '#c92a2a', 'not usable is red');
+
+  // 已装配：同一行没有重启提示。
+  const healthy = sectionOf(api, statusWithData({ voiceCompaction: compactionOf() }));
+  assert.equal(rowValueOf(healthy, '装配（registered / mounted / active / running）'),
+    'registered 是 · mounted 1 · active 1 · running 1');
+  assert.equal(textsOf(healthy).some((text) => text.includes('需重启')), false);
+  assert.equal(rowColorOf(healthy, '是否可用'), null, 'usable is not red');
+
+  console.log(`[3] restarting="${assembly}" ; healthy="${rowValueOf(healthy, '装配（registered / mounted / active / running）')}"`);
+});
+
+test('4. 复制报告：含自动压缩字段、受控码保留、不含路径与会话 id', async () => {
+  const api = loadDiagnostics();
+  const hot = compactionOf({
+    nearLimit: true,
+    pressure: {
+      nearLimit: true,
+      sessionId: 'seirein-2026-11-09',
+      tokens: 115_200,
+      windowTokens: 128_000,
+      ratio: 0.9,
+      threshold: 0.8,
+      at: 1,
+    },
+  });
+  const report = api.diagnosticsReportOf(statusWithData({ voiceCompaction: hot }), {
     clientVersion: '0.99.0',
     at: 1_700_000_000_000,
   });
-  assert.equal(typeof report, 'string');
   const parsed = JSON.parse(report);
+  assert.equal(parsed.compaction.presetId, 'seirein-voice-compaction');
+  assert.equal(parsed.compaction.status, 'registered');
+  assert.equal(parsed.compaction.source, 'registered');
+  assert.equal(parsed.compaction.registered, true);
+  assert.equal(parsed.compaction.enabled, true);
+  assert.equal(parsed.compaction.requiresRestart, false);
+  assert.equal(parsed.compaction.nearLimit, true);
+  assert.equal(parsed.compaction.pressure.tokens, 115_200);
+  assert.equal(parsed.compaction.pressure.windowTokens, 128_000);
+  assert.equal(parsed.compaction.pressure.ratio, 0.9);
+  assert.equal(parsed.compaction.pressure.threshold, 0.8);
+  assert.equal(JSON.stringify(parsed.compaction).includes('seirein-2026-11-09'), false,
+    'the sampled session id never enters the report');
+
+  // 冲突原因里的本机路径被脱敏，受控码与 note 原样保留。
+  const leaky = compactionOf({
+    status: 'conflict',
+    source: 'profile',
+    registered: false,
+    enabled: false,
+    reason: '自动压缩不可用：preset 注册失败（failed to open C:\\Users\\PrivateName\\voice-private.wav）',
+    note: '需重启 DSH 或执行 voice.session.recover 重新装配',
+  });
+  const leakReport = api.diagnosticsReportOf(statusWithData({ voiceCompaction: leaky }), {
+    clientVersion: '0.99.0',
+  });
+  const leakParsed = JSON.parse(leakReport);
+  assert.equal(leakParsed.compaction.status, 'conflict', 'controlled status code survives');
+  assert.equal(leakParsed.compaction.source, 'profile', 'controlled source code survives');
+  assert.match(leakParsed.compaction.reason, /<path>/u);
+  assert.equal(leakParsed.compaction.note, '需重启 DSH 或执行 voice.session.recover 重新装配');
+  for (const secret of ['PrivateName', 'voice-private.wav', 'C:\\Users']) {
+    assert.equal(leakReport.includes(secret), false, `the copied report leaked ${secret}`);
+  }
+
+  // 既有的报告契约不变：纯文本 JSON、白名单字段、无转写/字幕/音频路径。
+  assert.equal(typeof report, 'string');
   assert.equal(parsed.schema, 1);
   assert.equal(parsed.readError, null);
   assert.equal(parsed.instanceId, 'h7-abcd');
@@ -251,7 +400,6 @@ test('3. 复制报告：纯文本 JSON，不含转写/字幕/音频等用户内�
   assert.equal(parsed.motion.skip, 3);
   assert.equal(parsed.motion.lastSkipReason, 'no-candidate');
   assert.equal(parsed.libraries.lexicon.count, 8);
-
   for (const secret of [
     'PRIVATE TRANSCRIPT', 'PRIVATE SPEECH TEXT', 'PRIVATE AMBIENT AUDIO',
     'PRIVATE-AUDIO', 'captionText', 'speechText', 'voicePending', 'ambient.recent',
@@ -268,30 +416,25 @@ test('3. 复制报告：纯文本 JSON，不含转写/字幕/音频等用户内�
   });
   assert.deepEqual(copied, { ok: true, error: '' });
   assert.deepEqual(written, [report], 'the clipboard receives exactly the report');
-
   const unavailable = await api.copyDiagnosticsReport(report, null);
   assert.equal(unavailable.ok, false, 'no clipboard returns an error, never throws');
-  assert.equal(typeof unavailable.error, 'string');
 
-  // Even a failed read can be copied: the error text is part of the diagnostic summary.
+  // 读取失败也能复制：压缩块整体标记为不可用，而不是编造字段。
   const failedReport = JSON.parse(api.diagnosticsReportOf(null, { readError: 'HTTP 500' }));
   assert.equal(failedReport.readError, 'HTTP 500');
   assert.equal(failedReport.instanceId, null);
+  assert.equal(failedReport.compaction.available, false);
+  assert.equal(failedReport.compaction.presetId, null);
+  assert.equal(failedReport.compaction.enabled, null);
   assert.equal(Object.hasOwn(failedReport.voice, 'captionText'), false);
-});
 
-test('4. 复制报告脱敏：路径 / URL / 用户名不进报告，受控码保留，界面仍显示原文', async () => {
-  const api = loadDiagnostics();
-
-  // 纯函数：URL / 盘符路径 / home 路径 / UNC / 邮箱 一律换成占位符。
+  // 脱敏纯函数：路径 / URL / 用户名不进报告，受控码保留，界面仍显示原文。
   assert.equal(api.sanitizeDiagnosticText('C:\\Users\\PrivateName\\voice-private.wav'), '<path>');
   assert.equal(api.sanitizeDiagnosticText('failed to open /home/foo/bar'), 'failed to open <path>');
   assert.equal(api.sanitizeDiagnosticText('see https://x.y/z'), 'see <url>');
   assert.equal(api.sanitizeDiagnosticText('\\\\server\\share\\voice.wav'), '<path>');
   assert.equal(api.sanitizeDiagnosticText('mail: someone@example.com'), 'mail: <email>');
   assert.equal(api.sanitizeDiagnosticText(null), '', 'a non-string never throws');
-
-  // 受控码原样保留；自由文本错误压成「阶段 + 错误类别」。
   assert.equal(api.reportField('BLACK_FRAME'), 'BLACK_FRAME');
   assert.equal(api.reportField('HTTP 503'), 'HTTP 503');
   assert.equal(api.reportField('TTS_ABORTED'), 'TTS_ABORTED');
@@ -300,28 +443,17 @@ test('4. 复制报告脱敏：路径 / URL / 用户名不进报告，受控码�
     api.reportField('ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav', true),
     'ffmpeg: error',
   );
-  assert.equal(api.reportField('capture: failed /home/foo/bar', true), 'capture: error');
 
-  // 完整报告：lastError 里的真实 ffmpeg 原文被摘要，路径/用户名/文件名一个都不剩。
   const hearing = statusWithData().hearing;
   const leakyStatus = statusWithData({
     hearing: { ...hearing, lastError: 'ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav' },
   });
-  const report = api.diagnosticsReportOf(leakyStatus, { clientVersion: '0.99.0', at: 1_700_000_000_000 });
-  const parsed = JSON.parse(report);
-  assert.equal(parsed.voice.lastError, 'ffmpeg: error');
-  for (const secret of ['PrivateName', 'voice-private.wav', 'C:\\']) {
-    assert.equal(report.includes(secret), false, `the copied report leaked ${secret}`);
-  }
+  const leakyParsed = JSON.parse(api.diagnosticsReportOf(leakyStatus, { clientVersion: '0.99.0' }));
+  assert.equal(leakyParsed.voice.lastError, 'ffmpeg: error');
+  assert.ok(textsOf(sectionOf(api, leakyStatus)).some((text) => (
+    text.includes('ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav')
+  )), 'the panel still shows the raw detailed error');
 
-  // 对照：同一份状态的界面文案仍是原始详细错误，脱敏只作用于复制报告。
-  const shown = textsOf(sectionOf(api, leakyStatus));
-  assert.ok(
-    shown.some((text) => text.includes('ffmpeg: failed to open C:\\Users\\PrivateName\\voice-private.wav')),
-    'the panel still shows the raw detailed error',
-  );
-
-  // /home、URL、UNC 三种泄漏走同一条路：只剩「阶段: error」。
   const variants = [
     { lastError: 'capture: failed to open /home/foo/bar', stage: 'capture', needle: '/home' },
     { lastError: 'tts: https://x.y/z', stage: 'tts', needle: 'x.y' },
@@ -335,37 +467,106 @@ test('4. 复制报告脱敏：路径 / URL / 用户名不进报告，受控码�
     assert.equal(JSON.stringify(variant.voice).includes(needle), false, `${lastError} leaked ${needle}`);
   }
 
-  // 其它字符串字段也过同一个脱敏函数：路径变占位符。
   assert.equal(api.reportField('C:\\shots\\PRIVATE.png'), '<path>');
   const sceneReport = JSON.parse(api.diagnosticsReportOf(statusWithData({
     vision: { ...statusWithData().vision, scene: 'C:\\Users\\PrivateName\\scene.json' },
   })));
   assert.equal(sceneReport.vision.scene, '<path>');
-
-  // 读取失败与重启信息同样脱敏；受控码不动。
-  const failedReport = JSON.parse(api.diagnosticsReportOf(null, {
+  const failedRestart = JSON.parse(api.diagnosticsReportOf(null, {
     readError: 'HTTP 503',
     localRestart: { ok: false, message: 'ffmpeg: \\\\server\\share\\voice.wav' },
   }));
-  assert.equal(failedReport.readError, 'HTTP 503');
-  assert.equal(failedReport.restart.message, 'ffmpeg: error');
-  assert.equal(JSON.stringify(failedReport.restart).includes('server'), false);
-
+  assert.equal(failedRestart.readError, 'HTTP 503');
+  assert.equal(failedRestart.restart.message, 'ffmpeg: error');
+  assert.equal(JSON.stringify(failedRestart.restart).includes('server'), false);
   const abortReport = JSON.parse(api.diagnosticsReportOf(statusWithData({
     vision: { ...statusWithData().vision, virtualCamError: { code: 'TTS_ABORTED' } },
   })));
   assert.equal(abortReport.vision.virtualCamError, 'TTS_ABORTED');
 
-  // 复制出去的正是这份脱敏后的报告。
-  const written = [];
-  const copied = await api.copyDiagnosticsReport(report, {
-    writeText: async (text) => { written.push(text); },
-  });
-  assert.deepEqual(copied, { ok: true, error: '' });
-  assert.deepEqual(written, [report]);
+  console.log(`[4] compaction.status=${parsed.compaction.status} source=${parsed.compaction.source} `
+    + `ratio=${parsed.compaction.pressure.ratio} pathLeak=false copy=ok`);
 });
 
-test('5. 刷新重新拉取一次；诊断代码没有新增轮询', async () => {
+test('5. 缺字段 / 接口失败 / 畸形字段都显示不可用，不崩溃', async () => {
+  const api = loadDiagnostics();
+
+  // 空 status：五个分区 + 自动压缩全部占位，不抛异常。
+  const missingTree = sectionOf(api, {});
+  const missing = textsOf(missingTree);
+  assert.ok(missing.filter((text) => text === '不可用').length >= 16, 'missing fields show 不可用');
+  assert.ok(missing.includes('诊断（客户端）'), 'the panel still renders with no status');
+  for (const label of ['状态', '是否可用', '上下文压力', '装配（registered / mounted / active / running）']) {
+    assert.equal(rowValueOf(missingTree, label), '不可用', `missing compaction field renders 不可用: ${label}`);
+  }
+  for (const title of ['概况', '语音', '自动压缩', '视觉', '动作', '语言库 / 音频保留']) {
+    assert.ok(missing.includes(title), `missing data still renders the ${title} section`);
+  }
+  assert.equal(rowColorOf(missingTree, '是否可用'), null, 'an absent block is not painted red');
+
+  // 畸形字段（数字当状态、字符串当压力、非布尔当开关）同样不崩溃。
+  const odd = sectionOf(api, {
+    voiceCompaction: { status: 42, enabled: 'yes', pressure: 'nope', requiresRestart: 'yes', nearLimit: 1 },
+  });
+  assert.equal(rowValueOf(odd, '状态'), '不可用');
+  assert.equal(rowValueOf(odd, '是否可用'), '不可用');
+  assert.equal(rowValueOf(odd, '上下文压力'), '不可用');
+  assert.match(rowValueOf(odd, '装配（registered / mounted / active / running）'), /^registered — · mounted —/u);
+
+  const nonObject = sectionOf(api, { voiceCompaction: 'oops' });
+  assert.equal(rowValueOf(nonObject, '状态'), '不可用');
+  assert.equal(rowValueOf(nonObject, '装配（registered / mounted / active / running）'), '不可用');
+
+  // 读取失败：错误可见，所有分区仍是占位。
+  const failed = textsOf(api.diagnosticsSection(h, {
+    data: { status: null, error: 'HTTP 500', loading: false, at: 0 },
+    clientVersion: '0.99.0', restart: null, busy: false, onRefresh: () => {}, onCopy: () => {},
+  }));
+  assert.ok(failed.some((text) => text.includes('诊断读取失败：HTTP 500')), 'the read error is visible');
+  assert.ok(failed.filter((text) => text === '不可用').length >= 16, 'failed read keeps placeholders');
+
+  // 读取中：明确提示，刷新禁用，不冒充数值。
+  const loadingTree = api.diagnosticsSection(h, {
+    data: { status: null, error: '', loading: true, at: 0 },
+    clientVersion: '0.99.0', restart: null, busy: false, onRefresh: () => {}, onCopy: () => {},
+  });
+  assert.ok(textsOf(loadingTree).includes('正在读取诊断状态…'), 'loading hint');
+  assert.equal(buttonOf(loadingTree, '读取中…').props.disabled, true, 'refresh is disabled while loading');
+
+  // 单次拉取：一个面板只发一个 /assistant/status 请求，渲染不再请求。
+  const calls = [];
+  const api2 = loadDiagnostics(async (url, init) => {
+    calls.push({ url, init });
+    return { ok: true, status: 200, json: async () => statusWithData() };
+  });
+  const result = await api2.loadDiagnosticsStatus();
+  assert.equal(calls.length, 1, 'exactly one status request');
+  assert.equal(calls[0].url, '/assistant/status');
+  assert.equal(calls[0].init.cache, 'no-store');
+  assert.equal(result.error, '');
+  assert.equal(result.status.hearing.instanceId, 'h7-abcd');
+  for (let index = 0; index < 5; index += 1) sectionOf(api2, result.status);
+  assert.equal(calls.length, 1, 'rendering never fetches');
+
+  // 非 2xx 与超时都返回错误，不向调用方抛出。
+  const failedRead = await api2.loadDiagnosticsStatus(async () => ({ ok: false, status: 503 }));
+  assert.equal(failedRead.status, null);
+  assert.equal(failedRead.error, 'HTTP 503');
+  const timingOut = await api2.loadDiagnosticsStatus((_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener('abort', () => {
+      reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    });
+  }), 10);
+  assert.equal(timingOut.status, null);
+  assert.equal(timingOut.error, '请求超时', 'a timeout is reported, not thrown');
+
+  console.log(`[5] missingRows=4 placeholders>=16 oddFields=handled readError=HTTP 500 timeout=请求超时 requests=1`);
+});
+
+test('6. 回归：单次读取、手动刷新、无新增轮询；lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (t) => {
+  t.timeout = 420_000;
+
+  // 刷新重新拉取一次；诊断代码不安装定时器，Panel 挂载只读一次。
   let calls = 0;
   const api = loadDiagnostics(async () => {
     calls += 1;
@@ -375,11 +576,9 @@ test('5. 刷新重新拉取一次；诊断代码没有新增轮询', async () =>
       json: async () => ({ version: calls === 1 ? 'first' : 'second' }),
     };
   });
-
   const first = await api.loadDiagnosticsStatus();
   assert.equal(first.status.version, 'first');
   assert.equal(calls, 1);
-
   let refreshed = 0;
   const tree = api.diagnosticsSection(h, {
     data: { status: first.status, error: '', loading: false, at: 1 },
@@ -391,7 +590,6 @@ test('5. 刷新重新拉取一次；诊断代码没有新增轮询', async () =>
   });
   await buttonOf(tree, '刷新').props.onClick();
   assert.equal(refreshed, 1, 'the refresh button invokes its handler once');
-
   const second = await api.loadDiagnosticsStatus();
   assert.equal(second.status.version, 'second');
   assert.equal(calls, 2, 'each refresh is exactly one request');
@@ -404,29 +602,8 @@ test('5. 刷新重新拉取一次；诊断代码没有新增轮询', async () =>
   assert.match(clientSource, /diagnosticsSection\(h, \{/u, 'the panel is mounted in settings');
   assert.match(clientSource, /onRefresh: \(\) => void loadDiagnostics\(\)/u);
   assert.match(clientSource, /onCopy: \(\) => void copyDiagnostics\(\)/u);
-});
 
-/** Run one child suite and report its tail when it fails. */
-const runNode = (args) => new Promise((resolve) => {
-  // A nested `node --test` refuses to run when NODE_TEST_CONTEXT is inherited ("recursive run").
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
-  const child = spawn(process.execPath, args, {
-    cwd: projectRoot,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-    env,
-  });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (bytes) => { stdout += bytes; });
-  child.stderr.on('data', (bytes) => { stderr += bytes; });
-  child.once('error', (error) => resolve({ code: -1, stdout, stderr: String(error) }));
-  child.once('close', (code) => resolve({ code, stdout, stderr }));
-});
-
-test('6. 回归：lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (t) => {
-  t.timeout = 420_000;
+  // 子套件回归（client-diagnostics 本身即本条所在套件，不能递归自跑）。
   const suites = [
     ['--test', join('test', 'lexicon-ui.mjs')],
     ['--test', join('test', 'audio-retention-ui.mjs')],
@@ -448,4 +625,23 @@ test('6. 回归：lexicon-ui / audio-retention-ui / hearing-ui / smoke', async (
   }
   const summary = results.map(({ args, code }) => `${args.join(' ')} => exit ${code}`).join('; ');
   console.log(`[client-diagnostics 6] ${summary}`);
+});
+
+/** Run one child suite and report its tail when it fails. */
+const runNode = (args) => new Promise((resolve) => {
+  // A nested `node --test` refuses to run when NODE_TEST_CONTEXT is inherited ("recursive run").
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const child = spawn(process.execPath, args, {
+    cwd: projectRoot,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    env,
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (bytes) => { stdout += bytes; });
+  child.stderr.on('data', (bytes) => { stderr += bytes; });
+  child.once('error', (error) => resolve({ code: -1, stdout, stderr: String(error) }));
+  child.once('close', (code) => resolve({ code, stdout, stderr }));
 });
