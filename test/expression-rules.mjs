@@ -358,3 +358,25 @@ test('3. 冗余度量：重复正文 body.simCandidates>0，正文与口语版�
     + `bodyChars=${[...REPEATED_BODY].length} synthesized=${JSON.stringify(app.texts())}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// 4. History summary mode coexists with persona / expression; dialogue is untouched
+// ---------------------------------------------------------------------------
+test('4. 摘要模式段与 persona / 表达规则并存，正常对话段不被改写', async (t) => {
+  const app = await mount(t);
+  const summary = app.render('assistant:summary');
+  const persona = app.render('assistant:persona');
+  const expression = app.render('assistant:expression');
+
+  assert.equal(app.sections.get('assistant:summary')?.order, 331, 'the summary mode section keeps order 331');
+  assert.ok(summary.includes('历史摘要模式'), 'the summary mode heading is present');
+  assert.ok(summary.includes('当系统要求你总结、压缩或摘要对话历史时：'), 'the mode is scoped to summarization');
+  assert.ok(summary.includes('用第三人称、客观要点输出'), 'the summary output shape is objective third person');
+  assert.ok(summary.includes('不要以角色口吻回复'), 'the character voice is explicitly refused');
+  assert.ok(summary.includes('此模式优先于人设中的表达风格。'), 'the mode outranks the persona style');
+  assert.ok(persona.includes(PERSONA_LINE), 'the persona text is untouched');
+  assert.equal(persona.includes('历史摘要模式'), false, 'the rule never edits the persona text');
+  assert.ok(expression.includes('同一结论通常表达一次'), 'the normal expression rule still stands');
+  assert.ok(app.prompt().includes(PERSONA_LINE) && app.prompt().includes('历史摘要模式'), 'both survive in the assembled prompt');
+  t.diagnostic(`summary=${summary.length}chars order=${app.sections.get('assistant:summary').order} personaIntact=${persona.includes(PERSONA_LINE)}`);
+});

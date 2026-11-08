@@ -797,6 +797,9 @@ export function createVoiceCompaction({
   return {
     presetId, setup, ensure, attach, evidenceOf, ensurePreset,
     presetStatus, status: presetStatus, samplePressure,
+    // The window size the pressure sample uses, so recovery can report a real ratio instead of
+    // guessing one from `before`/`after` alone.
+    resolveWindowTokens,
   };
 }
 
@@ -848,6 +851,10 @@ export function createVoiceSessionRecovery({
         before: payload.before ?? null,
         after: payload.after ?? null,
         freed: payload.freed ?? null,
+        // Real pressure (tokens/window/ratio) at each point, or null when the meter could not be
+        // read: `before`/`after` alone are absolute counts, not the pressure an operator expects.
+        pressureBefore: payload.pressureBefore ?? null,
+        pressureAfter: payload.pressureAfter ?? null,
         // The machine code is the stable filter value; success falls back to its own note.
         reason: typeof payload.code === 'string' && payload.code.length > 0
           ? payload.code
@@ -869,6 +876,8 @@ export function createVoiceSessionRecovery({
     before: null,
     after: null,
     freed: null,
+    pressureBefore: null,
+    pressureAfter: null,
     compacted: false,
     ...payload,
   });
@@ -878,6 +887,25 @@ export function createVoiceSessionRecovery({
 
   /** Estimated request tokens (token meter first, backend measure second), or null. */
   const measureTokens = (agent, service) => measureAgentTokens(getService, agent, service);
+
+  /**
+   * Context pressure for a measured token count: `{ tokens, window, ratio }`, or null when the
+   * count or the window is unavailable. A ratio is never estimated from `before`/`after`; an
+   * unreadable meter or window stays null so the caller cannot mistake a guess for a measurement.
+   */
+  const pressureOf = (tokens, window) => {
+    if (tokens === null || !Number.isFinite(window) || window <= 0) return null;
+    return { tokens, window, ratio: Math.round((tokens / window) * 1000) / 1000 };
+  };
+  /** The window size the compaction engine samples against, or null when it cannot name one. */
+  const windowTokensOf = () => {
+    try {
+      const window = typeof engine?.resolveWindowTokens === 'function' ? engine.resolveWindowTokens() : null;
+      return Number.isFinite(window) && window > 0 ? window : null;
+    } catch {
+      return null;
+    }
+  };
 
   /**
    * Resolve the requested session (argument or today's voice session) and refuse before any
@@ -1003,14 +1031,19 @@ export function createVoiceSessionRecovery({
     }
 
     const service = serviceOf(agent);
+    const windowTokens = windowTokensOf();
     const before = measureTokens(agent, service);
+    const pressureBefore = pressureOf(before, windowTokens);
     if (typeof service?.compactNow !== 'function') {
-      return fail({ sessionId, mounted: true, before, code: 'compaction-unavailable', reason: '该作用域没有 compactNow()' });
+      return fail({ sessionId, mounted: true, before, pressureBefore, code: 'compaction-unavailable', reason: '该作用域没有 compactNow()' });
     }
     try {
       // Manual idle compaction: allowed below the pressure threshold, opens no turn.
       const compacted = await service.compactNow(agent, new AbortController().signal);
+      // Re-measure AFTER compaction (the same meter, only if it is available): `before`/`after` are
+      // raw counts, while `pressureBefore`/`pressureAfter` add the window and ratio an operator reads.
       const after = measureTokens(agent, service);
+      const pressureAfter = pressureOf(after, windowTokens);
       const freed = before !== null && after !== null ? before - after : null;
       const idle = compacted === null || compacted === undefined;
       return done({
@@ -1020,6 +1053,8 @@ export function createVoiceSessionRecovery({
         before,
         after,
         freed,
+        pressureBefore,
+        pressureAfter,
         compacted: !idle,
         ...(idle ? { reason: 'no-compactable-range' } : {}),
       });
@@ -1029,6 +1064,7 @@ export function createVoiceSessionRecovery({
         sessionId,
         mounted: true,
         before,
+        pressureBefore,
         code: 'compaction-failed',
         reason: describe(error),
         error: describe(error),
