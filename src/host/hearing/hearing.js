@@ -977,6 +977,7 @@ export function startHearing({
         // P1 evidence: how much of the input the echo did not cover, and what it was.
         extraChars: verdict.extraChars ?? 0,
         extraKind: verdict.extraKind ?? '',
+        residual: verdict.residual ?? '',
       });
     } catch {
       /* a diagnostic row must never break delivery */
@@ -1612,6 +1613,7 @@ export function startHearing({
           // A drop is a PURE echo: no uncovered characters, no extra kind.
           extraChars: echo.extraChars ?? 0,
           extraKind: echo.extraKind ?? '',
+          residual: echo.residual ?? '',
         });
       } catch {
         /* an event sink must never break capture */

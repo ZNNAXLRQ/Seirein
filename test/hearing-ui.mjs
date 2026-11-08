@@ -150,3 +150,56 @@ test('4. 回归：设置页的数字输入不再用 defaultValue 做一次性绑
   assert.match(clientSource, /value: sizeMaxDraft \?\? String\(sub\.sizeMax \?\? 32\),/u);
   assert.match(clientSource, /onChange: \(event\) => setSizeMaxDraft\(event\.target\.value\),/u);
 });
+
+/**
+ * 阈值保存后的提示分支：从 client.js 抽出真正发货的 `onSave` 处理器，用记录型 `act`/`show`
+ * 求值。三个分支分别是「重启成功（新实例）」「已保存但采集未运行」「重启失败」。
+ */
+const loadThresholdSave = () => {
+  const marker = "const result = await act({ action: 'hearing.threshold', db }, 'threshold');";
+  const at = clientSource.indexOf(marker);
+  assert.ok(at > 0, 'the shipped threshold save is found in client.js');
+  const anchor = clientSource.lastIndexOf('onSave: async (db) => {', at);
+  assert.ok(anchor > 0, 'the threshold row onSave handler is found');
+  const end = clientSource.indexOf('\n            },', anchor);
+  assert.ok(end > anchor, 'the onSave handler body is bounded');
+  const body = clientSource.slice(anchor + 'onSave: async (db) => {'.length, end);
+  return new Function('act', 'show', `return async (db) => {${body}\n};`);
+};
+
+test('5. 阈值保存提示：成功重启 / 采集未运行 / 失败三种分支', async () => {
+  const build = loadThresholdSave();
+  const run = async (result) => {
+    const shown = [];
+    const calls = [];
+    const onSave = build(
+      async (body, tag) => {
+        calls.push({ body, tag });
+        return result;
+      },
+      (message) => shown.push(message),
+    );
+    await onSave(-35);
+    return { shown, calls };
+  };
+
+  const restarted = await run({ ok: true, restarted: true, db: -35, instanceId: 'inst-1' });
+  assert.deepEqual(restarted.shown, ['已生效（新实例）'], '重启成功提示新实例已生效');
+  assert.deepEqual(
+    restarted.calls,
+    [{ body: { action: 'hearing.threshold', db: -35 }, tag: 'threshold' }],
+    '保存仍然发出 hearing.threshold 请求',
+  );
+
+  const idle = await run({ ok: true, restarted: false, db: -35, reason: 'not-running' });
+  assert.deepEqual(idle.shown, ['已保存（采集未运行）'], '采集未运行时说明已保存');
+
+  const failed = await run({
+    ok: false, restarted: false, db: -35, error: '重启采集失败', message: '重启失败：重启采集失败',
+  });
+  assert.deepEqual(failed.shown, ['重启失败：重启采集失败'], '失败时显示宿主给的 message');
+
+  const bare = await run({ ok: false });
+  assert.deepEqual(bare.shown, ['保存失败'], '没有 message/error 时回退到通用提示');
+});
+

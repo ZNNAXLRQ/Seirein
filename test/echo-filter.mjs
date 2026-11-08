@@ -223,6 +223,7 @@ test('1) 播放中识别出与正在播放文本完全相同 → drop，事件 h
     reason: 'playback-echo',
     extraChars: 0,
     extraKind: '',
+    residual: '',
   });
   assert.equal(candidatesOf(events).length, 0, 'a dropped echo is not also a candidate');
 });
@@ -672,6 +673,7 @@ test('18) P1 新增内容判定：correction / other / 单字符残余', async (
   assert.equal(single.candidates[0].payload.reason, 'mixed');
   assert.equal(single.candidates[0].payload.extraChars, 1, 'the residual is counted…');
   assert.equal(single.candidates[0].payload.extraKind, 'other', '…and is not a tone particle');
+  assert.equal(single.candidates[0].payload.residual, '吗', 'the residual itself is on the event');
 });
 
 // ---------------------------------------------------------------------------
@@ -703,8 +705,9 @@ test('19) P2 反例：单字「吗」把陈述变提问 → 放行，extraChars=
   assert.equal(candidates[0].payload.extraChars, 1);
   assert.equal(candidates[0].payload.extraKind, 'other', '「吗」is real content, not a protection word');
   assert.equal(candidates[0].payload.delivered, true);
+  assert.equal(candidates[0].payload.residual, '吗', 'the candidate event carries the uncovered text');
 
-  // The residual is carried on the verdict (`hearing.js` writes extraChars/extraKind to the event).
+  // The residual is carried on the verdict (`hearing.js` writes extraChars/extraKind/residual to the event).
   const verdict = gateTomorrow(text);
   assert.equal(verdict.drop, false);
   assert.equal(verdict.reason, 'mixed');
@@ -725,6 +728,7 @@ test('20) P2 纯回声对照：「我明天会去图书馆学习」→ 仍 drop�
   assert.equal(drops[0].payload.reason, 'playback-echo');
   assert.equal(drops[0].payload.extraChars, 0);
   assert.equal(drops[0].payload.extraKind, '');
+  assert.equal(drops[0].payload.residual, '', 'a pure echo has no residual');
   assert.equal(candidates.length, 0);
   assert.equal(stats.echoDropped, 1);
   const verdict = gateTomorrow(TOMORROW);
@@ -830,3 +834,32 @@ test('24) P2 回归：无 speechText / 未播放 → 放行（含单字新增）
   assert.equal(notPlaying.drops.length, 0);
   assert.equal(notPlaying.candidates[0].payload.reason, 'not-playing');
 });
+
+// ---------------------------------------------------------------------------
+// residual field: both echo rows carry the uncovered text (empty for a pure echo)
+// ---------------------------------------------------------------------------
+
+test('25) residual：candidate 事件带未覆盖原文，dropped 纯回声为 ""', async () => {
+  const mixed = await runClip({
+    streamingText: `${TOMORROW}吗`,
+    workerText: `${TOMORROW}吗`,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(mixed.candidates.length, 1);
+  assert.equal(mixed.candidates[0].payload.extraChars, 1);
+  assert.equal(mixed.candidates[0].payload.residual, '吗', 'candidate carries the uncovered text');
+
+  const pure = await runClip({
+    streamingText: TOMORROW,
+    workerText: TOMORROW,
+    playing: true,
+    playingText: TOMORROW,
+    vadSegments: [{ startMs: 100, endMs: 160 }],
+  });
+  assert.equal(pure.drops.length, 1);
+  assert.equal(pure.drops[0].payload.extraChars, 0);
+  assert.equal(pure.drops[0].payload.residual, '', 'a pure echo drops with an empty residual');
+});
+

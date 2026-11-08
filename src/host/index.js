@@ -342,7 +342,13 @@ import {
   createSpokenUnitStream,
   createUnitSizer,
   shouldSkipSpokenVersion,
+  splitSemanticUnits,
 } from './speech/spokenPipeline.js';
+import {
+  DEFAULT_ADJACENT_THRESHOLD,
+  DEFAULT_SIMILARITY_THRESHOLD,
+  spokenSimilarity,
+} from './speech/spoken-dedupe.js';
 
 import {
   C2_DEFAULT_FUZZY_DAYS,
@@ -9371,6 +9377,16 @@ export function apply(ctx, config) {
     '- 不要解释“我听到的是 X，但我理解为 Y”。',
   ].join('\n');
 
+  // Expression rule: one conclusion, said once. This is a functional instruction, not the persona
+  // text — the persona section stays untouched, and a persona that explicitly asks for repetition
+  // still wins (the last line says so).
+  const EXPRESSION_CONVENTION = [
+    '## 表达',
+    '同一结论通常表达一次。后续句子应补充新的事实、条件、理由或行动；',
+    '没有新增信息时，不换一种说法重述，也不在结尾再次总结。',
+    '保留必要的强调、纠正和自然的情绪表达；若人设明确要求重复风格，以人设文本为准。',
+  ].join('\n');
+
   // One answer, two expressions, one voice outlet. The final answer is spoken by the host, so
   // `assistant_say` is no longer the mandatory speaking channel; a progress line is a different
   // event from the answer and must never replace it.
@@ -9604,6 +9620,15 @@ export function apply(ctx, config) {
         name: 'assistant:voice-output',
         order: 320,
         text: scopedText(VOICE_OUTPUT_CONVENTION),
+      }),
+    );
+    // Functional expression rule, independent of the persona text: the persona section above is
+    // never rewritten, and this section only adds the "say each conclusion once" convention.
+    scope.effect(() =>
+      scope.systemPrompt.section({
+        name: 'assistant:expression',
+        order: 330,
+        text: scopedText(EXPRESSION_CONVENTION),
       }),
     );
     // No `assistant:memory-fixed` section any more (2026-11-06): importance never grants
@@ -10453,18 +10478,51 @@ export function apply(ctx, config) {
     return config?.typedReply?.voice !== false;
   };
   /**
+   * Read-only redundancy measurement for one expression of a reply. It counts sentence PAIRS that
+   * the spoken de-duplicator would treat as the same layer (same thresholds), and never edits the
+   * text: no sentence is removed, merged or reworded here.
+   */
+  const measureRedundancy = (text) => {
+    const sentences = splitSemanticUnits(String(text ?? ''), { clauseSplit: false });
+    let simCandidates = 0;
+    for (let left = 0; left < sentences.length; left += 1) {
+      for (let right = left + 1; right < sentences.length; right += 1) {
+        const threshold = right === left + 1 ? DEFAULT_ADJACENT_THRESHOLD : DEFAULT_SIMILARITY_THRESHOLD;
+        if (spokenSimilarity(sentences[left], sentences[right]) >= threshold) simCandidates += 1;
+      }
+    }
+    return { sentences: sentences.length, simCandidates };
+  };
+  /** One debug row per answered round: body and spoken version measured, never edited. */
+  const emitReplyRedundancy = ({ turn = null, bodyText = '', spokenText = '' } = {}) => {
+    void log.emit('voice.reply.redundancy', {
+      turn: Number.isSafeInteger(turn) ? turn : null,
+      body: measureRedundancy(bodyText),
+      spoken: measureRedundancy(spokenText),
+    }).catch(() => {});
+  };
+  /**
    * The typed round gets the same speech treatment as a voice round: the session keeps the full
    * body, the voice outlet says the condensed version. Short answers and explicit "read it all"
    * requests are spoken verbatim; a failed rewrite falls back to the full body.
    */
-  const condenseForSpeech = async (text, { signal = undefined, utterance = '' } = {}) => {
+  const condenseForSpeech = async (text, {
+    signal = undefined, utterance = '', turn = null, turnId = null,
+  } = {}) => {
     const raw = String(text ?? '');
     const full = formatSpeech(raw).speech.trim();
-    if (full.length === 0) return { text: raw, caption: raw, source: 'original' };
+    // `typed-reply` passes the turn as `turnId`; the metric row uses one field name either way.
+    const boundTurn = Number.isSafeInteger(turn) ? turn : (Number.isSafeInteger(turnId) ? turnId : null);
+    // Every exit is measured once (body vs. spoken), so a short/verbatim round is covered too.
+    const finish = (result) => {
+      emitReplyRedundancy({ turn: boundTurn, bodyText: full, spokenText: result.text });
+      return result;
+    };
+    if (full.length === 0) return finish({ text: raw, caption: raw, source: 'original' });
     // "详细讲 / 全部读出来" is a per-round decision: the typed path must keep that exception too.
-    if (requestsFullRead(utterance)) return { text: full, caption: full, source: 'original' };
-    if (isShortSpokenReply(full)) return { text: raw, caption: raw, source: 'original' };
-    if (lightweight === null) return { text: full, caption: full, source: 'full-fallback' };
+    if (requestsFullRead(utterance)) return finish({ text: full, caption: full, source: 'original' });
+    if (isShortSpokenReply(full)) return finish({ text: raw, caption: raw, source: 'original' });
+    if (lightweight === null) return finish({ text: full, caption: full, source: 'full-fallback' });
     let profileText = '';
     try {
       profileText = String(maintainProfile().readBoxes()?.user ?? '').trim();
@@ -10476,7 +10534,7 @@ export function apply(ctx, config) {
       const result = await lightweight.ask({
         task: 'spoken',
         context: 'none',
-        system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。`,
+        system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。\n提炼核心回应，不逐段复述正文；不要重复正文里已经说过的铺陈与例子；\n输出一段连贯口语，一句话说清一个意思。`,
         user: `<完整答复>\n${full}\n</完整答复>`,
         maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
         timeoutMs: SPOKEN_VERSION_TIMEOUT_MS,
@@ -10488,13 +10546,13 @@ export function apply(ctx, config) {
           turn: null, purpose: 'typed', replyVersion: 0, chars: checked.chars,
           source: 'condensed', ms: Number(result?.doneMs) || 0, adopted: true, refused: false,
         }).catch(() => {});
-        return { text: checked.text, caption: checked.text, source: 'condensed' };
+        return finish({ text: checked.text, caption: checked.text, source: 'condensed' });
       }
       void log.emit('voice.spoken.fallback', { turn: null, purpose: 'typed', reason: checked.reason }).catch(() => {});
     } catch (error) {
       void log.emit('voice.spoken.fallback', { turn: null, purpose: 'typed', reason: error?.message ?? String(error) }).catch(() => {});
     }
-    return { text: full, caption: full, source: 'full-fallback' };
+    return finish({ text: full, caption: full, source: 'full-fallback' });
   };
 
   const typedVoice = createTypedVoiceRelay({
@@ -11904,6 +11962,13 @@ export function apply(ctx, config) {
           // session; this never adds a second assistant message.
           bodyEndedText = done.text ?? '';
           const streamed = await applySpokenVersion();
+          // Read-only metric: the body and the spoken version are measured, never edited. It is
+          // written after the round's speech so both expressions are already final.
+          emitReplyRedundancy({
+            turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
+            bodyText: done.text ?? '',
+            spokenText: spokenPlan?.text ?? '',
+          });
           if (streamed !== undefined && streamed !== null) {
             if (streamed.sentences > 0) {
               await log.emit('voice.first-sentence', {

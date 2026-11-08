@@ -2963,7 +2963,9 @@ window.__ModuleLoader__.load({
             onDraft: setThresholdDraft,
             onSave: async (db) => {
               const result = await act({ action: 'hearing.threshold', db }, 'threshold');
-              if (result.ok) show(`阈值已设为 ${result.db} dB`);
+              if (result.ok && result.restarted) show('已生效（新实例）');
+              else if (result.ok) show('已保存（采集未运行）');
+              else show(result.message ?? result.error ?? '保存失败');
             },
           }),
           callModeSection(h, {
