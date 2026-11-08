@@ -19,6 +19,17 @@
  * Everything Harness-specific is reached through the Host context (`getService` + `ctx.on`); no
  * Harness package is imported, so a profile without the preset registry keeps working (the voice
  * agent simply stays uncompacted).
+ *
+ * Four limits are explicit, never silent:
+ *  - a same-id declaration is reused ONLY after its content passes `assessVoiceCompactionPreset`
+ *    (compaction rows, nothing else); an incompatible one is reported as `conflict` and neither
+ *    overwritten nor mounted;
+ *  - fail-open is a DEGRADED state: `status` carries `enabled:false` + `reason`, and context
+ *    pressure at `nearLimitRatio` of the window sets `near-limit:true` plus one throttled
+ *    `voice.compaction.near-limit` event;
+ *  - `detach()` removes only a definition this instance registered (a reused one is preserved);
+ *  - registration does not retro-assemble a running Agent: `status` separates `registered` /
+ *    `mounted` / `active` and, when they diverge, says restart or `voice.session.recover` is needed.
  */
 
 /** Preset identity Seirein's voice agent runs. */
@@ -55,6 +66,131 @@ export const VOICE_COMPACTION_PRESET = Object.freeze({
   ],
 });
 
+/**
+ * The capability rows this preset MUST carry, and the single pruning row it MAY carry. A same-id
+ * declaration that carries anything else (a tool, a persona, a permission grant) is NOT this
+ * preset: reusing it would hand the voice Agent capabilities this module never intended.
+ */
+export const VOICE_COMPACTION_REQUIRED_PLUGINS = Object.freeze(['compaction-basic', 'command-compact']);
+export const VOICE_COMPACTION_OPTIONAL_PLUGINS = Object.freeze(['tool-result-pruner']);
+/** Declaration keys that would grant a preset more than compaction. */
+const VOICE_COMPACTION_EXTRA_KEYS = Object.freeze([
+  'tools', 'permissions', 'persona', 'systemPrompt', 'prompt', 'allowedTools', 'sandbox', 'mcp',
+]);
+
+/** Pressure: warn at 80% of the context window, at most once per minute per plugin instance. */
+export const VOICE_COMPACTION_NEAR_LIMIT_RATIO = 0.8;
+export const VOICE_COMPACTION_NEAR_LIMIT_THROTTLE_MS = 60_000;
+/** Used only when neither the caller nor a token meter names a window size. */
+export const VOICE_COMPACTION_DEFAULT_WINDOW_TOKENS = 128_000;
+/** What the operator must do when a live Agent was never assembled. */
+export const VOICE_COMPACTION_RESTART_NOTE = '需重启 DSH 或执行 voice.session.recover 重新装配';
+
+/** `@deepseek-ai/dsh-compaction-basic` and `compaction-basic` name the same capability row. */
+const pluginNameOf = (row) => {
+  const raw = typeof row?.name === 'string' && row.name.length > 0
+    ? row.name
+    : (typeof row?.id === 'string' ? row.id : '');
+  const unscoped = raw.includes('/') ? raw.slice(raw.lastIndexOf('/') + 1) : raw;
+  return unscoped.replace(/^dsh-/u, '');
+};
+
+/** Every alias one row may be recognized by (its id, and its package name without scope). */
+const pluginAliasesOf = (row) => {
+  const aliases = [];
+  if (typeof row?.id === 'string') aliases.push(row.id.replace(/^dsh-/u, ''));
+  const name = pluginNameOf(row);
+  if (name.length > 0) aliases.push(name);
+  return [...new Set(aliases)];
+};
+
+/**
+ * Audit a same-id declaration before it may be reused.
+ *
+ * Compatible: exactly the required compaction rows plus (optionally) the pruner, inside a plain
+ * group and with no capability-bearing top-level/group key. Everything else is reported as a
+ * conflict — never silently mounted, never overwritten, never unregistered by this plugin.
+ *
+ * @param {unknown} definition the registry's stored declaration
+ * @returns {{compatible: boolean, reason: string, plugins: string[], missing: string[], extras: string[]}}
+ */
+export function assessVoiceCompactionPreset(definition) {
+  const leaves = [];
+  const extras = [];
+  for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
+    if (definition?.[key] !== undefined) extras.push(`preset:${key}`);
+  }
+  if (!Array.isArray(definition?.plugins)) {
+    return { compatible: false, reason: '无法读取 preset 定义内容（缺少 plugins）', plugins: [], missing: [], extras };
+  }
+  const walk = (list, depth) => {
+    if (!Array.isArray(list) || depth > 4) return;
+    for (const row of list) {
+      if (row === null || typeof row !== 'object') {
+        extras.push('插件:?');
+        continue;
+      }
+      if (row.group === true) {
+        for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
+          if (row[key] !== undefined) extras.push(`group:${key}`);
+        }
+        walk(row.config, depth + 1);
+        continue;
+      }
+      const aliases = pluginAliasesOf(row);
+      if (aliases.length === 0) extras.push('插件:?');
+      else leaves.push(aliases);
+    }
+  };
+  walk(definition.plugins, 0);
+  const allowed = new Set([...VOICE_COMPACTION_REQUIRED_PLUGINS, ...VOICE_COMPACTION_OPTIONAL_PLUGINS]);
+  const plugins = leaves.map((aliases) => aliases[0]);
+  const missing = VOICE_COMPACTION_REQUIRED_PLUGINS.filter((name) => !leaves.some((aliases) => aliases.includes(name)));
+  for (const aliases of leaves) {
+    if (!aliases.some((name) => allowed.has(name))) extras.push(`插件:${aliases[0]}`);
+  }
+  if (missing.length > 0) {
+    return { compatible: false, reason: `缺少压缩能力: ${missing.join(', ')}`, plugins, missing, extras };
+  }
+  if (extras.length > 0) {
+    return { compatible: false, reason: `附带压缩以外的内容: ${extras.join(', ')}`, plugins, missing, extras };
+  }
+  return { compatible: true, reason: '', plugins, missing, extras };
+}
+
+/** Estimated request tokens (token meter first, backend measure second), or null. */
+function measureAgentTokens(getService, agent, service) {
+  const total = (value) => {
+    const number = Number(value?.totalTokens ?? value);
+    return Number.isFinite(number) ? number : null;
+  };
+  try {
+    const meter = getService('tokenMeter');
+    if (typeof meter?.measure === 'function') {
+      const measured = total(meter.measure(agent.session));
+      if (measured !== null) return measured;
+    }
+  } catch {
+    /* no meter: the honest answer is null, never a guess */
+  }
+  try {
+    if (typeof service?.measure === 'function') return total(service.measure(agent.session));
+  } catch {
+    /* backend measurement is optional too */
+  }
+  return null;
+}
+
+/** The compaction engine of an Agent's own preset realm (undefined when unbound). */
+function compactionServiceOf(getService, agent) {
+  try {
+    const presets = getService('agentPresets');
+    return typeof presets?.serviceFor === 'function' ? presets.serviceFor(agent, 'compaction') : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The only Session identities this module may touch: `seirein-YYYY-MM-DD`. */
 const VOICE_SESSION_ID_RE = /^seirein-\d{4}-\d{2}-\d{2}$/u;
 /** @param {unknown} id @returns {boolean} whether the Session id is Seirein's dated voice session. */
@@ -68,6 +204,10 @@ export function isVoiceSessionId(id) {
  *   log?: { emit?: (type: string, payload: object) => unknown } | null,
  *   presetId?: string,
  *   presetDefinition?: object,
+ *   windowTokens?: number | null,
+ *   nearLimitRatio?: number,
+ *   nearLimitThrottleMs?: number,
+ *   now?: () => number,
  * }} options
  */
 export function createVoiceCompaction({
@@ -75,6 +215,10 @@ export function createVoiceCompaction({
   log = null,
   presetId = VOICE_COMPACTION_PRESET_ID,
   presetDefinition = VOICE_COMPACTION_PRESET,
+  windowTokens = null,
+  nearLimitRatio = VOICE_COMPACTION_NEAR_LIMIT_RATIO,
+  nearLimitThrottleMs = VOICE_COMPACTION_NEAR_LIMIT_THROTTLE_MS,
+  now = () => Date.now(),
 }) {
   /** Agents whose composition this instance already verified. */
   const mounted = new WeakSet();
@@ -83,13 +227,20 @@ export function createVoiceCompaction({
   /** Verified evidence per Agent; never derived from the recorded marker. */
   const records = new WeakMap();
   /** Registration state of the preset itself (one per plugin instance). */
-  let presetState = { status: 'idle', source: null, registered: false, error: null, at: 0 };
+  let presetState = { status: 'idle', source: null, registered: false, error: null, reason: null, at: 0 };
   /** In-flight registration; concurrent callers settle together. */
   let presetPending = null;
   /** Disposer returned by `agentPresets.register()`; owned only when this instance registered. */
   let presetUnregister = null;
   /** A detach in progress; a later attach waits for the previous definition to be gone. */
   let presetRelease = null;
+  /** Last sampled pressure (worst voice Agent), independent of any event emission. */
+  let pressure = {
+    nearLimit: false, sessionId: '', tokens: null, windowTokens: null, ratio: null,
+    threshold: nearLimitRatio, at: 0,
+  };
+  /** Throttle stamp for `voice.compaction.near-limit`; reset when pressure falls again. */
+  let nearLimitEmittedAt = 0;
 
   const note = (type, payload) => {
     try {
@@ -150,36 +301,60 @@ export function createVoiceCompaction({
   /**
    * Ensure the plugin-owned preset exists, at most once per instance.
    *
-   * Existing (same id) → reuse and never call `register()`. Missing → `register(definition)`.
+   * A same-id declaration is reused ONLY after `assessVoiceCompactionPreset` proves it carries the
+   * compaction rows and nothing else. An incompatible declaration is a CONFLICT: it is not
+   * overwritten, not unregistered, and not mounted, and the state says why. Missing → `register()`.
    * Failure → one `voice.compaction.preset.register-failed` event and a latched failed state;
-   * callers fail open, so voice keeps running without compaction. `unavailable` is retried by the
-   * next call because the registry service may simply not be mounted yet.
+   * callers fail open, so voice keeps running without compaction — and status reports exactly that,
+   * so fail-open is never mistaken for a working compressor. `unavailable` is retried because the
+   * registry service may simply not be mounted yet.
    */
   const ensurePreset = async (presetsArg) => {
     if (presetRelease !== null) await presetRelease.catch(() => {});
-    if (presetState.status === 'registered' || presetState.status === 'reused' || presetState.status === 'failed') {
+    if (
+      presetState.status === 'registered' || presetState.status === 'reused'
+      || presetState.status === 'failed' || presetState.status === 'conflict'
+    ) {
       return presetState;
     }
     if (presetPending !== null) return await presetPending;
     const presets = presetsArg ?? getService('agentPresets');
     if (presets === undefined || presets === null) {
-      presetState = { status: 'unavailable', source: null, registered: false, error: null, at: Date.now() };
+      presetState = { status: 'unavailable', source: null, registered: false, error: null, reason: null, at: Date.now() };
       return presetState;
     }
 
-    const run = (async () => {
-      const existing = await readExisting(presets);
-      if (existing !== undefined) {
-        presetState = { status: 'reused', source: sourceOf(existing), registered: false, error: null, at: Date.now() };
-        note('voice.compaction.preset.reused', { presetId, source: presetState.source });
+    /** Reuse only an audited-compatible declaration; anything else is an explicit conflict. */
+    const adoptExisting = (existing) => {
+      const source = sourceOf(existing);
+      const audit = assessVoiceCompactionPreset(existing);
+      if (!audit.compatible) {
+        presetState = {
+          status: 'conflict',
+          source,
+          registered: false,
+          error: null,
+          reason: audit.reason,
+          at: Date.now(),
+        };
+        note('voice.compaction.preset.conflict', { presetId, source, reason: audit.reason });
         return presetState;
       }
+      presetState = { status: 'reused', source, registered: false, error: null, reason: null, at: Date.now() };
+      note('voice.compaction.preset.reused', { presetId, source, plugins: audit.plugins });
+      return presetState;
+    };
+
+    const run = (async () => {
+      const existing = await readExisting(presets);
+      if (existing !== undefined) return adoptExisting(existing);
       if (typeof presets.register !== 'function') {
         presetState = {
           status: 'failed',
           source: null,
           registered: false,
           error: 'agentPresets.register() is unavailable',
+          reason: null,
           at: Date.now(),
         };
         note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
@@ -188,7 +363,7 @@ export function createVoiceCompaction({
       try {
         const disposer = await presets.register(presetDefinition);
         presetUnregister = typeof disposer === 'function' ? disposer : null;
-        presetState = { status: 'registered', source: 'registered', registered: true, error: null, at: Date.now() };
+        presetState = { status: 'registered', source: 'registered', registered: true, error: null, reason: null, at: Date.now() };
         note('voice.compaction.preset.registered', {
           presetId,
           source: 'registered',
@@ -196,14 +371,25 @@ export function createVoiceCompaction({
         });
       } catch (error) {
         // A declaration that appeared between the read and register() is a migration race, not a
-        // failure: the existing declaration wins and this instance must not remove it.
+        // failure: the declaration that won the race must pass the SAME audit before it is used.
         if (/duplicate agent preset/iu.test(describe(error))) {
-          presetState = { status: 'reused', source: 'profile', registered: false, error: null, at: Date.now() };
-          note('voice.compaction.preset.reused', { presetId, source: presetState.source, reason: 'duplicate' });
-        } else {
-          presetState = { status: 'failed', source: null, registered: false, error: describe(error), at: Date.now() };
-          note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
+          const raced = await readExisting(presets);
+          if (raced === undefined) {
+            presetState = {
+              status: 'conflict',
+              source: 'unknown',
+              registered: false,
+              error: null,
+              reason: '同 ID 定义已存在，但无法读取其内容，不能确认兼容',
+              at: Date.now(),
+            };
+            note('voice.compaction.preset.conflict', { presetId, source: 'unknown', reason: presetState.reason });
+            return presetState;
+          }
+          return adoptExisting(raced);
         }
+        presetState = { status: 'failed', source: null, registered: false, error: describe(error), reason: null, at: Date.now() };
+        note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
       }
       return presetState;
     })();
@@ -216,23 +402,137 @@ export function createVoiceCompaction({
     }
   };
 
-  /** Read-only snapshot for `status` and tests; never includes the declaration itself. */
-  const presetStatus = () => ({ presetId, ...presetState });
+  /** Live Agents whose session id belongs to Seirein's dated voice session. */
+  const liveVoiceAgents = () => {
+    try {
+      const agents = getService('agents');
+      const rows = typeof agents?.list === 'function' ? agents.list() : [];
+      return Array.isArray(rows) ? rows.filter((agent) => isVoiceSessionId(agent?.id)) : [];
+    } catch {
+      return [];
+    }
+  };
+
+  /** Window size: explicit option, then the token meter's own, then the documented default. */
+  const resolveWindowTokens = () => {
+    if (Number.isFinite(windowTokens) && windowTokens > 0) return windowTokens;
+    try {
+      const meter = getService('tokenMeter');
+      for (const key of ['windowTokens', 'contextWindow', 'window', 'limit', 'capacity']) {
+        const value = Number(meter?.[key]);
+        if (Number.isFinite(value) && value > 0) return value;
+      }
+    } catch {
+      /* no meter: the documented default is the only honest window */
+    }
+    return VOICE_COMPACTION_DEFAULT_WINDOW_TOKENS;
+  };
+
+  /**
+   * Sample context pressure for the live voice Agents and latch it into `pressure`.
+   *
+   * This is the warning that fail-open does not replace: when the measured request approaches the
+   * window (`ratio >= nearLimitRatio`), the flag is in `status` AND one throttled
+   * `voice.compaction.near-limit` event is written. Reading status is the sampling trigger (the Web
+   * card polls it), so an uncompacted session cannot grow silently into the limit without the
+   * operator-visible flag; the event is the durable trace, never the only signal.
+   */
+  const samplePressure = () => {
+    const window = resolveWindowTokens();
+    let worst = null;
+    for (const agent of liveVoiceAgents()) {
+      const tokens = measureAgentTokens(getService, agent, compactionServiceOf(getService, agent));
+      if (tokens === null) continue;
+      const ratio = window > 0 ? tokens / window : 0;
+      if (worst === null || ratio > worst.ratio) worst = { sessionId: agent.id, tokens, ratio };
+    }
+    const nearLimit = worst !== null && worst.ratio >= nearLimitRatio;
+    pressure = {
+      nearLimit,
+      sessionId: worst?.sessionId ?? '',
+      tokens: worst?.tokens ?? null,
+      windowTokens: window,
+      ratio: worst === null ? null : Math.round(worst.ratio * 1000) / 1000,
+      threshold: nearLimitRatio,
+      at: now(),
+    };
+    if (!nearLimit) {
+      nearLimitEmittedAt = 0;
+      return pressure;
+    }
+    const stamp = now();
+    if (stamp - nearLimitEmittedAt >= nearLimitThrottleMs) {
+      nearLimitEmittedAt = stamp;
+      note('voice.compaction.near-limit', { presetId, ...pressure });
+    }
+    return pressure;
+  };
+
+  /** Why automatic compaction is not usable, as the operator-facing reason. */
+  const unavailableReason = (state) => {
+    if (state.status === 'conflict') {
+      return `自动压缩不可用：同 ID preset 定义不兼容（${state.reason ?? '内容未通过核对'}）`;
+    }
+    if (state.status === 'failed') return `自动压缩不可用：preset 注册失败（${state.error ?? '未知错误'}）`;
+    if (state.status === 'unavailable') return '自动压缩不可用：找不到 agent preset 注册表';
+    return '自动压缩不可用：语音压缩 preset 尚未注册';
+  };
+
+  /**
+   * Read-only snapshot for `status` and tests; never includes the declaration itself.
+   *
+   * `registered` = this instance owns/validated the declaration, `mounted` = live voice Agents with
+   * verified mount evidence, `active` = live voice Agents whose compaction service resolves NOW.
+   * `enabled` is the functional answer (a registered preset does not make an already-running Agent
+   * compacted), and `requiresRestart` names the manual/recovery step when it is not.
+   */
+  const presetStatus = () => {
+    const agents = liveVoiceAgents();
+    const mountedCount = agents.filter((agent) => records.get(agent)?.ok === true).length;
+    const activeCount = agents.filter((agent) => compactionServiceOf(getService, agent) !== undefined).length;
+    const sampled = samplePressure();
+    const usable = presetState.status === 'registered' || presetState.status === 'reused';
+    const requiresRestart = agents.length > activeCount;
+    let enabled = usable;
+    let reason = usable ? '' : unavailableReason(presetState);
+    if (usable && agents.length > 0 && activeCount === 0) {
+      enabled = false;
+      reason = `自动压缩不可用：已运行的语音会话未装配（${VOICE_COMPACTION_RESTART_NOTE}）`;
+    }
+    return {
+      presetId,
+      ...presetState,
+      enabled,
+      reason,
+      running: agents.length,
+      mounted: mountedCount,
+      active: activeCount,
+      requiresRestart,
+      note: requiresRestart ? VOICE_COMPACTION_RESTART_NOTE : '',
+      nearLimit: sampled.nearLimit,
+      'near-limit': sampled.nearLimit,
+      pressure: { ...sampled },
+    };
+  };
 
   /** Release only a registration this instance made; a reused declaration is never removed. */
   const releasePreset = () => {
     if (presetRelease !== null) return presetRelease;
     const pending = presetPending;
     const early = presetUnregister;
+    const releasedSource = presetState.source;
     presetUnregister = null;
-    presetState = { status: 'idle', source: null, registered: false, error: null, at: 0 };
+    presetState = { status: 'idle', source: null, registered: false, error: null, reason: null, at: 0 };
     if (pending === null && typeof early !== 'function') return null;
     const release = (async () => {
       if (pending !== null) await pending.catch(() => {});
       // A registration that settled while detach waited is still ours to remove.
       const disposer = early ?? presetUnregister;
       presetUnregister = null;
-      if (typeof disposer === 'function') await disposer();
+      if (typeof disposer === 'function') {
+        await disposer();
+        note('voice.compaction.preset.released', { presetId, source: releasedSource, owned: true });
+      }
     })().catch(() => {});
     presetRelease = release;
     void release.finally(() => {
@@ -310,10 +610,14 @@ export function createVoiceCompaction({
       // declaration, so the preset must exist before mount() is attempted. A failure here is
       // contained; the voice Agent still runs, just without condensation.
       const preset = await ensurePreset(presets);
-      if (preset.status === 'failed' || preset.status === 'unavailable') {
-        return skip(agent, preset.status === 'failed' ? 'preset-register-failed' : 'preset-registry-unavailable', {
+      if (preset.status === 'failed' || preset.status === 'unavailable' || preset.status === 'conflict') {
+        const reason = preset.status === 'failed'
+          ? 'preset-register-failed'
+          : (preset.status === 'conflict' ? 'preset-conflict' : 'preset-registry-unavailable');
+        return skip(agent, reason, {
           presetId,
           ...(typeof preset.error === 'string' && preset.error.length > 0 ? { error: preset.error } : {}),
+          ...(typeof preset.reason === 'string' && preset.reason.length > 0 ? { conflict: preset.reason } : {}),
         });
       }
       const ctx = agentCtx ?? agent?.ctx;
@@ -474,7 +778,10 @@ export function createVoiceCompaction({
     }
   };
 
-  return { presetId, setup, ensure, attach, evidenceOf, ensurePreset, presetStatus, status: presetStatus };
+  return {
+    presetId, setup, ensure, attach, evidenceOf, ensurePreset,
+    presetStatus, status: presetStatus, samplePressure,
+  };
 }
 
 /** The ONE action that may re-assemble an existing voice session by hand. */
@@ -551,33 +858,10 @@ export function createVoiceSessionRecovery({
   });
 
   /** The compaction engine of the Agent's own preset realm (undefined when unbound). */
-  const serviceOf = (agent) => {
-    const presets = getService('agentPresets');
-    return typeof presets?.serviceFor === 'function' ? presets.serviceFor(agent, 'compaction') : undefined;
-  };
+  const serviceOf = (agent) => compactionServiceOf(getService, agent);
 
   /** Estimated request tokens (token meter first, backend measure second), or null. */
-  const measureTokens = (agent, service) => {
-    const total = (value) => {
-      const number = Number(value?.totalTokens ?? value);
-      return Number.isFinite(number) ? number : null;
-    };
-    try {
-      const meter = getService('tokenMeter');
-      if (typeof meter?.measure === 'function') {
-        const measured = total(meter.measure(agent.session));
-        if (measured !== null) return measured;
-      }
-    } catch {
-      /* no meter: the honest answer is null, never a guess */
-    }
-    try {
-      if (typeof service?.measure === 'function') return total(service.measure(agent.session));
-    } catch {
-      /* backend measurement is optional too */
-    }
-    return null;
-  };
+  const measureTokens = (agent, service) => measureAgentTokens(getService, agent, service);
 
   /**
    * Resolve the requested session (argument or today's voice session) and refuse before any
@@ -598,6 +882,12 @@ export function createVoiceSessionRecovery({
   const presetProblem = async (presets) => {
     if (typeof presets?.mount !== 'function') {
       return { code: 'preset-registry-unavailable', reason: '找不到 agent preset 注册表' };
+    }
+    // Recovery must not resume a session only to discover that the same-id declaration was
+    // incompatible: that decision is already made, and it is an actionable refusal.
+    const state = typeof engine?.presetStatus === 'function' ? engine.presetStatus() : null;
+    if (state?.status === 'conflict') {
+      return { code: 'preset-conflict', reason: state.reason ?? '同 ID preset 定义不兼容' };
     }
     try {
       const resolved = typeof presets.resolve === 'function' ? await presets.resolve(presetId) : { id: presetId };

@@ -29,6 +29,7 @@ import test from 'node:test';
 import {
   VOICE_COMPACTION_PRESET,
   VOICE_COMPACTION_PRESET_ID,
+  assessVoiceCompactionPreset,
   createVoiceCompaction,
   isVoiceSessionId,
 } from '../src/host/session/compaction/voice-compaction.js';
@@ -50,9 +51,11 @@ function createMessage(text) {
 function createHost({
   definitions = { [VOICE_COMPACTION_PRESET_ID]: VOICE_COMPACTION_PRESET },
   registerError = null,
+  mountError = null,
 } = {}) {
   const declared = new Map(Object.entries(definitions));
   let registerCalls = 0;
+  let mountAttempts = 0;
   const meter = createMeter();
   const mounts = [];
   const bindings = new Map(); // agent -> binding
@@ -139,10 +142,12 @@ function createHost({
   }
 
   function mountPreset(agentCtx, presetId) {
+    mountAttempts += 1;
     const definition = declared.get(presetId);
     if (definition === undefined) {
       throw Object.assign(new Error(`Unknown agent preset: ${presetId}`), { code: 'agent-preset/not-found' });
     }
+    if (mountError !== null) throw mountError;
     const agent = agentCtx?.agent;
     if (agent === undefined) throw new Error('mount requires an Agent context');
     mounts.push({ agentId: agent.id, presetId });
@@ -204,6 +209,8 @@ function createHost({
       list: () => liveAgents.slice(),
       get: (id) => liveById.get(id),
     },
+    // The same contract the recovery path uses: `measure(session)` -> tokens (number or object).
+    tokenMeter: { measure: (session) => ({ totalTokens: meter.measure(session?.messages ?? []) }) },
   };
   const getService = (name) => services[name];
 
@@ -275,10 +282,12 @@ function createHost({
   return {
     meter, log, events, mounts, liveAgents, services, ctx, agentPresets, declared,
     get registerCalls() { return registerCalls; },
+    get mountAttempts() { return mountAttempts; },
     createAgent, createAndAnnounce, announce, emit,
     listenersFor, commandFor, compactionFor, getService, cleanups,
     listenerCount: (agent, type) => listenersFor(agent, type).length,
     commandCount: (agent, name) => (commandFor(agent, name) === undefined ? 0 : 1),
+    createdCount: () => createdListeners.length,
   };
 }
 
@@ -796,4 +805,216 @@ test('17. status classifies a builtin declaration separately from a profile one'
   assert.equal(host.registerCalls, 0);
   assert.equal(helper.presetStatus().status, 'reused');
   assert.equal(helper.presetStatus().source, 'builtin');
+});
+
+test('18. a compatible same-id declaration is audited, reused and mounted', async () => {
+  const compatible = {
+    id: VOICE_COMPACTION_PRESET_ID,
+    name: 'hand-written compaction only',
+    plugins: [{
+      id: 'compaction',
+      name: 'cordis:group',
+      group: true,
+      isolate: { compaction: true },
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+      ],
+    }],
+  };
+  assert.equal(assessVoiceCompactionPreset(compatible).compatible, true, 'the compaction-only shape is compatible');
+  const host = createHost({ definitions: { [VOICE_COMPACTION_PRESET_ID]: compatible } });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(host.registerCalls, 0, 'the compatible declaration is never registered again');
+  const status = helper.presetStatus();
+  assert.equal(status.status, 'reused');
+  assert.equal(status.source, 'profile');
+  assert.equal(status.enabled, true);
+  assert.equal(status.reason, '');
+  assert.equal(status.running, 1);
+  assert.equal(status.mounted, 1, 'the compatibly-reused preset is mounted');
+  assert.equal(status.active, 1, 'its compaction service resolves for the live Agent');
+  assert.equal(status.requiresRestart, false);
+  assert.equal(host.mounts.length, 1);
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1);
+  assert.equal(host.commandCount(agent, 'compact'), 1);
+  assert.equal(host.events.find((event) => event.type === 'voice.compaction.preset.reused').payload.source, 'profile');
+  console.log(`[18] status=${status.status} source=${status.source} enabled=${status.enabled} mounted=${status.mounted} active=${status.active} registerCalls=${host.registerCalls}`);
+});
+
+test('19. an incompatible same-id declaration is a conflict: not reused, not mounted, not overwritten', async () => {
+  const incompatible = {
+    id: VOICE_COMPACTION_PRESET_ID,
+    name: 'accidental standard preset',
+    plugins: [{
+      id: 'compaction',
+      name: 'cordis:group',
+      group: true,
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+        { id: 'fs', name: '@deepseek-ai/dsh-tool-fs' },
+      ],
+    }],
+  };
+  const audit = assessVoiceCompactionPreset(incompatible);
+  assert.equal(audit.compatible, false, 'an extra fs tool makes the definition incompatible');
+  assert.match(audit.reason, /fs/u);
+
+  const host = createHost({ definitions: { [VOICE_COMPACTION_PRESET_ID]: incompatible } });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+
+  assert.equal(helper.evidenceOf(agent), undefined, 'nothing was mounted for the Agent');
+  assert.equal(host.mounts.length, 0);
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 0);
+  assert.equal(host.commandCount(agent, 'compact'), 0);
+  assert.equal(host.registerCalls, 0, 'conflict never falls through to overwrite/register');
+  assert.equal(host.declared.get(VOICE_COMPACTION_PRESET_ID), incompatible, 'the user definition is untouched');
+
+  const status = helper.presetStatus();
+  assert.equal(status.status, 'conflict');
+  assert.equal(status.enabled, false, 'a conflict is never reported as available');
+  assert.match(status.reason, /自动压缩不可用/u);
+  assert.match(status.reason, /fs/u);
+  assert.equal(status.registered, false);
+  assert.equal(status.mounted, 0);
+  assert.equal(status.active, 0);
+
+  const conflict = host.events.find((event) => event.type === 'voice.compaction.preset.conflict');
+  assert.ok(conflict !== undefined, 'the conflict is observable');
+  assert.match(conflict.payload.reason, /fs/u);
+  const skipped = host.events.find((event) => event.type === 'voice.compaction.skipped');
+  assert.equal(skipped.payload.reason, 'preset-conflict');
+  assert.match(skipped.payload.conflict, /fs/u);
+  console.log(`[19] status=${status.status} enabled=${status.enabled} mounts=${host.mounts.length} declaredIntact=${host.declared.get(VOICE_COMPACTION_PRESET_ID) === incompatible} reason=${status.reason}`);
+});
+
+test('20. register failure is degraded, not normal: enabled:false + reason, and near-limit warns', async () => {
+  let clock = 1_000_000;
+  const host = createHost({ definitions: {}, registerError: new Error('preset registry offline') });
+  const helper = createVoiceCompaction({
+    getService: host.getService,
+    log: host.log,
+    windowTokens: 1000,
+    now: () => clock,
+  });
+  helper.attach(host.ctx);
+  const agent = host.createAgent('seirein-2026-11-08');
+  fillHistory(agent);
+  await consumeSetupLikeHost(helper.setup, agent);
+  assert.equal(host.mounts.length, 0, 'fail-open: no compression mounted');
+
+  const expected = host.meter.measure(agent.session.messages);
+  const first = helper.presetStatus();
+  assert.equal(first.status, 'failed');
+  assert.equal(first.enabled, false, 'fail-open must not look like a working compressor');
+  assert.match(first.reason, /自动压缩不可用/u);
+  assert.match(first.reason, /offline/u);
+  assert.equal(first.nearLimit, true, `${expected} tokens against a 1000-token window is near the limit`);
+  assert.equal(first['near-limit'], true);
+  assert.equal(first.pressure.windowTokens, 1000);
+  assert.equal(first.pressure.tokens, expected);
+  assert.ok(first.pressure.ratio > 0.8);
+
+  const nearLimit = () => host.events.filter((event) => event.type === 'voice.compaction.near-limit');
+  assert.equal(nearLimit().length, 1, 'the pressure warning is written');
+  assert.equal(nearLimit()[0].payload.sessionId, 'seirein-2026-11-08');
+  helper.presetStatus();
+  assert.equal(nearLimit().length, 1, 'repeated samples are throttled');
+  clock += 60_000;
+  helper.presetStatus();
+  assert.equal(nearLimit().length, 2, 'a sample past the throttle reports again');
+  console.log(`[20] status=${first.status} enabled=${first.enabled} near-limit=${first['near-limit']} tokens=${first.pressure.tokens}/${first.pressure.windowTokens} events=${nearLimit().length} reason=${first.reason}`);
+});
+
+test('21. normal pressure raises no warning', async () => {
+  const host = createHost();
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log, windowTokens: 100_000 });
+  helper.attach(host.ctx);
+  const agent = host.createAgent('seirein-2026-11-08');
+  fillHistory(agent);
+  await consumeSetupLikeHost(helper.setup, agent);
+
+  const status = helper.presetStatus();
+  assert.equal(status.nearLimit, false);
+  assert.equal(status['near-limit'], false);
+  assert.equal(status.enabled, true);
+  assert.equal(status.mounted, 1);
+  assert.equal(status.active, 1);
+  assert.equal(host.events.filter((event) => event.type === 'voice.compaction.near-limit').length, 0);
+  console.log(`[21] near-limit=${status['near-limit']} tokens=${status.pressure.tokens}/${status.pressure.windowTokens} ratio=${status.pressure.ratio} events=0`);
+});
+
+test('22. detach unregisters only the definition this instance registered; reused survives', async () => {
+  // Own registration: attach -> detach removes exactly our definition.
+  const own = createHost({ definitions: {} });
+  const owner = createVoiceCompaction({ getService: own.getService, log: own.log });
+  const detach = owner.attach(own.ctx);
+  assert.equal(owner.attach(own.ctx), detach, 'a repeated attach returns the same detach');
+  assert.equal(own.createdCount(), 1, 'no duplicate agent/created hook');
+  await owner.ensurePreset();
+  assert.equal(own.declared.has(VOICE_COMPACTION_PRESET_ID), true);
+  assert.equal(own.registerCalls, 1);
+
+  await detach();
+  assert.equal(own.declared.has(VOICE_COMPACTION_PRESET_ID), false, 'detach removed only our own definition');
+  assert.equal(owner.presetStatus().status, 'idle');
+  const released = own.events.find((event) => event.type === 'voice.compaction.preset.released');
+  assert.ok(released !== undefined, 'the release is observable');
+  assert.equal(released.payload.owned, true);
+
+  // Repeated attach/detach: one net definition and one hook, never two.
+  owner.attach(own.ctx);
+  await owner.ensurePreset();
+  assert.equal(own.declared.size, 1);
+  assert.equal(own.registerCalls, 2, 're-registered after our disposal; one live definition');
+  assert.equal(own.createdCount(), 1);
+  const agent = await own.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(own.mounts.length, 1);
+  assert.equal(own.listenerCount(agent, 'agent/pre-step'), 1);
+
+  // Reused declaration: detach must never unregister the user's definition.
+  const user = createHost();
+  const guest = createVoiceCompaction({ getService: user.getService, log: user.log });
+  const userDetach = guest.attach(user.ctx);
+  await guest.ensurePreset();
+  assert.equal(guest.presetStatus().status, 'reused');
+  await userDetach();
+  assert.equal(user.declared.has(VOICE_COMPACTION_PRESET_ID), true, 'a reused definition is never removed');
+  assert.equal(user.registerCalls, 0);
+  assert.equal(guest.presetStatus().status, 'idle');
+  assert.equal(user.events.some((event) => event.type === 'voice.compaction.preset.released'), false);
+  console.log(`[22] own registerCalls=${own.registerCalls} declared=${own.declared.size} hooks=${own.createdCount()} | reused declared=${user.declared.has(VOICE_COMPACTION_PRESET_ID)} registerCalls=${user.registerCalls}`);
+});
+
+test('23. a running Agent is not retro-assembled: registered / mounted / active are separate', async () => {
+  const host = createHost({
+    mountError: Object.assign(new Error('agent preset is locked after the first turn'), { code: 'agent-preset/locked' }),
+  });
+  // The Agent was already running before this plugin instance attached (the old-session case).
+  host.createAgent('seirein-2026-11-08');
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(host.mountAttempts, 1, 'the reload sweep tried and was refused');
+
+  const status = helper.presetStatus();
+  assert.equal(status.status, 'reused', 'the definition is registered/validated');
+  assert.equal(status.registered, false);
+  assert.equal(status.running, 1);
+  assert.equal(status.mounted, 0, 'the already-running Agent was not assembled');
+  assert.equal(status.active, 0, 'no compaction service exists for it right now');
+  assert.equal(status.requiresRestart, true);
+  assert.equal(status.enabled, false);
+  assert.match(status.reason, /自动压缩不可用/u);
+  assert.match(status.reason, /需重启|voice\.session\.recover/u);
+  assert.match(status.note, /需重启/u);
+  const failed = host.events.find((event) => event.type === 'voice.compaction.failed');
+  assert.equal(failed.payload.reason, 'mount');
+  console.log(`[23] status=${status.status} registered=${status.registered} running/mounted/active=${status.running}/${status.mounted}/${status.active} requiresRestart=${status.requiresRestart} enabled=${status.enabled}`);
 });
