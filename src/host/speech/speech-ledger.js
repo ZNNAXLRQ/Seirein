@@ -29,9 +29,18 @@ export const SPEECH_PRIORITIES = Object.freeze({ ack: 1, progress: 2, explicit: 
  * slots still serialize the players). `queued` is true when an earlier speech of this host was
  * still unfinished at acceptance, and `queueWaitMs` is the accept -> run-start wait.
  *
- * @param {{emit?: Function, now?: Function, limit?: number}} [options]
+ * @param {{emit?: Function, onAudible?: Function, now?: Function, limit?: number, log?: Function|{emit: Function}}} [options]
+ *   `log` is an optional caller-injected debug sink for seat-wait attribution (`speech.seat.wait`):
+ *   an EventLog-like `{emit}` object or a bare `(type, payload) => {}` function. The ledger never
+ *   imports a logger itself; without `log` every wait behaves exactly as before and writes nothing.
  */
-export function createSpeechLedger({ emit = async () => {}, onAudible = null, now = () => Date.now(), limit = 256 } = {}) {
+export function createSpeechLedger({
+  emit = async () => {},
+  onAudible = null,
+  now = () => Date.now(),
+  limit = 256,
+  log = null,
+} = {}) {
   const records = new Map();
   let sequence = 0;
   let pending = 0;
@@ -120,6 +129,37 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
     queueWaitMs: record.queueWaitMs,
   });
   /**
+   * Caller-injected, best-effort debug line. Optional by design (the ledger owns no global logger),
+   * fire-and-forget (never awaited, never rethrown), and it never changes the wait itself.
+   */
+  const seatLog = (type, payload) => {
+    const write = typeof log === 'function' ? log : log?.emit;
+    if (typeof write !== 'function') return;
+    try {
+      void Promise.resolve(write.call(log, type, payload)).catch(() => {});
+    } catch {
+      /* debug attribution must never break playback */
+    }
+  };
+  /**
+   * One `speech.seat.wait` per seat wait, written when the wait ends: `waitMs` is start -> end
+   * (measured with the ledger clock), `queueDepth` is the number of earlier audible requests that
+   * still blocked this one when it joined, and `sessionId`/`turn` are the caller's attribution
+   * (null when omitted). A wait never reports twice (`seat.reported` one-shot latch).
+   */
+  const reportSeatWait = (record, seat, outcome) => {
+    if (seat.reported === true) return;
+    seat.reported = true;
+    seatLog('speech.seat.wait', {
+      speechId: record.speechId,
+      sessionId: seat.sessionId ?? null,
+      turn: Number.isInteger(seat.turn) ? seat.turn : null,
+      waitMs: Math.max(0, Math.round(now() - seat.startedAt)),
+      queueDepth: seat.queueDepth,
+      outcome,
+    });
+  };
+  /**
    * Event-facing cancellation reasons. Only three owners cancel speech: a newer turn, the user
    * (mute / barge-in / interrupt), or an explicit cancel request. The caller's raw reason stays in
    * `rawReason` for diagnosis, so old labels do not change what actually happened.
@@ -197,12 +237,13 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
     return payload;
   };
   /** Drop one queued playback-turn request and reject it (cancel/failure/timeout). */
-  const rejectTurnWaiter = (record, error) => {
+  const rejectTurnWaiter = (record, error, outcome = 'cancelled') => {
     const index = turnWaiters.findIndex((waiter) => waiter.record === record);
     if (index < 0) return false;
     const [waiter] = turnWaiters.splice(index, 1);
     clearTimeout(waiter.timer);
     waiter.signal?.removeEventListener?.('abort', waiter.onAbort);
+    waiter.report?.(outcome);
     waiter.reject(error);
     return true;
   };
@@ -223,6 +264,22 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
       return false;
     }
     return true;
+  };
+  /**
+   * How many earlier audible requests still block this one from the seat at the moment it starts
+   * waiting (the seat holder plus everyone queued ahead of it). It is the same predicate as
+   * `canGrantPlaybackTurn`, counted instead of short-circuited: a settled record whose last event
+   * is still queued (not `published`) is still ahead.
+   */
+  const seatQueueDepth = (record) => {
+    let ahead = 0;
+    for (const other of records.values()) {
+      if (other.order >= record.order) continue;
+      if (other.playbackExpected !== true) continue;
+      if (other.settled === true && other.published === true) continue;
+      ahead += 1;
+    }
+    return ahead;
   };
   /**
    * A yielded speech keeps its turn closed while a same-session/turn request at the preemptor's
@@ -268,6 +325,7 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
     waiter.record.resumeAfter = null;
     waiter.record.handoffFloor = null;
     waiter.record.resumeDeferred = false;
+    waiter.report?.('granted');
     waiter.resolve();
   };
   /** Grant the seat only to the oldest unresolved speech that is waiting for it. */
@@ -286,6 +344,7 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
         turnWaiters.shift();
         clearTimeout(head.timer);
         head.signal?.removeEventListener?.('abort', head.onAbort);
+        head.report?.('cancelled');
         head.reject(speechErrorOf(head.record));
         continue;
       }
@@ -614,17 +673,37 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
    *
    * `reportOnly` is for a speech resuming its remaining blocks after a hand-over: a long wait is
    * reported (never a failure), so the queued blocks stay alive behind a long preemptor.
+   *
+   * `sessionId`/`turn` are the caller's attribution for the optional `speech.seat.wait` debug line
+   * (null when omitted); the ledger's record values are deliberately not substituted here.
    */
-  const waitPlaybackTurn = (speechId, { signal, timeoutMs, reportOnly = false } = {}) => {
+  const waitPlaybackTurn = (
+    speechId,
+    { signal, timeoutMs, reportOnly = false, sessionId = null, turn = null } = {},
+  ) => {
     const record = records.get(String(speechId ?? ''));
     if (record === undefined || record === null) {
       return Promise.reject(Object.assign(new Error('Unknown speech'), { code: 'SPEECH_UNKNOWN' }));
     }
     if (record.settled) return Promise.reject(speechErrorOf(record));
-    if (record.turnGranted === true) return Promise.resolve();
-    if (signal?.aborted === true) return Promise.reject(abortReasonOf(signal));
+    // One seat-wait record per call; an immediate grant/abort still reports with waitMs 0.
+    const seat = { sessionId, turn, startedAt: now(), queueDepth: 0, reported: false };
+    if (record.turnGranted === true) {
+      reportSeatWait(record, seat, 'granted');
+      return Promise.resolve();
+    }
+    if (signal?.aborted === true) {
+      reportSeatWait(record, seat, 'cancelled');
+      return Promise.reject(abortReasonOf(signal));
+    }
     return new Promise((resolve, reject) => {
-      const waiter = { record, resolve, reject, signal, timer: null, onAbort: null };
+      const waiter = {
+        record, resolve, reject, signal, timer: null, onAbort: null,
+        sessionId, turn, startedAt: seat.startedAt,
+        // Snapshot on joining: how many audible requests still block this one (holder + queue).
+        queueDepth: seatQueueDepth(record), reported: false,
+      };
+      waiter.report = (outcome) => reportSeatWait(record, waiter, outcome);
       waiter.onAbort = () => { rejectTurnWaiter(record, abortReasonOf(signal)); };
       const raw = Number(timeoutMs);
       const waitMs = Number.isFinite(raw) && raw >= 0 ? raw : 15_000;
@@ -643,7 +722,7 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
             rejectTurnWaiter(record, Object.assign(
               new Error(`放音排队超过 ${waitMs}ms`),
               { code: 'SPEECH_QUEUE_TIMEOUT' },
-            ));
+            ), 'timeout');
             return;
           }
           if (reportedSlowTurn !== true) {
@@ -714,6 +793,7 @@ export function createSpeechLedger({ emit = async () => {}, onAudible = null, no
       sessionId: record.sessionId,
       turn: record.turn,
     })).catch(() => {});
+    waiter.report?.('granted');
     waiter.resolve();
     return { toSpeechId: best.speechId, remainingChunks: remaining };
   };
