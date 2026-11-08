@@ -635,7 +635,7 @@ test('6. 合并只认本会话的归属：delivery 优先、session+turn 其次�
   assert.equal(crossDay.rows.find((row) => row.sessionId === 'seirein-2026-11-10').totalMs, null,
     'the next day\'s turn 1 is a different round');
 
-  // 展示顺序：轮次倒序（行内没有事件时间，窗口由宿主按事件时间倒序给出）。
+  // 展示顺序：at 缺失（旧宿主 / 旧日志）时回退轮次倒序，与修复前一致。
   const order = await read(
     [
       turnRow({ turn: 2, sessionId: 'session-a', deliveryMessageId: 'msg-2' }),
@@ -662,7 +662,83 @@ test('6. 合并只认本会话的归属：delivery 优先、session+turn 其次�
     )} order=${order.rows.map((row) => row.turn).join(',')}`);
 });
 
-test('7. 回归：client-diagnostics / client-instance-settings / client-polling / smoke', async (t) => {
+test('7. 展示顺序按事件时间倒序；at 缺失回退轮次倒序', async () => {
+  const api = loadDiagnosticsApi();
+  const read = (turnRows, pipelineRows) => api.readDiagnosticsTimelines(async (body) => ({
+    ok: true,
+    probe: body.probe,
+    rows: body.probe === 'turn.timeline' ? turnRows : pipelineRows,
+  }));
+  const older = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+  const newer = new Date(Date.now() - 60 * 1000).toISOString();
+
+  // 昨天第 100 轮（older）、今天第 1 轮（newer）：更大的 turn 不是更新的轮次。
+  const crossDay = await read(
+    [
+      turnRow({ turn: 100, sessionId: 'seirein-2026-11-08', deliveryMessageId: 'msg-y', at: older }),
+      turnRow({ turn: 1, sessionId: 'seirein-2026-11-09', deliveryMessageId: 'msg-t', at: newer }),
+    ],
+    [pipelineRow({
+      turn: 1, sessionId: 'seirein-2026-11-09', deliveryMessageId: 'msg-t', totalMs: 900, at: newer,
+    })],
+  );
+  assert.deepEqual(crossDay.rows.map((row) => row.turn), [1, 100], 'event time decides, not the turn number');
+  assert.equal(crossDay.rows[0].at, newer, 'the merged row keeps the turn row\'s event time');
+  assert.equal(crossDay.rows[0].totalMs, 900, 'the same round still joins: merge rules are untouched');
+  assert.equal(crossDay.rows[0].hasPipeline, true);
+  const crossDayText = textOf(api.timelineSection(h, { data: crossDay }));
+  assert.ok(crossDayText.indexOf('轮次 1') < crossDayText.indexOf('轮次 100'),
+    'the card renders today\'s round 1 before yesterday\'s round 100');
+
+  // 宿主把更大 turn 放在前面时，客户端仍按事件时间重排。
+  const reversedInput = await read(
+    [
+      turnRow({ turn: 100, deliveryMessageId: 'msg-y', at: older }),
+      turnRow({ turn: 1, deliveryMessageId: 'msg-t', at: newer }),
+    ],
+    [],
+  );
+  assert.deepEqual(reversedInput.rows.map((row) => row.turn), [1, 100]);
+
+  // 只有 pipeline 行的轮次也按它自己的事件时间排。
+  const pipelineOnly = await read(
+    [],
+    [
+      pipelineRow({ turn: 100, deliveryMessageId: 'msg-100', at: older }),
+      pipelineRow({ turn: 1, deliveryMessageId: 'msg-1', at: newer }),
+    ],
+  );
+  assert.deepEqual(pipelineOnly.rows.map((row) => row.turn), [1, 100], 'pipeline-only rows carry their own at');
+
+  // at 缺失：回退轮次倒序，与修复前完全一致。
+  const legacy = await read(
+    [
+      turnRow({ turn: 2, deliveryMessageId: 'msg-2' }),
+      turnRow({ turn: 10, deliveryMessageId: 'msg-10' }),
+      turnRow({ turn: 5, deliveryMessageId: 'msg-5' }),
+    ],
+    [],
+  );
+  assert.deepEqual(legacy.rows.map((row) => row.turn), [10, 5, 2], 'no event time falls back to turn desc');
+
+  // 混合：带事件时间的行按时间在前，缺 at 的旧行按轮次排在后面。
+  const mixed = await read(
+    [
+      turnRow({ turn: 100, deliveryMessageId: 'msg-100', at: older }),
+      turnRow({ turn: 7, deliveryMessageId: 'msg-7' }),
+      turnRow({ turn: 1, deliveryMessageId: 'msg-1', at: newer }),
+    ],
+    [],
+  );
+  assert.deepEqual(mixed.rows.map((row) => row.turn), [1, 100, 7], 'undated rows sink, still turn-desc');
+
+  console.log(`[7] eventTime=[${crossDay.rows.map((row) => row.turn).join(',')}] `
+    + `pipelineOnly=[${pipelineOnly.rows.map((row) => row.turn).join(',')}] `
+    + `legacyFallback=[${legacy.rows.map((row) => row.turn).join(',')}] `
+    + `mixed=[${mixed.rows.map((row) => row.turn).join(',')}]`);
+});
+
+test('8. 回归：client-diagnostics / client-instance-settings / client-polling / smoke', async (t) => {
   t.timeout = 600_000;
   const suites = [
     ['--test', join('test', 'client-diagnostics.mjs')],
@@ -684,7 +760,7 @@ test('7. 回归：client-diagnostics / client-instance-settings / client-polling
     }
   }
   const summary = results.map(({ args, code }) => `${args.join(' ')} => exit ${code}`).join('; ');
-  console.log(`[7] ${summary}`);
+  console.log(`[8] ${summary}`);
 });
 
 /** Run one child suite and report its tail when it fails. */

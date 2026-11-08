@@ -3503,6 +3503,7 @@ window.__ModuleLoader__.load({
       const overlaps = diagnosticsObject(object.overlaps) ?? {};
       const kinds = diagnosticsObject(object.toolKinds) ?? {};
       return {
+        at: diagnosticsText(object.at),
         turn: diagnosticsNumber(object.turn, object.acceptTurn),
         sessionId: diagnosticsText(object.sessionId),
         deliveryMessageId: diagnosticsText(object.deliveryMessageId),
@@ -3524,6 +3525,7 @@ window.__ModuleLoader__.load({
       const object = diagnosticsObject(value);
       if (object === null) return null;
       return {
+        at: diagnosticsText(object.at),
         turn: diagnosticsNumber(object.turn),
         sessionId: diagnosticsText(object.sessionId),
         deliveryMessageId: diagnosticsText(object.deliveryMessageId),
@@ -3539,7 +3541,7 @@ window.__ModuleLoader__.load({
     /**
      * 按轮次合并两份时间线：优先精确 deliveryMessageId，其次校验过的 sessionId+turn；旧行没有
      * sessionId 时只有该轮两侧都唯一才回退。无法唯一确认的字段留 null（界面显示「—」），
-     * 绝不把另一会话同 turn 的数值借过来；排序只按轮次（行内没有事件时间）。
+     * 绝不把另一会话同 turn 的数值借过来；展示顺序见下面的 `at` 排序（事件时间，缺则轮次）。
      */
     function mergeDiagnosticsTimeline(turnRows, pipelineRows) {
       const claim = (map, key, row) => {
@@ -3588,6 +3590,7 @@ window.__ModuleLoader__.load({
       const mergedOf = new Map();
       for (const entry of turnRows) {
         const row = {
+          at: entry.at,
           turn: entry.turn,
           sessionId: entry.sessionId,
           deliveryMessageId: entry.deliveryMessageId,
@@ -3614,6 +3617,8 @@ window.__ModuleLoader__.load({
           continue;
         }
         rows.push({
+          // 合并行沿用 turn 行的事件时间（那是本轮汇总产生的时刻）；只有 pipeline 行时用它自己的。
+          at: entry.at,
           turn: entry.turn,
           sessionId: entry.sessionId,
           deliveryMessageId: entry.deliveryMessageId,
@@ -3628,12 +3633,25 @@ window.__ModuleLoader__.load({
           hasPipeline: true,
         });
       }
-      return rows.sort((left, right) => {
+      // 展示顺序：按事件时间（at）倒序，同一时刻再按轮次倒序。at 缺失的行没有可比较的事件时间，
+      // 回退到轮次倒序并排在已带时间的行之后；旧日志（宿主未投影 at）因此保持修复前的轮次顺序。
+      const atOf = (row) => {
+        const text = typeof row?.at === 'string' ? row.at : '';
+        const ms = Date.parse(text);
+        return Number.isFinite(ms) ? ms : null;
+      };
+      const byTurnDesc = (left, right) => {
         if (left.turn === null && right.turn === null) return 0;
         if (left.turn === null) return 1;
         if (right.turn === null) return -1;
         return right.turn - left.turn;
-      });
+      };
+      const dated = [];
+      const undated = [];
+      for (const row of rows) (atOf(row) === null ? undated : dated).push(row);
+      dated.sort((left, right) => atOf(right) - atOf(left) || byTurnDesc(left, right));
+      undated.sort(byTurnDesc);
+      return [...dated, ...undated];
     }
 
     /** 单个 probe：一次请求、一个硬超时；失败只返回 `{rows:[], error}`，不向调用方抛出。 */
@@ -3658,7 +3676,8 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 一次刷新读取两个 probe 各一次（共两个请求），合并成按轮次倒序的行；没有任何轮询。
+     * 一次刷新读取两个 probe 各一次（共两个请求），合并成按事件时间倒序的行（at 缺失的旧行回退
+     * 轮次倒序）；没有任何轮询。
      * `post` 与 `runSettingsAction` 同签名 `(body, timeoutMs) => Promise<object>`。
      */
     async function readDiagnosticsTimelines(post, limit = DIAGNOSTICS_TIMELINE_LIMIT) {

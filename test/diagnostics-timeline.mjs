@@ -647,3 +647,59 @@ test('11. the newest latency row is chosen by EVENT time, not by file/insertion 
     f.cleanup();
   }
 });
+
+test('12. both timeline probes project the event time and order by it, not by turn', async () => {
+  // 昨天（更早）的第 100 轮写在日志更靠前，今天（更新）的第 1 轮写在后面。
+  const older = at(6 * 60 * 60 * 1000);
+  const newer = at(60 * 1000);
+  const stamped = (type, payload, ts) => ({ id: `evt-${type}-${ts}`, ts, type, corr_id: null, payload });
+  const f = fixture([
+    stamped('voice.turn.timeline', turnPayload({ turn: 100, phases: [] }), older),
+    stamped('voice.turn.timeline', turnPayload({ turn: 1, phases: [] }), newer),
+    // 没有事件时间的旧行：at 保持 null，按扫描顺序排在带时间的行之后。
+    { id: 'evt-legacy', type: 'voice.turn.timeline', corr_id: null, payload: turnPayload({ turn: 5, phases: [] }) },
+    stamped('voice.pipeline.timeline', {
+      turn: 100, sessionId: 'session-a', deliveryMessageId: 'msg-100', bodyReadyMs: 8100,
+    }, older),
+    stamped('voice.pipeline.timeline', {
+      turn: 1, sessionId: 'session-a', deliveryMessageId: 'msg-1', bodyReadyMs: 8010,
+    }, newer),
+  ]);
+  const diagnostics = createDiagnostics({ root: f.root, isEnabled: true });
+  try {
+    assert.ok(DIAGNOSTICS_PROBES['turn.timeline'].fields.includes('at'), 'turn.timeline projects at');
+    assert.ok(DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS.includes('at'), 'pipeline.timeline projects at');
+
+    const turn = await diagnostics.query({ probe: 'turn.timeline', limit: 5 });
+    assert.deepEqual(turn.rows.map((row) => row.turn), [1, 100, 5],
+      'event time first; an undated row never outranks a dated one');
+    assert.equal(turn.rows[0].at, newer);
+    assert.equal(turn.rows[1].at, older);
+    assert.equal(turn.rows[2].at, null, 'a row with no time keeps null, never a made-up stamp');
+    assert.ok(Date.parse(turn.rows[0].at) > Date.parse(turn.rows[1].at));
+
+    const pipeline = await diagnostics.query({ probe: 'pipeline.timeline', limit: 5 });
+    assert.deepEqual(pipeline.rows.map((row) => row.turn), [1, 100], 'the pipeline window is time-ordered too');
+    assert.equal(pipeline.rows[0].at, newer);
+    assert.equal(pipeline.rows[1].at, older);
+    assert.equal(pipeline.rows[0].bodyReadyMs, 8010, 'the join and the stages are untouched');
+
+    // 载荷自带 ts 时优先用它（比日志行的写入时间更接近事件本身）。
+    const payloadStamped = fixture([
+      stamped('voice.turn.timeline', turnPayload({ turn: 2, phases: [], ts: newer }), older),
+    ]);
+    const fromPayload = await createDiagnostics({ root: payloadStamped.root, isEnabled: true })
+      .query({ probe: 'turn.timeline', limit: 5 });
+    try {
+      assert.equal(fromPayload.rows[0].at, newer, 'payload.ts wins over the log row ts');
+    } finally {
+      payloadStamped.cleanup();
+    }
+
+    console.log(`[12] turnAtOrder=[${turn.rows.map((row) => row.turn).join(',')}] `
+      + `at=[${turn.rows[0].at},${turn.rows[1].at},${JSON.stringify(turn.rows[2].at)}] `
+      + `pipelineAtOrder=[${pipeline.rows.map((row) => row.turn).join(',')}] payloadTs=${fromPayload.rows[0].at}`);
+  } finally {
+    f.cleanup();
+  }
+});

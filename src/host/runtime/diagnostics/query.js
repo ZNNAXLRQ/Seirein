@@ -81,8 +81,11 @@ const PIPELINE_TIMELINE_EVENT = 'voice.pipeline.timeline';
 /**
  * `turn.timeline` projection: one summary row per round. The phases array is replaced by
  * `phaseNames` / `longestPhase` / `toolKinds` / `phaseCount`, so the default answer stays small.
+ * `at` is the row's EVENT time (an ISO string): without it a caller can only order rounds by turn
+ * number, which puts "today's round 1" below "yesterday's round 100".
  */
 const TURN_TIMELINE_FIELDS = Object.freeze([
+  'at',
   'timelineId',
   'sessionId',
   'turn',
@@ -127,6 +130,7 @@ const PIPELINE_LATENCY_FIELDS = Object.freeze(['totalMs', 'asrMs', 'injectToAckM
 
 /** `pipeline.timeline` projection: the five pipeline stages plus the four joined latency stages. */
 export const DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS = Object.freeze([
+  'at',
   'turn',
   'sessionId',
   'deliveryMessageId',
@@ -236,6 +240,35 @@ const msOrNull = (value) => {
   const number = Number(value);
   return Number.isFinite(number) ? Math.round(number) : null;
 };
+
+/**
+ * A timeline row's EVENT time as an ISO string: the payload's own `ts` when it carries one,
+ * otherwise the event-log row's `ts` (the instant the host wrote the event). A row with neither
+ * keeps null — the caller then falls back to the turn number instead of inventing a time.
+ */
+function eventStampOf(row, payload) {
+  for (const value of [payload?.ts, row?.ts]) {
+    if (typeof value !== 'string') continue;
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
+  }
+  return null;
+}
+
+/**
+ * Newest event first. The scan already walks the tail newest-file-first, so this only corrects a
+ * row whose event time disagrees with its file position; an undated row keeps its scan position
+ * after the dated ones (a stable sort, so equal stamps never shuffle).
+ */
+function byEventTimeDesc(left, right) {
+  const leftMs = typeof left?.at === 'string' ? Date.parse(left.at) : Number.NaN;
+  const rightMs = typeof right?.at === 'string' ? Date.parse(right.at) : Number.NaN;
+  const leftDated = Number.isFinite(leftMs);
+  const rightDated = Number.isFinite(rightMs);
+  if (leftDated !== rightDated) return leftDated ? -1 : 1;
+  if (!leftDated) return 0;
+  return rightMs - leftMs;
+}
 
 /**
  * A short token: an id, an enum value or an error CODE. Anything that is not one (a sentence, a
@@ -355,6 +388,7 @@ function projectTurnTimelineRow(row, includePhases) {
   const phases = Array.isArray(payload.phases) ? payload.phases : null;
   const summary = summarizePhases(phases);
   const output = {
+    at: eventStampOf(row, payload),
     timelineId: tokenOf(payload.timelineId, 160),
     sessionId: tokenOf(payload.sessionId, 96),
     turn: intOrNull(payload.turn),
@@ -485,6 +519,7 @@ function projectPipelineTimelineRow(row, index) {
   const deliveryMessageId = tokenOf(payload.deliveryMessageId, 96);
   const joined = latencyFor(index, { turn, sessionId, deliveryMessageId });
   return {
+    at: eventStampOf(row, payload),
     turn,
     sessionId,
     deliveryMessageId,
@@ -523,12 +558,16 @@ function collectProjected(tail, { matches, limit, nowMs, project }) {
 }
 
 function collectTimelineRows(tail, { limit, nowMs, includePhases }) {
-  return collectProjected(tail, {
+  const collected = collectProjected(tail, {
     matches: (row) => row?.type === TURN_TIMELINE_EVENT,
     limit,
     nowMs,
     project: (row) => projectTurnTimelineRow(row, includePhases),
   });
+  // The window is chosen from the file tail, then ordered by EVENT time: a bigger turn number is
+  // never mistaken for a newer round, and an undated row keeps the scan order after the dated ones.
+  collected.rows.sort(byEventTimeDesc);
+  return collected;
 }
 
 function collectPipelineRows(tail, { limit, nowMs }) {
@@ -536,12 +575,14 @@ function collectPipelineRows(tail, { limit, nowMs }) {
     tail.rows,
     tail.rows.filter((row) => row?.type === PIPELINE_TIMELINE_EVENT),
   );
-  return collectProjected(tail, {
+  const collected = collectProjected(tail, {
     matches: (row) => row?.type === PIPELINE_TIMELINE_EVENT,
     limit,
     nowMs,
     project: (row) => projectPipelineTimelineRow(row, index),
   });
+  collected.rows.sort(byEventTimeDesc);
+  return collected;
 }
 
 /**
