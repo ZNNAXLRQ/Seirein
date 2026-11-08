@@ -807,3 +807,56 @@ test('7. no character budget truncates the carried points (negations and conditi
     + `blockVerbatim=yes spokenKeepsNegation=yes`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// 8. P2-2: a failed organizer speaks the new conclusion, never the old budget hog
+// ---------------------------------------------------------------------------
+
+test('8. a failed organizer plays the new conclusion and never spends the budget on old points', async (t) => {
+  const head1 = '旧要点一：先确认采集源类型。';
+  const head2 = '旧要点二：窗口采集要选中目标窗口。';
+  const head3 = '旧要点三：如果还黑屏就点开采集属性确认一次';
+  const OLD_PLAN = `${head1}${head2}${head3}${'旧'.repeat(1158 - head1.length - head2.length - head3.length - 1)}。`;
+  const OLD_BODY = `${OLD_PLAN}${'旧正文补充。'.repeat(20)}`;
+  const newHead = '新结论：把编码器改成硬件编码，然后重启一次采集，画面就会出来';
+  const NEW_106 = `${newHead}${'了'.repeat(106 - newHead.length - 1)}。`;
+  assert.equal(OLD_PLAN.length, 1158);
+  assert.equal(NEW_106.length, 106);
+  assert.ok(OLD_BODY.length > OLD_PLAN.length, 'fixture: the body is longer than the spoken plan');
+
+  const app = await mountRound(t, {
+    holdSynth: (text) => text.includes('旧要点一'),
+    replyFor: ({ turn }) => (turn === 1 ? OLD_BODY : NEW_106),
+    // The first round organizes normally; the carry round returns nothing usable (organizer failed).
+    spoken: (userText) => (userText.includes('<上一轮待传达>') ? '' : OLD_PLAN),
+  });
+  app.say('OBS 全黑怎么调');
+  await waitUntil(() => state.held === 1, 'the first old clip is held before any sound');
+  await app.waitForEvent('voice.response.group.ready', (payload) => payload.version === 1);
+  assert.equal(app.players().length, 0, 'no old sentence reached the player');
+
+  app.say('补充一下，那编码器呢');
+  const carry = await carryEventOf(app, (payload) => payload.merged === true);
+  assert.equal(carry.sentences, 3);
+  assert.equal(carry.chars, OLD_PLAN.length, 'the whole old plan is the carry material');
+
+  state.holdGate.resolve();
+  await waitUntil(() => app.spokenRequests().length === 2, 'the carry round asked the organizer');
+  const fallback = await app.waitForEvent('voice.spoken.fallback');
+  assert.equal(fallback.reason, 'empty', 'the organizer returned no usable spoken version');
+
+  const clips = sentenceClips(NEW_106);
+  await waitUntil(() => app.players().length === clips.length, 'the new conclusion reached the player');
+  const captions = app.playerCaptions();
+  assert.deepEqual(captions, clips, 'only the current answer is played');
+  assert.ok(!captions.join('').includes('旧要点'), 'no old point is spoken');
+  await playAll(app, clips.length);
+  const done = await app.waitForEvent('voice.response.group.done');
+  assert.equal(done.reason, 'played');
+  await tick(20);
+  assert.equal(app.players().length, clips.length, 'the held, superseded old clip never plays');
+  t.diagnostic(
+    `carry=${carry.sentences}句/${carry.chars}字 new=${NEW_106.length}字/1句 budget=1200 `
+    + `fallback=${fallback.reason} playedNew=${captions.join('').length} oldPlayed=0`,
+  );
+});

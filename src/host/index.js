@@ -106,6 +106,7 @@ import * as subtitleModule from './subtitle/subtitle.js';
 // continuation context through its own pre-step lane.
 import {
   CARRY_CONVEY_SYSTEM_NOTE,
+  composeCarryConveyFallback,
   composeCarryConveyText,
   composeCarryConveyUser,
   createResponseGroupStore,
@@ -11803,6 +11804,14 @@ export function apply(ctx, config) {
           const carryText = carry === null ? '' : carry.sentences.join('');
           // With carried points the merged speech may legitimately be longer than the new body.
           const speechSource = carryText.length === 0 ? full : composeCarryConveyText(carryText, full);
+          // Fallback never hard-merges over the budget: the current answer keeps its place and old
+          // points that do not fit stay pending for a later round.
+          const speechBudget = resolveSpeechBudget({ maxChars: voiceSpeechMaxChars() });
+          const fallback = carryText.length === 0 ? null : composeCarryConveyFallback(carryText, full, {
+            maxChars: speechBudget.unbounded ? 0 : speechBudget.maxChars,
+          });
+          const fallbackText = fallback === null ? full : fallback.text;
+          const carryPending = fallback === null ? [] : fallback.pending;
           const plan = {
             text: full,
             feedText: raw,
@@ -11827,18 +11836,20 @@ export function apply(ctx, config) {
             return plan;
           }
           if (carryText.length > 0 && requestsFullRead(spoken)) {
-            plan.text = speechSource;
-            plan.feedText = speechSource;
-            plan.chars = speechCharCount(speechSource);
+            plan.text = fallbackText;
+            plan.feedText = fallbackText;
+            plan.chars = speechCharCount(fallbackText);
+            plan.carryPending = carryPending;
             await emitSpokenVersion(plan, 'original', plan.chars, 0);
             return plan;
           }
           // One answer task per (turn, replyVersion, purpose): a repeated finish is not a new task.
           const task = voiceTaskDedupe.claim({ sessionId, turn: turnId, replyVersion, purpose: 'answer', text: full });
           if (task.ok !== true) {
-            plan.text = speechSource;
-            plan.feedText = carryText.length > 0 ? speechSource : raw;
-            plan.chars = speechCharCount(speechSource);
+            plan.text = fallbackText;
+            plan.feedText = carryText.length > 0 ? fallbackText : raw;
+            plan.chars = speechCharCount(fallbackText);
+            plan.carryPending = carryPending;
             plan.source = 'full-fallback';
             plan.fallback = 'duplicate-task';
             await emitSpokenVersion(plan, 'full-fallback', plan.chars, 0, 'duplicate-task');
@@ -11868,11 +11879,13 @@ export function apply(ctx, config) {
             }
             failure = checked.reason;
           }
-          // Fallback is the FULL body (plus the carried points), never a truncated summary.
-          plan.text = speechSource;
-          plan.chars = speechCharCount(speechSource);
+          // Fallback is the FULL current body, never a truncated summary. Carried points that do not
+          // fit (or that the new answer corrects) stay pending instead of eating the new answer.
+          plan.text = fallbackText;
+          plan.chars = speechCharCount(fallbackText);
           plan.source = 'full-fallback';
-          plan.feedText = carryText.length > 0 ? speechSource : raw;
+          plan.feedText = carryText.length > 0 ? fallbackText : raw;
+          plan.carryPending = carryPending;
           plan.ms = ms;
           plan.fallback = failure;
           await log.emit('voice.spoken.fallback', {
@@ -11903,6 +11916,12 @@ export function apply(ctx, config) {
         if (!responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion)) return null;
         if (plan.text.length === 0) return null;
         if (turnOwnership === null || !turnOwnership.canSpeak()) return null;
+        // The fallback could not fit the old points: they stay waiting instead of being forced in.
+        if (Array.isArray(plan.carryPending) && plan.carryPending.length > 0) {
+          responseGroups.deferCarry({
+            group: voiceGroup, version: voiceGroupVersion, sentences: plan.carryPending,
+          });
+        }
         // Batch 2: a continuation speaks past what was already heard — no restart from the top
         // and no lost unvoiced remainder. A first version has no prior answer and is unchanged.
         const adjusted = responseGroups.adjustSpeech({

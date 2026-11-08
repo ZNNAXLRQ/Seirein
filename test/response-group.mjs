@@ -42,8 +42,11 @@ import { join } from 'node:path';
 import { cleanupRoot, disposeAll } from './helpers/cleanup.mjs';
 import {
   CONTINUATION_MAX_GAP_MS,
+  composeCarryConveyFallback,
+  composeCarryConveyText,
   composeResponseGroupContext,
   createResponseGroupStore,
+  splitSpeechSentences,
 } from '../src/host/session/conversation/responseGroup.js';
 
 const state = {
@@ -1308,5 +1311,188 @@ test('21. never-spoken points are carried into the next speech; a sounded round 
   t.diagnostic(
     `carried=${carry.payload.sentences}句/${carry.payload.chars}字 gap=${carry.payload.gapMs}ms merged=true; `
     + `playedRound merged=${refused.payload.merged} reason=${refused.payload.reason}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 22. P2-1: a third input before B's plan keeps A's points in C's carry
+// ---------------------------------------------------------------------------
+
+test('22. A -> B -> C keeps the never-spoken A points when B\'s spoken plan is still missing', (t) => {
+  const { store, clock, events } = groupStore();
+  const A = '第一轮结论：窗口采集要选中目标窗口。第一轮条件：如果还黑屏就先别删场景。';
+  const B = '第二轮正文：先确认采集源类型是窗口采集。';
+  const first = store.beginInput({ sessionId: 's-carry-abc', text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: A });
+  store.adjustSpeech({ group: first.group, version: 1, text: A });
+  assert.equal(store.get(first.group.id).speechStarted, false, 'A never started sounding');
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-carry-abc', text: '补充一下，那采集源呢', at: clock.t });
+  assert.equal(second.continuation, true);
+  assert.equal(second.answerVersion, 2);
+  // B's body is ready, but its spoken organization has not returned yet.
+  store.noteAnswerBody({ group: first.group, version: 2, turn: 2, text: B });
+
+  clock.t += 2_000;
+  const third = store.beginInput({ sessionId: 's-carry-abc', text: '再补充一句，那编码器呢', at: clock.t });
+  assert.equal(third.continuation, true);
+  assert.equal(third.answerVersion, 3);
+  const carryRow = events.filter((row) => row.type === 'voice.carry.convey').at(-1);
+  assert.equal(carryRow.payload.merged, true);
+  assert.equal(carryRow.payload.sentences, 3, 'two A points plus B\'s body are inherited by C');
+  const carry = store.carryForSpeech(first.group, 3);
+  assert.deepEqual(carry.sentences, [
+    '第一轮结论：窗口采集要选中目标窗口。',
+    '第一轮条件：如果还黑屏就先别删场景。',
+    B,
+  ]);
+  assert.equal(carry.sentences.filter((row) => row.includes('要选中目标窗口')).length, 1, 'A appears exactly once');
+
+  // C's spoken plan conveys every point; the fulfilled carry is consumed and cleared.
+  const cPlan = `${A}${B}第三轮补充：编码器用硬件编码。`;
+  const adjusted = store.adjustSpeech({ group: first.group, version: 3, text: cPlan });
+  assert.equal(adjusted.carried, true);
+  assert.equal(adjusted.text, cPlan);
+  const pendingText = store.get(first.group.id).pendingSentences.join('');
+  assert.equal((pendingText.match(/窗口采集要选中目标窗口/gu) ?? []).length, 1, 'said once, never duplicated');
+  assert.equal(store.get(first.group.id).carryConvey, null, 'a fulfilled carry is cleared');
+  assert.equal(store.carryForSpeech(first.group, 3), null);
+  t.diagnostic(
+    `A=2句 B=1句 Ccarry=${carryRow.payload.sentences}句/${carryRow.payload.chars}字 `
+    + `repeated=0 fulfilled=cleared`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 23. P2-1: points that already played are never carried into a later round
+// ---------------------------------------------------------------------------
+
+test('23. a fully played round contributes no carry to the next round', (t) => {
+  const { store, clock, events } = groupStore();
+  const plan = '旧回答第一句。旧回答第二句。';
+  const first = store.beginInput({ sessionId: 's-carried-played', text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: plan });
+  store.adjustSpeech({ group: first.group, version: 1, text: plan });
+  for (let index = 0; index < 2; index += 1) {
+    const sentence = splitSpeechSentences(plan)[index];
+    store.notePlaybackStart({ group: first.group, version: 1, sentenceId: index, text: sentence });
+    store.notePlaybackEnd({
+      group: first.group, version: 1, sentenceId: index, chunkIndex: 0, chunkCount: 1,
+      status: 'completed', text: sentence,
+    });
+  }
+  assert.equal(store.get(first.group.id).state, 'done', 'the whole answer really played');
+
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-carried-played', text: '再补充一句', at: clock.t });
+  assert.equal(second.continuation, false, 'a finished round is a new round');
+  assert.equal(second.reason, 'prior-done');
+  assert.equal(
+    events.filter((row) => row.type === 'voice.carry.convey').length,
+    0,
+    'nothing unplayed is left, so no carry decision exists',
+  );
+  assert.equal(store.get(second.group.id).carryConvey, null);
+  assert.deepEqual(store.get(second.group.id).pendingSentences, []);
+  t.diagnostic('played=2/2 carryRows=0 newCarry=null pending=0');
+});
+
+// ---------------------------------------------------------------------------
+// 24. P2-2: budget shortage - the new conclusion plays, old points stay pending
+// ---------------------------------------------------------------------------
+
+test('24. a 1158-char carry plus a 106-char conclusion with a failed organizer keeps the conclusion', (t) => {
+  const { store, clock } = groupStore();
+  const head1 = '旧要点一：先确认采集源类型。';
+  const head2 = '旧要点二：窗口采集要选中目标窗口。';
+  const head3 = '旧要点三：如果还黑屏就点开采集属性确认一次';
+  const oldText = `${head1}${head2}${head3}${'旧'.repeat(1158 - head1.length - head2.length - head3.length - 1)}。`;
+  const newHead = '新结论：把编码器改成硬件编码，然后重启一次采集，画面就会出来';
+  const newText = `${newHead}${'了'.repeat(106 - newHead.length - 1)}。`;
+  assert.equal(oldText.length, 1158, 'fixture: three old sentences total 1158 chars');
+  assert.equal(splitSpeechSentences(oldText).length, 3);
+  assert.equal(newText.length, 106, 'fixture: the new conclusion is 106 chars');
+
+  const first = store.beginInput({ sessionId: 's-budget', text: 'OBS 全黑怎么调', at: clock.t });
+  store.noteAnswerPlan({ group: first.group, version: 1, text: oldText });
+  store.adjustSpeech({ group: first.group, version: 1, text: oldText });
+  clock.t += 2_000;
+  const second = store.beginInput({ sessionId: 's-budget', text: '补充一下，那编码器呢', at: clock.t });
+  assert.equal(second.continuation, true);
+  store.noteAnswerBody({ group: first.group, version: 2, turn: 2, text: newText });
+
+  // The organizer was unavailable: the budget-aware fallback keeps the current answer whole.
+  const fallback = composeCarryConveyFallback(oldText, newText, { maxChars: 1200 });
+  assert.equal(fallback.merged, false);
+  assert.equal(fallback.text, newText, 'the 106-char conclusion is the whole fallback plan');
+  assert.equal(fallback.pending.join(''), oldText, 'all old points stay pending, uncut');
+  store.deferCarry({ group: first.group, version: 2, sentences: fallback.pending });
+  const adjusted = store.adjustSpeech({ group: first.group, version: 2, text: fallback.text });
+  assert.equal(adjusted.text, newText, 'the old points are never prepended');
+  assert.equal(adjusted.deferred, true, 'the carry is explicitly deferred, not fulfilled');
+  const retained = store.carryForSpeech(first.group, 2);
+  assert.deepEqual(retained.sentences, splitSpeechSentences(oldText), 'old points remain as 待传达');
+
+  // What actually plays is the new conclusion only.
+  store.notePlaybackStart({ group: first.group, version: 2, sentenceId: 0, text: newText });
+  const played = store.get(first.group.id).played;
+  assert.deepEqual(played, [newText]);
+  assert.ok(!played.join('').includes('旧要点'), 'no old sentence is played');
+  assert.equal(store.carryForSpeech(first.group, 2).sentences.join(''), oldText);
+
+  // The fallback answer played, but the deferred points were never in a plan: a later same-topic
+  // round still inherits them, exactly once.
+  store.notePlaybackEnd({
+    group: first.group, version: 2, sentenceId: 0, chunkIndex: 0, chunkCount: 1,
+    status: 'completed', text: newText,
+  });
+  assert.equal(store.get(first.group.id).state, 'done');
+  clock.t += 2_000;
+  const later = store.beginInput({ sessionId: 's-budget', text: '再补充一句，那显示器呢', at: clock.t });
+  const laterCarry = store.carryForSpeech(later.group, later.answerVersion);
+  assert.ok(laterCarry !== null, 'the deferred points survive the played fallback');
+  assert.deepEqual(laterCarry.sentences, splitSpeechSentences(oldText));
+  const laterPlan = `${oldText}第四轮补充：显示器接电就行。`;
+  const laterAdjusted = store.adjustSpeech({ group: later.group, version: later.answerVersion, text: laterPlan });
+  assert.equal(laterAdjusted.carried, true);
+  assert.equal((laterAdjusted.text.match(/旧要点一/gu) ?? []).length, 1, 'each point is spoken at most once');
+  t.diagnostic(
+    `old=${oldText.length}字/3句 new=${newText.length}字/1句 budget=1200 fallback=new-only `
+    + `played=1 oldPlayed=0 pending=${retained.sentences.length}句 laterCarry=${laterCarry.sentences.length}句`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 25. P2-2: a correction in the new answer wins over the old conclusion
+// ---------------------------------------------------------------------------
+
+test('25. a correcting new conclusion is spoken instead of the old conclusion', (t) => {
+  const oldText = '旧结论：先重启软件。条件：不要先删除场景。';
+  const newText = '更正：不是先重启软件，而是先换一个采集源。';
+  const fallback = composeCarryConveyFallback(oldText, newText, { maxChars: 1200 });
+  assert.equal(fallback.merged, false);
+  assert.equal(fallback.text, newText, 'the correction is the spoken version');
+  assert.ok(!fallback.text.includes('旧结论'), 'the old conclusion is not repeated');
+  assert.deepEqual(fallback.pending, ['旧结论：先重启软件。', '条件：不要先删除场景。']);
+  t.diagnostic(
+    `old="${oldText}" new="${fallback.text}" oldConclusionSpoken=no pending=${fallback.pending.length}句`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 26. P2-2: enough budget keeps the original merge (old points still ride along)
+// ---------------------------------------------------------------------------
+
+test('26. when the budget is sufficient the old points still merge (original behavior kept)', (t) => {
+  const oldText = '旧要点一：先确认采集源。旧要点二：再看编码器。';
+  const newText = '新结论：窗口采集已经能看到画面。';
+  const fallback = composeCarryConveyFallback(oldText, newText, { maxChars: 1200 });
+  assert.equal(fallback.merged, true);
+  assert.equal(fallback.text, `${oldText}${newText}`);
+  assert.deepEqual(fallback.pending, []);
+  assert.equal(fallback.text, composeCarryConveyText(oldText, newText), 'the original merge is unchanged');
+  t.diagnostic(
+    `old=${oldText.length}字 new=${newText.length}字 budget=1200 merged=yes pending=0`,
   );
 });

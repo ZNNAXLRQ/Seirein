@@ -302,6 +302,9 @@ export function composeCarryConveyUser(carryText, source) {
   return `<上一轮待传达>\n${String(carryText ?? '')}\n</上一轮待传达>\n<完整答复>\n${String(source ?? '')}\n</完整答复>`;
 }
 
+/** Explicit correction in the NEW answer: old points must not be replayed over it. */
+const CARRY_CORRECTION = /(?:更正|纠正|改为|(?:不是|并非)[^。！？；;]{0,24}?(?:而是|是)|以[^。！？；;]{0,12}为准)/u;
+
 /**
  * Deterministic merge used when the organizer is unavailable: the carried points, then the new
  * answer with exactly repeated sentences dropped. Nothing is cut or reworded (no char budget).
@@ -316,6 +319,32 @@ export function composeCarryConveyText(carryText, newText) {
     return true;
   });
   return [...carried, ...fresh].join('');
+}
+
+/**
+ * Budget-aware fallback when the organizer is unavailable (or refused): the CURRENT answer keeps
+ * its place, and carried points only ride along when they fit the speech budget and the new answer
+ * does not correct them. Otherwise they stay pending for a later round, never forced into this
+ * playback (the old "old + new" hard merge could spend the whole budget on the old points).
+ *
+ * @returns {{text: string, pending: string[], merged: boolean}}
+ */
+export function composeCarryConveyFallback(carryText, newText, { maxChars = 0 } = {}) {
+  const fresh = splitSpeechSentences(newText);
+  const freshKeys = new Set(fresh.map(sentenceKey).filter(Boolean));
+  const carried = splitSpeechSentences(carryText).filter((sentence) => {
+    const key = sentenceKey(sentence);
+    return key.length > 0 && !freshKeys.has(key);
+  });
+  // A correction in the new answer wins: replaying the old point would contradict it.
+  const corrected = CARRY_CORRECTION.test(String(newText ?? ''));
+  const merged = corrected ? [] : [...carried, ...fresh];
+  const budget = Number(maxChars) > 0 ? Math.trunc(Number(maxChars)) : 0;
+  const fits = budget === 0 || [...merged.join('')].length <= budget;
+  if (!fits || merged.length === 0) {
+    return { text: fresh.join(''), pending: carried, merged: false };
+  }
+  return { text: merged.join(''), pending: [], merged: true };
 }
 
 /**
@@ -628,6 +657,11 @@ export function createResponseGroupStore({
       seen.add(key);
       rows.push(String(sentence));
     };
+    const carry = group.carryConvey ?? null;
+    // An unfulfilled carry is still unspoken material of this group. A third input arriving before
+    // the next spoken plan is back must inherit the original points too (A -> B -> C), never drop
+    // them just because `pendingSentences`/the current body no longer mention them.
+    for (const sentence of carry?.sentences ?? []) push(sentence);
     for (const sentence of group.pendingSentences ?? []) push(sentence);
     if (answer !== null) {
       for (const sentence of unspokenSentencesOf(answer, { maxSentences: pendingLimit })) push(sentence);
@@ -718,13 +752,27 @@ export function createResponseGroupStore({
   /**
    * B: may this input carry the previous round's never-spoken points into its own speech?
    * Only "previous round never started sounding + inside the 15 s window + still the same subject"
-   * merges. Every uncertain answer is NO: a window alone never carries anything.
+   * merges. A budget-deferred point was excluded from its round's plan, so it is still unspoken
+   * even after that round started speaking. Every uncertain answer is NO.
    */
   const carryDecision = (group, text, at) => {
     // The unvoiced remainder of the previous round: an answer that was streamed straight to the
     // speaker never populated `pendingSentences`, so the decided plan/body is the source of truth.
     const pending = pendingSpeechOf(group);
     const sentences = pending === null ? [] : pending.sentences;
+    // A budget-deferred carry was excluded from its round's plan, so it never sounded: it may still
+    // ride the next round even after that round started speaking. Every other point is replayed
+    // only while the round was still silent.
+    const played = playedKeySet(group);
+    const seen = new Set();
+    const deferredSentences = (group.carryConvey?.deferred === true ? group.carryConvey.sentences ?? [] : [])
+      .map((sentence) => String(sentence ?? ''))
+      .filter((sentence) => {
+        const key = sentenceKey(sentence);
+        if (key.length === 0 || played.has(key) || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
     // A round with nothing unvoiced has nothing to decide (and no event is written).
     if (sentences.length === 0) return null;
     const base = {
@@ -735,14 +783,19 @@ export function createResponseGroupStore({
     };
     if (base.gapMs > gapLimit) return { ...base, merged: false, reason: 'prior-idle' };
     // A round that already sounded is never re-spoken automatically, whatever the new input says.
-    if (group.speechStarted === true) return { ...base, merged: false, reason: 'prior-played' };
+    // Deferred points are the one exception: no spoken plan ever contained them.
+    if (group.speechStarted === true && deferredSentences.length === 0) {
+      return { ...base, merged: false, reason: 'prior-played' };
+    }
     if (isTopicSwitchInput(text) || isReturnToTopicInput(text)) {
       return { ...base, merged: false, reason: 'topic-switch' };
     }
     if (isNewInstructionInput(text)) return { ...base, merged: false, reason: 'new-instruction' };
     const priorText = `${group.lastUserInput}\n${answerSource(group.currentAnswer ?? group.priorAnswer)}`;
     if (!isSameTopicInput(text, priorText)) return { ...base, merged: false, reason: 'not-same-topic' };
-    return { ...base, merged: true, reason: 'same-topic' };
+    // Once a round sounded, only its never-planned deferred points may be carried.
+    const carried = group.speechStarted === true ? deferredSentences : sentences;
+    return { ...base, sentences: carried, chars: carried.join('').length, merged: true, reason: 'same-topic' };
   };
 
   /** Attach the carried points to this group/version and report the decision (one row per input). */
@@ -768,6 +821,29 @@ export function createResponseGroupStore({
       gapMs: carry.gapMs,
       answerVersion: version,
     });
+  };
+
+  /**
+   * A fallback plan could not convey the carried points inside the speech budget: keep exactly
+   * those points as still-unfulfilled carry material for a later round.
+   */
+  const deferCarry = ({ group, version, sentences = [] } = {}) => {
+    if (group === null || group === undefined) return null;
+    const rows = (Array.isArray(sentences) ? sentences : [])
+      .map((sentence) => String(sentence ?? '').trim())
+      .filter((sentence) => sentenceKey(sentence).length > 0);
+    if (rows.length === 0) return null;
+    const prior = group.carryConvey ?? null;
+    group.carryConvey = {
+      priorGroupId: prior?.priorGroupId ?? group.id,
+      sentences: rows.slice(-pendingLimit),
+      chars: rows.join('').length,
+      version,
+      reason: 'budget-deferred',
+      deferred: true,
+      at: now(),
+    };
+    return group.carryConvey;
   };
 
   /** The carried points this answer version's spoken organization must convey (null when none). */
@@ -1065,8 +1141,12 @@ export function createResponseGroupStore({
     if (carryForSpeech(group, version) !== null) {
       replacePendingFromPlan(group, original);
       if (Number.isInteger(turn)) answer.turn = turn;
+      // A budget-deferred fallback did NOT convey them: keep the points pending for a later round.
+      const deferred = group.carryConvey?.deferred === true;
+      if (!deferred) group.carryConvey = null;
       return {
-        text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false, carried: true,
+        text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false,
+        carried: !deferred, deferred,
       };
     }
     const priorUnspoken = group.pendingSentences.slice();
@@ -1123,6 +1203,8 @@ export function createResponseGroupStore({
     group.state = 'playing';
     // B: the never-started window closes at the first real sound; after this the carry gate is off.
     group.speechStarted = true;
+    // A normal carry was already fulfilled by its spoken plan; never let it be inherited again.
+    if (group.carryConvey !== null && group.carryConvey.deferred !== true) group.carryConvey = null;
     group.updatedAt = at;
     answer.updatedAt = at;
     if (sentence.length > 0 && !answer.playedSentences.some((row) => sentenceKey(row) === sentenceKey(sentence))) {
@@ -1242,6 +1324,8 @@ export function createResponseGroupStore({
     // A completed answer has no pending coverage left, whichever path closed it (streamed blocks
     // or the whole-reply fallback's single clip).
     group.pendingSentences = [];
+    // A played/concluded answer fulfilled a normal carry; a deferred one was never spoken.
+    if (group.carryConvey !== null && group.carryConvey.deferred !== true) group.carryConvey = null;
     if (group.currentAnswer?.version === version) {
       group.state = 'done';
       group.reason = reason;
@@ -1382,6 +1466,7 @@ export function createResponseGroupStore({
     noteAnswerPlan,
     adjustSpeech,
     carryForSpeech,
+    deferCarry,
     notePlaybackStart,
     notePlaybackEnd,
     notePlaybackSkipped,
@@ -1418,6 +1503,7 @@ export function createResponseGroupStore({
           chars: group.carryConvey.chars,
           version: group.carryConvey.version,
           reason: group.carryConvey.reason,
+          deferred: group.carryConvey.deferred === true,
         },
         currentAnswer: group.currentAnswer === null ? null : {
           version: group.currentAnswer.version,
