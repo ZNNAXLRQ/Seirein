@@ -28,6 +28,8 @@
  *  18. store: answer text done + speech incomplete becomes speechPending (never into a new group)
  *  19. store: "接着播/继续" is the only path that restores speechPending content
  *  20. store: a superseded group's late body/plan/playback is never mixed into the new group
+ *  21. store (B): a never-spoken round's points are carried into the next spoken organization,
+ *      but a round that already started sounding is never auto-carried
  *
  * Run: node --test test/response-group.mjs
  */
@@ -455,6 +457,21 @@ function groupStore(overrides = {}) {
     events,
     abandoned: () => events.find((row) => row.type === 'voice.response.group.abandoned') ?? null,
   };
+}
+
+/**
+ * One group whose text is complete but whose speaker never started: the exact B case where the
+ * unvoiced points may be carried into the NEXT round's spoken organization.
+ */
+function openNeverPlayedGroup(store, clock, {
+  sessionId, text = 'OBS 全黑怎么调', plan = '旧回答第一句。旧回答第二句。',
+}) {
+  const input = store.beginInput({ sessionId, text, at: clock.t });
+  store.noteAnswerPlan({ group: input.group, version: 1, text: plan });
+  store.adjustSpeech({ group: input.group, version: 1, text: plan });
+  assert.equal(store.get(input.group.id).speechStarted, false, 'the fixture never started sounding');
+  assert.equal(store.get(input.group.id).played.length, 0, 'played=0 is the carry gate');
+  return input;
 }
 
 /**
@@ -1242,5 +1259,54 @@ test('20. a superseded group\'s late body/plan/playback never mixes into the new
   assert.ok(!context.includes('迟到'), 'the new group never sees the late result');
   t.diagnostic(
     `old=${first.group.id}/abandoned lateBody=kept new=${second.group.id} mixed=0 stolen=0`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 21. B: never-spoken points are carried; a sounded round is never auto-carried
+// ---------------------------------------------------------------------------
+
+test('21. never-spoken points are carried into the next speech; a sounded round is not', (t) => {
+  const { store, clock, events } = groupStore();
+  const first = openNeverPlayedGroup(store, clock, { sessionId: 's-carry' });
+  const carriedPlan = '旧回答第一句。旧回答第二句。';
+
+  clock.t += 5_000;
+  const second = store.beginInput({ sessionId: 's-carry', text: '补充一下，那个采集源呢', at: clock.t });
+  assert.equal(second.continuation, true, 'a same-topic supplement still continues the group');
+  const carry = events.find((row) => row.type === 'voice.carry.convey');
+  assert.ok(carry !== undefined, 'the carry decision is reported');
+  assert.equal(carry.payload.merged, true);
+  assert.equal(carry.payload.reason, 'same-topic');
+  assert.equal(carry.payload.priorGroupId, first.group.id);
+  assert.equal(carry.payload.sentences, 2);
+  assert.equal(carry.payload.chars, carriedPlan.length);
+  assert.equal(carry.payload.gapMs, 5_000);
+
+  // The organizer gets the points and says them; adjustSpeech must not prepend them a second time.
+  const carried = store.carryForSpeech(second.group, second.answerVersion);
+  assert.deepEqual(carried.sentences, ['旧回答第一句。', '旧回答第二句。']);
+  assert.equal(carried.chars, carriedPlan.length);
+  const adjusted = store.adjustSpeech({ group: second.group, version: 2, text: '新的口语版。' });
+  assert.equal(adjusted.carried, true);
+  assert.deepEqual(adjusted.prepended, []);
+  assert.equal(adjusted.text, '新的口语版。');
+  assert.equal(store.carryForSpeech(second.group, 1), null, 'the carry belongs to one answer version only');
+
+  // A round that already sounded is never auto-carried, even with unvoiced content left.
+  const played = openPlayingGroup(store, clock, { sessionId: 's-carry-played' });
+  clock.t += 2_000;
+  const next = store.beginInput({ sessionId: 's-carry-played', text: '采集源还是黑的', at: clock.t });
+  const refused = events.filter((row) => row.type === 'voice.carry.convey').at(-1);
+  assert.equal(refused.payload.merged, false);
+  assert.equal(refused.payload.reason, 'prior-played');
+  assert.equal(store.get(next.group.id).carryConvey, null);
+  assert.equal(store.carryForSpeech(next.group, next.answerVersion), null);
+  // The old group still owns its unvoiced tail as speechPending (explicit resume only).
+  assert.deepEqual(store.get(played.group.id).speechPending.sentences, ['旧回答第二句。']);
+  assert.equal(store.get(played.group.id).speechStarted, true);
+  t.diagnostic(
+    `carried=${carry.payload.sentences}句/${carry.payload.chars}字 gap=${carry.payload.gapMs}ms merged=true; `
+    + `playedRound merged=${refused.payload.merged} reason=${refused.payload.reason}`,
   );
 });

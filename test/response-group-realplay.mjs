@@ -13,6 +13,8 @@
  *   2. a cancelled clip releases even though its player never ends (the long-play leak)
  *   3. a replaced version is immediately inactive and a late end cannot restart it; the newer
  *      version stays active until its own end
+ *   4. B: a carried plan (old points already organized into the new answer) is played as ONE speech,
+ *      every sentence exactly once — the player never learns about the carry
  *
  * Run: node --test test/response-group-realplay.mjs
  */
@@ -201,5 +203,39 @@ test('3. a replaced version does not stay active and cannot restart on a late en
   assert.equal(newStates.at(-1), 'released');
   t.diagnostic(
     `old=${oldStates.join('->')} new=${newStates.join('->')} oldActive=false newActiveAtEnd=false`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 4. A carried plan is one speech: every organized sentence plays once
+// ---------------------------------------------------------------------------
+
+test('4. a carried plan is played as one speech, every sentence exactly once', async (t) => {
+  const events = [];
+  const app = makeSpeaker({ events, ledgerSpeechId: 'speech-carry' });
+  // The host's organizer produced ONE text that already contains the old points and the new answer.
+  const merged = '先补上上次没说完的：窗口采集要选中目标窗口。改成游戏采集就能看到画面。';
+  app.speaker.push(merged);
+  const finishing = app.speaker.finish({ fullText: merged });
+
+  await waitUntil(() => app.state.plays.length === 1, 'the first sentence reached the player');
+  app.state.plays[0].gate.resolve();
+  await waitUntil(() => app.state.plays.length === 2, 'the second sentence reached the player');
+  app.state.plays[1].gate.resolve();
+
+  const stats = await finishing;
+  assert.equal(stats.played, 2, 'each sentence of the organized plan played once');
+  assert.deepEqual(
+    app.state.plays.map((play) => play.text),
+    ['先补上上次没说完的：窗口采集要选中目标窗口。', '改成游戏采集就能看到画面。'],
+    'the player consumes the organized text as-is: no carry knowledge, no replayed old clip',
+  );
+  assert.equal(app.state.plays.length, 2, 'no third clip was synthesized or replayed');
+  assert.equal(app.speaker.isActive(), false);
+  const states = lifecycleRows(events).map((row) => row.state);
+  assert.ok(states.includes('finished'));
+  assert.equal(states.at(-1), 'released');
+  t.diagnostic(
+    `sentences=${app.state.plays.length} played=${stats.played} states=${states.join('->')} carryAware=false`,
   );
 });

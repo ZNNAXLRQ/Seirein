@@ -80,6 +80,17 @@ const CONTINUATION_OPENER = /^\s*(?:还有|补充|再补充|另外|对了|再加
 /** An explicit request to resume content that is waiting unplayed ("继续/接着播"). */
 const EXPLICIT_RESUME = /^\s*(?:继续|接着|往下)/u;
 
+/**
+ * "切回/回到/返回" leaves the subject being discussed (the classic "切回桌面"): for the carry
+ * decision it is a topic switch even though the group machine already calls it a new instruction.
+ */
+const RETURN_TO_TOPIC = /(?:切(?:回|到|换(?:到|成)?)|回到|返回)/u;
+
+/** Is this input an explicit return to another subject (never a same-topic supplement)? */
+export function isReturnToTopicInput(text) {
+  return RETURN_TO_TOPIC.test(String(text ?? ''));
+}
+
 /** Parse one user input for an explicit cancel. `remainder` is the content after the opener. */
 export function isExplicitCancelInput(text) {
   const source = String(text ?? '');
@@ -156,6 +167,55 @@ function sentenceKeys(text) {
   return splitSpeechSentences(text).map(sentenceKey).filter((key) => key.length > 0);
 }
 
+/** Function words that say nothing about the subject; they never prove a shared topic. */
+const TOPIC_STOP = new Set([
+  '什么', '怎么', '这个', '那个', '一下', '可以', '然后', '还是', '就是', '这样', '那样',
+  '我们', '你们', '他们', '不是', '没有', '现在', '时候', '知道', '意思', '问题', '回答',
+  '看看', '再说', '补充', '还有', '另外', '接着', '继续', '已经', '需要', '应该', '真的',
+]);
+
+/**
+ * Content tokens of one text: Han character bigrams plus Latin/digit terms. Deliberately coarse —
+ * it only has to answer "is this still the same subject", never to understand it.
+ */
+function topicTokens(text) {
+  const out = new Set();
+  const runs = String(text ?? '').toLowerCase().match(/[\p{Script=Han}]+|[a-z0-9][a-z0-9._-]*/gu) ?? [];
+  for (const run of runs) {
+    if (/^\p{Script=Han}/u.test(run)) {
+      if (run.length <= 2) {
+        if (!TOPIC_STOP.has(run)) out.add(run);
+        continue;
+      }
+      for (let index = 0; index + 2 <= run.length; index += 1) {
+        const gram = run.slice(index, index + 2);
+        if (!TOPIC_STOP.has(gram)) out.add(gram);
+      }
+      continue;
+    }
+    if (run.length >= 2) out.add(run);
+  }
+  return out;
+}
+
+/**
+ * Is the new input still about the same thing? The 15 s window is only an upper bound, never
+ * evidence: without a continuation opener or real token overlap the answer is NO (no carry).
+ */
+export function isSameTopicInput(text, priorText) {
+  if (isContinuationInput(text)) return true;
+  const prior = topicTokens(priorText);
+  if (prior.size === 0) return false;
+  let shared = 0;
+  let sharedTerm = false;
+  for (const token of topicTokens(text)) {
+    if (!prior.has(token)) continue;
+    if (/^\p{Script=Han}/u.test(token)) shared += 1;
+    else sharedTerm = true;
+  }
+  return sharedTerm || shared >= 2;
+}
+
 /** The source a pending answer should be read from: its decided plan, else its body. */
 function answerSource(answer) {
   if (answer === null || answer === undefined) return '';
@@ -228,6 +288,34 @@ export function composeContinuationSpeech({
     skippedPlayed,
     unplayedPrior,
   };
+}
+
+/**
+ * B: the previous round's never-spoken points are carried as "待传达" material for the next
+ * round's spoken organization. They are NOT a user message, NOT merged into the visible answer
+ * and NOT a copy of the body: the organizer weaves them into the one spoken version it produces.
+ */
+export const CARRY_CONVEY_SYSTEM_NOTE = '如有【待传达】，用一两句把其中仍有效的信息自然融入本次口语回复；不逐句复述、不重复；相互矛盾时以新回答为准。';
+
+/** The organizer's user block: the carried points, then the complete body (never truncated). */
+export function composeCarryConveyUser(carryText, source) {
+  return `<上一轮待传达>\n${String(carryText ?? '')}\n</上一轮待传达>\n<完整答复>\n${String(source ?? '')}\n</完整答复>`;
+}
+
+/**
+ * Deterministic merge used when the organizer is unavailable: the carried points, then the new
+ * answer with exactly repeated sentences dropped. Nothing is cut or reworded (no char budget).
+ */
+export function composeCarryConveyText(carryText, newText) {
+  const carried = splitSpeechSentences(carryText);
+  const seen = new Set(carried.map(sentenceKey).filter((key) => key.length > 0));
+  const fresh = splitSpeechSentences(newText).filter((sentence) => {
+    const key = sentenceKey(sentence);
+    if (key.length === 0 || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return [...carried, ...fresh].join('');
 }
 
 /**
@@ -335,6 +423,12 @@ function groupView(group, extra = {}) {
     speechPending: group.speechPending === null || group.speechPending === undefined
       ? 0
       : group.speechPending.sentences.length,
+    /** B: has any sentence of this group actually started sounding? (played=0 ⇔ false) */
+    speechStarted: group.speechStarted === true,
+    /** B: points this group's speech must convey from the previous never-spoken round. */
+    carry: group.carryConvey === null || group.carryConvey === undefined
+      ? 0
+      : group.carryConvey.sentences.length,
     ...extra,
   };
 }
@@ -621,6 +715,72 @@ export function createResponseGroupStore({
     return { continuation: false, reason: `prior-${group.state}` };
   };
 
+  /**
+   * B: may this input carry the previous round's never-spoken points into its own speech?
+   * Only "previous round never started sounding + inside the 15 s window + still the same subject"
+   * merges. Every uncertain answer is NO: a window alone never carries anything.
+   */
+  const carryDecision = (group, text, at) => {
+    // The unvoiced remainder of the previous round: an answer that was streamed straight to the
+    // speaker never populated `pendingSentences`, so the decided plan/body is the source of truth.
+    const pending = pendingSpeechOf(group);
+    const sentences = pending === null ? [] : pending.sentences;
+    // A round with nothing unvoiced has nothing to decide (and no event is written).
+    if (sentences.length === 0) return null;
+    const base = {
+      priorGroupId: group.id,
+      sentences,
+      chars: sentences.join('').length,
+      gapMs: Math.max(0, at - (Number(group.segments[group.segments.length - 1]?.at) || group.createdAt)),
+    };
+    if (base.gapMs > gapLimit) return { ...base, merged: false, reason: 'prior-idle' };
+    // A round that already sounded is never re-spoken automatically, whatever the new input says.
+    if (group.speechStarted === true) return { ...base, merged: false, reason: 'prior-played' };
+    if (isTopicSwitchInput(text) || isReturnToTopicInput(text)) {
+      return { ...base, merged: false, reason: 'topic-switch' };
+    }
+    if (isNewInstructionInput(text)) return { ...base, merged: false, reason: 'new-instruction' };
+    const priorText = `${group.lastUserInput}\n${answerSource(group.currentAnswer ?? group.priorAnswer)}`;
+    if (!isSameTopicInput(text, priorText)) return { ...base, merged: false, reason: 'not-same-topic' };
+    return { ...base, merged: true, reason: 'same-topic' };
+  };
+
+  /** Attach the carried points to this group/version and report the decision (one row per input). */
+  const applyCarry = (group, carry, version) => {
+    if (carry === null || carry === undefined) return;
+    group.carryConvey = carry.merged === true && carry.sentences.length > 0
+      ? {
+        priorGroupId: carry.priorGroupId,
+        sentences: carry.sentences.slice(),
+        chars: carry.chars,
+        version,
+        reason: carry.reason,
+        at: now(),
+      }
+      : null;
+    publish('voice.carry.convey', {
+      groupId: group.id,
+      priorGroupId: carry.priorGroupId,
+      sentences: carry.sentences.length,
+      chars: carry.chars,
+      merged: carry.merged === true,
+      reason: carry.reason,
+      gapMs: carry.gapMs,
+      answerVersion: version,
+    });
+  };
+
+  /** The carried points this answer version's spoken organization must convey (null when none). */
+  const carryForSpeech = (group, version) => {
+    if (group === null || group === undefined) return null;
+    const carry = group.carryConvey;
+    if (carry === null || carry === undefined) return null;
+    if (carry.version !== version || !isCurrentAnswer(group, version)) return null;
+    const sentences = carry.sentences.filter((row) => String(row).trim().length > 0);
+    if (sentences.length === 0) return null;
+    return { priorGroupId: carry.priorGroupId, sentences, chars: sentences.join('').length };
+  };
+
   const createGroup = ({ sessionId, speakerId, text, at, reason }) => {
     sequence += 1;
     const answer = createAnswer(1, { at });
@@ -648,6 +808,13 @@ export function createResponseGroupStore({
        * only restored by an explicit "继续/接着播". Null while the group is live.
        */
       speechPending: null,
+      /** B: did any sentence of this group really start sounding? (the carry gate) */
+      speechStarted: false,
+      /**
+       * B: the previous round's never-spoken points, kept for THIS group's spoken organization
+       * only. It is not a user message, not a body, and not written into memory.
+       */
+      carryConvey: null,
       cancelReason: '',
       // Cached copies for the bounded continuation context (the message itself is never stored).
       lastUserInput: String(text ?? ''),
@@ -733,16 +900,25 @@ export function createResponseGroupStore({
     // never voiced. Without it the content stays speechPending and a new group never sees it.
     if (isExplicitResumeInput(text)) {
       const pending = newestSpeechPending(sessionId);
-      if (pending !== null) return continueGroup(pending, text, at, 'resume-pending');
+      if (pending !== null) {
+        // An explicit resume restores the unplayed text verbatim: it is never re-organized.
+        const resumed = continueGroup(pending, text, at, 'resume-pending');
+        resumed.group.carryConvey = null;
+        return resumed;
+      }
     }
     const current = newestFor(sessionId);
+    // B: the carry decision is taken against the previous round BEFORE it is retired.
+    const carry = current === null ? null : carryDecision(current, text, at);
     let decision = { continuation: false, reason: 'new' };
     if (current !== null) {
       decision = decide(current, text, at);
       if (decision.continuation === true) {
         // A same-group continuation is already an explicit continuation decision; it may keep
         // the unvoiced remainder of the previous version.
-        return continueGroup(current, text, at, decision.reason);
+        const continued = continueGroup(current, text, at, decision.reason);
+        applyCarry(continued.group, carry, continued.answerVersion);
+        return continued;
       }
       // Any non-continuation path retires the old group. Its answered-but-unvoiced content is
       // kept as speechPending (not merged, not auto-played) before the group becomes terminal.
@@ -754,6 +930,7 @@ export function createResponseGroupStore({
       }
     }
     const group = createGroup({ sessionId, speakerId, text, at, reason: decideReason(current, decision) });
+    applyCarry(group, carry, 1);
     return {
       group,
       generation: group.generation,
@@ -883,6 +1060,15 @@ export function createResponseGroupStore({
     if (answer === null || !Array.isArray(group.pendingSentences)) {
       return { text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false };
     }
+    // B: the carried points were already woven into THIS plan by the spoken organizer; prepending
+    // the old sentences again would say them twice. The plan owns the pending coverage instead.
+    if (carryForSpeech(group, version) !== null) {
+      replacePendingFromPlan(group, original);
+      if (Number.isInteger(turn)) answer.turn = turn;
+      return {
+        text: original, prepended: [], skippedPlayed: [], unplayedPrior: [], changed: false, carried: true,
+      };
+    }
     const priorUnspoken = group.pendingSentences.slice();
     const composed = composeContinuationSpeech({
       priorPlanText: priorUnspoken.join(''),
@@ -935,6 +1121,8 @@ export function createResponseGroupStore({
     const sentence = String(text ?? '').trim();
     answer.state = 'speaking';
     group.state = 'playing';
+    // B: the never-started window closes at the first real sound; after this the carry gate is off.
+    group.speechStarted = true;
     group.updatedAt = at;
     answer.updatedAt = at;
     if (sentence.length > 0 && !answer.playedSentences.some((row) => sentenceKey(row) === sentenceKey(sentence))) {
@@ -1193,6 +1381,7 @@ export function createResponseGroupStore({
     noteAnswerBody,
     noteAnswerPlan,
     adjustSpeech,
+    carryForSpeech,
     notePlaybackStart,
     notePlaybackEnd,
     notePlaybackSkipped,
@@ -1222,6 +1411,13 @@ export function createResponseGroupStore({
           chars: group.speechPending.chars,
           version: group.speechPending.version,
           reason: group.speechPending.reason,
+        },
+        carryConvey: group.carryConvey === null || group.carryConvey === undefined ? null : {
+          priorGroupId: group.carryConvey.priorGroupId,
+          sentences: [...group.carryConvey.sentences],
+          chars: group.carryConvey.chars,
+          version: group.carryConvey.version,
+          reason: group.carryConvey.reason,
         },
         currentAnswer: group.currentAnswer === null ? null : {
           version: group.currentAnswer.version,

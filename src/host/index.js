@@ -105,6 +105,9 @@ import * as subtitleModule from './subtitle/subtitle.js';
 // module is pure state/text; the host here feeds it from the real voice lanes and injects the
 // continuation context through its own pre-step lane.
 import {
+  CARRY_CONVEY_SYSTEM_NOTE,
+  composeCarryConveyText,
+  composeCarryConveyUser,
   createResponseGroupStore,
   isExplicitCancelInput,
   responseGroupContextMessage,
@@ -11724,7 +11727,7 @@ export function apply(ctx, config) {
         firstBodyAt = Date.now();
       };
       /** One model call for a long answer; persona + the confirmed body only (no recall, no tools). */
-      const requestSpokenVersion = async (source) => {
+      const requestSpokenVersion = async (source, { carryText = '' } = {}) => {
         const controller = new AbortController();
         const lane = turnOwnership?.signal ?? null;
         const forward = () => controller.abort(lane?.reason ?? new DOMException('Spoken version cancelled', 'AbortError'));
@@ -11745,11 +11748,16 @@ export function apply(ctx, config) {
             }
           })();
           const profileBlock = profileText.length > 0 ? `\n\n【用户画像】\n${profileText}` : '';
+          // B: carried points are extra INPUT for the spoken organization only; the body below is
+          // still the complete answer, and nothing about it is shortened.
+          const carryBlock = carryText.length > 0 ? `\n\n${CARRY_CONVEY_SYSTEM_NOTE}` : '';
           const pending = lightweight.ask({
             task: 'spoken',
             context: 'none',
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。`,
-            user: `<完整答复>\n${source}\n</完整答复>`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。${carryBlock}`,
+            user: carryText.length > 0
+              ? composeCarryConveyUser(carryText, source)
+              : `<完整答复>\n${source}\n</完整答复>`,
             maxTokens: Math.min(1024, Math.max(120, Math.ceil(source.length * 1.5))),
             // The rewrite runs after the answer is complete, so it gets a real budget instead of the
             // old 800 ms "first fragment" cap; the lightweight channel still enforces its deadline.
@@ -11789,6 +11797,12 @@ export function apply(ctx, config) {
           const turnId = Number.isSafeInteger(stage.turn) ? stage.turn : null;
           const replyVersion = replyVersionOf(sessionId, turnId);
           const startedAt = Date.now();
+          // B: the previous round's never-spoken points ride this round's spoken organization only.
+          // They never enter the body, the session history or memory (`carryForSpeech` is a view).
+          const carry = responseGroups.carryForSpeech(voiceGroup, voiceGroupVersion);
+          const carryText = carry === null ? '' : carry.sentences.join('');
+          // With carried points the merged speech may legitimately be longer than the new body.
+          const speechSource = carryText.length === 0 ? full : composeCarryConveyText(carryText, full);
           const plan = {
             text: full,
             feedText: raw,
@@ -11802,18 +11816,29 @@ export function apply(ctx, config) {
             // never spoken by itself and never replaces `text`).
             bodyText: full,
           };
-          if (full.length === 0) {
+          if (full.length === 0 && carryText.length === 0) {
             await emitSpokenVersion(plan, 'original', 0, 0);
             return plan;
           }
           // A short answer and an explicit "read it all" request never cost a second model call.
-          if (isShortSpokenReply(full) || requestsFullRead(spoken)) {
+          // Carried points are different: they still have to be conveyed, so they get organized.
+          if (carryText.length === 0 && (isShortSpokenReply(full) || requestsFullRead(spoken))) {
+            await emitSpokenVersion(plan, 'original', plan.chars, 0);
+            return plan;
+          }
+          if (carryText.length > 0 && requestsFullRead(spoken)) {
+            plan.text = speechSource;
+            plan.feedText = speechSource;
+            plan.chars = speechCharCount(speechSource);
             await emitSpokenVersion(plan, 'original', plan.chars, 0);
             return plan;
           }
           // One answer task per (turn, replyVersion, purpose): a repeated finish is not a new task.
           const task = voiceTaskDedupe.claim({ sessionId, turn: turnId, replyVersion, purpose: 'answer', text: full });
           if (task.ok !== true) {
+            plan.text = speechSource;
+            plan.feedText = carryText.length > 0 ? speechSource : raw;
+            plan.chars = speechCharCount(speechSource);
             plan.source = 'full-fallback';
             plan.fallback = 'duplicate-task';
             await emitSpokenVersion(plan, 'full-fallback', plan.chars, 0, 'duplicate-task');
@@ -11822,7 +11847,7 @@ export function apply(ctx, config) {
           let failure = '';
           let candidate = '';
           try {
-            const result = await requestSpokenVersion(full);
+            const result = await requestSpokenVersion(full, { carryText });
             candidate = String(result?.text ?? '');
           } catch (error) {
             // A provider code is the actionable reason; a DOMException only has a name.
@@ -11831,7 +11856,7 @@ export function apply(ctx, config) {
           }
           const ms = Date.now() - startedAt;
           if (failure.length === 0) {
-            const checked = normalizeSpokenVersion(full, candidate);
+            const checked = normalizeSpokenVersion(speechSource, candidate);
             if (checked.ok === true) {
               plan.text = checked.text;
               plan.chars = checked.chars;
@@ -11843,11 +11868,11 @@ export function apply(ctx, config) {
             }
             failure = checked.reason;
           }
-          // Fallback is the FULL body, never a truncated imitation of a summary.
-          plan.text = full;
-          plan.chars = speechCharCount(full);
+          // Fallback is the FULL body (plus the carried points), never a truncated summary.
+          plan.text = speechSource;
+          plan.chars = speechCharCount(speechSource);
           plan.source = 'full-fallback';
-          plan.feedText = raw;
+          plan.feedText = carryText.length > 0 ? speechSource : raw;
           plan.ms = ms;
           plan.fallback = failure;
           await log.emit('voice.spoken.fallback', {
@@ -12118,6 +12143,8 @@ export function apply(ctx, config) {
       const canStreamSpokenVersion = () => {
         // A continuation must speak past what was already heard, which needs the whole text.
         if (groupInput.continuation) return false;
+        // B: carried points must be woven in by the organizer, which needs the whole plan too.
+        if (responseGroups.carryForSpeech(voiceGroup, voiceGroupVersion) !== null) return false;
         if (lightweight === null) return false;
         const raw = bodyEndedText !== null ? bodyEndedText : bodyConfirmed;
         const full = formatSpeech(raw).speech.trim();
