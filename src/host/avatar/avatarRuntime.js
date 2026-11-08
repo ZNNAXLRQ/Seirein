@@ -2948,8 +2948,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     // No open speech session means there is no boundary left to wait for: a staged event that was
     // waiting for the next clip starts now instead of being stranded when the host stops reporting.
+    // The answer's opening intent is the exception: without a clip there is no "first body start",
+    // so its moment is gone and it is reported as expired, never started outside the answer.
     // This runs AFTER the action-end check above, so an ending action does not defer it by a tick.
-    if (intentState.pending !== null && clipState.session !== true) releaseIntent(at, 'no-session');
+    if (intentState.pending !== null && clipState.session !== true) {
+      if (intentState.pending.event === 'answer-start') {
+        dropPendingIntent('expired', { by: 'no-session', at, intentLabel: 'answer-start' });
+      } else {
+        releaseIntent(at, 'no-session');
+      }
+    }
     // Mid-sentence or between clips: keep the single waiting candidate; a clip start releases it.
     if (clipState.active === true || clipState.awaitingStart === true) return;
     // A released communication intent already owns the one action slot; never start a second.
@@ -3066,8 +3074,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       clipState.index = Number.isInteger(index) ? index : clipState.index + 1;
       clipState.startedAt = time;
       // The sentence boundary is the ONE release point for a staged communication intent. At most
-      // one intent starts per clip, and an action still running simply defers it to the next clip.
-      if (intentState.servedClip !== clipState.index) releaseIntent(time, 'sentence-start');
+      // one intent starts per clip, and an action still running simply defers it to the next clip —
+      // EXCEPT the answer's opening intent, which was staged for THIS boundary and never waits.
+      const opening = intentState.pending !== null && intentState.pending.event === 'answer-start'
+        && intentState.pending.holdForClipStart === true;
+      if (opening === true) releaseAnswerStartAtClipStart(time);
+      else if (intentState.servedClip !== clipState.index) releaseIntent(time, 'sentence-start');
       // A sentence gap is a REAL playback boundary: only here may the executor draw a
       // `sentence-gap` preset. It is skipped when a staged intent already owns this boundary or an
       // action is still running, so two gestures never overlap.
@@ -3137,8 +3149,15 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const time = Number.isFinite(at) ? at : clockNow();
     const wasOpen = clipState.session;
     // The end of the queue is still a boundary: a staged intent may start there before the
-    // session closes (answer-end's `settle` lands here when no further clip follows).
-    if (intentState.pending !== null) releaseIntent(time, 'speech-end');
+    // session closes (answer-end's `settle` lands here when no further clip follows). A missed
+    // answer-start is the exception: speech end is NOT its boundary, and the host has already
+    // moved the status out of `speaking`, so it is expired here instead of executed in the wrong
+    // state (that delayed release was the reported `no-candidate`).
+    if (intentState.pending !== null && intentState.pending.event === 'answer-start') {
+      dropPendingIntent('expired', { by: 'speech-end', at: time, intentLabel: 'answer-start' });
+    } else if (intentState.pending !== null) {
+      releaseIntent(time, 'speech-end');
+    }
     clipState.session = false;
     clipState.active = false;
     clipState.awaitingStart = false;
@@ -3155,7 +3174,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
 
   // ---- communication events → sentence-level intents (P-139 stage 2) -----------------------
   /** Drop the one staged intent with an explicit reason; nothing is ever silently forgotten. */
-  function dropPendingIntent(reason, { by = '', at = clockNow() } = {}) {
+  function dropPendingIntent(reason, { by = '', at = clockNow(), intentLabel = null } = {}) {
     const pending = intentState.pending;
     if (pending === null) return null;
     intentState.pending = null;
@@ -3164,13 +3183,63 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     recordIdleEvent('avatar.intent.dropped', {
       reason,
       event: pending.event,
-      intent: pending.intent,
+      /** The mapped gesture (`nod`); the timing contract can name the phase instead. */
+      intent: intentLabel ?? pending.intent,
+      mapped: pending.intent,
       actionId: pending.ticket,
       generation: pending.generation,
       by,
       at,
     });
     return pending;
+  }
+
+  /**
+   * Release the opening intent of an answer at the first body clip's real start. The generic
+   * boundary release may defer a busy action or skip an already-served clip index, which used to
+   * leave the intent pending until `speechEnd` — after the host had already moved the status out
+   * of `speaking`, so every answer-start recipe (states=speaking) held with `no-candidate`.
+   * This boundary owns the intent: it starts here or it is dropped here, never later.
+   */
+  function releaseAnswerStartAtClipStart(at) {
+    const pending = intentState.pending;
+    if (pending === null || pending.event !== 'answer-start') return null;
+    pending.holdForClipStart = false;
+    if (pending.generation !== intentState.generation) {
+      dropPendingIntent('expired', { by: 'clip-start', at, intentLabel: 'answer-start' });
+      return { ok: false, code: null, released: false, dropped: true, reason: 'expired' };
+    }
+    if (actionState.current !== null) {
+      dropPendingIntent('missed', { by: 'clip-start', at, intentLabel: 'answer-start' });
+      return { ok: false, code: null, released: false, dropped: true, reason: 'missed' };
+    }
+    const released = releaseIntent(at, 'sentence-start');
+    if (released.released !== true && released.dropped !== true) {
+      // It stayed pending (an unexpected gate): never let it wait for speechEnd.
+      dropPendingIntent('missed', { by: 'clip-start', at, intentLabel: 'answer-start' });
+      return { ok: false, code: null, released: false, dropped: true, reason: 'missed' };
+    }
+    return released;
+  }
+
+  /**
+   * Drop the answer's opening intent without a boundary (the first body clip was cancelled, its
+   * turn expired or its clip start never arrived). Reported once; never retried at speechEnd.
+   */
+  function dropAnswerStart(reason = 'cancelled', { at = null } = {}) {
+    if (state.disposed) return disposedResult();
+    const time = Number.isFinite(at) ? at : clockNow();
+    const why = reason === 'missed' || reason === 'expired' ? reason : 'cancelled';
+    const pending = intentState.pending;
+    if (pending === null || pending.event !== 'answer-start') {
+      recordIdleEvent('avatar.intent.dropped', {
+        intent: 'answer-start', event: 'answer-start', reason: why, by: 'host', at: time,
+      });
+      return { ok: true, dropped: false, reason: why };
+    }
+    pending.holdForClipStart = false;
+    dropPendingIntent(why, { by: 'host', at: time, intentLabel: 'answer-start' });
+    return { ok: true, dropped: true, reason: why };
   }
 
   /**
@@ -3183,7 +3252,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    */
   function invalidateIntents(reason, { at = clockNow(), interrupted = false, clearClip = false, hard = false } = {}) {
     const staleGeneration = intentState.generation;
-    dropPendingIntent('stale-generation', { by: reason, at });
+    // A turn/session switch expires the answer's opening intent (its boundary belongs to the old
+    // answer); every other staged phase keeps the historical `stale-generation` reason.
+    if (intentState.pending?.event === 'answer-start') {
+      dropPendingIntent('expired', { by: reason, at, intentLabel: 'answer-start' });
+    } else {
+      dropPendingIntent('stale-generation', { by: reason, at });
+    }
     intentState.generation += 1;
     intentState.servedClip = -1;
     // A generation switch breaks any run of conclusions: the next turn may mark its own.
@@ -3391,7 +3466,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * judged conclusion sentence): the turn/session check, the single slot, the degradation rule and
    * the sentence-boundary release are identical, only the source of the intent differs.
    */
-  function stageIntent({ event, mapped, profile = null, at = null, sessionId = null, turnId = null }) {
+  function stageIntent({ event, mapped, profile = null, at = null, sessionId = null, turnId = null,
+    holdForClipStart = false }) {
     const name = String(event ?? '');
     const time = Number.isFinite(at) ? at : clockNow();
     const nextSession = Number.isInteger(sessionId) ? sessionId : intentState.sessionId;
@@ -3424,6 +3500,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       sessionId: intentState.sessionId,
       turnId: intentState.turnId,
       at: time,
+      /** The host staged this for a clip start it is about to report: that boundary releases it. */
+      holdForClipStart: holdForClipStart === true,
     };
     // Single slot: a newer phase supersedes a still-waiting intent (the older one is reported).
     if (intentState.pending !== null) dropPendingIntent('superseded', { by: name, at: time });
@@ -3449,8 +3527,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       turnId: next.turnId,
       at: time,
     });
-    // Sentence-level release: the head window of the clip that just started releases now; a later
-    // event waits for the next clip start; no speech session means there is no boundary to wait for.
+    // Sentence-level release: a `holdForClipStart` admission waits for the boundary the host is
+    // about to report (staging must never execute the gesture before the real start); the head
+    // window of an already-started clip releases now; a later event waits for the next clip start;
+    // no speech session means there is no boundary to wait for.
+    if (holdForClipStart === true) {
+      return {
+        ok: true, code: null, event: name, intent: next.intent, actionId: next.ticket,
+        staged: true, released: false, dropped: false, degraded: decision.degraded === true,
+        profile: next.profile, reason: 'awaiting-clip-start',
+      };
+    }
     const headOfSentence = clipState.active === true
       && Number.isFinite(clipState.startedAt)
       && time - clipState.startedAt <= host.intentHeadWindowMs
@@ -3487,7 +3574,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * `sessionId` / `turnId` identify the conversation generation: passing a new value is a turn
    * switch, which invalidates the previous generation before this event is staged.
    */
-  function intentEvent(event, { at = null, sessionId = null, turnId = null } = {}) {
+  function intentEvent(event, { at = null, sessionId = null, turnId = null, holdForClipStart = false } = {}) {
     if (state.disposed) return disposedResult();
     const name = String(event ?? '');
     if (!MOTION_EVENTS.includes(name)) {
@@ -3511,6 +3598,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       at: time,
       sessionId,
       turnId,
+      holdForClipStart,
     });
     // The autonomous expression layer follows the same phase edge. It runs AFTER staging because a
     // turn/session switch invalidates (and clears) the old generation's expressions inside
@@ -4680,6 +4768,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     speechEnd,
     /** Report one communication phase (turn-start / user-speaking / thinking / answer-* / idle / confused). */
     intentEvent,
+    /** Drop the answer's opening intent (first body clip cancelled / expired) once, never retried. */
+    dropAnswerStart,
     /** Mark one answer sentence as a conclusion: one slightly larger nod, never back-to-back. */
     markConclusion,
     /** Conversation-end relax: decay the posture to the base over 2–4 s, no jump. */

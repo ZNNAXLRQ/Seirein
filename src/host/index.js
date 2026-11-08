@@ -362,6 +362,8 @@ import {
   collectModelStream,
   createSpokenUnitStream,
   createUnitSizer,
+  hasSpeakableText,
+  joinSpokenUnits,
   shouldSkipSpokenVersion,
   splitSemanticUnits,
 } from './speech/spokenPipeline.js';
@@ -2678,6 +2680,15 @@ export function apply(ctx, config) {
       void log.emit(message, payload).catch(() => {});
       return;
     }
+    // The answer's opening intent lifecycle: its ONE admission and any timing drop are debug
+    // rows of their own (at most once per answer; never repeated per tick).
+    if ((message === 'avatar.intent.staged' || message === 'avatar.intent.dropped')
+      && data?.event === 'answer-start') {
+      const payload = { ...data };
+      delete payload.level;
+      void log.emit(message, payload).catch(() => {});
+      return;
+    }
     const level = typeof data?.level === 'string' ? data.level : 'debug';
     if (level !== 'warn' && level !== 'error') return;
     void log.emit('avatar.runtime.log', { level, message: String(message ?? '') }).catch(() => {});
@@ -3223,8 +3234,12 @@ export function apply(ctx, config) {
     'turn-start': 0, 'user-speaking': 0, thinking: 0, 'answer-start': 0, 'answer-end': 0, idle: 0,
     confused: 0,
   };
-  /** One conversation phase for the one-slot sentence-level intent (P-139). */
-  const avatarIntent = (event, { sessionId = '', turnId = null, at = null } = {}) => {
+  /**
+   * One conversation phase for the one-slot sentence-level intent (P-139). `holdForClipStart`
+   * stages the answer's opening intent for the clip boundary the host is about to report: that
+   * boundary — not the preparation and not speechEnd — is its one release point.
+   */
+  const avatarIntent = (event, { sessionId = '', turnId = null, at = null, holdForClipStart = false } = {}) => {
     // Wiring counter: proves which phases the host really reported, even when the runtime itself
     // refuses/defers them. Observation only, never consulted by the host.
     if (avatarIntentCalls[event] !== undefined) avatarIntentCalls[event] += 1;
@@ -3234,9 +3249,15 @@ export function apply(ctx, config) {
         at,
         sessionId: avatarIntentSessionId(sessionId),
         turnId: Number.isInteger(turnId) ? turnId : null,
+        holdForClipStart,
       }),
     );
   };
+  /** The answer's first body clip was cancelled/expired before its opening intent could run. */
+  const avatarAnswerStartDropped = (reason, at) => avatarCall(
+    'dropAnswerStart',
+    (current) => current.dropAnswerStart(reason, { at }),
+  );
   // ---- P-139 stage 4: conclusions, confusion and the conversation-end relax -------------------
   // Each surface hangs off an event the host already sees: the conclusion off the clip start of the
   // sentence that really sounds, confusion off the answer's own words, relax off the speech end.
@@ -4035,9 +4056,13 @@ export function apply(ctx, config) {
     avatarStatus('speaking', 'playback.start');
     // P-54: one clip boundary per SENTENCE, never per intra-sentence block: only block 0 opens it.
     if ((session.chunkIndex ?? 0) === 0) {
+      // P-139: the answer's first body block stages its opening intent BEFORE the boundary that
+      // owns it, and `avatarClip('start')` below is the ONE release point. Staging after that
+      // boundary (the old order) could only wait for a later clip or for speechEnd, where the
+      // status has already left `speaking` — the reported `no-candidate`. The waiting line has
+      // `sentenceId === null`, so it can never stage this intent.
+      if (session.sentenceId === 0) avatarIntent('answer-start', { at, holdForClipStart: true });
       avatarClip('start', session);
-      // P-139: the answer's first sentence is the one sentence head that starts its gesture.
-      if (session.sentenceId === 0) avatarIntent('answer-start', { at });
       // P-139v: a conclusion is judged on the sentence that really sounds, at THIS clip's start.
       const owner = session.owner;
       if (typeof owner?.sessionId === 'string') {
@@ -4067,6 +4092,12 @@ export function apply(ctx, config) {
     session.transportPending = false;
     // A cancel carries its detail ('muted', 'superseded', …); it is still a cancel, never an end.
     session.endReason = reason === 'end' || reason === 'watchdog' || reason === 'failed' ? reason : 'cancelled';
+    // P-139: the answer's first body clip was cancelled/failed before its first sound, so its
+    // opening intent never got a boundary to run at. Report that once here; it is never revived.
+    if (session.sentenceId === 0 && (session.chunkIndex ?? 0) === 0 && session.startedAt === 0
+      && (session.endReason === 'cancelled' || session.endReason === 'failed')) {
+      avatarAnswerStartDropped('cancelled', session.endedAt);
+    }
     // Back to waiting when the clip ends or is interrupted; never clobber a newer state.
     avatarStatusIf(['speaking'], 'waiting', `playback.${reason}`);
     if (playback === session) {
@@ -12029,6 +12060,10 @@ export function apply(ctx, config) {
         const task = voiceTaskDedupe.claim({ sessionId, turn: turnId, replyVersion, purpose: 'answer', text: full });
         const settings = voiceChunkSettings();
         semanticUnitMode = true;
+        // The exact units handed to the speaker, in playback order. They are also the plan's
+        // sentence boundaries: the response group must count the same units the player completes
+        // (a comma cut is one unit, not one punctuation sentence).
+        const fedUnits = [];
         const units = createSpokenUnitStream({
           signal: controller.signal,
           // Measured synthesis cost sizes the first block; a whole short sentence always wins.
@@ -12042,9 +12077,10 @@ export function apply(ctx, config) {
             const unit = spokenMarks.firstUnitAt === 0
               ? rawUnit.replace(/^(?:口语版|口播版|语音版|spoken\s*version|speech)\s*[:：]\s*/iu, '').trim()
               : rawUnit;
-            if (unit.length === 0) return;
+            if (unit.length === 0 || !hasSpeakableText(unit)) return;
             if (spokenMarks.firstUnitAt === 0) spokenMarks.firstUnitAt = Date.now();
             rememberUnit(unit);
+            fedUnits.push(unit);
             // A clause unit has no terminator: the newline lets the speaker's own splitter flush it
             // as one clip without changing a single spoken character.
             speaker.push(`${unit}\n`);
@@ -12163,7 +12199,11 @@ export function apply(ctx, config) {
           group: voiceGroup,
           version: voiceGroupVersion,
           turn: turnId,
-          text: plan.text,
+          // One sentence per unit the speaker was actually fed, so the group's "every sentence
+          // completed" test counts exactly the clips that can finish. Using the un-separated text
+          // made a comma-split tail (units 4-6 of one punctuation sentence) look complete after
+          // its first unit, closing the group before the last two units could play.
+          text: fedUnits.length > 0 ? joinSpokenUnits(fedUnits) : plan.text,
           feedText: plan.feedText,
           source: plan.source,
           chars: plan.chars,

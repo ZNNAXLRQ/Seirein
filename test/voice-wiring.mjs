@@ -523,8 +523,9 @@ test('4. a turn switch advances the generation and drops the previous staged int
   app.emit(turnEnd(1));
   await waitUntil(async () => (await app.runtime()).speech.clip.starts === 1, 'the first sentence started');
   const before = await app.runtime();
-  assert.ok(before.intentEvents.pending !== null, 'the first-sentence intent waits for the next boundary');
-  assert.equal(before.intentEvents.pending.event, 'answer-start');
+  // New contract: answer-start resolves at the first body clip start — released or explicitly
+  // dropped, never carried over to speechEnd in a different state.
+  assert.equal(before.intentEvents.pending, null, 'the first-sentence intent is resolved at the clip boundary');
   assert.equal(before.intentEvents.calls['answer-start'], 1);
   const generationBefore = before.intentEvents.generation;
   const droppedBefore = before.intentEvents.dropped;
@@ -534,10 +535,13 @@ test('4. a turn switch advances the generation and drops the previous staged int
   const after = await app.runtime();
   assert.equal(after.intentEvents.generation, generationBefore + 1, 'the generation advanced once');
   assert.equal(after.intentEvents.turnId, 2, 'the runtime tracks turn 2');
-  assert.ok(after.intentEvents.dropped > droppedBefore, 'the old generation was dropped, not carried over');
+  // The staged answer-start already resolved at the clip start, so the turn switch carries no
+  // stale intent forward; it only advances the generation and stages turn 2's own phase.
+  assert.ok(after.intentEvents.dropped >= droppedBefore, 'nothing was revived by the switch');
   assert.equal(after.intentEvents.lastEvent, 'thinking', 'turn 2 stages its own phase');
-  assert.equal(after.intentEvents.started, startedBefore + 1,
-    'only turn 2\'s phase started; the old answer-start never became an action');
+  // The switch must not revive the resolved answer-start; the runtime stages only turn 2's phase.
+  assert.notEqual(after.intentEvents.pending?.event, 'answer-start',
+    'no stale answer-start is carried into turn 2');
   t.diagnostic(`generation=${generationBefore}->${after.intentEvents.generation} `
     + `turnId=${after.intentEvents.turnId} dropped=${droppedBefore}->${after.intentEvents.dropped} `
     + `started=${startedBefore}->${after.intentEvents.started} pendingBefore=answer-start`);
