@@ -3351,7 +3351,8 @@ window.__ModuleLoader__.load({
       'read-failed': '读取事件日志失败',
     };
 
-    /** turn.timeline 行 -> 投影；counts / overlaps / toolKinds 整块缺失时保持 null。 */    const diagnosticsTimelineOf = (value) => {
+    /** turn.timeline 行 -> 投影；counts / overlaps / toolKinds 整块缺失时保持 null。 */
+    const diagnosticsTimelineOf = (value) => {
       const object = diagnosticsObject(value);
       if (object === null) return null;
       const counts = diagnosticsObject(object.counts) ?? {};
@@ -3359,6 +3360,8 @@ window.__ModuleLoader__.load({
       const kinds = diagnosticsObject(object.toolKinds) ?? {};
       return {
         turn: diagnosticsNumber(object.turn, object.acceptTurn),
+        sessionId: diagnosticsText(object.sessionId),
+        deliveryMessageId: diagnosticsText(object.deliveryMessageId),
         status: diagnosticsText(object.status),
         modelRounds: diagnosticsNumber(counts.modelRounds),
         toolKinds: {
@@ -3372,12 +3375,14 @@ window.__ModuleLoader__.load({
       };
     };
 
-    /** pipeline.timeline 行 -> 投影；只保留合并展示需要的计时字段。 */
+    /** pipeline.timeline 行 -> 投影；只保留合并展示需要的计时字段与会话/交付标识。 */
     const diagnosticsPipelineTimelineOf = (value) => {
       const object = diagnosticsObject(value);
       if (object === null) return null;
       return {
         turn: diagnosticsNumber(object.turn),
+        sessionId: diagnosticsText(object.sessionId),
+        deliveryMessageId: diagnosticsText(object.deliveryMessageId),
         totalMs: diagnosticsNumber(object.totalMs),
         asrMs: diagnosticsNumber(object.asrMs),
         injectToAckMs: diagnosticsNumber(object.injectToAckMs),
@@ -3387,13 +3392,61 @@ window.__ModuleLoader__.load({
       };
     };
 
-    /** 按轮次合并两份时间线：同一轮取一条，只在一侧出现的行保留并把另一侧字段留 null。 */
+    /**
+     * 按轮次合并两份时间线：优先精确 deliveryMessageId，其次校验过的 sessionId+turn；旧行没有
+     * sessionId 时只有该轮两侧都唯一才回退。无法唯一确认的字段留 null（界面显示「—」），
+     * 绝不把另一会话同 turn 的数值借过来；排序只按轮次（行内没有事件时间）。
+     */
     function mergeDiagnosticsTimeline(turnRows, pipelineRows) {
+      const claim = (map, key, row) => {
+        if (key === '') return;
+        // A repeated key is ambiguous: a null value means "present but never merged".
+        map.set(key, map.has(key) ? null : row);
+      };
+      const countTurns = (rows) => {
+        const counts = new Map();
+        for (const row of rows) {
+          if (row.turn !== null) counts.set(row.turn, (counts.get(row.turn) ?? 0) + 1);
+        }
+        return counts;
+      };
+      const turnCount = countTurns(turnRows);
+      const pipelineTurnCount = countTurns(pipelineRows);
+      const byDelivery = new Map();
+      const bySessionTurn = new Map();
+      const legacyTurnRows = new Map();
+      for (const row of turnRows) {
+        claim(byDelivery, row.deliveryMessageId, row);
+        if (row.turn === null) continue;
+        if (row.sessionId !== '') {
+          claim(bySessionTurn, `${row.sessionId}\u0000${row.turn}`, row);
+        } else if (turnCount.get(row.turn) === 1) {
+          legacyTurnRows.set(row.turn, row);
+        }
+      }
+      const uniqueLegacyRow = (turn) => (
+        turnCount.get(turn) === 1 && pipelineTurnCount.get(turn) === 1
+          ? legacyTurnRows.get(turn) ?? null
+          : null
+      );
+      const matchOf = (entry) => {
+        if (entry.deliveryMessageId !== '' && byDelivery.has(entry.deliveryMessageId)) {
+          return byDelivery.get(entry.deliveryMessageId);
+        }
+        if (entry.turn === null) return null;
+        if (entry.sessionId !== '') {
+          const key = `${entry.sessionId}\u0000${entry.turn}`;
+          if (bySessionTurn.has(key)) return bySessionTurn.get(key);
+        }
+        return uniqueLegacyRow(entry.turn);
+      };
       const rows = [];
-      const byTurn = new Map();
+      const mergedOf = new Map();
       for (const entry of turnRows) {
         const row = {
           turn: entry.turn,
+          sessionId: entry.sessionId,
+          deliveryMessageId: entry.deliveryMessageId,
           status: entry.status,
           modelRounds: entry.modelRounds,
           toolKinds: entry.toolKinds,
@@ -3404,19 +3457,22 @@ window.__ModuleLoader__.load({
           hasTurn: true,
           hasPipeline: false,
         };
-        if (row.turn !== null && !byTurn.has(row.turn)) byTurn.set(row.turn, row);
+        mergedOf.set(entry, row);
         rows.push(row);
       }
       for (const entry of pipelineRows) {
-        const match = entry.turn === null ? undefined : byTurn.get(entry.turn);
-        if (match !== undefined) {
-          match.totalMs = entry.totalMs;
-          match.firstAudioMs = entry.firstAudioMs;
-          match.hasPipeline = true;
+        const match = matchOf(entry);
+        const target = match === null ? undefined : mergedOf.get(match);
+        if (target !== undefined && target.hasPipeline === false) {
+          target.totalMs = entry.totalMs;
+          target.firstAudioMs = entry.firstAudioMs;
+          target.hasPipeline = true;
           continue;
         }
         rows.push({
           turn: entry.turn,
+          sessionId: entry.sessionId,
+          deliveryMessageId: entry.deliveryMessageId,
           status: '',
           modelRounds: null,
           toolKinds: null,

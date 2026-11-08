@@ -407,34 +407,86 @@ function latencyStages(payload) {
 
 const NO_LATENCY = Object.freeze(Object.fromEntries(PIPELINE_LATENCY_FIELDS.map((field) => [field, null])));
 
-/** Newest `voice.latency` stages per delivery id and per turn (rows arrive chronologically). */
-function indexLatencyRows(rows) {
+/**
+ * Keep the newest candidate by EVENT time. A row with no usable stamp keeps insertion order as its
+ * only tie-break, so "newest" never silently follows file order for stamped rows.
+ */
+function keepNewest(map, key, candidate) {
+  const previous = map.get(key);
+  if (previous === undefined || candidate.at > previous.at
+    || (candidate.at === previous.at && candidate.seq > previous.seq)) {
+    map.set(key, candidate);
+  }
+}
+
+/**
+ * Newest `voice.latency` stages per delivery id and per (session, turn). A row without a session id
+ * is legacy and is indexed by turn only while that turn is globally unique (see `byTurn` below).
+ */
+function indexLatencyRows(rows, pipelineRows) {
   const byDelivery = new Map();
-  const byTurn = new Map();
+  const bySessionTurn = new Map();
+  const legacyByTurn = new Map();
+  const scopedTurns = new Set();
+  const pipelineTurnCount = new Map();
+  for (const pipelineRow of Array.isArray(pipelineRows) ? pipelineRows : []) {
+    const turn = intOrNull(pipelineRow?.payload?.turn);
+    if (turn !== null) pipelineTurnCount.set(turn, (pipelineTurnCount.get(turn) ?? 0) + 1);
+  }
+  let seq = 0;
   for (const row of Array.isArray(rows) ? rows : []) {
     if (row?.type !== 'voice.latency') continue;
     const payload = isPlainObject(row?.payload) ? row.payload : {};
-    const stages = latencyStages(payload);
+    const stamp = Date.parse(row?.ts);
+    const candidate = { stages: latencyStages(payload), at: Number.isFinite(stamp) ? stamp : -Infinity, seq };
+    seq += 1;
     const deliveryMessageId = tokenOf(payload.deliveryMessageId, 96);
-    if (deliveryMessageId !== null) byDelivery.set(deliveryMessageId, stages);
+    if (deliveryMessageId !== null) keepNewest(byDelivery, deliveryMessageId, candidate);
     const turn = intOrNull(payload.turn);
-    if (turn !== null) byTurn.set(turn, stages);
+    if (turn === null) continue;
+    const sessionId = tokenOf(payload.sessionId, 96);
+    if (sessionId !== null) {
+      keepNewest(bySessionTurn, `${sessionId}\u0000${turn}`, candidate);
+      scopedTurns.add(turn);
+      continue;
+    }
+    if (!legacyByTurn.has(turn)) legacyByTurn.set(turn, []);
+    legacyByTurn.get(turn).push(candidate);
   }
-  return { byDelivery, byTurn };
+  // A legacy row joins a turn only when the turn is unambiguous on BOTH sides: exactly one
+  // session-less latency row and exactly one pipeline row. Otherwise the fields stay null.
+  const byTurn = new Map();
+  for (const [turn, candidates] of legacyByTurn) {
+    if (candidates.length === 1 && !scopedTurns.has(turn) && pipelineTurnCount.get(turn) === 1) {
+      byTurn.set(turn, candidates[0].stages);
+    }
+  }
+  return { byDelivery, bySessionTurn, byTurn };
+}
+
+/** Exact delivery id first, then the verified (session, turn); a bare turn only when it is unique. */
+function latencyFor(index, { turn, sessionId, deliveryMessageId }) {
+  if (deliveryMessageId !== null && index.byDelivery.has(deliveryMessageId)) {
+    return index.byDelivery.get(deliveryMessageId).stages;
+  }
+  if (turn === null) return NO_LATENCY;
+  if (sessionId !== null) {
+    const key = `${sessionId}\u0000${turn}`;
+    if (index.bySessionTurn.has(key)) return index.bySessionTurn.get(key).stages;
+  }
+  return index.byTurn.get(turn) ?? NO_LATENCY;
 }
 
 /** `pipeline.timeline`: the five pipeline stages plus the latency stages of the same round. */
 function projectPipelineTimelineRow(row, index) {
   const payload = isPlainObject(row?.payload) ? row.payload : {};
   const turn = intOrNull(payload.turn);
+  const sessionId = tokenOf(payload.sessionId, 96);
   const deliveryMessageId = tokenOf(payload.deliveryMessageId, 96);
-  // delivery id first (the stable key), the turn as the fallback join; neither means no join.
-  const joined = (deliveryMessageId === null ? undefined : index.byDelivery.get(deliveryMessageId))
-    ?? (turn === null ? undefined : index.byTurn.get(turn))
-    ?? NO_LATENCY;
+  const joined = latencyFor(index, { turn, sessionId, deliveryMessageId });
   return {
     turn,
-    sessionId: tokenOf(payload.sessionId, 96),
+    sessionId,
     deliveryMessageId,
     bodyReadyMs: msOrNull(payload.bodyReadyMs),
     spokenFirstSentenceMs: msOrNull(payload.spokenFirstSentenceMs),
@@ -480,7 +532,10 @@ function collectTimelineRows(tail, { limit, nowMs, includePhases }) {
 }
 
 function collectPipelineRows(tail, { limit, nowMs }) {
-  const index = indexLatencyRows(tail.rows);
+  const index = indexLatencyRows(
+    tail.rows,
+    tail.rows.filter((row) => row?.type === PIPELINE_TIMELINE_EVENT),
+  );
   return collectProjected(tail, {
     matches: (row) => row?.type === PIPELINE_TIMELINE_EVENT,
     limit,

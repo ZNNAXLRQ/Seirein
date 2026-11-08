@@ -8,7 +8,8 @@
  *     在恢复结果与诊断压缩区都只做黄字提示，不自动滚动、不自动压缩、不自动新建会话。
  *
  * 做法与 client-diagnostics / client-instance-settings 相同：把 client.js 里真正发货的区块
- * 抽出来，用记录型 `h` 求值（不需要 DOM、React 或宿主）。第 6 条跑要求的回归套件。
+ * 抽出来，用记录型 `h` 求值（不需要 DOM、React 或宿主）。第 6 条校验按会话合并，第 7 条跑
+ * 要求的回归套件。
  *
  * Run: node --test test/diagnostics-ui-timeline.mjs
  */
@@ -47,6 +48,7 @@ return {
   timelineSection,
   readDiagnosticsTimelines,
   diagnosticsTimelineOf,
+  diagnosticsPipelineTimelineOf,
   mergeDiagnosticsTimeline,
   copyDiagnosticsReport,
   DIAGNOSTICS_TIMELINE_LIMIT,
@@ -537,7 +539,130 @@ test('5. 容量建议：stillNearLimit / recommendation / compressionEffective �
     + `colour=#b8860b manual=${manual.warnings.length} healthy=${healthy.warnings.length} autoActions=0`);
 });
 
-test('6. 回归：client-diagnostics / client-instance-settings / client-polling / smoke', async (t) => {
+test('6. 合并只认本会话的归属：delivery 优先、session+turn 其次、旧行仅唯一时回退', async () => {
+  const api = loadDiagnosticsApi();
+  const read = (turnRows, pipelineRows) => api.readDiagnosticsTimelines(async (body) => ({
+    ok: true,
+    probe: body.probe,
+    rows: body.probe === 'turn.timeline' ? turnRows : pipelineRows,
+  }));
+
+  // A/B 同一 turn=1：各自保留自己的数值，不串、不合并成一行。
+  const same = await read(
+    [
+      turnRow({ turn: 1, sessionId: 'session-a', deliveryMessageId: 'msg-a1', status: 'ok' }),
+      turnRow({ turn: 1, sessionId: 'session-b', deliveryMessageId: 'msg-b1', status: 'no-audio' }),
+    ],
+    [
+      pipelineRow({ turn: 1, sessionId: 'session-a', deliveryMessageId: 'msg-a1', totalMs: 1111, firstAudioMs: 2111 }),
+      pipelineRow({ turn: 1, sessionId: 'session-b', deliveryMessageId: 'msg-b1', totalMs: 2222, firstAudioMs: 3222 }),
+    ],
+  );
+  assert.equal(same.rows.length, 2, 'the same turn in two sessions stays two rows');
+  const rowA = same.rows.find((row) => row.sessionId === 'session-a');
+  const rowB = same.rows.find((row) => row.sessionId === 'session-b');
+  assert.equal(rowA.totalMs, 1111, 'session A keeps its own latency');
+  assert.equal(rowA.firstAudioMs, 2111);
+  assert.equal(rowB.totalMs, 2222, 'session B keeps its own latency');
+  assert.equal(rowB.firstAudioMs, 3222);
+  assert.equal(rowB.status, 'no-audio', 'status is each row\'s own');
+
+  // 精确 deliveryMessageId 优先：turn 差一（旧实现的回退会串）也能确认是同一交付。
+  const offByOne = await read(
+    [turnRow({ turn: 10, sessionId: 'session-a', deliveryMessageId: 'msg-10' })],
+    [pipelineRow({ turn: 11, sessionId: 'session-a', deliveryMessageId: 'msg-10', totalMs: 1010, firstAudioMs: 2010 })],
+  );
+  assert.equal(offByOne.rows.length, 1, 'the delivery id wins over the off-by-one turn');
+  assert.equal(offByOne.rows[0].turn, 10);
+  assert.equal(offByOne.rows[0].totalMs, 1010);
+  assert.equal(offByOne.rows[0].hasPipeline, true);
+
+  // 旧行（没有 sessionId）：该 turn 两侧都唯一才回退。
+  const legacyMatch = await read(
+    [turnRow({ turn: 12, sessionId: '', deliveryMessageId: '' })],
+    [pipelineRow({ turn: 12, sessionId: '', deliveryMessageId: '', totalMs: 1212, firstAudioMs: 2212 })],
+  );
+  assert.equal(legacyMatch.rows.length, 1);
+  assert.equal(legacyMatch.rows[0].totalMs, 1212, 'the only row for that turn may join');
+
+  const legacyAmbiguous = await read(
+    [turnRow({ turn: 13, sessionId: '', deliveryMessageId: '' })],
+    [
+      pipelineRow({ turn: 13, sessionId: '', deliveryMessageId: '', totalMs: 1313 }),
+      pipelineRow({ turn: 13, sessionId: 'session-b', deliveryMessageId: 'msg-b13', totalMs: 1314 }),
+    ],
+  );
+  const ambiguousTurn = legacyAmbiguous.rows.find((row) => row.hasTurn === true);
+  assert.equal(ambiguousTurn.totalMs, null, 'two pipeline rows make the turn ambiguous');
+  assert.equal(legacyAmbiguous.rows.some((row) => row.hasTurn === false), true,
+    'the unconfirmed pipeline row stays apart instead of being merged');
+
+  // latency 尚未到达：同 turn 的其它会话有自己的数值，本行仍是 null（界面「—」）。
+  const missing = await read(
+    [
+      turnRow({ turn: 14, sessionId: 'session-a', deliveryMessageId: 'msg-a14' }),
+      turnRow({ turn: 14, sessionId: 'session-b', deliveryMessageId: 'msg-b14', status: 'no-audio' }),
+    ],
+    [pipelineRow({ turn: 14, sessionId: 'session-b', deliveryMessageId: 'msg-b14', totalMs: 1414 })],
+  );
+  const onlyA = missing.rows.find((row) => row.sessionId === 'session-a');
+  const onlyB = missing.rows.find((row) => row.sessionId === 'session-b');
+  assert.equal(onlyA.totalMs, null, 'session A never borrows session B\'s latency');
+  assert.equal(onlyB.totalMs, 1414);
+
+  const notArrived = await read(
+    [turnRow({ turn: 15, sessionId: 'session-a', deliveryMessageId: 'msg-a15' })],
+    [pipelineRow({ turn: 15, sessionId: 'session-a', deliveryMessageId: 'msg-a15', totalMs: null, firstAudioMs: null })],
+  );
+  assert.equal(notArrived.rows.length, 1);
+  assert.equal(notArrived.rows[0].totalMs, null);
+  assert.equal(notArrived.rows[0].hasPipeline, true, 'the pipeline row is merged but has no latency yet');
+  const notArrivedText = textOf(api.timelineSection(h, { data: notArrived }));
+  assert.ok(notArrivedText.includes('总时长 —'));
+  assert.ok(notArrivedText.includes('首音 —'));
+  assert.equal(notArrivedText.includes('总时长 0ms'), false, 'a missing latency is never shown as 0');
+  assert.equal(notArrivedText.includes('首音 0ms'), false);
+
+  // 跨日轮次重置：两个日期会话都是 turn=1，后一天不继承前一天的数值。
+  const crossDay = await read(
+    [
+      turnRow({ turn: 1, sessionId: 'seirein-2026-11-09', deliveryMessageId: 'msg-09' }),
+      turnRow({ turn: 1, sessionId: 'seirein-2026-11-10', deliveryMessageId: 'msg-10' }),
+    ],
+    [pipelineRow({ turn: 1, sessionId: 'seirein-2026-11-09', deliveryMessageId: 'msg-09', totalMs: 909 })],
+  );
+  assert.equal(crossDay.rows.find((row) => row.sessionId === 'seirein-2026-11-09').totalMs, 909);
+  assert.equal(crossDay.rows.find((row) => row.sessionId === 'seirein-2026-11-10').totalMs, null,
+    'the next day\'s turn 1 is a different round');
+
+  // 展示顺序：轮次倒序（行内没有事件时间，窗口由宿主按事件时间倒序给出）。
+  const order = await read(
+    [
+      turnRow({ turn: 2, sessionId: 'session-a', deliveryMessageId: 'msg-2' }),
+      turnRow({ turn: 1, sessionId: 'session-a', deliveryMessageId: 'msg-1' }),
+      turnRow({ turn: 3, sessionId: 'session-a', deliveryMessageId: 'msg-3' }),
+    ],
+    [],
+  );
+  assert.deepEqual(order.rows.map((row) => row.turn), [3, 2, 1], 'newest round first');
+
+  // 保留的会话/交付标识只用于合并，绝不进入可复制的诊断报告。
+  const report = JSON.parse(api.diagnosticsReportOf({ version: '0.99.0' }, { timeline: same }));
+  for (const entry of report.timeline.rows) {
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'firstAudioMs', 'modelRounds', 'residualMs', 'status', 'toolKinds', 'toolWallMs', 'totalMs', 'turn',
+    ], 'the joined row ids never reach the copyable report');
+  }
+  assert.equal(JSON.stringify(report).includes('session-b'), false);
+
+  console.log(`[6] sameTurn sessions: a=${rowA.totalMs} b=${rowB.totalMs} deliveryWins turn=${offByOne.rows[0].turn} `
+    + `legacyUnique=${legacyMatch.rows[0].totalMs} legacyAmbiguous=${JSON.stringify(ambiguousTurn.totalMs)} `
+    + `missingA=${JSON.stringify(onlyA.totalMs)} crossDay=${JSON.stringify(
+      crossDay.rows.find((row) => row.sessionId === 'seirein-2026-11-10').totalMs,
+    )} order=${order.rows.map((row) => row.turn).join(',')}`);
+});
+
+test('7. 回归：client-diagnostics / client-instance-settings / client-polling / smoke', async (t) => {
   t.timeout = 600_000;
   const suites = [
     ['--test', join('test', 'client-diagnostics.mjs')],
@@ -559,7 +684,7 @@ test('6. 回归：client-diagnostics / client-instance-settings / client-polling
     }
   }
   const summary = results.map(({ args, code }) => `${args.join(' ')} => exit ${code}`).join('; ');
-  console.log(`[6] ${summary}`);
+  console.log(`[7] ${summary}`);
 });
 
 /** Run one child suite and report its tail when it fails. */

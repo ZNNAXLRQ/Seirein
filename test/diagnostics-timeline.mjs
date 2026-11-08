@@ -531,3 +531,119 @@ test('8. regression: the existing event probes keep their cap and audit shape', 
     f.cleanup();
   }
 });
+
+// ---------------------------------------------------------------------------
+// The `voice.latency` join must never key on a bare turn alone.
+// ---------------------------------------------------------------------------
+
+const pipelineEvent = (sessionId, turn, deliveryMessageId, offsetMs) => event('voice.pipeline.timeline', {
+  sessionId,
+  deliveryMessageId,
+  turn,
+  bodyReadyMs: 100,
+  firstAudioMs: 1000,
+}, offsetMs);
+
+const latencyEvent = (sessionId, turn, deliveryMessageId, stages, offsetMs) => event('voice.latency', {
+  ...(sessionId === null ? {} : { sessionId }),
+  ...(deliveryMessageId === null ? {} : { deliveryMessageId }),
+  turn,
+  ...stages,
+}, offsetMs);
+
+test('9. same turn in another session never lends its latency, missing stays null', async () => {
+  const f = fixture([
+    pipelineEvent('seirein-2026-11-09', 1, 'msg-09', 6000),
+    latencyEvent('seirein-2026-11-09', 1, 'msg-09', { totalMs: 1111, asrMs: 111 }, 5900),
+    pipelineEvent('seirein-2026-11-10', 1, 'msg-10', 4000),
+    latencyEvent('seirein-2026-11-10', 1, 'msg-10', { totalMs: 2222, asrMs: 222 }, 3900),
+    // Session 11 has no latency row of its own: it must not borrow either turn-1 row above.
+    pipelineEvent('seirein-2026-11-11', 1, 'msg-11', 3000),
+    // A new-format latency row of ANOTHER session for turn 2, and a legacy pipeline row without a
+    // delivery id: the bare turn is ambiguous, so nothing may be joined.
+    latencyEvent('seirein-2026-11-09', 2, null, { totalMs: 3333 }, 2500),
+    pipelineEvent('seirein-2026-11-12', 2, null, 2000),
+  ]);
+  const diagnostics = createDiagnostics({ root: f.root, isEnabled: true });
+  try {
+    const result = await diagnostics.query({ probe: 'pipeline.timeline', limit: 10 });
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+      result.rows.map((row) => [row.sessionId, row.turn]),
+      [
+        ['seirein-2026-11-12', 2],
+        ['seirein-2026-11-11', 1],
+        ['seirein-2026-11-10', 1],
+        ['seirein-2026-11-09', 1],
+      ],
+      'one row per session+turn, newest first',
+    );
+    const [turn2, missing, tenth, ninth] = result.rows;
+    assert.equal(turn2.totalMs, null, 'another session\'s turn 2 latency is never borrowed');
+    assert.equal(missing.totalMs, null, 'a round with no latency row stays null');
+    assert.equal(missing.asrMs, null);
+    assert.equal(missing.bodyReadyMs, 100, 'its own pipeline stages are untouched');
+    assert.equal(tenth.totalMs, 2222, 'each same-turn row keeps its own value');
+    assert.equal(tenth.asrMs, 222);
+    assert.equal(ninth.totalMs, 1111);
+    assert.equal(ninth.asrMs, 111);
+    console.log(`[9] same-turn joins: 11-09=${ninth.totalMs} 11-10=${tenth.totalMs} `
+      + `11-11=${JSON.stringify(missing.totalMs)} 11-12=${JSON.stringify(turn2.totalMs)} (no cross-session borrow)`);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('10. a legacy latency row (no session id) joins only while its turn is globally unique', async () => {
+  const f = fixture([
+    pipelineEvent('session-a', 3, null, 9000),
+    latencyEvent(null, 3, null, { totalMs: 3000 }, 8900),
+    pipelineEvent('session-a', 4, null, 8000),
+    latencyEvent(null, 4, null, { totalMs: 4001 }, 7900),
+    latencyEvent(null, 4, null, { totalMs: 4002 }, 7800),
+    pipelineEvent('session-a', 5, null, 7000),
+    latencyEvent(null, 5, null, { totalMs: 5000 }, 6900),
+    pipelineEvent('session-b', 5, null, 6800),
+    pipelineEvent('session-a', 6, null, 6000),
+    latencyEvent('session-b', 6, null, { totalMs: 6000 }, 5900),
+    pipelineEvent('session-b', 6, null, 5800),
+  ]);
+  const diagnostics = createDiagnostics({ root: f.root, isEnabled: true });
+  try {
+    const result = await diagnostics.query({ probe: 'pipeline.timeline', limit: 10 });
+    const byKey = new Map(result.rows.map((row) => [`${row.sessionId}#${row.turn}`, row]));
+    assert.equal(byKey.get('session-a#3').totalMs, 3000, 'the only row for turn 3 may join');
+    assert.equal(byKey.get('session-a#4').totalMs, null, 'two legacy rows for turn 4 are ambiguous');
+    assert.equal(byKey.get('session-a#5').totalMs, null, 'one legacy row over two pipeline rows is ambiguous');
+    assert.equal(byKey.get('session-b#5').totalMs, null);
+    assert.equal(byKey.get('session-a#6').totalMs, null, 'a scoped turn-6 row is another session\'s');
+    assert.equal(byKey.get('session-b#6').totalMs, 6000, 'the exact session+turn still joins');
+    console.log(`[10] legacy turn3=${byKey.get('session-a#3').totalMs} turn4=${JSON.stringify(byKey.get('session-a#4').totalMs)} `
+      + `turn5=${JSON.stringify(byKey.get('session-a#5').totalMs)} scopedTurn6 a=${JSON.stringify(byKey.get('session-a#6').totalMs)} `
+      + `b=${byKey.get('session-b#6').totalMs}`);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('11. the newest latency row is chosen by EVENT time, not by file/insertion order', async () => {
+  const f = fixture([
+    event('voice.pipeline.timeline', {
+      sessionId: 'session-n', deliveryMessageId: 'msg-n7', turn: 7, bodyReadyMs: 100,
+    }, 5000),
+    // The newer event is written first; the older one is the last line of the file.
+    latencyEvent('session-n', 7, 'msg-n7', { totalMs: 7001, asrMs: 71 }, 800),
+    latencyEvent('session-n', 7, 'msg-n7', { totalMs: 7002, asrMs: 72 }, 4000),
+  ]);
+  const diagnostics = createDiagnostics({ root: f.root, isEnabled: true });
+  try {
+    const result = await diagnostics.query({ probe: 'pipeline.timeline', limit: 5 });
+    assert.equal(result.rows.length, 1);
+    assert.equal(result.rows[0].totalMs, 7001, 'event order decides, not the last line of the file');
+    assert.equal(result.rows[0].asrMs, 71);
+    console.log(`[11] newestByEventTime totalMs=${result.rows[0].totalMs} asrMs=${result.rows[0].asrMs} `
+      + `(file-order value 7002 rejected)`);
+  } finally {
+    f.cleanup();
+  }
+});

@@ -196,12 +196,18 @@ const LONG_MERGED = '结论：前十六条都确认过了，如果还是没反�
 
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Watchdog clock for the polling helpers. `performance.now()` is monotonic and is NOT the clock the
+ * fixtures replace, so a frozen/advanced `Date.now` can never stretch (or disable) a timeout.
+ */
+const elapsedNow = () => performance.now();
+
 const waitUntil = async (check, message, timeoutMs = 6000) => {
-  const started = Date.now();
+  const started = elapsedNow();
   for (;;) {
     const value = await check();
     if (value) return value;
-    if (Date.now() - started > timeoutMs) throw new Error(`timed out: ${message}`);
+    if (elapsedNow() - started > timeoutMs) throw new Error(`timed out: ${message}`);
     await tick(5);
   }
 };
@@ -398,11 +404,11 @@ async function mountRound(t, {
     }
   };
   const waitForEvent = async (type, predicate = () => true, timeoutMs = 6000) => {
-    const startedAt = Date.now();
+    const startedAt = elapsedNow();
     for (;;) {
       const row = (await events()).find((event) => event.type === type && predicate(event.payload ?? {}));
       if (row !== undefined) return row.payload ?? {};
-      if (Date.now() - startedAt > timeoutMs) throw new Error(`timed out waiting for ${type}`);
+      if (elapsedNow() - startedAt > timeoutMs) throw new Error(`timed out waiting for ${type}`);
       await tick(10);
     }
   };
@@ -455,9 +461,12 @@ const joined = (texts) => texts.join('');
 // ---------------------------------------------------------------------------
 
 test('1. a never-spoken round plus a same-topic supplement are spoken once, deduped', async (t) => {
+  // Deterministic clock: the host stamps both inputs with `Date.now`, and the test advances that
+  // clock by exactly 5 s. Real elapsed time (awaiting the first plan, holding the clip) is no
+  // longer added to the measured gap, so the assertion below is exact on any machine/load.
   const realNow = Date.now;
-  let skewMs = 0;
-  Date.now = () => realNow() + skewMs;
+  let fixedNow = realNow();
+  Date.now = () => fixedNow;
   t.after(() => { Date.now = realNow; });
   const app = await mountRound(t, {
     holdSynth: (text) => text.includes('采集源没选对'),
@@ -472,23 +481,17 @@ test('1. a never-spoken round plus a same-topic supplement are spoken once, dedu
   const firstGroup = ready.groupId;
   assert.equal(app.players().length, 0, 'the old version never reached the player');
 
-  skewMs = 5_000;
+  fixedNow += 5_000;
   app.say('补充一下，那窗口采集还是黑屏呢');
-  let carry;
-  let continued;
-  try {
-    carry = await carryEventOf(app, (payload) => payload.merged === true);
-    continued = await app.waitForEvent('voice.response.group.continued');
-  } finally {
-    skewMs = 0;
-  }
+  const carry = await carryEventOf(app, (payload) => payload.merged === true);
+  const continued = await app.waitForEvent('voice.response.group.continued');
   assert.equal(carry.groupId, continued.groupId);
   assert.equal(carry.priorGroupId, firstGroup, 'the carried points belong to the never-spoken round');
   assert.equal(carry.reason, 'same-topic');
   assert.equal(carry.merged, true);
   assert.equal(carry.sentences, 2, 'both old sentences are carried as points');
   assert.ok(carry.chars >= OLD_SPOKEN.length, `the whole old plan is carried (${carry.chars} chars)`);
-  assert.ok(carry.gapMs >= 4_900 && carry.gapMs < 5_200, `the gap is measured between inputs (${carry.gapMs} ms)`);
+  assert.equal(carry.gapMs, 5_000, `the gap is measured between the two input stamps (${carry.gapMs} ms)`);
 
   state.holdGate.resolve();
   await waitUntil(() => app.spokenRequests().length === 2, 'the second spoken version was organized');
