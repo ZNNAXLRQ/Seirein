@@ -14,6 +14,7 @@ import {
   VOICE_LATENCY_OBSERVATION_FIELDS,
   VOICE_LATENCY_OPTIONAL_FIELDS,
 } from '../../session/delivery/dispatch.js';
+import { TOOL_KINDS } from '../../session/timeline/turn-timeline.js';
 
 /** Query defaults and hard caps. `limit` is clamped, never trusted. */
 export const DIAGNOSTICS_LIMITS = Object.freeze({
@@ -22,6 +23,18 @@ export const DIAGNOSTICS_LIMITS = Object.freeze({
   scanBytes: 256 * 1024,
   maxAgeMs: 24 * 60 * 60 * 1000,
 });
+
+/**
+ * The timeline probes are bounded deeper than the event probes (a row is a whole round, not one
+ * stage), but a caller still cannot widen the window: `limit` is clamped to this hard cap.
+ */
+export const DIAGNOSTICS_TIMELINE_LIMITS = Object.freeze({ defaultLimit: 20, maxLimit: 100 });
+
+/** Hard cap on phases a probe may return even when `includePhases` is requested. */
+export const DIAGNOSTICS_TIMELINE_PHASE_CAP = 64;
+
+/** Rotated generations of the event log (`events.jsonl.1` to `.5`, see runtime/event-log.js). */
+export const DIAGNOSTICS_EVENT_GENERATIONS = 5;
 
 /** The canonical event probes (aliases are resolved below and never add a new surface). */
 const VOICE_FIELDS = Object.freeze([
@@ -61,11 +74,91 @@ const NOISE_FIELDS = Object.freeze([
   'tags',
 ]);
 
+/** The new probes' event types (one source for the registry and the projections below). */
+const TURN_TIMELINE_EVENT = 'voice.turn.timeline';
+const PIPELINE_TIMELINE_EVENT = 'voice.pipeline.timeline';
+
+/**
+ * `turn.timeline` projection: one summary row per round. The phases array is replaced by
+ * `phaseNames` / `longestPhase` / `toolKinds` / `phaseCount`, so the default answer stays small.
+ */
+const TURN_TIMELINE_FIELDS = Object.freeze([
+  'timelineId',
+  'sessionId',
+  'turn',
+  'acceptTurn',
+  'deliveryMessageId',
+  'groupId',
+  'lane',
+  'status',
+  'reason',
+  'origin',
+  'counts',
+  'overlaps',
+  'residualMs',
+  'droppedPhases',
+  'phaseCount',
+  'phaseNames',
+  'longestPhase',
+  'toolKinds',
+]);
+
+/** The `turn.timeline` shape with `includePhases: true`: `phases` is the only added key. */
+export const DIAGNOSTICS_TURN_TIMELINE_FIELDS = Object.freeze([...TURN_TIMELINE_FIELDS, 'phases']);
+
+/** One projected phase: a fixed field set, never `extra`, tool arguments or a tool result. */
+export const DIAGNOSTICS_TIMELINE_PHASE_FIELDS = Object.freeze([
+  'name',
+  'actionId',
+  'startMs',
+  'endMs',
+  'durMs',
+  'source',
+  'status',
+  'reason',
+  'wait',
+  'toolName',
+  'toolKind',
+  'parallelGroup',
+]);
+
+/** The `voice.latency` stages `pipeline.timeline` joins onto its own row. */
+const PIPELINE_LATENCY_FIELDS = Object.freeze(['totalMs', 'asrMs', 'injectToAckMs', 'ackToFirstTextMs']);
+
+/** `pipeline.timeline` projection: the five pipeline stages plus the four joined latency stages. */
+export const DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS = Object.freeze([
+  'turn',
+  'sessionId',
+  'deliveryMessageId',
+  'bodyReadyMs',
+  'spokenFirstSentenceMs',
+  'translatedFirstMs',
+  'firstChunkSynthMs',
+  'firstAudioMs',
+  ...PIPELINE_LATENCY_FIELDS,
+]);
+
 /** Whitelisted probes. `fields` is the only projection for an event probe. */
 export const DIAGNOSTICS_PROBES = Object.freeze({
   'voice.latency': Object.freeze({ kind: 'events', type: 'voice.latency', fields: VOICE_FIELDS }),
   'noise.shadow': Object.freeze({ kind: 'events', type: 'hearing.noise.shadow', fields: NOISE_FIELDS }),
   'hearing.noise.shadow': Object.freeze({ kind: 'events', type: 'hearing.noise.shadow', fields: NOISE_FIELDS }),
+  // P-46 stage 3: a round's own timeline, summarized. The phases array is NOT part of the default
+  // projection (it is the biggest part of the row); `includePhases: true` appends a capped,
+  // per-field projection of it.
+  'turn.timeline': Object.freeze({
+    kind: 'timeline',
+    type: TURN_TIMELINE_EVENT,
+    fields: TURN_TIMELINE_FIELDS,
+    limit: DIAGNOSTICS_TIMELINE_LIMITS,
+  }),
+  // P-46 stage 3: the spoken pipeline stages, joined to the same round's `voice.latency` stages.
+  'pipeline.timeline': Object.freeze({
+    kind: 'pipeline',
+    type: PIPELINE_TIMELINE_EVENT,
+    fields: DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS,
+    limit: DIAGNOSTICS_TIMELINE_LIMITS,
+  }),
   hotkeys: Object.freeze({ kind: 'state', source: 'hotkeys' }),
   hotkey: Object.freeze({ kind: 'state', source: 'hotkeys' }),
   'memory.stats': Object.freeze({ kind: 'state', source: 'memory.stats' }),
@@ -130,6 +223,32 @@ export function sanitizeDiagnosticValue(value, depth = 0) {
 
 const finiteNumber = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
 
+/** A count/step/version: absent or empty stays null (a measured 0 is preserved). */
+const intOrNull = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : null;
+};
+
+/** A duration or stamp: absent stays null (a measured 0 is preserved). */
+const msOrNull = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.round(number) : null;
+};
+
+/**
+ * A short token: an id, an enum value or an error CODE. Anything that is not one (a sentence, a
+ * path, a tool argument) collapses to null, so a projected phase or origin never carries free
+ * text even when the raw event does.
+ */
+const TOKEN_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,159}$/u;
+function tokenOf(value, max = 96) {
+  if (typeof value !== 'string') return null;
+  const text = redactDiagnosticText(value.trim()).slice(0, max);
+  return text.length === 0 || !TOKEN_SHAPE.test(text) ? null : text;
+}
+
 /** State probes are built from named fields; unknown fields and sensitive keys never pass. */
 const STATE_PROJECTORS = Object.freeze({
   hotkeys(raw) {
@@ -192,17 +311,224 @@ function projectEventRow(definition, row) {
   return output;
 }
 
+/** Dedupe the names, count the tool kinds and keep the longest phase, never a phase itself. */
+function summarizePhases(phases) {
+  const names = [];
+  const toolKinds = Object.fromEntries(TOOL_KINDS.map((kind) => [kind, 0]));
+  let longest = null;
+  for (const phase of Array.isArray(phases) ? phases : []) {
+    if (!isPlainObject(phase)) continue;
+    const name = tokenOf(phase.name, 32);
+    if (name !== null && names.length < 12 && !names.includes(name)) names.push(name);
+    const kind = isPlainObject(phase.tool) ? phase.tool.kind : null;
+    if (name === 'tool' && Object.hasOwn(toolKinds, kind)) toolKinds[kind] += 1;
+    const durMs = msOrNull(phase.durMs);
+    if (durMs === null || durMs < 0) continue;
+    if (longest === null || durMs > longest.durMs) longest = { name, durMs };
+  }
+  return { names, longest, toolKinds };
+}
+
+/** One phase, field by field: no `extra`, no tool arguments and no tool result ever pass. */
+function projectPhase(phase) {
+  if (!isPlainObject(phase)) return null;
+  const tool = isPlainObject(phase.tool) ? phase.tool : {};
+  return {
+    name: tokenOf(phase.name, 32),
+    actionId: tokenOf(phase.actionId, 96),
+    startMs: msOrNull(phase.startMs),
+    endMs: msOrNull(phase.endMs),
+    durMs: msOrNull(phase.durMs),
+    source: tokenOf(phase.source, 32),
+    status: tokenOf(phase.status, 24),
+    reason: tokenOf(phase.reason, 32),
+    wait: phase.wait === true,
+    toolName: tokenOf(tool.name, 64),
+    toolKind: TOOL_KINDS.includes(tool.kind) ? tool.kind : null,
+    parallelGroup: tokenOf(tool.parallelGroup, 12),
+  };
+}
+
+/** `turn.timeline`: one row per round; the phases array is replaced by its summary. */
+function projectTurnTimelineRow(row, includePhases) {
+  const payload = isPlainObject(row?.payload) ? row.payload : {};
+  const phases = Array.isArray(payload.phases) ? payload.phases : null;
+  const summary = summarizePhases(phases);
+  const output = {
+    timelineId: tokenOf(payload.timelineId, 160),
+    sessionId: tokenOf(payload.sessionId, 96),
+    turn: intOrNull(payload.turn),
+    acceptTurn: intOrNull(payload.acceptTurn),
+    deliveryMessageId: tokenOf(payload.deliveryMessageId, 96),
+    groupId: tokenOf(payload.groupId, 96),
+    lane: tokenOf(payload.lane, 24),
+    status: tokenOf(payload.status, 24),
+    reason: tokenOf(payload.reason, 32),
+    origin: {
+      at: msOrNull(payload.origin?.at),
+      source: tokenOf(payload.origin?.source, 16),
+    },
+    counts: {
+      modelRounds: intOrNull(payload.counts?.modelRounds),
+      attempts: intOrNull(payload.counts?.attempts),
+      attemptFailures: intOrNull(payload.counts?.attemptFailures),
+      toolCalls: intOrNull(payload.counts?.toolCalls),
+      toolFailures: intOrNull(payload.counts?.toolFailures),
+      retries: intOrNull(payload.counts?.retries),
+    },
+    overlaps: {
+      toolMsSum: msOrNull(payload.overlaps?.toolMsSum),
+      toolWallMs: msOrNull(payload.overlaps?.toolWallMs),
+      parallelTools: intOrNull(payload.overlaps?.parallelTools),
+    },
+    residualMs: msOrNull(payload.residualMs),
+    droppedPhases: intOrNull(payload.droppedPhases),
+    phaseCount: phases === null ? null : phases.length,
+    phaseNames: summary.names,
+    longestPhase: summary.longest,
+    toolKinds: summary.toolKinds,
+  };
+  // Opt-in only: a full phase list is the biggest part of the row, so it is capped and projected.
+  if (includePhases === true && phases !== null) {
+    output.phases = phases
+      .slice(0, DIAGNOSTICS_TIMELINE_PHASE_CAP)
+      .map(projectPhase)
+      .filter((phase) => phase !== null);
+  }
+  return output;
+}
+
+/** The four joined `voice.latency` stages as one value object; an unmeasured stage stays null. */
+function latencyStages(payload) {
+  const stages = {};
+  for (const field of PIPELINE_LATENCY_FIELDS) stages[field] = msOrNull(payload?.[field]);
+  return stages;
+}
+
+const NO_LATENCY = Object.freeze(Object.fromEntries(PIPELINE_LATENCY_FIELDS.map((field) => [field, null])));
+
+/** Newest `voice.latency` stages per delivery id and per turn (rows arrive chronologically). */
+function indexLatencyRows(rows) {
+  const byDelivery = new Map();
+  const byTurn = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row?.type !== 'voice.latency') continue;
+    const payload = isPlainObject(row?.payload) ? row.payload : {};
+    const stages = latencyStages(payload);
+    const deliveryMessageId = tokenOf(payload.deliveryMessageId, 96);
+    if (deliveryMessageId !== null) byDelivery.set(deliveryMessageId, stages);
+    const turn = intOrNull(payload.turn);
+    if (turn !== null) byTurn.set(turn, stages);
+  }
+  return { byDelivery, byTurn };
+}
+
+/** `pipeline.timeline`: the five pipeline stages plus the latency stages of the same round. */
+function projectPipelineTimelineRow(row, index) {
+  const payload = isPlainObject(row?.payload) ? row.payload : {};
+  const turn = intOrNull(payload.turn);
+  const deliveryMessageId = tokenOf(payload.deliveryMessageId, 96);
+  // delivery id first (the stable key), the turn as the fallback join; neither means no join.
+  const joined = (deliveryMessageId === null ? undefined : index.byDelivery.get(deliveryMessageId))
+    ?? (turn === null ? undefined : index.byTurn.get(turn))
+    ?? NO_LATENCY;
+  return {
+    turn,
+    sessionId: tokenOf(payload.sessionId, 96),
+    deliveryMessageId,
+    bodyReadyMs: msOrNull(payload.bodyReadyMs),
+    spokenFirstSentenceMs: msOrNull(payload.spokenFirstSentenceMs),
+    translatedFirstMs: msOrNull(payload.translatedFirstMs),
+    firstChunkSynthMs: msOrNull(payload.firstChunkSynthMs),
+    firstAudioMs: msOrNull(payload.firstAudioMs),
+    totalMs: joined.totalMs,
+    asrMs: joined.asrMs,
+    injectToAckMs: joined.injectToAckMs,
+    ackToFirstTextMs: joined.ackToFirstTextMs,
+  };
+}
+
+/** Walk the tail newest-first and project up to `limit` matching rows. */
+function collectProjected(tail, { matches, limit, nowMs, project }) {
+  const rows = [];
+  let extraMatches = 0;
+  let ageTruncated = false;
+  for (let index = tail.rows.length - 1; index >= 0; index -= 1) {
+    const row = tail.rows[index];
+    if (!matches(row)) continue;
+    const at = Date.parse(row?.ts);
+    if (Number.isFinite(at) && nowMs - at > DIAGNOSTICS_LIMITS.maxAgeMs) {
+      ageTruncated = true;
+      continue;
+    }
+    if (rows.length >= limit) {
+      extraMatches += 1;
+      continue;
+    }
+    rows.push(project(row));
+  }
+  return { rows, extraMatches, ageTruncated };
+}
+
+function collectTimelineRows(tail, { limit, nowMs, includePhases }) {
+  return collectProjected(tail, {
+    matches: (row) => row?.type === TURN_TIMELINE_EVENT,
+    limit,
+    nowMs,
+    project: (row) => projectTurnTimelineRow(row, includePhases),
+  });
+}
+
+function collectPipelineRows(tail, { limit, nowMs }) {
+  const index = indexLatencyRows(tail.rows);
+  return collectProjected(tail, {
+    matches: (row) => row?.type === PIPELINE_TIMELINE_EVENT,
+    limit,
+    nowMs,
+    project: (row) => projectPipelineTimelineRow(row, index),
+  });
+}
+
 /**
- * Read the current `events.jsonl` from the tail only. A partially read first line is dropped,
- * and `truncated` says the byte budget omitted older bytes (not that the result is invalid).
+ * Read the current `events.jsonl` plus its rotated generations (`events.jsonl.1` to `.5`). The
+ * budget is spent newest generation first, a partially read first line is dropped from each file,
+ * and the returned rows are still chronological (oldest generation first, then the current file).
+ * `truncated` says the byte budget omitted older bytes, not that the result is invalid.
  */
-export function readRecentEvents({ root, maxBytes = DIAGNOSTICS_LIMITS.scanBytes } = {}) {
-  const file = join(String(root ?? ''), 'data', 'events.jsonl');
+export function readRecentEvents({
+  root,
+  maxBytes = DIAGNOSTICS_LIMITS.scanBytes,
+  generations = DIAGNOSTICS_EVENT_GENERATIONS,
+} = {}) {
+  const base = join(String(root ?? ''), 'data', 'events.jsonl');
+  const depth = Math.max(0, Math.floor(Number(generations) || 0));
+  let remaining = Math.max(1, Math.floor(Number(maxBytes) || DIAGNOSTICS_LIMITS.scanBytes));
+  const chunks = [];
+  let truncated = false;
+  for (let index = 0; index <= depth; index += 1) {
+    if (remaining <= 0) {
+      // The budget is spent: older bytes (of this or an older generation) are not read.
+      truncated = true;
+      break;
+    }
+    const part = readFileTail(index === 0 ? base : `${base}.${index}`, remaining);
+    if (part === null) continue; // that generation does not exist (yet)
+    truncated = truncated || part.truncated;
+    if (part.rows.length > 0) chunks.push({ index, rows: part.rows });
+    remaining -= part.bytes;
+  }
+  // Generations were read newest first; the caller expects a chronological window.
+  const rows = chunks.sort((a, b) => b.index - a.index).flatMap((chunk) => chunk.rows);
+  return { rows, truncated };
+}
+
+/** Tail of one event-log file; null when it does not exist. A torn first line is dropped. */
+function readFileTail(file, maxBytes) {
   let fd;
   try {
     fd = openSync(file, 'r');
   } catch (error) {
-    if (error?.code === 'ENOENT') return { rows: [], truncated: false };
+    if (error?.code === 'ENOENT') return null;
     throw error;
   }
   try {
@@ -226,7 +552,7 @@ export function readRecentEvents({ root, maxBytes = DIAGNOSTICS_LIMITS.scanBytes
         // A torn line is skipped; the rest of the tail is still usable.
       }
     }
-    return { rows, truncated: start > 0 };
+    return { rows, truncated: start > 0, bytes: length };
   } finally {
     closeSync(fd);
   }
@@ -263,7 +589,8 @@ export function createDiagnostics({
 
   return {
     /**
-     * @param {{probe?: string, limit?: number}} [input]
+     * @param {{probe?: string, limit?: number, includePhases?: boolean}} [input] `includePhases`
+     *   only affects `turn.timeline`; it is opt-in because the phase list is the big part of a row.
      * @returns {Promise<{ok: boolean, probe?: string, rows?: object[], truncated?: boolean,
      *   ms?: number, reason?: string, error?: string}>}
      */
@@ -278,11 +605,12 @@ export function createDiagnostics({
       }
 
       const started = now();
+      const bounds = definition.limit ?? DIAGNOSTICS_LIMITS;
       const requestedLimit = input.limit === undefined || input.limit === null ? null : Number(input.limit);
       let limit = requestedLimit === null || !Number.isFinite(requestedLimit)
-        ? DIAGNOSTICS_LIMITS.defaultLimit
+        ? bounds.defaultLimit
         : Math.trunc(requestedLimit);
-      limit = Math.min(DIAGNOSTICS_LIMITS.maxLimit, Math.max(1, limit));
+      limit = Math.min(bounds.maxLimit, Math.max(1, limit));
 
       if (definition.kind === 'state') {
         const canonical = PROBE_ALIASES[probe] ?? probe;
@@ -309,28 +637,26 @@ export function createDiagnostics({
       }
 
       const nowMs = now();
-      const rows = [];
-      let extraMatches = 0;
-      let ageTruncated = false;
-      for (let index = tail.rows.length - 1; index >= 0; index -= 1) {
-        const row = tail.rows[index];
-        if (row?.type !== definition.type) continue;
-        const at = Date.parse(row?.ts);
-        if (Number.isFinite(at) && nowMs - at > DIAGNOSTICS_LIMITS.maxAgeMs) {
-          ageTruncated = true;
-          continue;
-        }
-        if (rows.length >= limit) {
-          extraMatches += 1;
-          continue;
-        }
-        rows.push(projectEventRow(definition, row));
+      // Three projections over the same bounded tail: the flat event whitelist, the summarized
+      // turn timeline and the pipeline timeline joined to its `voice.latency` row.
+      let collected;
+      if (definition.kind === 'timeline') {
+        collected = collectTimelineRows(tail, { limit, nowMs, includePhases: input.includePhases === true });
+      } else if (definition.kind === 'pipeline') {
+        collected = collectPipelineRows(tail, { limit, nowMs });
+      } else {
+        collected = collectProjected(tail, {
+          matches: (row) => row?.type === definition.type,
+          limit,
+          nowMs,
+          project: (row) => projectEventRow(definition, row),
+        });
       }
 
-      const truncated = tail.truncated === true || extraMatches > 0 || ageTruncated;
+      const truncated = tail.truncated === true || collected.extraMatches > 0 || collected.ageTruncated;
       const ms = Math.max(0, Math.round(now() - started));
       audit(emit, { probe, limit, ms, truncated });
-      return { ok: true, probe, rows, truncated, ms };
+      return { ok: true, probe, rows: collected.rows, truncated, ms };
     },
   };
 }
