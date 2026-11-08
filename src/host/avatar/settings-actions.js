@@ -3,6 +3,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+import { PRESET_NATIVE_CHANNELS } from './motion-config.js';
 import { OPERATIONS, PRESETS, STYLES } from './presets/index.js';
 
 // ---------------------------------------------------------------------------------------------
@@ -191,6 +192,20 @@ function unverifiedChannels(preset, verified) {
   return [];
 }
 
+const PRESET_NATIVE_SET = new Set(PRESET_NATIVE_CHANNELS);
+
+/**
+ * Split missing channels into the two DIFFERENT causes instead of merging them into one sentence:
+ * a native channel (body/breath) belongs to VTS's own animation and is simply not mapped on the
+ * current model, while any other channel is injectable but its mapping is not verified yet.
+ * The availability decision is unchanged: a missing channel still excludes the preset.
+ */
+function missingChannelReasons(missing) {
+  const nativeUnmapped = missing.filter(channel => PRESET_NATIVE_SET.has(channel));
+  const channelUnverified = missing.filter(channel => !PRESET_NATIVE_SET.has(channel));
+  return { nativeUnmapped, channelUnverified };
+}
+
 const stylesOf = styles => styles.map(style => STYLE_LABELS.get(style) ?? style);
 
 export const ACTIONS = Object.freeze([
@@ -306,7 +321,9 @@ export function createAvatarSettingsActions(services) {
         reasons.push(lockText);
       } else {
         const missing = unverifiedChannels(preset, verified);
-        if (missing.length > 0) reasons.push(`能力未验证：${missing.join('、')}`);
+        const { nativeUnmapped, channelUnverified } = missingChannelReasons(missing);
+        if (nativeUnmapped.length > 0) reasons.push(`当前模型未映射：${nativeUnmapped.join('、')}`);
+        if (channelUnverified.length > 0) reasons.push(`能力未验证：${channelUnverified.join('、')}`);
         if (preset.requiresTarget && targetVerified !== true) reasons.push('需要目标：当前未提供注视目标');
         if (preset.requiresDirection && directionVerified !== true) reasons.push('需要方向：当前未提供声源方向');
       }
@@ -352,6 +369,10 @@ export function createAvatarSettingsActions(services) {
       };
     });
 
+    // Read-only diagnostic: native channels this model has not mapped. A later verified mapping
+    // simply removes the channel here and restores its presets to candidates, with no restart.
+    const unmappedNative = PRESET_NATIVE_CHANNELS.filter(channel => !verified.has(channel));
+
     return {
       ok: true,
       items,
@@ -359,6 +380,7 @@ export function createAvatarSettingsActions(services) {
       overrides,
       defaultPriority: MOTION_PRESET_DEFAULT_PRIORITY,
       verifiedChannels,
+      unmappedNative,
       targetVerified,
       directionVerified,
       locked: locks.length > 0,
