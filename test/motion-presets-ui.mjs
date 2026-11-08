@@ -9,7 +9,7 @@
  *   5) 优先级 0–100 夹紧；
  *   6) 单条/家族/全局恢复默认；
  *   7) 坏 JSON → 默认值 + motion.presets.corrupt；
- *   8) 能力缺失 / 需要目标 / 需要方向 / 隐私锁定的只读原因；
+ *   8) 能力缺失 / 需要目标 / 需要方向的只读原因；隐私不再锁定动作；
  *   9) UI 控件（搜索框、三个过滤、启停、优先级、恢复默认、待接线预览）；
  *  10) 预设库与选择器契约回归（motion-preset-library / preset-selector / smoke 另行执行）。
  *
@@ -407,9 +407,9 @@ test('7. 坏 JSON 回退默认并记录 motion.presets.corrupt', async (t) => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// 8. Unavailable reasons are read-only: capability / target / direction / privacy
+// 8. Unavailable reasons are read-only: capability / target / direction; privacy locks capture only
 // ---------------------------------------------------------------------------------------------
-test('8. 不可用原因：能力缺失、需要目标、需要方向、隐私锁定', async (t) => {
+test('8. 不可用原因：能力缺失、需要目标、需要方向；隐私不锁定动作', async (t) => {
   const capabilityEnv = makeEnv({ avatarCapabilitiesStatus: () => ({ verified: ['headX'] }) });
   const targetEnv = makeEnv();
   const directionEnv = makeEnv();
@@ -440,10 +440,12 @@ test('8. 不可用原因：能力缺失、需要目标、需要方向、隐私�
   assert.equal(directionItem.available, false);
   assert.match(directionItem.reason, /需要方向/);
 
-  const privacy = await privacyEnv.handler({ action: 'motion.presets.list' });
-  assert.equal(privacy.locked, true);
-  assert.ok(privacy.items.every(item => item.available === false));
-  assert.ok(privacy.items.every(item => item.reason.includes('隐私锁定')));
+  const privacy = await privacyEnv.handler({ action: 'motion.presets.list', privacy: true });
+  assert.equal(privacy.locked, false, 'privacy is not a motion lock');
+  assert.deepEqual(privacy.lockReasons, []);
+  assert.ok(privacy.items.every(item => !item.reason.includes('隐私锁定')));
+  assert.ok(privacy.items.filter(item => item.requiresTarget).every(item => item.available === false));
+  assert.ok(privacy.items.filter(item => item.requiresTarget).every(item => item.reason.includes('需要目标')));
 
   // The same reason reaches the row as read-only text (no button changes it).
   const tree = renderSection(direction);

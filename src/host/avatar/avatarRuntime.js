@@ -311,6 +311,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * `...userConfig` spread below, so there is still exactly one decision point.
    */
   let presetExecution = userConfig.presetExecution === true;
+  /**
+   * Target/direction proofs are separate from the gaze MAPPING: a verified cursor target proves a
+   * real target exists even when the model has no gaze input. Preset channels still filter, so a
+   * gaze-target recipe cannot run without verified gaze inputs.
+   */
+  let attentionTargetVerified = false;
+  let attentionDirectionVerified = false;
   const host = {
     autoTickMs: Number.isFinite(userConfig.autoTickMs) ? userConfig.autoTickMs : DEFAULT_HOST_CONFIG.autoTickMs,
     flushIntervalMs: Number.isFinite(userConfig.flushIntervalMs) && userConfig.flushIntervalMs > 0
@@ -1459,10 +1466,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    */
   function refreshPresetCapabilities() {
     const controlled = statusChannels().controlled;
-    const attention = inner.snapshot().motion?.attention ?? null;
     inner.setPresetCapabilities({
       channels: controlled,
-      targetVerified: attention?.verified === true && attention?.mode === 'user',
+      targetVerified: attentionTargetVerified === true,
+      // A cursor bearing is a real direction even without a gaze channel: head-turn presets may
+      // use it while the gaze-target channel filter still keeps unusable channels out.
+      directionVerified: attentionDirectionVerified === true,
     });
   }
 
@@ -2293,18 +2302,27 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
-   * Publish (or clear) the verified attention direction. Without a proof flag this only records
-   * the preset neutral direction; `lookAtUser` never invents a target from random eye drift.
+   * Publish (or clear) the verified attention target/direction. Without a proof flag this only
+   * records the preset neutral direction; `lookAtUser` never invents a target from random drift.
+   * A finite, verified target also proves a DIRECTION, even when the model has no gaze channel.
    */
-  function setAttention(target, { verified = false, source = 'host' } = {}) {
+  function setAttention(target, { verified = false, source = 'host', at = null, record = true } = {}) {
     if (state.disposed) return disposedResult();
-    // A target is only "user" when BOTH a verified gaze channel and a proven position exist.
-    // Otherwise the runtime keeps the preset neutral direction instead of guessing.
+    const x = Number(target?.x);
+    const y = Number(target?.y);
+    const provenTarget = verified === true && Number.isFinite(x) && Number.isFinite(y);
+    attentionTargetVerified = provenTarget;
+    attentionDirectionVerified = provenTarget;
+    // A gaze target additionally needs a verified gaze channel. Without one the controller keeps
+    // its neutral attention pose, but the cursor bearing above still proves a direction.
     const controlled = statusChannels().controlled;
     const hasGaze = controlled.includes('gazeX') || controlled.includes('gazeY');
-    const attention = inner.setAttention(target, { verified: verified === true && hasGaze, source });
+    const supplied = provenTarget && Number.isFinite(at) ? { ...target, at } : target;
+    const attention = inner.setAttention(supplied, { verified: provenTarget && hasGaze, source });
     refreshPresetCapabilities();
-    recordIdleEvent('avatar.attention', { ...attention });
+    // A 4 Hz cursor sample is live state, not history: the host asks for `record:false` so no
+    // coordinate trail accumulates in the idle-event buffer.
+    if (record !== false) recordIdleEvent('avatar.attention', { ...attention });
     return { ok: true, code: null, attention };
   }
 
@@ -3057,7 +3075,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           at: time,
           verifiedChannels: controlled,
           targetVerified: attention?.verified === true && attention?.mode === 'user',
-          directionVerified: false,
+          directionVerified: attentionDirectionVerified === true,
           seed: `gap:${clipState.index}:${clipState.starts}`,
         });
         if (drawn.started === true) {
@@ -3230,7 +3248,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           at,
           verifiedChannels: controlled,
           targetVerified,
-          directionVerified: false,
+          directionVerified: attentionDirectionVerified === true,
           generation: pending.generation,
           seed: `intent:${pending.ticket}:${pending.event}`,
         });

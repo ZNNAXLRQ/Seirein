@@ -68,6 +68,7 @@ import { createDependencyRegistry } from './runtime/dependency-registry.js';
 export { createDependencyRegistry } from './runtime/dependency-registry.js';
 
 import { connectObs } from './vision/obs.js';
+import { createCursorAttentionSource } from './vision/attention-source.js';
 import {
   DEFAULT_HOTKEYS,
   HOTKEY_ACTIONS,
@@ -266,6 +267,8 @@ import {
 // Namespace access for optional image helpers (shrinkShot): a capture build without them still
 // delivers full-resolution frames instead of failing the whole module link.
 import * as sightRuntime from './vision/sight.js';
+// A black / not-yet-live virtual-camera frame is judged from its own pixels before delivery.
+import { assessFrame } from './vision/black-frame.js';
 import { ambientSourceEvent, ambientSourceOf } from './hearing/ambient.js';
 import { VISION_MODES, VisionMode } from './vision/vision.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
@@ -2471,10 +2474,36 @@ export function apply(ctx, config) {
   /** How many verified attention targets were really published (a test can assert zero). */
   let avatarAttentionCalls = 0;
   /**
-   * The vision lane's proven user position — the ONLY source of a "look at the user" target.
+   * The mouse is the target/direction source: the cursor is sampled at 4 Hz and projected onto
+   * the avatar window's centre. `attentionAnchorBounds` caches the real VTS rectangle when it has
+   * been read; the saved layer rectangle is the fallback, then the screen centre inside the source.
+   */
+  let attentionAnchorBounds = null;
+  const attentionSource = createCursorAttentionSource({
+    ...(typeof config?.attentionCursor?.readCursor === 'function'
+      ? { readCursor: config.attentionCursor.readCursor } : {}),
+    ...(typeof config?.attentionCursor?.readScreen === 'function'
+      ? { readScreen: config.attentionCursor.readScreen } : {}),
+    ...(typeof config?.attentionCursor?.now === 'function'
+      ? { now: config.attentionCursor.now } : {}),
+    readAnchor: typeof config?.attentionCursor?.readAnchor === 'function'
+      ? config.attentionCursor.readAnchor
+      : () => {
+        const bounds = attentionAnchorBounds;
+        if (bounds !== null && !isCaptureRect(bounds, WPF_OFFSCREEN) && !isCaptureRect(bounds, VTS_OFFSCREEN)) {
+          return bounds;
+        }
+        return savedLayerGeometry();
+      },
+    intervalMs: Number(config?.attentionCursor?.intervalMs ?? 250),
+    onSample: () => {
+      refreshAvatarAttention();
+    },
+  });
+  /**
+   * The vision lane's proven user position — an explicitly configured override over the cursor.
    * A live observation may carry `{x, y}`; the vision component may also expose the same value as
-   * `config.vision.userPosition` (object or function). Missing/stale/invalid evidence is `null`,
-   * and then no attention call is made (the controller keeps its neutral 0,0). Never randomised.
+   * `config.vision.userPosition` (object or function). Missing/stale/invalid evidence is `null`.
    */
   const visionUserPosition = () => {
     let evidence = config?.vision?.userPosition ?? null;
@@ -2494,19 +2523,39 @@ export function apply(ctx, config) {
     return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
   };
   /**
-   * Publish attention only with BOTH proofs: a verified gaze channel and a real user position.
-   * Without either, `setAttention` is not called at all — silence is safer than a fabricated look.
+   * Publish the current target. An explicit vision position wins; otherwise a verified cursor
+   * sample is the target. No evidence means either "clear" (never leave a stale look) or no call
+   * when nothing was published; a read failure is never repaired with a guess.
    */
   const refreshAvatarAttention = () => {
     const current = avatarRuntime;
     if (current === null) return null;
     const snap = current.snapshot();
     if (snap.disposed === true) return null;
-    const target = visionUserPosition();
+    const cursor = attentionSource.snapshot();
+    const visionTarget = visionUserPosition();
+    const evidence = visionTarget !== null
+      ? { target: visionTarget, source: 'vision' }
+      : (cursor.verified === true && Number.isFinite(cursor.x) && Number.isFinite(cursor.y)
+        ? { target: { x: cursor.x, y: cursor.y, at: cursor.at }, source: 'cursor' }
+        : null);
     const controlled = snap.channels?.controlled ?? [];
-    if (target === null || (!controlled.includes('gazeX') && !controlled.includes('gazeY'))) return null;
-    avatarAttentionCalls += 1;
-    return current.setAttention(target, { verified: true, source: 'vision' });
+    const hasGaze = controlled.includes('gazeX') || controlled.includes('gazeY');
+    if (evidence === null) {
+      if (snap.motion?.attention?.mode === 'user') {
+        current.setAttention(null, { verified: false, source: 'cursor', record: false });
+      }
+      return null;
+    }
+    if (hasGaze) avatarAttentionCalls += 1;
+    // Even without a gaze channel the runtime records the direction proof (head-turn presets).
+    return current.setAttention(evidence.target, {
+      verified: true,
+      source: evidence.source,
+      at: evidence.target?.at ?? null,
+      // Cursor samples are live state, never a coordinate history.
+      record: evidence.source !== 'cursor',
+    });
   };
   /** Hard gate: old frames stop NOW (no fade/drain) and the reason is recorded once per lock. */
   const lockAvatarMotion = (reason = 'unspecified') => {
@@ -2733,6 +2782,8 @@ export function apply(ctx, config) {
     // the user's overrides come from data/motion-presets.json (the selector's own shape).
     avatarRuntime.setPresetExecution(config?.presetExecution !== false);
     avatarRuntime.setPresetOverrides(motionPresetStore.read());
+    // A rebuilt runtime inherits the CURRENT cursor target, not a stale one.
+    refreshAvatarAttention();
     // Privacy deliberately does NOT gate motion: it closes capture only, so a runtime created
     // while privacy is on still runs presets and idle. Nothing is added to the lock set here.
     // A rebuilt runtime inherits the host's current activity instead of starting from idle.
@@ -2748,6 +2799,12 @@ export function apply(ctx, config) {
     if (result.ok === true) {
       const mouth = avatarTransport.getMouthInput();
       if (mouth.length > 0) current.setMouthInput(mouth);
+      // Cache the real window rectangle for the cursor anchor (fallback: saved layer geometry).
+      void vtsWindow.capture().then((captured) => {
+        if (captured?.ok !== true) return;
+        attentionAnchorBounds = captured.bounds;
+        refreshAvatarAttention();
+      }).catch(() => {});
       // A runtime created after discovery (or a model switch) learns the verified set here.
       if (runtime.avatarMotion !== undefined) await applyAvatarChannelMappings(runtime.avatarMotion);
       // The new socket recovers the gate a previous drop closed. Privacy holds no motion gate.
@@ -7413,6 +7470,23 @@ export function apply(ctx, config) {
           lastCaptureAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
           obsRunning: { type: 'boolean' },
           virtualCam: { type: 'boolean' },
+          virtualCamError: {
+            description: '最近一次黑帧/未出画面失败的原因与时间；正常画面或重启采集后会被清除',
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  reason: { type: 'string' },
+                  at: { type: 'integer' },
+                  bytes: { type: 'integer' },
+                  virtualCam: { type: 'boolean' },
+                },
+                required: ['reason', 'at', 'bytes', 'virtualCam'],
+              },
+              { type: 'null' },
+            ],
+          },
           idleSeconds: { type: 'integer' },
           privacyScene: { type: 'string' },
           device: { type: 'string' },
@@ -7623,6 +7697,15 @@ export function apply(ctx, config) {
   let virtualCamOn = false;
   /** Last frame captured for the agent, so the settings card can preview it. */
   let lastVision = null;
+  /** Previous judged frame per source: the "two identical frames" rule needs its predecessor. */
+  const visionFramePrints = new Map();
+  /** Most recent black-frame refusal, surfaced by status as `vision.virtualCamError`. */
+  let virtualCamError = null;
+  // Cursor attention sampling starts here, after `lastVision` exists: privacy pauses it and clears
+  // the target, but never touches the motion runtime (actions keep ticking).
+  attentionSource.setPrivacy(vision.mode === 'privacy');
+  attentionSource.start();
+  ctx.effect(() => () => attentionSource.stop());
   let visionGeneration = 0;
   let visionController = new AbortController();
   let visionChanging = false;
@@ -7637,6 +7720,8 @@ export function apply(ctx, config) {
 
   /** Short same-source merge window: a burst of "look now" requests is one real capture. */
   const VISION_COALESCE_MS = 500;
+  /** One retry after a suspected black frame: the camera needs a moment to produce real pixels. */
+  const VISION_BLACK_RETRY_MS = 1200;
   const visionCaptureLanes = new Map();
   /** Perception ledger for `status.perception` (a refusal is not a capture failure). */
   const perceptionCounters = { captures: 0, coalesced: 0, staleDropped: 0, rejected: 0, failed: 0 };
@@ -7718,6 +7803,8 @@ export function apply(ctx, config) {
     lastVisionStaleRecorded = false;
     // A burst merged into the old generation must never be reused across the boundary.
     visionCaptureLanes.clear();
+    // A frame from another generation/scene is not the predecessor of this one.
+    visionFramePrints.clear();
     const files = [...visionFiles.keys()];
     visionFiles.clear();
     return Promise.all([watcherStopping, ...files.map((file) => discardVisionFile(file))]);
@@ -7759,6 +7846,8 @@ export function apply(ctx, config) {
       lastCaptureAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : null,
       obsRunning: autostartRunning.obs === true,
       virtualCam: virtualCamOn,
+      // The most recent black-frame refusal stays readable (what and when) until a real frame.
+      virtualCamError: virtualCamError === null ? null : { ...virtualCamError },
       idleSeconds: sceneIdleTimer === null ? 0 : Math.max(0, Math.round((sceneIdleUntil - Date.now()) / 1000)),
       scenes: obsScenes,
       privacyScene: privacySceneName(),
@@ -7766,6 +7855,9 @@ export function apply(ctx, config) {
       // The card sees age/stale/hint, not just a raw path: a preview older than the freshness
       // window must not present itself as the current desktop.
       lastShot: currentVisionView(),
+      // The mouse is the target/direction source; `verified:false` is honest (no cursor read or
+      // privacy paused sampling), never a fabricated target.
+      attention: attentionSource.snapshot(),
     };
   };
 
@@ -8018,6 +8110,8 @@ export function apply(ctx, config) {
         visionReturn = { mode: vision.mode, scene: vision.scene, capturing: wasCapturing };
       }
       vision.userSet('privacy');
+      // Privacy pauses the cursor target now; the motion runtime keeps its own frames running.
+      attentionSource.setPrivacy(true);
     }
     const cleanup = invalidateVision();
     // Queueing may wait on an older OBS request; handle cleanup errors immediately while
@@ -8042,6 +8136,8 @@ export function apply(ctx, config) {
           // The source/scene just committed is the new "previous" for the next privacy lock.
           visionReturn = { mode, scene: vision.scene, capturing: false };
           persistVision();
+          // Cursor attention resumes sampling (and republishes on its first sample).
+          attentionSource.setPrivacy(false);
           resumeAfter = captureIntent;
         }
         return { ok: true, ...vision.snapshot(), to: result.to, warning: result.warning ?? '' };
@@ -8139,6 +8235,52 @@ export function apply(ctx, config) {
     lane.promise.then((value) => onSettled(true, value), (error) => onSettled(false, error));
   });
 
+  /** Judge one frame for the black-frame retry: read, assess, remember its fingerprint. */
+  const judgeVisionFrame = async (shot, source) => {
+    const data = await readFile(shot.file).catch(() => null);
+    if (data === null) return null;
+    const at = Number(shot.capturedAt ?? shot.at) || Date.now();
+    const verdict = assessFrame({ data, at, previous: visionFramePrints.get(source) ?? null });
+    if (verdict !== null) visionFramePrints.set(source, verdict.frame);
+    return verdict;
+  };
+
+  /**
+   * Take one frame and refuse to deliver a black / not-yet-live one: judge the pixels, retry
+   * exactly once after a short settle wait, and fail (never deliver) if it is still black.
+   * `take` returns null for a storyboard that has nothing to pack, which passes through unjudged.
+   */
+  const captureVerified = async ({ take, source, virtualCam, token, assertCurrent = null }) => {
+    const first = await take();
+    const firstVerdict = first === null || first === undefined ? null : await judgeVisionFrame(first, source);
+    if (firstVerdict === null || firstVerdict.black !== true) {
+      if (virtualCamError !== null) virtualCamError = null;
+      return first;
+    }
+    await discardUndelivered(first.file, 'black-frame');
+    await new Promise((resolve) => setTimeout(resolve, VISION_BLACK_RETRY_MS));
+    if (assertCurrent !== null) await assertCurrent();
+    assertVisionToken(token);
+    const second = await take();
+    const retried = second === null || second === undefined ? null : await judgeVisionFrame(second, source);
+    if (retried !== null && retried.black === true) {
+      virtualCamError = {
+        reason: retried.reason, at: Date.now(), bytes: Number(second.bytes) || 0, virtualCam,
+      };
+      await log.emit('vision.capture.black', {
+        reason: retried.reason, bytes: virtualCamError.bytes, virtualCam,
+      }).catch(() => {});
+      await discardUndelivered(second.file, 'black-frame');
+      throw new Error(
+        `疑似黑帧/未出画面（${retried.reason}）：连续两次抓取都没有有效画面，本次不交付`
+        + (virtualCam ? '；请检查 OBS 虚拟摄像头是否已出画面' : ''),
+      );
+    }
+    await log.emit('vision.capture.retried', { reason: firstVerdict.reason, source, virtualCam }).catch(() => {});
+    if (virtualCamError !== null) virtualCamError = null;
+    return second;
+  };
+
   /**
    * Capture for the agent, honouring the current mode. Privacy is refused outright; scene
    * mode reads OBS's program output through the virtual camera; watch mode reads the desktop.
@@ -8201,24 +8343,35 @@ export function apply(ctx, config) {
       try {
         const dir = join(root, 'cache', 'screens');
         const ffmpegPath = resolveFfmpeg(root, config);
-        if (captureToken.mode === 'scene') {
-          await assertProgramScene(captureToken);
-          await ensureSceneCamera(captureToken);
-          assertVisionToken(captureToken);
-          await assertProgramScene(captureToken);
-          if (ffmpegPath === null) throw new Error('场景模式需要 ffmpeg（用来读取 OBS 虚拟摄像头）');
-          shot = await captureDevice({ dir, ffmpegPath, device: virtualCamDevice(), signal: captureToken.signal });
-        } else if (ffmpegPath !== null) {
-          // Desktop capture never depends on OBS. Do not fall back after cancellation.
-          try {
-            shot = await captureDesktop({ dir, ffmpegPath, signal: captureToken.signal });
-          } catch (error) {
+        const take = async () => {
+          if (captureToken.mode === 'scene') {
+            await assertProgramScene(captureToken);
+            await ensureSceneCamera(captureToken);
             assertVisionToken(captureToken);
-            shot = { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
+            await assertProgramScene(captureToken);
+            if (ffmpegPath === null) throw new Error('场景模式需要 ffmpeg（用来读取 OBS 虚拟摄像头）');
+            return captureDevice({ dir, ffmpegPath, device: virtualCamDevice(), signal: captureToken.signal });
           }
-        } else {
-          shot = { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
-        }
+          if (ffmpegPath !== null) {
+            // Desktop capture never depends on OBS. Do not fall back after cancellation.
+            try {
+              return await captureDesktop({ dir, ffmpegPath, signal: captureToken.signal });
+            } catch (error) {
+              assertVisionToken(captureToken);
+              return { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
+            }
+          }
+          return { ...(await capture({ dir, signal: captureToken.signal })), engine: 'powershell' };
+        };
+        // A black startup frame is retried once here, so a not-yet-live virtual camera can never
+        // become the model's "current screen" (the failure still refuses delivery, see below).
+        shot = await captureVerified({
+          take,
+          source: `capture:${captureToken.mode}`,
+          virtualCam: captureToken.mode === 'scene',
+          token: captureToken,
+          assertCurrent: () => assertProgramScene(captureToken),
+        });
         assertVisionToken(captureToken);
         // A scene may have been switched in OBS while ffmpeg was decoding this frame.
         await assertProgramScene(captureToken);
@@ -8739,7 +8892,14 @@ export function apply(ctx, config) {
       try {
         assertVisionToken(token);
         await assertProgramScene(token);
-        sheet = await session.take();
+        // The storyboard is judged from its own pixels too: an all-black sheet is not the screen.
+        sheet = await captureVerified({
+          take: () => session.take(),
+          source: `sheet:${token.mode}`,
+          virtualCam: token.mode === 'scene',
+          token,
+          assertCurrent: () => assertProgramScene(token),
+        });
         assertVisionToken(token);
         await assertProgramScene(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
@@ -13646,6 +13806,7 @@ export function apply(ctx, config) {
     get writeSettings() { return writeSettings; }
   }) },
 { actions: avatarActions, handle: createAvatarSettingsActions({
+    get attentionSource() { return attentionSource; },
     get avatarLayerController() { return avatarLayerController; },
     get avatarCapabilitiesStatus() { return avatarCapabilitiesStatus; },
     get avatarMotionLockReasons() { return [...avatarMotionLocks]; },

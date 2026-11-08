@@ -51,7 +51,7 @@ const SEMANTIC_LABELS = Object.freeze({
 });
 
 const LOCK_REASON_LABELS = Object.freeze({
-  privacy: '隐私锁定', disconnect: 'VTS 连接断开', 'component-disabled': '形象组件已关闭',
+  disconnect: 'VTS 连接断开', 'component-disabled': '形象组件已关闭',
   'model-changed': '模型切换中',
 });
 
@@ -252,15 +252,27 @@ export function createAvatarSettingsActions(services) {
     return fallbackMotionStore;
   };
 
-  /** Privacy and every other hard motion gate make the whole catalog temporarily unavailable. */
-  const motionLockReasons = (body) => {
+  /**
+   * Hard motion gates only. Privacy is a CAPTURE lock and never a motion lock (6562664), so it is
+   * not a reason here and an old host value carrying `privacy` is dropped instead of shown.
+   */
+  const motionLockReasons = () => {
     const reasons = new Set();
-    if (body.privacy === true) reasons.add('privacy');
     for (const reason of Array.isArray(services.avatarMotionLockReasons) ? services.avatarMotionLockReasons : []) {
-      if (typeof reason === 'string' && reason.length > 0) reasons.add(reason);
+      if (typeof reason === 'string' && reason.length > 0 && reason !== 'privacy') reasons.add(reason);
     }
-    if (services.vision?.mode === 'privacy') reasons.add('privacy');
     return [...reasons];
+  };
+
+  /** Current cursor attention proof (source of truth when the caller sends no explicit flag). */
+  const attentionProof = () => {
+    const source = services.attentionSource;
+    const sample = typeof source?.snapshot === 'function' ? source.snapshot() : services.attention;
+    if (sample === null || typeof sample !== 'object') return null;
+    return sample.verified === true
+      && Number.isFinite(Number(sample.x)) && Number.isFinite(Number(sample.y))
+      ? { x: Number(sample.x), y: Number(sample.y), at: sample.at ?? null }
+      : null;
   };
 
   const listMotionPresets = async (body = {}) => {
@@ -274,9 +286,16 @@ export function createAvatarSettingsActions(services) {
       ? body.verifiedChannels.filter(channel => typeof channel === 'string' && channel.length > 0)
       : (Array.isArray(capability.verified) ? capability.verified : []);
     const verified = new Set(verifiedChannels);
-    const targetVerified = body.targetVerified === true;
-    const directionVerified = body.directionVerified === true;
-    const locks = motionLockReasons(body);
+    // The mouse is the target/direction source: when the caller sends no explicit proof, use the
+    // current cursor sample. A failed read has no x/y and therefore proves nothing.
+    const cursorProof = attentionProof();
+    const targetVerified = body.targetVerified !== undefined
+      ? body.targetVerified === true
+      : cursorProof !== null;
+    const directionVerified = body.directionVerified !== undefined
+      ? body.directionVerified === true
+      : cursorProof !== null;
+    const locks = motionLockReasons();
     const lockText = locks.length === 0
       ? ''
       : `动作已锁定：${locks.map(reason => labelOf(LOCK_REASON_LABELS, reason)).join('、')}`;
