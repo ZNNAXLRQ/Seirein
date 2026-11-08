@@ -151,7 +151,7 @@ Seirein 是 DSH 的**插件**，不是独立软件。装好 DSH Desktop 后，�
 #### 2.1.1 先确认三件事
 
 1. 系统是 **Windows 10 / 11 x64**。语音、视觉、字幕依赖 Windows 的 PowerShell / WPF / DirectShow，其它系统用不了这些功能。
-2. 已经装好 **DSH Desktop** 并能正常打开。DSH 的官方地址：<https://github.com/deepseek-ai/deepseek-harness>（桌面版下载页 `TODO(确认链接)`）。
+2. 已经装好 **DSH Desktop** 并能正常打开。DSH 的官方地址：<https://github.com/deepseek-ai/deepseek-harness>；桌面版安装包在 <https://github.com/deepseek-ai/deepseek-harness/releases>。
 3. 电脑能上网。安装依赖、Edge TTS、第一次下载 VAD 模型都需要网络。
 
 安装本身**不需要**你装 Node.js、pnpm，也不需要开命令行。DSH 会处理依赖。
@@ -319,7 +319,7 @@ Seirein 是 DSH 的**插件**，不是独立软件。装好 DSH Desktop 后，�
 
 **作用：** 边说边出字、判断一句话说完了、把话投递给助手。
 
-**下载：** <https://github.com/k2-fsa/sherpa-onnx/releases> → 打开 `asr-models` 这个发布 → 找名字以 `sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23` 开头的压缩包（具体附件名 `TODO(确认链接)`）。
+**下载：** 直接下载 <https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23.tar.bz2>（`asr-models` 发布里的精确附件名；同页还有 `-mobile` 版本，桌面端用这个非 mobile 版）。解压后把目录内容放到 `<数据根>\models\stream`。
 
 **放到哪里：** 解压后放到
 
@@ -348,7 +348,9 @@ tokens.txt
 
 **作用：** 一句话说完后，再用更准的模型重新识别一遍终稿；标点、数字、专有名词会更稳，也支持中 / 英 / 日 / 韩 / 粤。
 
-**下载：** 和流式模型同一个 `asr-models` 发布页，找 `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`（具体附件名 `TODO(确认链接)`）。
+**下载：** 和流式模型同一个 `asr-models` 发布页，精确附件名 `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2`：
+<https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2>
+（想要更小可用同页 `...-int8-2024-07-17.tar.bz2`）。解压后放到 `<数据根>\models\final`。
 
 **放到哪里：**
 
@@ -982,7 +984,7 @@ tokens.txt
 4. 麦克风靠近一点，戴耳机减少回声。
 5. 把门限往上调一点（例如 `-45`），减少噪声触发。
 6. 换一个麦克风或 USB 接口再试。
-7. 日语 / 韩语 / 粤语仍很差：默认流式模型主要针对中文；需要匹配语种的流式模型（高级配置 `asrModelDir`，兼容型号 `TODO(确认)`）。
+7. 日语 / 韩语 / 粤语仍很差：默认流式模型主要针对中文；换语种需要换流式模型目录（高级配置 `asrModelDir`）。代码接受任意 sherpa-onnx streaming zipformer transducer 目录（含 `encoder/decoder/joiner` 的 `.onnx` 与 `tokens`）；具体语种型号未逐一验证，先把官方对应语种模型按同样结构放进去再试。
 
 #### 2.6.6 字幕不显示
 
@@ -1543,7 +1545,7 @@ npm pack --dry-run --json
 | 透明层 | `PrintWindow` + 色键能用；移动 VTS 出屏会破坏透明推流；WGC 需原生帮助程序（P-68，条件触发） | 实验性，不适合作为稳定直播层 |
 | OBS 场景截图 | `GetSourceScreenshot` 对场景返回空 | 场景模式只能走虚拟摄像头，首帧 0.5–1.5 s |
 | 真机 / 真实库 | 麦克风、环境音自启、字幕字体、透明层、真实记忆库未全部复核 | 单测通过 ≠ 真机通过；发布前按 V-xx 清单复验 |
-| FFmpeg / ASR 模型分发 | 代码只解析路径；ASR 模型缺失会直接报错 | 发布包需要额外说明模型来源与放置位置，`TODO(确认安装器是否负责)` |
+| FFmpeg / ASR 模型分发 | 代码只解析路径；ASR 模型缺失会直接报错 | 安装器不负责下载 FFmpeg 与 ASR 模型，需用户按 2.2 自行放置；只有 VAD 与声纹模型由插件按需自动下载 |
 
 ### 4.5 调试入口
 
