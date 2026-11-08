@@ -213,6 +213,19 @@ export const EXPRESSION_MOTION = Object.freeze({
 
 
 /**
+ * The 14° head budget in SEMANTIC units (1 unit = 30°). Every head channel shares it; the roll is
+ * the one axis whose VTS input range is far wider (±90), so a composed roll could otherwise ask for
+ * 30°+ on the wire. It is capped HERE, on the semantic pose, before the writer: the input layer is
+ * never used as the clamp.
+ */
+const HEAD_ROLL_CAP = EXPRESSION_MOTION.MAX_HEAD_DEGREES / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+
+
+/** Clamp a semantic head-roll value to the shared 14° head budget. */
+const clampHeadRoll = (value) => Math.max(-HEAD_ROLL_CAP, Math.min(HEAD_ROLL_CAP, finite(value, 0)));
+
+
+/**
  * Expression RELEASE window — the tail of an autonomous expression. An expression drives channels
  * the idle frame does not own (gaze / brow / body / roll), so dropping them from the write set the
  * moment the envelope ends leaves the VTS input at its LAST non-zero value: the model keeps the
@@ -2260,6 +2273,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       state.springs[axis] = next;
       pose[axis] = clampSigned(next.current);
     }
+    // A damped spring can still overshoot its (already capped) target by a fraction of a degree;
+    // the 14° roll guarantee is enforced on the semantic pose, never by truncating the input value.
+    pose.headZ = clampHeadRoll(pose.headZ);
 
     // Brows: slope limit ≤ 6 / s, so an emotion cannot snap them.
     const browStep = LIMITS.BROW_SLOPE_PER_SECOND * dt;
@@ -2344,6 +2360,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
       composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
     }
+    // The roll is held to the same 14° head budget as the other head channels on the SEMANTIC
+    // pose, before the spring and long before the input value: the target itself is capped, so the
+    // gesture keeps its smooth shape instead of being truncated on the wire.
+    composed.headZ = clampHeadRoll(composed.headZ);
     const pose = applyDynamics(composed, frame, dt);
     publish(pose);
     stepIdleActions(frame, dt, now);

@@ -227,6 +227,49 @@ export function toInputValue(entry, u, { bidirectional = false } = {}) {
 }
 
 
+/** One semantic head unit is the documented 30° (see OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT). */
+export const HEAD_DEGREES_PER_POSE_UNIT = 30;
+
+
+/**
+ * Quantise a HEAD angle (headX / headY / headZ) onto its input's own range. Head semantics keep
+ * the "1 = 30°" convention, so the three-stage conversion is explicit:
+ *
+ *   semantic u → degrees = u · 30 → input = that channel's own position
+ *
+ * `toInputValue` spreads u over the WHOLE half-range, which is only identical to the degree value
+ * while the input is ±30: a ±90 input (VTS FaceAngleZ) would turn a 0.7 semantic value into 62.6°
+ * instead of 21°, i.e. it amplified the roll 3×. Normalising by the channel's own half-range makes
+ * ±30 unchanged and removes that amplification:
+ *
+ *   halfRange = (max − min) / 2     normalized = degrees / halfRange
+ *   input = min + (normalized + 1) / 2 · (max − min)      (= centre + degrees)
+ *
+ * A missing or degenerate range (`max <= min`) falls back to the documented `toInputValue`
+ * behaviour, so a broken capability row can never inject NaN / Infinity.
+ *
+ * @param {{min?: number, max?: number, defaultValue?: number}|null} entry
+ * @param {number} u semantic value (1 = 30°)
+ * @returns {number}
+ */
+export function toHeadInputValue(entry, u) {
+  const rawMin = entry?.min;
+  const rawMax = entry?.max;
+  const min = Number(rawMin);
+  const max = Number(rawMax);
+  // A truly missing range must not be mistaken for the toInputValue defaults 0..1.
+  const hasRange = rawMin !== undefined && rawMin !== null
+    && rawMax !== undefined && rawMax !== null
+    && Number.isFinite(min) && Number.isFinite(max) && max > min;
+  if (!hasRange) return toInputValue(entry, u, { bidirectional: true });
+  const degrees = clampSigned(finite(u, 0)) * HEAD_DEGREES_PER_POSE_UNIT;
+  const halfRange = (max - min) / 2;
+  const normalized = degrees / halfRange;
+  const value = min + ((normalized + 1) / 2) * (max - min);
+  return Math.max(min, Math.min(max, value));
+}
+
+
 // ---------------------------------------------------------------------------------------------
 // Composition — the arbitration table, in the float domain
 // ---------------------------------------------------------------------------------------------

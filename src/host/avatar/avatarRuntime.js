@@ -86,8 +86,16 @@ export {
   ALIVE_FALLBACK_GAIN,
   CONFUSED_BROW_CHANNELS,
 } from './motion-config.js';
-import { toInputValue } from './dynamics.js';
-export { createBlinkState, stepBlink, springParams, stepSpringAxis, toInputValue } from './dynamics.js';
+import { toHeadInputValue, toInputValue } from './dynamics.js';
+export {
+  HEAD_DEGREES_PER_POSE_UNIT,
+  createBlinkState,
+  stepBlink,
+  springParams,
+  stepSpringAxis,
+  toHeadInputValue,
+  toInputValue,
+} from './dynamics.js';
 export { composeChannels } from './mixer.js';
 import { DEFAULT_CONFIG, createBehaviorRuntime } from './motion-controller.js';
 export {
@@ -985,7 +993,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         : idleWriteValue(item, raw, speechScale, { writeScale });
       entries.push({
         input: item.inputName,
-        value: toInputValue(item, value, { bidirectional: isBidirectional(item.channel) }),
+        value: writeInputValue(item, item.channel, value),
         channel: item.channel,
       });
       written.add(item.inputName);
@@ -999,7 +1007,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (!Number.isFinite(raw)) continue;
       entries.push({
         input: binding.inputName,
-        value: toInputValue(binding, intentWriteValue(channel, raw), { bidirectional: isBidirectional(channel) }),
+        value: writeInputValue(binding, channel, intentWriteValue(channel, raw)),
         channel,
       });
       written.add(binding.inputName);
@@ -2204,6 +2212,20 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     return String(input ?? '').toLowerCase() === String(state.mouthInput).toLowerCase();
   }
 
+  /** Head angles share the "1 semantic unit = 30°" convention; all other channels stay normalized. */
+  const HEAD_ANGLE_CHANNELS = new Set(['headX', 'headY', 'headZ']);
+
+  /**
+   * ONE semantic → input conversion for every writer. A head angle is converted through its own
+   * range (degrees first), so a ±30 input is byte-identical to before while FaceAngleZ's real ±90
+   * range no longer amplifies the roll 3×. Gaze / brow / eye / mouth / body keep `toInputValue`.
+   */
+  function writeInputValue(entry, channel, value) {
+    return HEAD_ANGLE_CHANNELS.has(channel)
+      ? toHeadInputValue(entry, value)
+      : toInputValue(entry, value, { bidirectional: isBidirectional(channel) });
+  }
+
   /**
    * The floor is opt-out, not opt-in: `idleSwayScale: 0`, `idleAmplitude: 0` or `idleMaxStep: 0`
    * each mean "this runtime must not move on its own". A channel whose own `gain` or style
@@ -3186,7 +3208,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         : idleWriteValue(item, raw, speechScale, { allowFloor: true, writeScale });
       entries.push({
         input: item.inputName,
-        value: toInputValue(item, value, { bidirectional: isBidirectional(item.channel) }),
+        value: writeInputValue(item, item.channel, value),
         channel: item.channel,
       });
       writtenInputs.add(item.inputName);
@@ -3208,7 +3230,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       const value = intentWriteValue(channel, raw);
       entries.push({
         input: binding.inputName,
-        value: toInputValue(binding, value, { bidirectional: isBidirectional(channel) }),
+        value: writeInputValue(binding, channel, value),
         channel,
       });
       writtenInputs.add(binding.inputName);
