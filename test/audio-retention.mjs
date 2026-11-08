@@ -24,11 +24,13 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, readdir, rm, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_RETENTION_LIMITS,
@@ -40,6 +42,7 @@ import {
 } from '../src/host/hearing/audio-retention.js';
 import { createHearingSettingsActions } from '../src/host/hearing/settings-actions.js';
 import { startHearing } from '../src/host/hearing/hearing.js';
+import { cleanupRoot } from './helpers/cleanup.mjs';
 
 const SAMPLE_RATE = RETENTION_SAMPLE_RATE;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -475,6 +478,244 @@ test('7) 设置动作：开关持久化并即时生效，list 不含音频，del
   const unwired = createHearingSettingsActions({ ...services, retentionStore: null });
   assert.equal((await unwired({ action: 'audio.retention.list' })).code, 'AUDIO_RETENTION_UNAVAILABLE');
   assert.equal((await unwired({ action: 'audio.retention.export', id: 'x' })).code, 'AUDIO_RETENTION_UNAVAILABLE');
+});
+
+// ---------------------------------------------------------------------------
+// Host wiring: mount the real plugin entry with a recording hearing stub.
+//
+// `index.js` imports `./hearing/hearing.js` by URL; this suite's top-level import already put the
+// real module at that URL. A resolve hook rewrites ONLY index.js's specifier to a query URL, so
+// index.js links a stub capture lane while the capture-level tests above keep the real one.
+// ---------------------------------------------------------------------------
+
+const retentionHost = { starts: [], sessions: [] };
+globalThis.__retentionHostTest = retentionHost;
+
+const HOST_INDEX_URL = new URL('../src/host/index.js', import.meta.url).href;
+const HEARING_URL = new URL('../src/host/hearing/hearing.js', import.meta.url).href;
+const HEARING_STUB_URL = `${HEARING_URL}?retention-host-stub`;
+
+const HEARING_STUB_SOURCE = `
+const state = globalThis.__retentionHostTest;
+export const modelReady = () => true;
+export const finalModelReady = () => true;
+export const isLoopbackDevice = (name) => /CABLE|Stereo Mix|Virtual/i.test(String(name));
+export const selectMicrophoneDevice = (devices, requested) => ({
+  device: requested || devices[0] || '', loopback: false, error: '',
+});
+export const listDevices = async () => ['Fake Mic'];
+export const startHearing = (options) => {
+  state.starts.push(options);
+  let settle;
+  const done = new Promise((resolve) => { settle = resolve; });
+  const session = {
+    device: options.device,
+    stats: () => ({ rmsDb: -20, peakDb: -10 }),
+    stop() { settle(); },
+    done,
+  };
+  state.sessions.push(session);
+  return session;
+};
+export const watchHearingExit = () => {};
+export const annotateTranscript = (text) => text;
+export const joinDetailFields = () => ({});
+export const mergeJoinFallback = () => ({});
+export const offlineLimitedNote = () => '';
+export const truncationNotice = () => '';
+`;
+
+let hostApply = null;
+
+/** Import index.js once, with only its hearing specifier redirected to the stub. */
+async function loadHostApply() {
+  if (hostApply !== null) return hostApply;
+  const hook = registerHooks({
+    resolve(specifier, context, next) {
+      if (specifier === './hearing/hearing.js'
+        && String(context.parentURL ?? '').split('?')[0] === HOST_INDEX_URL) {
+        return { url: HEARING_STUB_URL, shortCircuit: true };
+      }
+      return next(specifier, context);
+    },
+    load(url, context, next) {
+      if (url === HEARING_STUB_URL) {
+        return { format: 'module', shortCircuit: true, source: HEARING_STUB_SOURCE };
+      }
+      return next(url, context);
+    },
+  });
+  try {
+    hostApply = (await import('../src/host/index.js')).apply;
+  } finally {
+    hook.deregister();
+  }
+  return hostApply;
+}
+
+/** Mount the plugin against a fake Cordis context (same shape as `speaker-host-wiring.mjs`). */
+async function mountHost(t) {
+  const apply = await loadHostApply();
+  const root = await mkdtemp(join(tmpdir(), 'seirein-retention-host-'));
+  await mkdir(join(root, 'data'), { recursive: true });
+  await mkdir(join(root, 'workspace'), { recursive: true });
+  await writeFile(join(root, 'data', 'features.json'), JSON.stringify({
+    hearing: true, ambient: false, voice: false, vision: false,
+    subtitle: false, avatar: false, memory: false, fastpath: false,
+  }));
+  await writeFile(join(root, 'data', 'settings.json'), JSON.stringify({
+    langs: { speech: 'zh', subtitle: 'zh' },
+    autoMemory: { enabled: false },
+    voice: {},
+  }));
+
+  retentionHost.starts = [];
+  retentionHost.sessions = [];
+
+  const tools = new Map();
+  const routes = new Map();
+  const disposers = [];
+  const effect = (fn) => {
+    const cleanup = fn();
+    if (typeof cleanup === 'function') disposers.push(cleanup);
+    return cleanup;
+  };
+  const scope = {
+    effect,
+    on: () => () => {},
+    systemPrompt: { section: () => () => {} },
+    webServer: {
+      register(route) {
+        routes.set(route.path, route.handler);
+        return () => routes.delete(route.path);
+      },
+    },
+  };
+  apply({
+    effect,
+    on: () => () => {},
+    get: () => undefined,
+    tools: {
+      register(definition) {
+        tools.set(definition.name, definition);
+        return () => tools.delete(definition.name);
+      },
+    },
+    inject: (_dependencies, registerScope) => registerScope(scope),
+  }, { root, enabled: true, ffmpegPath: process.execPath, asrMergeWindowMs: 10 });
+
+  const listen = tools.get('assistant_listen');
+  assert.ok(listen !== undefined, 'assistant_listen is registered');
+
+  const action = async (body) => {
+    const handler = routes.get('/assistant/action');
+    assert.equal(typeof handler, 'function', 'the action route is registered');
+    const { Readable } = await import('node:stream');
+    let result;
+    await handler(
+      Object.assign(Readable.from([JSON.stringify(body)]), { method: 'POST' }),
+      { writeHead() {}, end(value) { result = value; } },
+    );
+    return JSON.parse(result);
+  };
+  const status = async () => {
+    const handler = routes.get('/assistant/status');
+    assert.equal(typeof handler, 'function', 'the status route is registered');
+    let result = '';
+    await handler({ method: 'GET', url: '/assistant/status' }, {
+      writeHead() {},
+      end(value) { result = value; },
+    });
+    return JSON.parse(result);
+  };
+  const start = async () => listen.execute({ action: 'start' }, {});
+
+  t.after(async () => {
+    for (const session of retentionHost.sessions) session.stop();
+    await cleanupRoot(root, disposers);
+  });
+
+  return { root, action, status, start };
+}
+
+test('8) Host 接线：动作可用、开关持久化并即时生效、list/删除/试听、隐私拒绝', async (t) => {
+  const app = await mountHost(t);
+
+  // 1. Boot: the actions exist before any capture and report an empty store (no directory yet).
+  let listed = await app.action({ action: 'audio.retention.list' });
+  assert.equal(listed.ok, true, listed.error);
+  assert.equal(listed.count, 0);
+  assert.deepEqual(listed.items, []);
+  assert.equal(existsSync(join(app.root, 'cache', 'retention')), false, 'list does not create the store');
+  assert.equal((await app.status()).retention.enabled, false, 'default OFF is projected to the card');
+  assert.equal(listed.limits.maxClips, 20);
+
+  // 2. Switch: persisted to settings.json and applied to the Host store immediately.
+  const on = await app.action({ action: 'voice.audioRetention', enabled: true });
+  assert.equal(on.ok, true);
+  assert.equal(on.enabled, true);
+  assert.equal(on.limits.maxClips, 20);
+  const saved = JSON.parse(await readFile(join(app.root, 'data', 'settings.json'), 'utf8'));
+  assert.equal(saved.voice.audioRetention, true, 'voice.audioRetention is persisted');
+  assert.equal((await app.status()).retention.enabled, true, 'status follows the persisted switch');
+
+  // 3. Capture: startHearing receives the Host store, its root and the privacy probe.
+  const started = await app.start();
+  assert.equal(started.ok, true, started.error);
+  const options = retentionHost.starts.at(-1);
+  assert.equal(options.retentionRoot, app.root);
+  assert.equal(typeof options.isPrivacy, 'function');
+  assert.equal(options.isPrivacy(), false);
+  const store = options.audioRetention;
+  assert.equal(store.isEnabled(), true, 'the live store follows the switch without a restart');
+
+  // A suspicious final reaching the same store is exactly what the actions must list.
+  const kept = await store.retain({ utteranceId: 41, samples: pcm(200), reason: 'noise' });
+  assert.equal(kept.ok, true);
+  await store.flush();
+  listed = await app.action({ action: 'audio.retention.list' });
+  assert.equal(listed.count, 1, 'the action reads the store the capture lane borrowed');
+  assert.equal(listed.items[0].utteranceId, 41);
+  assert.equal(listed.items[0].reason, 'noise');
+  assert.equal(Object.hasOwn(listed.items[0], 'samples'), false, 'list never carries audio');
+
+  // 4. Preview returns a path only; delete one / all work through the actions.
+  const exported = await app.action({ action: 'audio.retention.export', id: listed.items[0].id });
+  assert.equal(exported.ok, true);
+  assert.equal(existsSync(exported.path), true, 'the path is playable');
+  const single = await app.action({ action: 'audio.retention.delete', id: listed.items[0].id });
+  assert.equal(single.ok, true);
+  assert.equal((await app.action({ action: 'audio.retention.list' })).count, 0);
+
+  await store.retain({ utteranceId: 42, samples: pcm(100), reason: 'echo' });
+  await store.retain({ utteranceId: 43, samples: pcm(100), reason: 'low-evidence' });
+  await store.flush();
+  const all = await app.action({ action: 'audio.retention.delete', all: true });
+  assert.equal(all.ok, true);
+  assert.equal(all.removed, 2);
+  assert.equal((await app.action({ action: 'audio.retention.list' })).count, 0);
+
+  // 5. Privacy: the probe reaches `vision.mode`, and the same store refuses the write.
+  const privacy = await app.action({ action: 'privacy.toggle' });
+  assert.equal(privacy.ok, true, privacy.error);
+  assert.equal(options.isPrivacy(), true, 'privacy is read through the Host vision mode');
+  const refused = await store.retain({ utteranceId: 44, samples: pcm(200), reason: 'noise' });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, 'PRIVACY');
+  await store.flush();
+  assert.equal((await app.action({ action: 'audio.retention.list' })).count, 0);
+  await app.action({ action: 'privacy.toggle' });
+
+  // 6. Switch off: further writes are refused, nothing is deleted behind the user's back.
+  const off = await app.action({ action: 'voice.audioRetention', enabled: false });
+  assert.equal(off.enabled, false);
+  assert.equal(store.isEnabled(), false);
+  const disabled = await store.retain({ utteranceId: 45, samples: pcm(100), reason: 'noise' });
+  assert.equal(disabled.code, 'DISABLED');
+
+  console.log(`[retention-host 8] bootList=0 defaultOff=${(await app.status()).retention.enabled === false} `
+    + `saved=${saved.voice.audioRetention} wiring=store/root/privacy kept=1 export=${exported.ok} `
+    + `deleteOne=0 deleteAll=${all.removed} privacy=${refused.code} off=${disabled.code}`);
 });
 
 test('0) 纯函数：理由判定与 WAV 编码', () => {

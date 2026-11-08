@@ -2436,7 +2436,9 @@ window.__ModuleLoader__.load({
           retentionFailure(result);
           return;
         }
-        setRetentionPreview((current) => (current !== null && current?.id === id ? null : current));
+        setRetentionPreview((current) => (
+          id === 'all' || (current !== null && current?.id === id) ? null : current
+        ));
         show(id === 'all' ? `已全部删除 ${Number(result.removed ?? 0)} 条` : '已删除该片段');
         await loadRetention();
       }, [act, loadRetention, retentionFailure, show]);
