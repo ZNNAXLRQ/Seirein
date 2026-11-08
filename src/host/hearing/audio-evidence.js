@@ -384,6 +384,51 @@ export function wouldDropVerdict(input = {}) {
 
 
 /**
+ * The **low-evidence** delivery verdict (shadow first): the real (Silero) VAD measured exactly zero
+ * speech, the streaming pass decoded nothing, and the offline pass still produced text — i.e. the
+ * only thing that "heard" a word was the accurate pass on an utterance the speech detector calls
+ * silent.
+ *
+ * All five conditions must hold, and a protected short answer is checked before the verdict:
+ *  - `vadSpeechRatio` exactly `0` (a null/unmeasured value is **not** low evidence — `no-vad`);
+ *  - the streaming text is empty (tags/punctuation only count as empty);
+ *  - the offline text is non-empty (that is the hallucination source this verdict is about);
+ *  - the endpoint was the no-token silence rule (`silence`); `max-duration` has its own policy;
+ *  - the delivered text is not a protected short answer (好/不/停/OK…) — the whitelist is checked
+ *    last, so a real short answer is reported as `whitelisted` instead of low evidence.
+ *
+ * `durationMs` is accepted so callers can pass the whole snapshot unchanged; it is not a condition
+ * (the endpoint reason already describes the cut).
+ *
+ * @param {{text?: string, vadSpeechRatio?: number|null, onlineText?: string, offlineText?: string,
+ *          endpointReason?: string, durationMs?: number}} [input]
+ * @returns {{lowEvidence: false, reason: string}|{lowEvidence: true, reason: string,
+ *           wouldDrop: true}}
+ */
+export function lowEvidenceVerdict(input = {}) {
+  const {
+    text = '',
+    vadSpeechRatio = null,
+    onlineText = '',
+    offlineText = '',
+    endpointReason = 'other',
+  } = input ?? {};
+  const key = shadowTextKey(text);
+  if (key === '') return { lowEvidence: false, reason: 'no-text' };
+  const ratio = Number.isFinite(vadSpeechRatio) ? Number(vadSpeechRatio) : null;
+  if (ratio === null) return { lowEvidence: false, reason: 'no-vad' };
+  if (ratio !== 0) return { lowEvidence: false, reason: 'vad-speech' };
+  if (shadowTextKey(onlineText) !== '') return { lowEvidence: false, reason: 'online-text' };
+  if (shadowTextKey(offlineText) === '') return { lowEvidence: false, reason: 'no-offline-text' };
+  if (endpointReason === 'max-duration') return { lowEvidence: false, reason: 'max-duration' };
+  if (endpointReason !== 'silence') return { lowEvidence: false, reason: 'endpoint-other' };
+  // Whitelist last: only a clip that would otherwise be low evidence can report `whitelisted`.
+  if (isProtectedShortAnswer(text)) return { lowEvidence: false, reason: 'whitelisted' };
+  return { lowEvidence: true, reason: 'silent-offline-hallucination', wouldDrop: true };
+}
+
+
+/**
  * The suspects recorded for one final judgment. Each is a hypothesis for the follow-up comparison,
  * never a filter: an empty list means "nothing suspicious here", and the text is delivered exactly
  * as before either way.

@@ -106,6 +106,7 @@ import {
   shadowTextKey,
   voicedMetrics,
   wouldDropVerdict,
+  lowEvidenceVerdict,
   echoGate,
   noiseSuspects,
   onlineOfflineAgree,
@@ -138,6 +139,7 @@ export {
   PROTECTED_SHORT_ANSWERS,
   isProtectedShortAnswer,
   wouldDropVerdict,
+  lowEvidenceVerdict,
   echoTextKey,
   echoMatch,
   echoGate,
@@ -271,6 +273,15 @@ export function startHearing({
    * `no-text`) remain record-only. `false` turns the whole applied rule off for a regression test.
    */
   echoFilter = true,
+  /**
+   * Low-evidence gate (**default OFF = shadow only**). When off, `lowEvidenceVerdict` is still
+   * computed for every final and its candidates are recorded as `hearing.low-evidence.shadow`;
+   * delivery is never changed. When `true`, a candidate (real VAD ratio exactly 0 + empty streaming
+   * text + non-empty offline text + silence endpoint, minus the protected-short-answer whitelist)
+   * is withheld and `hearing.low-evidence.dropped` is written. Enabling it is the only way this
+   * verdict can touch delivery; the host maps its own setting here later.
+   */
+  lowEvidenceGate = false,
   /**
    * Round-1 VAD shadow (worker sessions only). `vadModelPath` defaults to a `silero_vad.onnx`
    * next to the ASR models; when the shared `<root>/models` copy is missing it is downloaded on
@@ -809,6 +820,8 @@ export function startHearing({
   let dropAtBoundaryCount = 0;
   /** Finals actually withheld by the high-confidence echo rule (the only applied noise rule). */
   let echoDropped = 0;
+  /** Finals withheld by the low-evidence gate (only ever nonzero when `lowEvidenceGate` is on). */
+  let lowEvidenceDropped = 0;
   const DELIVER_LATENCY_MAX_SAMPLES = 240;
   const deliverLatencySamples = [];
   const DIAGNOSTICS_SAMPLE_MS = 60_000;
@@ -1030,6 +1043,55 @@ export function startHearing({
         delivered,
         wouldDrop,
         wouldDropReason,
+      });
+    } catch {
+      /* a diagnostic row must never break capture or delivery */
+    }
+  };
+  /**
+   * Low-evidence shadow rows already written. As with every round-1 shadow this list is a log
+   * throttle only: the row is written after the delivery verdict, nothing reads it back, and it is
+   * emitted only for a clip that *is* a low-evidence candidate (or its whitelisted exception).
+   */
+  const lowEvidenceRows = [];
+  /**
+   * Record one `hearing.low-evidence.shadow` row for an already-made delivery verdict.
+   *
+   * A row is written only when the utterance matched the low-evidence shape (real VAD ratio 0,
+   * empty streaming text, non-empty offline text, silence endpoint) — either as
+   * `reason: 'silent-offline-hallucination'` or, for a protected short answer, as
+   * `reason: 'whitelisted'`. Every other verdict writes nothing, so a quiet room does not flood
+   * the log. Fields: `{ utteranceId, reason, vadRatio, textChars, delivered }`.
+   *
+   * Throttle: the same reason + similar text within `SHADOW_SUPPRESS_WINDOW_MS` writes one
+   * `hearing.low-evidence.shadow.suppressed { count }` instead of a second full row.
+   */
+  const noteLowEvidence = (snapshot, outcome, verdict, delivered) => {
+    if (!asrWorkerRequested) return;
+    if (verdict.lowEvidence !== true && verdict.reason !== 'whitelisted') return;
+    try {
+      const at = Date.now();
+      for (let index = lowEvidenceRows.length - 1; index >= 0; index -= 1) {
+        if (at - lowEvidenceRows[index].at >= SHADOW_SUPPRESS_WINDOW_MS) lowEvidenceRows.splice(index, 1);
+      }
+      const textKey = shadowTextKey(outcome.text);
+      const known = lowEvidenceRows.find(
+        (row) => row.reason === verdict.reason && similarShadowText(row.text, textKey),
+      );
+      if (known !== undefined) {
+        known.count += 1;
+        onEvent?.('hearing.low-evidence.shadow.suppressed', { level: 'debug', count: known.count });
+        return;
+      }
+      lowEvidenceRows.push({ at, reason: verdict.reason, text: textKey, count: 0 });
+      if (lowEvidenceRows.length > 64) lowEvidenceRows.shift();
+      onEvent?.('hearing.low-evidence.shadow', {
+        level: 'debug',
+        utteranceId: snapshot.id,
+        reason: verdict.reason,
+        vadRatio: snapshot.vadSpeechRatio ?? null,
+        textChars: [...outcome.text].length,
+        delivered,
       });
     } catch {
       /* a diagnostic row must never break capture or delivery */
@@ -1375,9 +1437,21 @@ export function startHearing({
         vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
       })
       : null;
+    // Low evidence is judged on the final snapshot's evidence chain. `lowEvidenceGate` defaults to
+    // false, so this verdict is recorded by the shadow below and never touches delivery.
+    const lowEvidence = lowEvidenceVerdict({
+      text: outcome.text,
+      vadSpeechRatio: snapshot.vadSpeechRatio ?? null,
+      onlineText: snapshot.onlineText,
+      offlineText: outcome.offlineText ?? '',
+      endpointReason: snapshot.endpointReason,
+      durationMs: snapshot.durationMs,
+    });
+    const lowDrop = candidate && lowEvidenceGate === true && lowEvidence.lowEvidence === true;
     // The verdict is final here. The shadow row is written *after* it and is never read back by it.
-    const delivered = candidate && echo?.drop !== true;
+    const delivered = candidate && echo?.drop !== true && !lowDrop;
     noteNoiseShadow(snapshot, outcome, delivered);
+    noteLowEvidence(snapshot, outcome, lowEvidence, delivered);
     if (echo !== null && echo.drop !== true && (echo.match.matched || playingNow)) {
       noteEchoCandidate(snapshot, echo);
     }
@@ -1390,6 +1464,21 @@ export function startHearing({
           matchedChars: echo.match.matchedChars,
           playingChars: echo.match.playingChars,
           reason: echo.reason,
+        });
+      } catch {
+        /* an event sink must never break capture */
+      }
+      return false;
+    }
+    if (lowDrop) {
+      lowEvidenceDropped += 1;
+      try {
+        onEvent?.('hearing.low-evidence.dropped', {
+          level: 'debug',
+          utteranceId: snapshot.id,
+          reason: lowEvidence.reason,
+          vadRatio: snapshot.vadSpeechRatio ?? null,
+          textChars: [...outcome.text].length,
         });
       } catch {
         /* an event sink must never break capture */
@@ -2191,6 +2280,7 @@ export function startHearing({
       dropped,
       hallucination,
       echoDropped,
+      lowEvidenceDropped,
       truncations,
       bufferedSamples: utteranceSamples,
       device,
