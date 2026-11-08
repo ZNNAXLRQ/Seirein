@@ -799,6 +799,27 @@ export function createAvatarLayer({ root, log }) {
 const VOICE_BUSY_LINE = '上一条还在处理，等处理完请再说一次。';
 
 /**
+ * The one instruction every spoken-version request uses (typed, whole-answer and streamed).
+ *
+ * A spoken version is not "the whole body, compressed": it is a short, clear spoken response
+ * organized around what THIS turn needs. The five steps happen inside the SAME request as the
+ * rewrite (no separate analysis call). Length is a result, never a target: the character count is
+ * only a soft anti-padding cue and no fixed compression ratio exists. The hard contract stays the
+ * output shape (one readable passage, no headings/list markers) enforced by
+ * `normalizeSpokenVersion`; the persona is rendered above this block by every caller.
+ */
+const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不加标题、编号或列表符号）。在这一次请求里按下面五步组织，直接给结果，不要输出分析过程：
+1. 识别本次需求：结合当前问题与必要上下文，判断用户要的是直接答案、推荐、差异、解释还是完整列举，不能只按正文篇幅决定重点。
+2. 选取需要说的信息：先说直接回答，再取最相关、最有决策价值的内容；表格、列表、备选项与论证按需取用，不默认全部覆盖。例如问“推荐哪个”，只说首选、主要理由与关键取舍，不逐条读整张表。
+3. 保留所选结论的必要条件：无关细节可以省略，但会改变结论的否定、适用条件、关键数字、时间、风险与不确定性必须保留；用户一次问了多个问题，就逐项回应，不遗漏其中任何一个。
+4. 按人设重新组织口头表达：保留语气、称呼、措辞与互动方式；不照搬正文结构，也不靠额外铺垫、撒娇或结尾总结来机械体现人设。
+5. 检查清晰度与冗余：同一观点通常只说一次，后面只补充新信息；保留必要的递进与自然强调；不要为了变短而删句或直接截断，篇幅靠取舍而不是靠砍字。
+长度是结果不是目标：字数只作软性的防铺陈约束，没有固定压缩比，也不要求压到某个比例。用户本轮明确要求详细、完整列举或全部朗读时，按正文本身的完整度表达，不要为了简短而省略。
+只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。
+提炼核心回应，不逐段复述正文；不要重复正文里已经说过的铺陈与例子；
+输出一段连贯口语，一句话说清一个意思。`;
+
+/**
  * Deliver one voice request into a session. When another waiter already owns the session the
  * wait resolves immediately as busy; sending anyway would queue the text behind the previous
  * turn and speak that turn's answer as if it belonged to this utterance. In that case the
@@ -11314,8 +11335,9 @@ export function apply(ctx, config) {
   };
   /**
    * The typed round gets the same speech treatment as a voice round: the session keeps the full
-   * body, the voice outlet says the condensed version. Short answers and explicit "read it all"
-   * requests are spoken verbatim; a failed rewrite falls back to the full body.
+   * body, the voice outlet says a short, need-organized spoken version (`source:'condensed'`).
+   * Short answers and explicit "read it all" requests are spoken verbatim; a failed rewrite falls
+   * back to the full body.
    */
   const condenseForSpeech = async (text, {
     signal = undefined, utterance = '', turn = null, turnId = null,
@@ -11349,7 +11371,11 @@ export function apply(ctx, config) {
       const result = await lightweight.ask({
         task: 'spoken',
         context: 'none',
-        system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。\n提炼核心回应，不逐段复述正文；不要重复正文里已经说过的铺陈与例子；\n输出一段连贯口语，一句话说清一个意思。`,
+        // The channel's default spoken task instruction is the old "compress the whole body" line;
+        // `SPOKEN_VERSION_GUIDE` replaces it. Passing the existing `instruction` option as '' keeps
+        // that prompt from being appended a second time (it does not change the channel itself).
+        instruction: '',
+        system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}`,
         user: `<完整答复>\n${full}\n</完整答复>`,
         maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
         timeoutMs: SPOKEN_VERSION_TIMEOUT_MS,
@@ -11384,7 +11410,7 @@ export function apply(ctx, config) {
     captureSignal: () => speechSignal(),
     // A5: the typed lane resolves the same `voice.speechMaxChars` budget as the auto lane.
     maxChars: () => voiceSpeechMaxChars(),
-    // One condensed spoken version per typed round, decided from the whole body.
+    // One need-organized spoken version per typed round, decided from the whole body.
     prepareRoundText: (text, options) => condenseForSpeech(text, options),
     // The spoken share was cut on a sentence boundary: a trailing caption line points at the rest.
     onSpeechBudget: () => {
@@ -12093,9 +12119,9 @@ export function apply(ctx, config) {
       };
       // ---- the one spoken version of this turn -----------------------------
       // The full body stays the only official answer (session + memory). Automatic playback says
-      // exactly one spoken version: original when short or explicitly requested, condensed when
-      // long, full body when the rewrite fails. The decision waits at most a short cap, so the
-      // first audio never queues behind the rewrite.
+      // exactly one spoken version: original when short or explicitly requested, a short
+      // need-organized version when long, full body when the rewrite fails. The decision waits at
+      // most a short cap, so the first audio never queues behind the rewrite.
       const spokenWaitMs = resolveSpokenWaitMs(
         readSettings().voice?.spokenWaitMs ?? config?.voice?.spokenWaitMs,
       );
@@ -12147,7 +12173,10 @@ export function apply(ctx, config) {
           const pending = lightweight.ask({
             task: 'spoken',
             context: 'none',
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。${carryBlock}`,
+            // Same as the typed path: the guide is the whole prompt, so the channel's old
+            // compression instruction is explicitly suppressed instead of being appended.
+            instruction: '',
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${carryBlock}`,
             user: carryText.length > 0
               ? composeCarryConveyUser(carryText, source)
               : `<完整答复>\n${source}\n</完整答复>`,
@@ -12503,7 +12532,7 @@ export function apply(ctx, config) {
           })();
           const profileBlock = profileText.length > 0 ? `\n\n【用户画像】\n${profileText}` : '';
           const stream = await requestTaskStream({
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n只输出一段可直接朗读的口语版：保留关键结论、必要条件与下一步，省略展开论证、举例与格式标记。只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}`,
             user: `<完整答复>\n${full}\n</完整答复>`,
             maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
             signal: controller.signal,

@@ -2,9 +2,10 @@
  * One complete answer, two expressions, one voice outlet.
  *
  * The session and the auto-memory record the FULL body once. The automatic lane speaks exactly one
- * spoken version: the original text for a short answer, a condensed rewrite for a long one, and the
- * full body (with `voice.spoken.fallback`) when the rewrite fails. `assistant_say` is only an
- * explicit standalone/progress line and never replaces the final answer.
+ * spoken version: the original text for a short answer, a short response organized around what the
+ * current turn needs (not "the whole body, compressed"), and the full body (with
+ * `voice.spoken.fallback`) when the rewrite fails. `assistant_say` is only an explicit
+ * standalone/progress line and never replaces the final answer.
  *
  * Run: node --test test/spoken-version.mjs
  */
@@ -170,10 +171,15 @@ async function mountRound(t, {
   spokenError = null,
   spokenDelayMs = 0,
   beforeReply = null,
+  personaText = '',
 } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-spoken-version-'));
   await mkdir(join(root, 'data'), { recursive: true });
   await mkdir(join(root, 'workspace'), { recursive: true });
+  if (personaText.length > 0) {
+    await mkdir(join(root, 'memory'), { recursive: true });
+    await writeFile(join(root, 'memory', 'persona.md'), personaText);
+  }
   await writeFile(join(root, 'data', 'features.json'), JSON.stringify({
     hearing: true, ambient: false, voice: true, vision: false,
     subtitle: true, avatar: false, memory: true, fastpath: false,
@@ -247,6 +253,23 @@ async function mountRound(t, {
         try { entry.fn(...args); } catch { /* isolate like the real bus */ }
       }
     },
+  };
+  // The typed lane: a session the voice delivery never claimed. Same event shapes the real feed
+  // writes, so `condenseForSpeech` is exercised without an agent loop.
+  const typedSession = { id: 'spoken-version-typed', header: { cwd: join(root, 'workspace') }, append() {} };
+  let typedSeq = 0;
+  const driveTyped = (turn, { body, utterance = '明天出门要注意什么' } = {}) => {
+    const fire = (type, data) => bus.fire('session/event', typedSession, {
+      type, seq: ++typedSeq, time: Date.now(), data,
+    });
+    fire('turn/start', { turn });
+    fire('user/message', {
+      turn, id: `u-${turn}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: utterance }],
+    });
+    fire('assistant/message', {
+      turn, step: 1, message: { id: `a-${turn}`, role: 'assistant', content: [{ type: 'text', text: body }] },
+    });
+    fire('turn/end', { turn, reason: { kind: 'completed' } });
   };
   const makeAgent = (sessionId) => {
     const session = { id: sessionId, header: { cwd: join(root, 'workspace') }, append() {} };
@@ -361,6 +384,8 @@ async function mountRound(t, {
     sessionId: sessionTarget.sessionId,
     say: (text) => state.onUpdate({ final: text, durationMs: 100 }),
     toolSay: (args) => tools.get('assistant_say').execute(args, exec),
+    driveTyped,
+    typedSession,
     events,
     waitForEvent,
     players: () => state.players,
@@ -413,7 +438,8 @@ test('2. a long answer gets one condensed spoken version that keeps the key conc
   const version = await app.waitForEvent('voice.spoken.version');
   assert.equal(app.spokenRequests.length, 1, 'exactly one spoken-version call');
   assert.equal(version.source, 'condensed');
-  assert.ok(version.chars < [...LONG_BODY].length * 0.8, `condensed ${version.chars} < 80% of ${[...LONG_BODY].length}`);
+  // The shape contract is "shorter than the body"; there is no fixed compression ratio.
+  assert.ok(version.chars < [...LONG_BODY].length, `spoken ${version.chars} < body ${[...LONG_BODY].length}`);
   const spokenText = app.texts().join('');
   assert.ok(spokenText.includes('结论'), 'the conclusion is kept');
   assert.ok(spokenText.includes('下一步'), 'the next step is kept');
@@ -637,3 +663,201 @@ test('11. an 800-character single paragraph is condensed, never read verbatim', 
   assert.ok(app.texts().join('').length < 100, 'only the short spoken version was synthesized');
   t.diagnostic(`source=${version.source} bodyChars=${[...long].length} spokenChars=${app.texts().join('').length}`);
 });
+
+// ---------------------------------------------------------------------------
+// 12-19. Need-oriented organization (user-final definition, 2026-11-09)
+//
+// The spoken version is NOT "the whole body, compressed". The same rewrite request carries five
+// steps: identify the need, select the information, keep the conditions that change the conclusion,
+// reorganize in persona, then check clarity. Length is a result (no fixed ratio); nothing is cut by
+// similarity or by character count.
+// ---------------------------------------------------------------------------
+const PERSONA_TEXT = '# 人设与用户画像\n\n> 由助手在对话中维护，用户不需要编辑本文件。\n\n- 说话温柔，称呼用户为"你"\n';
+const PERSONA_LINE = '- 说话温柔，称呼用户为"你"';
+
+const GUIDE_MARKERS = [
+  '1. 识别本次需求',
+  '2. 选取需要说的信息',
+  '3. 保留所选结论的必要条件',
+  '4. 按人设重新组织口头表达',
+  '5. 检查清晰度与冗余',
+  '直接答案、推荐、差异、解释还是完整列举',
+  '按需取用，不默认全部覆盖',
+  '首选、主要理由与关键取舍',
+  '不逐条读整张表',
+  '否定、适用条件、关键数字、时间、风险与不确定性',
+  '逐项回应',
+  '不照搬正文结构',
+  '不靠额外铺垫、撒娇或结尾总结',
+  '同一观点通常只说一次',
+  '长度是结果不是目标',
+  '字数只作软性的防铺陈约束',
+  '没有固定压缩比',
+];
+
+const assertNeedGuide = (system, label) => {
+  assert.ok(system.startsWith('【人设】'), `${label}: the persona section stays first`);
+  for (const marker of GUIDE_MARKERS) {
+    assert.ok(system.includes(marker), `${label}: missing "${marker}"`);
+  }
+  // The hard output contract survives: one passage, no headings/list markers.
+  assert.ok(system.includes('只输出一段可直接朗读的口语版'), `${label}: one-passage contract`);
+  assert.ok(system.includes('不加标题、编号或列表符号'), `${label}: no headings/list markers`);
+  // The old "compress the whole body" instruction is gone.
+  assert.ok(!system.includes('保留关键结论、必要条件与下一步，省略展开论证'),
+    `${label}: the old compression-only instruction was replaced`);
+  // No fixed ratio / character target was introduced.
+  assert.doesNotMatch(system, /压缩比\s*[为是]?\s*\d|压缩到\s*\d|不超过\s*\d+\s*(?:字|%|％)/u,
+    `${label}: no fixed compression ratio or character cap`);
+};
+
+const RECOMMEND_BODY = '下面把候选方案列出来。方案A：本地缓存，读取快，但需要额外维护失效逻辑。方案B：远程接口，维护简单，但网络抖动会影响延迟。方案C：混合方案，兼顾两者，但实现成本最高。综合来看，如果每日请求在一万次以内，方案B最省心；如果要求离线可用，方案A更稳。';
+const RECOMMEND_SPOKEN = '首选方案B，主要理由是维护简单，代价是网络抖动会影响延迟。';
+const COMPLEX_BODY = '结论：不要直接重装系统。前提是硬盘还能正常读取；如果硬盘已经出现异响，请先断电并备份，否则可能扩大损坏。当前错误码是 0x80070005，过去 24 小时出现了 3 次。下一步是明早 9 点前把重要数据复制到外置盘，再决定是否重装。';
+const COMPLEX_SPOKEN = '不要直接重装系统：只有硬盘还能正常读取时才能继续；如果硬盘有异响，先断电备份，否则可能扩大损坏。错误码 0x80070005，24 小时内出现了 3 次，明早 9 点前先备份。';
+const MULTI_BODY = '先回答你问的两件事：第一，明天下午有雨，降水概率七成，出门带伞。第二，地铁二号线今晚十点后停运，晚归要改乘公交。另外补充一个无关的细节：周末公园有活动。';
+const MULTI_SPOKEN = '明天下午有雨，降水概率七成，出门带伞。地铁二号线今晚十点后停运，晚归改乘公交。';
+
+// 12. Typed lane: the five-step guide is the request, with the persona kept above it.
+test('12. the typed spoken-version prompt is a five-step need-oriented guide with the persona', async (t) => {
+  const app = await mountRound(t, { personaText: PERSONA_TEXT });
+  app.driveTyped(1, { body: RECOMMEND_BODY });
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the typed spoken-version request was made');
+  const system = String(app.spokenRequests[0].system ?? '');
+  assertNeedGuide(system, 'typed');
+  assert.ok(system.includes(PERSONA_LINE), 'the persona content is still passed to the rewrite');
+  assert.equal(app.spokenRequests.length, 1, 'one request: the five steps run inside it, no separate analysis call');
+  await playText(app, RECOMMEND_SPOKEN);
+  t.diagnostic(`lane=typed systemChars=${system.length} steps=5 separateAnalysisCalls=0`);
+});
+
+// 13. Answer/stream lane: the same guide, still one request.
+test('13. the answer/stream spoken-version prompt uses the same five-step guide', async (t) => {
+  const app = await mountRound(t, { replyText: RECOMMEND_BODY, spoken: () => RECOMMEND_SPOKEN });
+  app.say('推荐哪个');
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the streamed spoken-version request was made');
+  const system = String(app.spokenRequests[0].system ?? '');
+  assertNeedGuide(system, 'answer');
+  assert.equal(app.spokenRequests.length, 1, 'one request: no extra analysis call');
+  // The longer guide does not buy a larger output budget: the existing sizing is untouched.
+  assert.equal(
+    Number(app.spokenRequests[0].maxTokens),
+    Math.min(1024, Math.max(120, Math.ceil(RECOMMEND_BODY.length * 1.5))),
+    'the streamed rewrite keeps its existing maxTokens budget',
+  );
+  assert.equal(app.spokenRequests[0].reasoningEffort, 'off', 'the shared reasoning policy is unchanged');
+  await playText(app, RECOMMEND_SPOKEN);
+  const version = await app.waitForEvent('voice.spoken.version');
+  assert.equal(version.source, 'condensed');
+  t.diagnostic(
+    `lane=answer systemChars=${system.length} requestCalls=${app.spokenRequests.length} `
+    + `maxTokens=${app.spokenRequests[0].maxTokens} source=${version.source}`,
+  );
+});
+
+// 14. Recommendation: first choice + reason + tradeoff, never the whole table.
+test('14. a recommendation speaks the first choice, reason and tradeoff, not the whole table', async (t) => {
+  const app = await mountRound(t, { replyText: RECOMMEND_BODY, spoken: () => RECOMMEND_SPOKEN });
+  app.say('这几个方案推荐哪个');
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the recommendation was organized');
+  const system = String(app.spokenRequests[0].system ?? '');
+  assert.ok(
+    system.includes('例如问“推荐哪个”，只说首选、主要理由与关键取舍，不逐条读整张表。'),
+    'the prompt turns "推荐哪个" into first choice + reason + tradeoff, not a table read-out',
+  );
+  await playText(app, RECOMMEND_SPOKEN);
+  const spoken = app.texts().join('');
+  assert.equal(spoken, RECOMMEND_SPOKEN, 'the model output is spoken verbatim, no post-hoc deletion');
+  assert.ok(spoken.includes('首选'), 'first choice kept');
+  assert.ok(spoken.includes('理由'), 'main reason kept');
+  assert.ok(spoken.includes('代价'), 'key tradeoff kept');
+  assert.ok(!spoken.includes('方案A') && !spoken.includes('方案C'), 'the other table rows are not read out');
+  t.diagnostic(`recommendation="${spoken}" tableRowsRead=0 synthesizeCalls=${app.texts().length}`);
+});
+
+// 15. Complex conditions: negation, condition, number, time and risk survive when they change the answer.
+test('15. a conditional answer keeps the negation, condition, numbers and time', async (t) => {
+  const app = await mountRound(t, { replyText: COMPLEX_BODY, spoken: () => COMPLEX_SPOKEN });
+  app.say('我该直接重装系统吗');
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the conditional answer was organized');
+  const system = String(app.spokenRequests[0].system ?? '');
+  assert.ok(
+    system.includes('会改变结论的否定、适用条件、关键数字、时间、风险与不确定性必须保留'),
+    'the prompt forbids dropping conditions that change the conclusion',
+  );
+  await playText(app, COMPLEX_SPOKEN);
+  const spoken = app.texts().join('');
+  assert.equal(spoken, COMPLEX_SPOKEN);
+  assert.ok(spoken.includes('不要'), 'the negation is kept');
+  assert.ok(spoken.includes('如果'), 'the condition is kept');
+  assert.ok(spoken.includes('0x80070005') && spoken.includes('3 次'), 'the key numbers are kept');
+  assert.ok(spoken.includes('明早 9 点'), 'the time is kept');
+  t.diagnostic(`keptNegation=yes keptCondition=yes keptNumbers=yes keptTime=yes chars=${[...spoken].length}`);
+});
+
+// 16. Multiple questions: every question gets an answer; an unrelated aside is not read.
+test('16. when the user asks two things, both are answered item by item', async (t) => {
+  const app = await mountRound(t, { replyText: MULTI_BODY, spoken: () => MULTI_SPOKEN });
+  app.say('明天带伞吗，地铁还开吗');
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the two questions were organized');
+  const system = String(app.spokenRequests[0].system ?? '');
+  assert.ok(system.includes('用户一次问了多个问题，就逐项回应'), 'the prompt asks for one response per question');
+  await playText(app, MULTI_SPOKEN);
+  const spoken = app.texts().join('');
+  assert.ok(spoken.includes('带伞') && spoken.includes('停运'), 'both questions are answered');
+  assert.ok(!spoken.includes('公园'), 'the unrelated aside is not read out');
+  t.diagnostic(`answers=2/2 unrelatedAside=omitted chars=${[...spoken].length}`);
+});
+
+// 17. Persona: kept as a section, never a mechanical ending.
+test('17. the persona stays a section and the prompt forbids a mechanical persona ending', async (t) => {
+  const app = await mountRound(t, { personaText: PERSONA_TEXT });
+  app.driveTyped(1, { body: RECOMMEND_BODY });
+  await waitUntil(() => app.spokenRequests.length >= 1, 'the typed spoken-version request was made');
+  const system = String(app.spokenRequests[0].system ?? '');
+  const personaAt = system.indexOf('【人设】');
+  const guideAt = system.indexOf('1. 识别本次需求');
+  assert.ok(personaAt === 0, 'the persona block is first');
+  assert.ok(guideAt > personaAt, 'the guide follows the persona, it does not replace it');
+  assert.ok(system.includes(PERSONA_LINE), 'the current persona text is present');
+  assert.ok(system.includes('不靠额外铺垫、撒娇或结尾总结来机械体现人设'),
+    'the prompt explicitly rejects a mechanical ending as persona expression');
+  assert.ok(!system.includes('结尾加') && !system.includes('最后说一句'),
+    'no instruction asks for an added closing line');
+  await playText(app, RECOMMEND_SPOKEN);
+  t.diagnostic(`personaAt=${personaAt} guideAt=${guideAt} mechanicalEndingRequired=no`);
+});
+
+// 18. "全部读出来" still takes the original path: no rewrite, no forced brevity.
+test('18. an explicit "全部读出来" keeps the original full-body path', async (t) => {
+  const app = await mountRound(t, { replyText: LONG_BODY, spoken: () => LONG_SPOKEN });
+  app.say('把正文全部读出来');
+  await playText(app, LONG_BODY);
+  await tick(50);
+  assert.equal(app.spokenRequests.length, 0, 'no spoken-version request for an explicit full read');
+  assert.ok(app.texts().join('').includes(BODY_ONLY), 'the full body is spoken');
+  assert.ok(!app.texts().includes(LONG_SPOKEN), 'no shortened version is substituted');
+  const version = await app.waitForEvent('voice.spoken.version');
+  assert.equal(version.source, 'original');
+  t.diagnostic(`spokenRequests=0 source=${version.source} clips=${app.texts().length}`);
+});
+
+// 19. Contract: the observation rows keep exactly their pre-change field set.
+test('19. voice.spoken.version / voice.spoken.text keep their existing fields', async (t) => {
+  const app = await mountRound(t, { replyText: LONG_BODY, spoken: () => LONG_SPOKEN });
+  app.say('明天出门要注意什么');
+  await playText(app, LONG_SPOKEN);
+  const version = await app.waitForEvent('voice.spoken.version');
+  assert.deepEqual(Object.keys(version).sort(), [
+    'adopted', 'chars', 'decision', 'ms', 'purpose', 'refused', 'replyVersion', 'source', 'turn',
+  ]);
+  const textRow = await app.waitForEvent('voice.spoken.text', (payload) => payload.purpose === 'answer');
+  assert.deepEqual(Object.keys(textRow).sort(), [
+    'answerVersion', 'bodyChars', 'groupId', 'purpose', 'source',
+    'spokenChars', 'spokenText', 'topicOverlap', 'turn',
+  ]);
+  assert.equal(textRow.spokenText, LONG_SPOKEN, 'the logged text is the expression that was played');
+  assert.equal(textRow.source, version.source);
+  t.diagnostic(`versionFields=${Object.keys(version).length} textFields=${Object.keys(textRow).length} source=${version.source}`);
+});
+
