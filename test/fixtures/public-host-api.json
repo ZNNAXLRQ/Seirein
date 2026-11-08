@@ -138,6 +138,7 @@
     "DEFAULT_AVATAR_STYLE",
     "EXPRESSION_MOTION",
     "EXPRESSION_RELEASE",
+    "HEAD_DEGREES_PER_POSE_UNIT",
     "HOLD_MICRO_DRIFT",
     "IDLE_ACTION_CHANNELS",
     "IDLE_ACTION_INTENTS",
@@ -191,6 +192,7 @@
     "springParams",
     "stepBlink",
     "stepSpringAxis",
+    "toHeadInputValue",
     "toInputValue"
   ],
   "profile/profileMaintain.js": [
