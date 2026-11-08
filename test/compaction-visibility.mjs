@@ -176,6 +176,29 @@ test('2. content audit: only the compaction set is compatible', () => {
   assert.equal(assessVoiceCompactionPreset(missingCompact).compatible, false);
   assert.match(assessVoiceCompactionPreset(missingCompact).reason, /command-compact/u);
 
+  // P2-2: the package NAME proves the capability; a local row id is only a label.
+  const misnamed = withGroupRows([
+    { id: 'compaction-basic', name: '@deepseek-ai/dsh-agent-loop' },
+    { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+  ]);
+  const misnamedAudit = assessVoiceCompactionPreset(misnamed);
+  assert.equal(misnamedAudit.compatible, false, 'a correct local id cannot stand in for the package name');
+  assert.match(misnamedAudit.reason, /dsh-agent-loop/u, 'the wrong package is named in the conflict');
+
+  const arbitraryIds = withGroupRows([
+    { id: 'x1', name: '@deepseek-ai/dsh-compaction-basic' },
+    { id: 'x2', name: '@deepseek-ai/dsh-command-compact' },
+  ]);
+  assert.equal(
+    assessVoiceCompactionPreset(arbitraryIds).compatible,
+    true,
+    'any local ids are accepted when the package names are the compaction set',
+  );
+
+  const idOnly = withGroupRows([{ id: 'compaction-basic' }, { id: 'command-compact' }]);
+  assert.equal(assessVoiceCompactionPreset(idOnly).compatible, false, 'an id with no package name proves nothing');
+  assert.match(assessVoiceCompactionPreset(idOnly).reason, /无包名/u);
+
   const persona = { ...VOICE_COMPACTION_PRESET, persona: { name: 'coder' } };
   const personaAudit = assessVoiceCompactionPreset(persona);
   assert.equal(personaAudit.compatible, false, 'a persona is not compaction');

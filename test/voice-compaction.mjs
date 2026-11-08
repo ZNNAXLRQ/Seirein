@@ -143,11 +143,17 @@ function createHost({
 
   function mountPreset(agentCtx, presetId) {
     mountAttempts += 1;
-    const definition = declared.get(presetId);
-    if (definition === undefined) {
+    const record = declared.get(presetId);
+    if (record === undefined) {
       throw Object.assign(new Error(`Unknown agent preset: ${presetId}`), { code: 'agent-preset/not-found' });
     }
     if (mountError !== null) throw mountError;
+    // The shipped registry stores `{ config, context, ready }`: mount reads the config, never the
+    // wrapper. The fake accepts both shapes so a test can exercise the real record shape.
+    const definition = record.config !== null && typeof record.config === 'object'
+      && !Array.isArray(record.config) && record.plugins === undefined
+      ? record.config
+      : record;
     const agent = agentCtx?.agent;
     if (agent === undefined) throw new Error('mount requires an Agent context');
     mounts.push({ agentId: agent.id, presetId });
@@ -992,7 +998,86 @@ test('22. detach unregisters only the definition this instance registered; reuse
   console.log(`[22] own registerCalls=${own.registerCalls} declared=${own.declared.size} hooks=${own.createdCount()} | reused declared=${user.declared.has(VOICE_COMPACTION_PRESET_ID)} registerCalls=${user.registerCalls}`);
 });
 
-test('23. a running Agent is not retro-assembled: registered / mounted / active are separate', async () => {
+test('23. a real registry record is audited through config: compatible reuse, no re-registration', async () => {
+  // The shipped `definitions` map stores `{ config, context, ready, ... }`, not the bare preset.
+  const record = {
+    config: { ...VOICE_COMPACTION_PRESET },
+    context: { baseUrl: '' },
+    ready: Promise.resolve(),
+    generation: {},
+  };
+  const host = createHost({ definitions: { [VOICE_COMPACTION_PRESET_ID]: record } });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  const status = helper.presetStatus();
+  assert.equal(status.status, 'reused', 'the wrapped compatible declaration is reused, not misread as a conflict');
+  assert.equal(status.source, 'profile', 'a record without a provenance marker stays profile');
+  assert.equal(status.enabled, true);
+  assert.equal(status.mounted, 1);
+  assert.equal(status.active, 1);
+  assert.equal(host.registerCalls, 0, 'the wrapped declaration is never registered again');
+  assert.equal(host.declared.get(VOICE_COMPACTION_PRESET_ID), record, 'the registry record is untouched');
+  assert.equal(host.mounts.length, 1);
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 1);
+  assert.equal(host.commandCount(agent, 'compact'), 1);
+  const reused = host.events.find((event) => event.type === 'voice.compaction.preset.reused');
+  assert.ok(reused !== undefined, 'the reuse is observable');
+  assert.equal(reused.payload.source, 'profile');
+  assert.deepEqual(reused.payload.plugins, [
+    '@deepseek-ai/dsh-compaction-basic',
+    '@deepseek-ai/dsh-command-compact',
+    '@deepseek-ai/dsh-compaction-tool-result-pruner',
+  ]);
+  console.log(`[23] wrapped status=${status.status} source=${status.source} enabled=${status.enabled} registerCalls=${host.registerCalls} mounted=${status.mounted}`);
+});
+
+test('24. an incompatible config inside a real registry record is a conflict, never mounted', async () => {
+  const incompatible = {
+    id: VOICE_COMPACTION_PRESET_ID,
+    name: 'wrapped standard preset',
+    plugins: [{
+      id: 'compaction',
+      name: 'cordis:group',
+      group: true,
+      config: [
+        { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic' },
+        { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+        { id: 'fs', name: '@deepseek-ai/dsh-tool-fs' },
+      ],
+    }],
+  };
+  const record = { config: incompatible, context: { baseUrl: '' }, ready: Promise.resolve() };
+  const host = createHost({ definitions: { [VOICE_COMPACTION_PRESET_ID]: record } });
+  const helper = createVoiceCompaction({ getService: host.getService, log: host.log });
+  helper.attach(host.ctx);
+
+  const agent = await host.createAndAnnounce('seirein-2026-11-08');
+  assert.equal(helper.evidenceOf(agent), undefined, 'nothing was mounted for the Agent');
+  assert.equal(host.mounts.length, 0);
+  assert.equal(host.listenerCount(agent, 'agent/pre-step'), 0);
+  assert.equal(host.commandCount(agent, 'compact'), 0);
+  assert.equal(host.registerCalls, 0, 'conflict never falls through to register/overwrite');
+  assert.equal(host.declared.get(VOICE_COMPACTION_PRESET_ID), record, 'the wrapped record is untouched');
+
+  const status = helper.presetStatus();
+  assert.equal(status.status, 'conflict');
+  assert.equal(status.enabled, false);
+  assert.equal(status.registered, false);
+  assert.equal(status.mounted, 0);
+  assert.equal(status.active, 0);
+  assert.match(status.reason, /自动压缩不可用/u);
+  assert.match(status.reason, /dsh-tool-fs/u);
+  const conflict = host.events.find((event) => event.type === 'voice.compaction.preset.conflict');
+  assert.ok(conflict !== undefined, 'the conflict is observable');
+  assert.match(conflict.payload.reason, /fs/u);
+  const skipped = host.events.find((event) => event.type === 'voice.compaction.skipped');
+  assert.equal(skipped.payload.reason, 'preset-conflict');
+  console.log(`[24] wrapped status=${status.status} enabled=${status.enabled} mounts=${host.mounts.length} declaredIntact=${host.declared.get(VOICE_COMPACTION_PRESET_ID) === record} reason=${status.reason}`);
+});
+
+test('25. a running Agent is not retro-assembled: registered / mounted / active are separate', async () => {
   const host = createHost({
     mountError: Object.assign(new Error('agent preset is locked after the first turn'), { code: 'agent-preset/locked' }),
   });
@@ -1016,5 +1101,5 @@ test('23. a running Agent is not retro-assembled: registered / mounted / active 
   assert.match(status.note, /需重启/u);
   const failed = host.events.find((event) => event.type === 'voice.compaction.failed');
   assert.equal(failed.payload.reason, 'mount');
-  console.log(`[23] status=${status.status} registered=${status.registered} running/mounted/active=${status.running}/${status.mounted}/${status.active} requiresRestart=${status.requiresRestart} enabled=${status.enabled}`);
+  console.log(`[25] status=${status.status} registered=${status.registered} running/mounted/active=${status.running}/${status.mounted}/${status.active} requiresRestart=${status.requiresRestart} enabled=${status.enabled}`);
 });

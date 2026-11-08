@@ -67,12 +67,19 @@ export const VOICE_COMPACTION_PRESET = Object.freeze({
 });
 
 /**
- * The capability rows this preset MUST carry, and the single pruning row it MAY carry. A same-id
- * declaration that carries anything else (a tool, a persona, a permission grant) is NOT this
- * preset: reusing it would hand the voice Agent capabilities this module never intended.
+ * The exact npm package names that prove a capability row. A row's `id` is only a local label:
+ * `{ id: 'compaction-basic', name: '@deepseek-ai/dsh-agent-loop' }` is an agent loop, NOT
+ * compaction, so capability is read from `name` and from nothing else. A same-id declaration that
+ * carries anything besides these rows (a tool, a persona, a permission grant) is NOT this preset:
+ * reusing it would hand the voice Agent capabilities this module never intended.
  */
-export const VOICE_COMPACTION_REQUIRED_PLUGINS = Object.freeze(['compaction-basic', 'command-compact']);
-export const VOICE_COMPACTION_OPTIONAL_PLUGINS = Object.freeze(['tool-result-pruner']);
+export const VOICE_COMPACTION_REQUIRED_PLUGINS = Object.freeze([
+  '@deepseek-ai/dsh-compaction-basic',
+  '@deepseek-ai/dsh-command-compact',
+]);
+export const VOICE_COMPACTION_OPTIONAL_PLUGINS = Object.freeze([
+  '@deepseek-ai/dsh-compaction-tool-result-pruner',
+]);
 /** Declaration keys that would grant a preset more than compaction. */
 const VOICE_COMPACTION_EXTRA_KEYS = Object.freeze([
   'tools', 'permissions', 'persona', 'systemPrompt', 'prompt', 'allowedTools', 'sandbox', 'mcp',
@@ -86,32 +93,20 @@ export const VOICE_COMPACTION_DEFAULT_WINDOW_TOKENS = 128_000;
 /** What the operator must do when a live Agent was never assembled. */
 export const VOICE_COMPACTION_RESTART_NOTE = '需重启 DSH 或执行 voice.session.recover 重新装配';
 
-/** `@deepseek-ai/dsh-compaction-basic` and `compaction-basic` name the same capability row. */
-const pluginNameOf = (row) => {
-  const raw = typeof row?.name === 'string' && row.name.length > 0
-    ? row.name
-    : (typeof row?.id === 'string' ? row.id : '');
-  const unscoped = raw.includes('/') ? raw.slice(raw.lastIndexOf('/') + 1) : raw;
-  return unscoped.replace(/^dsh-/u, '');
-};
-
-/** Every alias one row may be recognized by (its id, and its package name without scope). */
-const pluginAliasesOf = (row) => {
-  const aliases = [];
-  if (typeof row?.id === 'string') aliases.push(row.id.replace(/^dsh-/u, ''));
-  const name = pluginNameOf(row);
-  if (name.length > 0) aliases.push(name);
-  return [...new Set(aliases)];
-};
+/**
+ * The package name a declaration row stands for. Only `name` counts; the row `id` is a label and
+ * is deliberately not consulted here (it may be renamed without changing the capability).
+ */
+const packageNameOf = (row) => (typeof row?.name === 'string' ? row.name.trim() : '');
 
 /**
  * Audit a same-id declaration before it may be reused.
  *
- * Compatible: exactly the required compaction rows plus (optionally) the pruner, inside a plain
- * group and with no capability-bearing top-level/group key. Everything else is reported as a
- * conflict — never silently mounted, never overwritten, never unregistered by this plugin.
+ * Compatible: exactly the required compaction PACKAGES plus (optionally) the pruner, inside a
+ * plain group and with no capability-bearing top-level/group key. Everything else is reported as
+ * a conflict — never silently mounted, never overwritten, never unregistered by this plugin.
  *
- * @param {unknown} definition the registry's stored declaration
+ * @param {unknown} definition the registry's stored declaration (already unwrapped from its record)
  * @returns {{compatible: boolean, reason: string, plugins: string[], missing: string[], extras: string[]}}
  */
 export function assessVoiceCompactionPreset(definition) {
@@ -137,25 +132,26 @@ export function assessVoiceCompactionPreset(definition) {
         walk(row.config, depth + 1);
         continue;
       }
-      const aliases = pluginAliasesOf(row);
-      if (aliases.length === 0) extras.push('插件:?');
-      else leaves.push(aliases);
+      const name = packageNameOf(row);
+      if (name.length === 0) {
+        // Without a package name a row proves nothing, whatever its local id claims.
+        const label = typeof row.id === 'string' && row.id.length > 0 ? row.id : '?';
+        extras.push(`插件:${label}(无包名)`);
+        continue;
+      }
+      leaves.push(name);
     }
   };
   walk(definition.plugins, 0);
   const allowed = new Set([...VOICE_COMPACTION_REQUIRED_PLUGINS, ...VOICE_COMPACTION_OPTIONAL_PLUGINS]);
-  const plugins = leaves.map((aliases) => aliases[0]);
-  const missing = VOICE_COMPACTION_REQUIRED_PLUGINS.filter((name) => !leaves.some((aliases) => aliases.includes(name)));
-  for (const aliases of leaves) {
-    if (!aliases.some((name) => allowed.has(name))) extras.push(`插件:${aliases[0]}`);
+  const missing = VOICE_COMPACTION_REQUIRED_PLUGINS.filter((name) => !leaves.includes(name));
+  for (const name of leaves) {
+    if (!allowed.has(name)) extras.push(`插件:${name}`);
   }
-  if (missing.length > 0) {
-    return { compatible: false, reason: `缺少压缩能力: ${missing.join(', ')}`, plugins, missing, extras };
-  }
-  if (extras.length > 0) {
-    return { compatible: false, reason: `附带压缩以外的内容: ${extras.join(', ')}`, plugins, missing, extras };
-  }
-  return { compatible: true, reason: '', plugins, missing, extras };
+  const reasons = [];
+  if (missing.length > 0) reasons.push(`缺少压缩能力: ${missing.join(', ')}`);
+  if (extras.length > 0) reasons.push(`附带压缩以外的内容: ${extras.join(', ')}`);
+  return { compatible: reasons.length === 0, reason: reasons.join('；'), plugins: leaves, missing, extras };
 }
 
 /** Estimated request tokens (token meter first, backend measure second), or null. */
@@ -264,14 +260,31 @@ export function createVoiceCompaction({
   };
 
   /**
+   * The shipped registry stores `{ config, context, ready, ... }` per id; only `config` is the
+   * declaration. A hand-written map (and the tests) may still hold the bare definition, so the
+   * wrapper is recognized by its `config` member and unwrapped before any audit.
+   */
+  const definitionOf = (record) => (
+    record !== null && typeof record === 'object'
+    && record.config !== null && typeof record.config === 'object'
+    && !Array.isArray(record.config)
+    && record.plugins === undefined
+      ? record.config
+      : record
+  );
+
+  /**
    * Provenance of an existing declaration. The plugin's own registration never reaches this path
    * (it is recorded before the next read). A leftover declaration is the migration case — it came
    * from the profile patch, or from a bundle that declared the same id — so "profile" is the honest
-   * default; only an explicit marker upgrades it to "builtin".
+   * default; only an explicit marker upgrades it to "builtin". The marker may sit on the registry
+   * record or inside its config, so both layers are read.
    */
-  const sourceOf = (record) => {
-    if (typeof record?.source === 'string' && record.source.length > 0) return record.source;
-    if (record?.builtin === true) return 'builtin';
+  const sourceOf = (record, definition) => {
+    for (const candidate of [record, definition]) {
+      if (typeof candidate?.source === 'string' && candidate.source.length > 0) return candidate.source;
+      if (candidate?.builtin === true) return 'builtin';
+    }
     return 'profile';
   };
 
@@ -325,9 +338,12 @@ export function createVoiceCompaction({
     }
 
     /** Reuse only an audited-compatible declaration; anything else is an explicit conflict. */
-    const adoptExisting = (existing) => {
-      const source = sourceOf(existing);
-      const audit = assessVoiceCompactionPreset(existing);
+    const adoptExisting = (record) => {
+      // The registry record wraps the definition; auditing the wrapper would always see a missing
+      // `plugins` and misreport a fully compatible preset as a conflict.
+      const definition = definitionOf(record);
+      const source = sourceOf(record, definition);
+      const audit = assessVoiceCompactionPreset(definition);
       if (!audit.compatible) {
         presetState = {
           status: 'conflict',
