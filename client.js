@@ -6086,7 +6086,15 @@ window.__ModuleLoader__.load({
             );
           })(),
         )),
-        settingsBlock('avatar', settingsCard(h, 'avatar', '形象与动作',
+        settingsBlock('avatar', (() => {
+          // 形象卡片在 v1 里是自带 IIFE 的；重排到分区数组时快照定义跟着卡片走，
+          // 否则 ready / l / hotkeys 会在渲染时 ReferenceError（设置页整块崩掉）。
+          const l = status.live2d ?? {};
+          const ready = l.ready === true;
+          const socketOpen = l.socketOpen === true;
+          const hotkeys = l.hotkeys ?? [];
+          const expressions = l.expressions ?? [];
+          return settingsCard(h, 'avatar', '形象与动作',
               settingsGroup(h, 'vts', 'VTS 连接与表情',
                 line('VTS', ready
                   ? `已连接 · ${l.model || '未知模型'}`
@@ -6326,7 +6334,8 @@ window.__ModuleLoader__.load({
                 reset: resetMotionPresets,
                 refresh: () => { void loadMotionPresets(); },
               }),
-        )),
+          );
+        })()),
         settingsBlock('memory', (() => {
           // 人设库：记忆卡片的子容器，位置紧随记忆卡片之后。用户只编辑两段文本，分类由宿主拆分填写。
           // 「分类管理」：列表在展开时加载；改名/合并/删除后刷新列表，act() 已顺带刷新容量。
