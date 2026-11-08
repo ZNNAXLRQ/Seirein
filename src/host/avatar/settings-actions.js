@@ -217,6 +217,15 @@ export const ACTIONS = Object.freeze([
   'transparent.stop',
 ]);
 
+/** Push saved overrides into a live runtime; a missing/stale runtime must not fail the write. */
+const syncMotionOverrides = (services, overrides) => {
+  try {
+    services.ensureAvatarRuntime?.()?.setPresetOverrides?.(overrides);
+  } catch {
+    /* settings write already succeeded; a dead runtime is rebuilt on demand */
+  }
+};
+
 export function createAvatarSettingsActions(services) {
   const emit = async (type, payload) => {
     try {
@@ -370,6 +379,7 @@ export function createAvatarSettingsActions(services) {
     }
 
     const saved = store.write(state);
+syncMotionOverrides(services, saved);
     const preset = PRESET_BY_ID.get(id);
     const enabled = kind === 'action'
       ? !saved.disabled.includes(id) && !(preset !== undefined && saved.disabledFamilies.includes(preset.family))
@@ -387,6 +397,7 @@ export function createAvatarSettingsActions(services) {
 
     if (body.all === true) {
       const saved = store.write(createDefaultMotionPresetOverrides());
+syncMotionOverrides(services, saved);
       await emit('motion.presets.changed', {
         kind: 'all',
         id: '',
@@ -419,6 +430,7 @@ export function createAvatarSettingsActions(services) {
     }
 
     const saved = store.write(state);
+syncMotionOverrides(services, saved);
     const preset = PRESET_BY_ID.get(id);
     const enabled = kind === 'action'
       ? !saved.disabled.includes(id) && !(preset !== undefined && saved.disabledFamilies.includes(preset.family))

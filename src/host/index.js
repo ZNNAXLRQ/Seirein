@@ -2672,6 +2672,10 @@ export function apply(ctx, config) {
     if (cachedStyle !== undefined && cachedStyle !== null) {
       avatarRuntime.setStyle(cachedStyle.style, { styleVersion: cachedStyle.styleVersion });
     }
+    // Preset execution is the default action writer: the preset library drives action boundaries and
+    // the user's overrides come from data/motion-presets.json (the selector's own shape).
+    avatarRuntime.setPresetExecution(config?.presetExecution !== false);
+    avatarRuntime.setPresetOverrides(motionPresetStore.read());
     // A privacy scene active before this runtime existed must hold it too: a new generation is
     // never a way to write into a private state.
     if (vision.mode === 'privacy') {
@@ -13396,6 +13400,7 @@ export function apply(ctx, config) {
     get avatarCapabilitiesStatus() { return avatarCapabilitiesStatus; },
     get avatarMotionLockReasons() { return [...avatarMotionLocks]; },
     get discoverAvatarCapabilities() { return discoverAvatarCapabilities; },
+    get ensureAvatarRuntime() { return ensureAvatarRuntime; },
     get ensureAvatarLayer() { return ensureAvatarLayer; },
     get ensureComponent() { return ensureComponent; },
     get features() { return features; },
