@@ -1232,6 +1232,10 @@ export function createAckWarmPool({
               speechLang: identity.speechLang,
               voice: buildMeta.voice ?? '',
               personaVersion: identity.persona,
+              // P-46 stage 2: an idle-window warm line has no delivery identity: all three stay null.
+              turn: null,
+              deliveryMessageId: null,
+              sessionId: null,
             });
             // The batch may have been disposed/cleared/superseded while TTS ran.
             if (isStale(run) === true) return discard(run, startedAt, key);

@@ -15,6 +15,7 @@
  *   6. a turn learned during the recall wait is published with that same turn's hits (one snapshot,
  *      never a stale pre-wait turn next to fresh hits);
  *   7. a wait that ends with the turn still unknown publishes null/null, never another turn's recall.
+ *   8. P-46 stage 2: `speech.seat.wait` is written to the same log with the round's session/turn.
  *
  * The real host is mounted with a fake hearing/TTS/player and a synthetic agent that commits one
  * turn per delivery and runs the registered `agent/pre-step` waterfall, so the C2 recall happens
@@ -513,10 +514,18 @@ test('2) voice.reply, voice.first-sentence, voice.latency and the stream probe c
       round.probe.turn, round.timeline.turn]),
     new Set([1]),
   );
+  // P-46 stage 2: the playback seat wait is written to this same event log with the caller's
+  // session/turn attribution, so it joins the round like any other speech row.
+  const seatWaits = app.rows('speech.seat.wait').map((entry) => entry.payload);
+  const replySeat = seatWaits.find((row) => row.turn === 1 && row.sessionId === round.injected.sessionId);
+  assert.ok(replySeat !== undefined, 'the round logged an attributed speech.seat.wait');
+  assert.ok(Number.isInteger(replySeat.waitMs) && replySeat.waitMs >= 0, 'seat waitMs is a measured duration');
+  assert.ok(typeof replySeat.outcome === 'string' && replySeat.outcome.length > 0, 'seat outcome is present');
 
   console.log(`[2] reply turn=${round.reply.turn} first-sentence turn=${round.firstSentence.turn} `
     + `latency turn=${round.latency.turn} probe turn=${round.probe.turn} deliveryMessageId=${round.reply.deliveryMessageId} `
-    + `timeline turn=${round.timeline.turn} status=${round.timeline.status}`);
+    + `timeline turn=${round.timeline.turn} status=${round.timeline.status} `
+    + `seat turn=${replySeat.turn} waitMs=${replySeat.waitMs} outcome=${replySeat.outcome}`);
 });
 
 // ---------------------------------------------------------------------------

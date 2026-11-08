@@ -1669,6 +1669,8 @@ export function apply(ctx, config) {
   const speechLedger = createSpeechLedger({
     emit: (type, payload) => log.emit(type, payload),
     onAudible: noteFirstAudible,
+    // P-46 stage 2: seat-wait attribution (`speech.seat.wait`) writes to the same event log.
+    log,
   });
   activeSpeechLedger = speechLedger;
   // The spoken-version tasks are deduped by `(turn, replyVersion, purpose)`. `replyVersion` counts
@@ -2834,7 +2836,7 @@ export function apply(ctx, config) {
       return;
     }
     // Preset observability: the controller already throttles select/skip to one per class per
-    // second and commits to one per 250 ms, and silences them with `presetDebugEvents:false`.
+    // second and commit events are first+last per action with a 1 s trailing window, and silences them with `presetDebugEvents:false`.
     // Log sink only (start carries amplitude/duration/stages evidence; never a second writer).
     if (message === 'avatar.preset.select' || message === 'avatar.preset.skip'
       || message === 'avatar.preset.commit' || message === 'avatar.preset.start') {
@@ -4028,6 +4030,8 @@ export function apply(ctx, config) {
   const synthesizeChunked = async (prepared, {
     voice, signal, liveSignal = null, chunking: chunkingOverride = undefined,
     purpose = 'answer', sentenceId = 0, firstBlock = false,
+    // P-46 stage 2: optional turn attribution, forwarded to every block's synthesis.
+    turn = null, deliveryMessageId = null, sessionId = null,
   }) => {
     // `chunking:false` is the streamed spoken-version path: the semantic unit is already sized
     // from measured synthesis cost, so the comma-level block splitter must not cut it again.
@@ -4074,6 +4078,10 @@ export function apply(ctx, config) {
       purpose,
       chunkIndex,
       sentenceId,
+      // P-46 stage 2: the caller's turn attribution rides on every block (null when unnamed).
+      turn,
+      deliveryMessageId,
+      sessionId,
     });
     const firstBlockAt = Date.now();
     const audio = await synthesizeBlock(list[0], signal);
@@ -4676,6 +4684,8 @@ export function apply(ctx, config) {
     onPlaybackSession = null, onSubtitle = null, owner = null, subtitleFinal = true,
     // Observation only: the lane purpose reported by the streamed TTS request row.
     purpose = 'speech',
+    // P-46 stage 2: optional turn attribution forwarded to the streamed request row.
+    turn = null, deliveryMessageId = null, sessionId = null,
     // P2: the text the stream is synthesized from — `text` itself unless a lane says otherwise.
     speechText = text,
   }) => {
@@ -4720,6 +4730,9 @@ export function apply(ctx, config) {
         ffplayPath,
         signal,
         purpose,
+        turn,
+        deliveryMessageId,
+        sessionId,
         onStart: (info) => {
           // First chunk handed to the player: the transport is no longer pending. Data arrival is
           // not speaker sound, so this session records firstData* only and keeps PCM/audible null.
@@ -6987,6 +7000,8 @@ export function apply(ctx, config) {
           if (!first) {
             await speechLedger.waitPlaybackTurn(speechId, {
               signal: lane, timeoutMs: speechQueueWaitMs(), reportOnly: true,
+              // P-46 stage 2: the seat wait is attributable to this tool call's turn.
+              sessionId, turn: turnId,
             });
             lane.throwIfAborted();
           }
@@ -7061,6 +7076,8 @@ export function apply(ctx, config) {
               text: spokenText, voice, lang: prepared.speechLang, textLang: prepared.speechLang, dir, signal: combined,
               // Observation only: a line spoken by the say tool.
               purpose: 'tool',
+              // P-46 stage 2: the tool line's turn attribution (say has no delivery message id).
+              turn: turnId, sessionId,
             });
             synthMs = Date.now() - synthAt;
             chunkMs = synthMs;
@@ -7079,6 +7096,7 @@ export function apply(ctx, config) {
               const turnAt = Date.now();
               await speechLedger.waitPlaybackTurn(speechId, {
                 signal: combined, timeoutMs: speechQueueWaitMs(),
+                sessionId, turn: turnId,
               });
               waitTurnMs = Math.max(0, Date.now() - turnAt);
               combined.throwIfAborted();
@@ -7099,6 +7117,8 @@ export function apply(ctx, config) {
                 owner: speechOwner,
                 // Observation only: the streamed answer transport.
                 purpose: 'answer',
+                // P-46 stage 2: the streamed line's turn attribution.
+                turn: turnId, sessionId,
               });
               result = played.result;
               playedSession = played.session;
@@ -7121,6 +7141,7 @@ export function apply(ctx, config) {
               const blockStartedAt = Date.now();
               const chunked = await synthesizeChunked(prepared, {
                 voice, signal: combined, liveSignal: live, purpose: 'tool',
+                turn: turnId, sessionId,
               });
               // Register ownership the instant block 0 exists, BEFORE the playback-turn wait: a
               // cancel while queued must still delete this file (the finally below owns it).
@@ -7135,6 +7156,7 @@ export function apply(ctx, config) {
               const turnAt = Date.now();
               await speechLedger.waitPlaybackTurn(speechId, {
                 signal: combined, timeoutMs: speechQueueWaitMs(),
+                sessionId, turn: turnId,
               });
               waitTurnMs = Math.max(0, Date.now() - turnAt);
               combined.throwIfAborted();
@@ -11088,7 +11110,7 @@ export function apply(ctx, config) {
    * failure notices). `subtitle` is optional: when the subtitle language differs from the speech
    * language, the caller passes both texts.
    */
-  const speakLine = async (text, subtitle = '') => {
+  const speakLine = async (text, subtitle = '', { turn = null, sessionId = null } = {}) => {
     if (!features.enabled('voice')) return null;
     try {
       const signal = speechSignal();
@@ -11115,6 +11137,8 @@ export function apply(ctx, config) {
         signal,
         // Observation only: the shared whole-line notice/fallback outlet.
         purpose: 'say',
+        // P-46 stage 2: attribution from the caller (null when this notice belongs to no turn).
+        turn, sessionId,
       });
       signal.throwIfAborted();
       const synthesizedAt = Date.now();
@@ -11143,7 +11167,9 @@ export function apply(ctx, config) {
   // and synthesis run in parallel with the answer from the delivery instant; the clip itself only
   // plays when the two-second deadline arrives and the reply body has not started speaking. It
   // never claims the turn's voice owner: the answer keeps its own entry.
-  const synthesizeAckLine = async ({ speech, signal, captionLang, speechLang }) => {
+  const synthesizeAckLine = async ({
+    speech, signal, captionLang, speechLang, turn = null, sessionId = null,
+  }) => {
     const formatted = formatSpeech(speech);
     const text = formatted.speech.trim();
     if (formatted.empty || text.length === 0) throw new Error('候音为空');
@@ -11164,6 +11190,8 @@ export function apply(ctx, config) {
       signal,
       // Observation only: the turn's waiting line.
       purpose: 'ack',
+      // P-46 stage 2: the waiting line belongs to the same turn/session as the answer.
+      turn, sessionId,
       // A1: the waiting line outranks body prefetch that is still queued in the TTS slot. The
       // priority only reorders waiting jobs; it never interrupts a synthesis already running.
       priority: ACK_SYNTH_PRIORITY,
@@ -11294,7 +11322,11 @@ export function apply(ctx, config) {
       return [];
     }
   };
-  const synthesizeAckWarmLine = async ({ text, signal, dir, captionLang, speechLang }) => {
+  const synthesizeAckWarmLine = async ({
+    text, signal, dir, captionLang, speechLang,
+    // P-46 stage 2: a warm line is built in an idle window and has no delivery identity.
+    turn = null, deliveryMessageId = null, sessionId = null,
+  }) => {
     // `text` is the caption line generated in the subtitle language. Translation to the voice
     // language and TTS both happen here, during the idle window, never at the trigger.
     const formatted = formatSpeech(text);
@@ -11313,6 +11345,8 @@ export function apply(ctx, config) {
       signal,
       // Observation only: an idle-window warm-pool line.
       purpose: 'ack-warm',
+      // P-46 stage 2: always null here; the pool owns no turn until a real delivery takes it.
+      turn, deliveryMessageId, sessionId,
     });
     // The batch was cancelled after this clip finished: delete its audio before the pool decides
     // whether to keep it, so a cancelled warm run never leaves a partial file behind.
@@ -11687,7 +11721,7 @@ export function apply(ctx, config) {
     onSpeechBudget: () => {
       void showSubtitle(SPEECH_TRUNCATION_NOTE, 2500, null).catch(() => {});
     },
-    synthesize: async ({ text, signal, sentenceId }) => {
+    synthesize: async ({ text, signal, sentenceId, turn = null, sessionId = null, deliveryMessageId = null }) => {
       // The round-level condense already happened in `prepareRoundText`; per-sentence text is used
       // as-is so a long answer is condensed ONCE, not once per sentence.
       const captionStream = captionStreamFor(text, { signal, sentenceId });
@@ -11704,6 +11738,8 @@ export function apply(ctx, config) {
       };
       const { audio, chunkTexts, synthesizeChunk } = await synthesizeChunked(prepared, {
         voice, signal, liveSignal: liveSpeech,
+        // P-46 stage 2: the typed round's own attribution (null when the speaker named none).
+        turn, sessionId, deliveryMessageId,
       });
       return {
         ...audio,
@@ -11782,7 +11818,8 @@ export function apply(ctx, config) {
     },
     speakWhole: async (value, scope = {}) => {
       await answerAfterAck(scope?.sessionId, scope?.turnId);
-      const result = await speakLine(value);
+      // P-46 stage 2: the typed whole-line fallback names the same typed round.
+      const result = await speakLine(value, '', { sessionId: scope?.sessionId, turn: scope?.turnId });
       const at = Number(result?.audioStartedAt) || 0;
       if (at > 0) ackLane?.bodyStarted({ sessionId: scope?.sessionId, turn: scope?.turnId, at });
       if (at > 0) noteReplySpoke(scope?.sessionId, scope?.turnId);
@@ -12061,7 +12098,7 @@ export function apply(ctx, config) {
         });
         // P-46: a round that never delivered still gets its one row (no body, no turn).
         await timelineEmit('failed', 'session-unavailable');
-        if (features.enabled('voice')) await speakLine('语音通道暂时不可用。');
+        if (features.enabled('voice')) await speakLine('语音通道暂时不可用。', '', { sessionId });
         return;
       }
       sessionReadyAt = Date.now();
@@ -12110,6 +12147,11 @@ export function apply(ctx, config) {
           sentenceVoice = createReplySpeaker({
             signal: lane,
             startedAt: Number(timing.transcriptAt) || Date.now(),
+            // P-46 stage 2: the speaker's synthesis seams name this reply's session and turn.
+            // They are getters because `acceptTurn` only becomes known once the round is accepted.
+            sessionId,
+            turn: () => acceptTurn,
+            deliveryMessageId: () => deliveryMessageId,
             // A5: the same `voice.speechMaxChars` budget as the typed lane and `assistant_say`;
             // the speaker ends the spoken share on a sentence boundary, never mid-sentence.
             maxChars: voiceSpeechMaxChars(),
@@ -12158,6 +12200,8 @@ export function apply(ctx, config) {
                 voice, signal: combined, liveSignal: liveSpeech,
                 // Observation only: this sentence is the answer's body, tagged with its block id.
                 purpose: 'answer', sentenceId,
+                // P-46 stage 2: the reply body names the accepted turn and its delivery message.
+                turn: acceptTurn, deliveryMessageId, sessionId,
                 // The streamed spoken-version path already sized this unit from measured synthesis
                 // cost; re-cutting it at a comma would defeat that measurement. P-148: its FIRST
                 // unit is still cut once, near the target, so block 0 does not wait for the unit.
@@ -12236,6 +12280,8 @@ export function apply(ctx, config) {
                   // FIFO by acceptance order, not by which sentence finished synthesizing first.
                   await speechLedger.waitPlaybackTurn(speechId, {
                     signal: laneSignal, timeoutMs: speechQueueWaitMs(),
+                    // P-46 stage 2: the reply seat wait is attributable to this answer's turn.
+                    sessionId, turn: turnId,
                   });
                   laneSignal.throwIfAborted();
                   // The version may have been replaced while this block waited for the seat.
@@ -12357,7 +12403,8 @@ export function apply(ctx, config) {
               if (claim.ok !== true) return null;
               let result;
               try {
-                result = await speakLine(value);
+                // P-46 stage 2: the whole-reply fallback belongs to this answer's turn.
+                result = await speakLine(value, '', { sessionId, turn: turnId });
               } catch (error) {
                 speechLedger.releaseText({ sessionId, turn: turnId, text: value });
                 throw error;
@@ -13154,7 +13201,14 @@ export function apply(ctx, config) {
           await log.emit('voice.pending', { chars: pendingLine.length, drafted: pendingLine !== PENDING_FALLBACK });
           // A2: once body speech has started, a late canned line would supersede the playing
           // sentence (one playback session), so it is skipped rather than cutting the answer.
-          if (sentenceVoice?.hasPlayed() !== true) await speakLine(pendingLine);
+          if (sentenceVoice?.hasPlayed() !== true) {
+            // P-46 stage 2: the pending line names the turn it was drafted for (when known).
+            await speakLine(pendingLine, '', {
+              sessionId,
+              turn: Number.isInteger(stage.acceptTurn) ? stage.acceptTurn
+                : (Number.isInteger(stage.turn) ? stage.turn : null),
+            });
+          }
         }
         const done = await resultPromise;
         // The body text is already streaming; this remaining stamp only positions the last stage.

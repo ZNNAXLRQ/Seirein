@@ -185,6 +185,15 @@ export function createReplySpeaker({
   /** A5: the final `{type:'voice.speech.budget', …}` report, kept separate from prefetch events. */
   onBudget = null,
   now = () => Date.now(),
+  /**
+   * P-46 stage 2: optional turn attribution copied onto every synthesis request. `turn` and
+   * `deliveryMessageId` may also be getters (the reply lane learns `acceptTurn` after the body
+   * starts arriving). When a caller names none, the seam receives an explicit null — never a
+   * fabricated 0 or an empty id.
+   */
+  sessionId = '',
+  turn = null,
+  deliveryMessageId = null,
 } = {}) {
   const controller = new AbortController();
   const lane = signal === undefined || signal === null ? controller.signal : AbortSignal.any([signal, controller.signal]);
@@ -402,6 +411,22 @@ export function createReplySpeaker({
     return new Promise((resolve) => { waiters.push(resolve); });
   };
 
+  // P-46 stage 2: attribution values may be late-bound getters; resolve them at synthesis time
+  // and normalise to null so a missing turn/id is never invented.
+  const attributionValue = (value) => (typeof value === 'function' ? value() : value);
+  const turnAttribution = () => {
+    const value = attributionValue(turn);
+    return Number.isInteger(value) ? value : null;
+  };
+  const sessionAttribution = () => {
+    const value = attributionValue(sessionId);
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  };
+  const deliveryAttribution = () => {
+    const value = attributionValue(deliveryMessageId);
+    return typeof value === 'string' && value.length > 0 ? value : null;
+  };
+
   const synthesizeItem = async (item) => {
     if (lane.aborted) throw lane.reason ?? new DOMException('Reply speech cancelled', 'AbortError');
     const synthAt = now();
@@ -411,7 +436,15 @@ export function createReplySpeaker({
     }
     // The seam must observe cancellation too: a provider that ignores its signal may otherwise
     // pin the run (and `finish`) long after this version was replaced.
-    const pendingAudio = Promise.resolve(synthesizeSentence({ text: item.text, sentenceId: item.seq, signal: lane }));
+    const pendingAudio = Promise.resolve(synthesizeSentence({
+      text: item.text,
+      sentenceId: item.seq,
+      signal: lane,
+      // P-46 stage 2: the reply's own turn attribution (explicit null when unnamed).
+      turn: turnAttribution(),
+      sessionId: sessionAttribution(),
+      deliveryMessageId: deliveryAttribution(),
+    }));
     let audio;
     try {
       audio = await abortable(pendingAudio);

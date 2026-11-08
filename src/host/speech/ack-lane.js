@@ -270,6 +270,8 @@ export function createAckLane({
             speechLang: langOf(speechLang),
             signal: draftSignal,
             turn: record.turn,
+            // P-46 stage 2: the waiting line names its own session too.
+            sessionId: record.sessionId,
           });
           if (record.cancelled) return false;
           if (record.source !== '') return false;
@@ -423,6 +425,8 @@ export function createAckLane({
           speechLang: langOf(speechLang),
           signal: record.signal,
           turn: record.turn,
+          // P-46 stage 2: the fixed fallback line belongs to the same session/turn.
+          sessionId: record.sessionId,
         });
         if (record.cancelled || record.settled) return;
         if (audio === null || audio === undefined) throw ackError('fallback', '通用兜底合成失败');

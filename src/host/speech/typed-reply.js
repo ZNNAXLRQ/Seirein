@@ -488,6 +488,9 @@ export function createTypedVoiceRelay({
       startedAt: now(),
       maxChars: roundMaxChars,
       budget: resolveBudget,
+      // P-46 stage 2: the typed round's attribution; the host copies it onto `voice.tts.request`.
+      sessionId,
+      turn: turnId,
       // A5: `voice.speech.budget` reaches the event log through the same emit seam as the rest.
       onBudget: (event) => {
         const { type, ...data } = event;
