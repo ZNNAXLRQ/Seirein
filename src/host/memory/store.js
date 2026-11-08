@@ -1083,6 +1083,32 @@ export class MemoryStore {
   }
 
   /**
+   * Stage-3 speaker attribution stored with one message record, or null.
+   *
+   * Read-only and deliberately outside `messageColumns()`: existing queries keep their exact
+   * shape. A legacy row (or a typed/assistant message) has no value and returns null.
+   *
+   * @param {string} messageId
+   * @returns {{speakerId: string|null, assigned: boolean, confidence: string,
+   *            source: string, at: string|null}|null}
+   */
+  messageAttribution(messageId) {
+    this.open();
+    const key = typeof messageId === 'string' ? messageId.trim() : '';
+    if (key.length === 0) return null;
+    const row = this.db
+      .prepare("SELECT speaker_attribution AS value FROM memory_event WHERE message_id = ?")
+      .get(key);
+    if (row === undefined || typeof row.value !== 'string' || row.value.length === 0) return null;
+    try {
+      const parsed = JSON.parse(row.value);
+      return parsed !== null && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Raise a record that the user has explicitly confirmed as a convention/fact. Auto records
    * start at 30 and are deliberately excluded from `restore()`; this is the one way up, used
    * when a manual `assistant_remember` names the record it confirms.
@@ -1881,7 +1907,7 @@ export class MemoryStore {
     if (before > target) {
       const columns = `id, ts, domain, kind, text, importance, clarity,
         message_id, session_id, turn_id, role, truncated, superseded_by, hidden, tz_used, raw_text,
-        unresolved, pressure_epoch, pressure_contribution`;
+        unresolved, pressure_epoch, pressure_contribution, speaker_attribution`;
       const selectHidden = this.db.prepare(`SELECT ${columns}
         FROM memory_event WHERE clarity = 'trace' AND hidden = 1
         ORDER BY importance ASC, ts ASC LIMIT ?`);
@@ -1892,8 +1918,8 @@ export class MemoryStore {
         `INSERT OR IGNORE INTO memory_archive
           (id, ts, domain, kind, text, importance, clarity, archived_at, reason,
            message_id, session_id, turn_id, role, truncated, superseded_by, hidden, tz_used,
-           raw_text, unresolved, pressure_epoch, pressure_contribution)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           raw_text, unresolved, pressure_epoch, pressure_contribution, speaker_attribution)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const remove = this.db.prepare('DELETE FROM memory_event WHERE id = ?');
 
@@ -1906,6 +1932,7 @@ export class MemoryStore {
             row.truncated ?? 0, row.superseded_by ?? null, row.hidden ?? 0, row.tz_used ?? null,
             row.raw_text ?? null, row.unresolved ?? 0,
             row.pressure_epoch ?? 0, row.pressure_contribution ?? 0,
+            row.speaker_attribution ?? null,
           );
           remove.run(row.id);
           moved += 1;
