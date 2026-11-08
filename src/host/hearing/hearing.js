@@ -157,6 +157,13 @@ export {
 
 
 /**
+ * Default silence point of the endpoint-continuation probe (shadow, observation only). At this
+ * trailing silence the probe freezes a candidate; a resumption before the real endpoint becomes a
+ * `hearing.endpoint.continuation` row. The host may override it per capture session.
+ */
+export const CONTINUATION_PROBE_MS = 1200;
+
+/**
  * Start streaming recognition.
  * @param {{ffmpegPath: string, modelDir: string, finalModelDir?: string, device: string,
  *          gainDb?: number, streamThreads?: number, finalThreads?: number, decodeCapSec?: number,
@@ -188,6 +195,15 @@ export function startHearing({
   finalThreads = 2,
   /** Endpoint-rule override (test/config seam); omitted keeps DEFAULT_ENDPOINT_RULES. */
   endpointRules = null,
+  /**
+   * Endpoint-continuation probe (shadow, **default ON**). It answers one question the final
+   * endpoint row cannot: did the speaker resume talking after a silence that a shorter endpoint
+   * (1.2 s instead of 1.8 s) would already have cut? The host maps `voice.endpointProbe !== false`
+   * here; `false` writes zero probe rows. `endpointProbeMs` is the silence point (default 1200 ms).
+   * Neither value changes an endpoint rule, grouping, delivery or merge.
+   */
+  endpointProbe = true,
+  endpointProbeMs = CONTINUATION_PROBE_MS,
   decodeCapSec = 15,
   /** Shared audio between neighbouring offline pieces; 0 restores the old hard cut. */
   asrSegmentOverlapMs = DEFAULT_SEGMENT_OVERLAP_MS,
@@ -1058,6 +1074,103 @@ export function startHearing({
   /** Resume evidence is measured on the same 20 ms frames as the energy VAD. */
   const GROUP_FRAME_SAMPLES = Math.max(1, Math.round((16000 * VOICED_FRAME_MS) / 1000));
 
+  // ---- Endpoint-continuation probe: observation only, no rule/delivery/merge reads it. ----
+  /** Silence point of a continuation candidate; invalid values keep the 1200 ms default. */
+  const ENDPOINT_PROBE_MS = Number.isFinite(Number(endpointProbeMs)) && Number(endpointProbeMs) > 0
+    ? Math.min(Number(endpointProbeMs), 60_000)
+    : CONTINUATION_PROBE_MS;
+  /** A resumed word must stay voiced this long, so one click inside the silence is not a resume. */
+  const ENDPOINT_PROBE_VOICE_MS = 120;
+  /** One row per class per window: the probe is a statistic, not a log of every pause. */
+  const ENDPOINT_PROBE_THROTTLE_MS = 10_000;
+  const endpointProbeOn = asrWorkerRequested && endpointProbe !== false;
+  const endpointProbeAt = { continuation: 0, 'no-continuation': 0 };
+  let probeSeenSpeech = false;
+  let probeSilenceMs = 0;
+  /** Silence when the probe point was crossed (0 = not reached); both rows report it. */
+  let probeCandidateMs = 0;
+  let probeContinued = false;
+  let probeResumeRunMs = 0;
+  let probeResumeSilenceMs = 0;
+
+  const emitEndpointProbe = (kind, payload) => {
+    if (!endpointProbeOn) return;
+    const at = Date.now();
+    if (at - endpointProbeAt[kind] < ENDPOINT_PROBE_THROTTLE_MS) return;
+    endpointProbeAt[kind] = at;
+    try {
+      onEvent?.(`hearing.endpoint.${kind}`, { level: 'debug', ...payload });
+    } catch {
+      /* an event sink must never break capture */
+    }
+  };
+  const resetEndpointProbe = () => {
+    probeSeenSpeech = false;
+    probeSilenceMs = 0;
+    probeCandidateMs = 0;
+    probeContinued = false;
+    probeResumeRunMs = 0;
+    probeResumeSilenceMs = 0;
+  };
+  /** The candidate became a real continuation: the speaker resumed before the endpoint. */
+  const markProbeContinuation = (utteranceId) => {
+    if (probeCandidateMs <= 0 || probeContinued) return;
+    probeContinued = true;
+    emitEndpointProbe('continuation', {
+      utteranceId,
+      source: inputSource,
+      silenceMs: probeCandidateMs,
+      probeMs: ENDPOINT_PROBE_MS,
+      continuedMs: Math.max(probeCandidateMs, probeResumeSilenceMs || probeSilenceMs),
+    });
+  };
+  /**
+   * Trailing-silence tracking on the same 20 ms frames the energy VAD already uses. The utterance
+   * starts at its first voiced frame (leading room tone is not silence after a word), a candidate is
+   * frozen when the silence reaches `ENDPOINT_PROBE_MS`, and only a sustained voiced run (or a new
+   * partial, see `processChunk`) turns it into a continuation. Nothing is emitted for a silence that
+   * never reaches the probe point.
+   */
+  const noteEndpointProbeAudio = (samples) => {
+    for (let offset = 0; offset < samples.length; offset += GROUP_FRAME_SAMPLES) {
+      const frame = samples.subarray(offset, Math.min(samples.length, offset + GROUP_FRAME_SAMPLES));
+      let frameSquares = 0;
+      for (const sample of frame) frameSquares += sample * sample;
+      const voiced = frameSquares > 0
+        && 20 * Math.log10(Math.sqrt(frameSquares / frame.length)) >= MIN_RMS_DB;
+      const frameMs = (frame.length * 1000) / 16000;
+      if (voiced) {
+        if (!probeSeenSpeech) {
+          probeSeenSpeech = true;
+        } else if (probeCandidateMs > 0 && !probeContinued) {
+          if (probeResumeRunMs === 0) probeResumeSilenceMs = probeSilenceMs;
+          probeResumeRunMs += frameMs;
+          if (probeResumeRunMs >= ENDPOINT_PROBE_VOICE_MS) markProbeContinuation(utteranceSeq + 1);
+        }
+        probeSilenceMs = 0;
+      } else if (probeSeenSpeech) {
+        probeResumeRunMs = 0;
+        probeSilenceMs += frameMs;
+        if (probeCandidateMs === 0 && probeSilenceMs >= ENDPOINT_PROBE_MS) probeCandidateMs = probeSilenceMs;
+      }
+    }
+  };
+  /** New words after the probe point are the second continuation signal (no 120 ms wait). */
+  const noteEndpointProbePartial = (utteranceId) => {
+    if (probeCandidateMs > 0 && !probeContinued) markProbeContinuation(utteranceId);
+  };
+  /** Endpoint reached: a frozen candidate that never resumed is the no-continuation row. */
+  const settleEndpointProbe = (utteranceId, endReason) => {
+    // Only a silence endpoint means "the sentence ended here"; a max-duration/internal cut is a
+    // different event and must not be reported as a no-continuation.
+    if (endpointProbeOn && endReason === 'silence' && probeCandidateMs > 0 && !probeContinued) {
+      emitEndpointProbe('no-continuation', {
+        utteranceId, source: inputSource, silenceMs: probeCandidateMs,
+      });
+    }
+    resetEndpointProbe();
+  };
+
   /**
    * The synchronous SenseVoice recognizer is a fallback, not the normal path: with the worker on,
    * the model is built on this thread only after the thread had to be given up on
@@ -1731,13 +1844,23 @@ export function startHearing({
     stream.acceptWaveform({ sampleRate: 16000, samples });
     while (recognizer.isReady(stream)) recognizer.decode(stream);
 
+    // Endpoint-continuation probe: the same frames, measured after recognition and before the
+    // endpoint check. It only advances local counters and writes the two debug rows.
+    if (endpointProbeOn) noteEndpointProbeAudio(samples);
+
     const result = recognizer.getResult(stream);
     const clean = sanitize(result.text);
     if (clean !== partial) {
+      // Only a partial that was already present can be a *new* word after the probe point; the
+      // first partial of the utterance belongs to the speech that started it.
+      const hadPartial = partial.length > 0;
       partial = clean;
       onUpdate?.({ partial });
       // Continuation signal #2, streaming: new words after the endpoint (not the offline final).
-      if (clean.length > 0) noteGroupContinuation();
+      if (clean.length > 0) {
+        noteGroupContinuation();
+        if (endpointProbeOn && hadPartial) noteEndpointProbePartial(utteranceSeq + 1);
+      }
     }
 
     // Round-1 VAD shadow: the same frame goes to the detector after the streaming pass consumed
@@ -1841,6 +1964,9 @@ export function startHearing({
         // to why the streaming endpoint fired, so a 20 s cut can be both max-duration and split.
         offlineSplit: snapshot.offlineSplit === true,
       });
+      // The endpoint closed this utterance: a frozen probe candidate that never resumed is a
+      // no-continuation row; either way the probe state restarts for the next utterance.
+      settleEndpointProbe(snapshot.id, snapshot.endReason);
 
       // A short but audible clip still gets the accurate pass: SenseVoice is exactly what recovers
       // a 300 ms "好" the streaming transducer may render loosely. Duration no longer gates it.

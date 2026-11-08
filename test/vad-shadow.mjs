@@ -702,3 +702,19 @@ test('15) 影子行标记来源：麦克风 mic、回环 loopback，且 front(fa
     assert.equal(final.final, '好', 'delivery is unchanged');
   }
 });
+
+test('16) 默认开启的端点续说探针在短句上零事件，VAD 影子与投递不变', async () => {
+  const { final, events } = await runClip({
+    ms: 600,
+    vadFactory: () => fakeVad({ segments: [{ startMs: 100, endMs: 500 }] }),
+  });
+
+  // 600 ms of speech has no 1.2 s trailing silence: the probe stays silent, so the existing VAD
+  // contract and delivery are exactly what they were before the probe existed.
+  assert.equal(ofType(events, 'hearing.endpoint.continuation').length, 0);
+  assert.equal(ofType(events, 'hearing.endpoint.no-continuation').length, 0);
+  assert.equal(vadShadows(events).length, 1, 'the VAD shadow is untouched');
+  assert.equal(vadShadows(events)[0].payload.source, 'mic');
+  assert.deepEqual(vadShadows(events).map((event) => event.payload.speechMs), [400]);
+  assert.equal(final.final, '好');
+});
