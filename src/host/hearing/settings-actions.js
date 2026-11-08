@@ -26,7 +26,13 @@ export function createHearingSettingsActions(services) {
         const opened = await (0, services.openContainer)('hearing', 'hearing.start');
         if (!opened.ok) return { ok: false, code: 'FEATURE_DISABLED', feature: 'hearing', error: opened.error ?? '听觉组件无法启用' };
         const result = await (0, services.startListening)(body.device);
-        return { ok: result.ok, error: result.error ?? '', ...(result.ok ? {} : { code: 'START_FAILED', feature: 'hearing' }) };
+        return {
+          ok: result.ok,
+          // The instance that actually opened: the card and the logs can name the same capture.
+          ...(result.ok ? { instanceId: result.instanceId ?? '', device: result.device ?? '' } : {}),
+          error: result.error ?? '',
+          ...(result.ok ? {} : { code: 'START_FAILED', feature: 'hearing' }),
+        };
       }
       case 'hearing.autoListen': {
         const enabled = body.enabled === true;
@@ -64,14 +70,32 @@ export function createHearingSettingsActions(services) {
         services.runtime.asrMinRmsDb = value;
         (0, services.writeSettings)({ asrMinRmsDb: value });
         await services.log.emit('hearing.threshold', { db: value });
-        // Restart capture so the new floor applies immediately when it is running.
-        if (services.hearing !== null) {
-          const device = services.hearing.device;
-          await (0, services.stopListening)();
-          const restarted = await (0, services.startListening)(device);
-          return { ok: true, db: value, restarted: restarted.ok };
+        // Restart capture so the saved floor is in force from a NEW instance. The reply is the
+        // restart's real outcome: a failed restart is a failed save, never `ok:true` + a quiet
+        // `restarted:false` (the old bug: the settings page reported success while nothing ran).
+        if (services.hearing === null) {
+          services.thresholdRestart = { lastAt: new Date().toISOString(), ok: null, error: '' };
+          return { ok: true, db: value, restarted: false, reason: 'not-running', minRmsDb: value };
         }
-        return { ok: true, db: value, restarted: false };
+        const device = services.hearing.device;
+        let restarted = null;
+        try {
+          await (0, services.stopListening)();
+          restarted = await (0, services.startListening)(device);
+        } catch (error) {
+          restarted = { ok: false, error: error?.message ?? String(error) };
+        }
+        const restartedOk = restarted?.ok === true;
+        const instanceId = restartedOk ? String(restarted.instanceId ?? '') : '';
+        const error = restartedOk ? '' : (restarted?.error || '重启采集失败');
+        services.thresholdRestart = { lastAt: new Date().toISOString(), ok: restartedOk, error };
+        if (!restartedOk) {
+          await services.log.emit('hearing.threshold.restart.failed', { db: value, device, error });
+          return { ok: false, db: value, restarted: false, error, message: `重启失败：${error}` };
+        }
+        return {
+          ok: true, db: value, restarted: true, instanceId, minRmsDb: value, message: '已生效（新实例）',
+        };
       }
       case 'hearing.device': {
         const device = String(body.device ?? '');
@@ -159,3 +183,30 @@ export function createHearingSettingsActions(services) {
 };
   return handler;
 }
+
+/**
+ * The hearing block of `/assistant/status`, projected over the live capture instance.
+ *
+ * `base` is the status builder's own block (kept as-is). The session owns the evidence the card
+ * needs: `instanceId` (which capture session is running) and `minRmsDb` (the floor it resolves
+ * *now* — a live getter, so a saved value is visible even before a restart lands). The last
+ * threshold-save restart is kept here too, because the action reply is transient while a failed
+ * restart must stay visible; `ok: null` means "no restart attempted" (capture was not running).
+ * `fallbackMinRmsDb` is the floor the next `startHearing` would begin with while stopped.
+ */
+export function projectHearingStatus(base, { session = null, restart = null, fallbackMinRmsDb = -50 } = {}) {
+  let live = Number.NaN;
+  try {
+    if (typeof session?.minRmsDb === 'function') live = Number(session.minRmsDb());
+  } catch {
+    /* a status read must never fail because a session probe did */
+  }
+  const fallback = Number(fallbackMinRmsDb);
+  return {
+    ...(base ?? {}),
+    instanceId: typeof session?.instanceId === 'string' ? session.instanceId : '',
+    minRmsDb: Number.isFinite(live) ? live : (Number.isFinite(fallback) ? fallback : -50),
+    thresholdRestart: restart ?? { lastAt: null, ok: null, error: '' },
+  };
+}
+

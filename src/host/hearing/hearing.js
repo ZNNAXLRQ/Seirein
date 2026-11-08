@@ -171,6 +171,18 @@ export {
 
 
 /**
+ * Capture-instance evidence: every `startHearing` call is one instance with a stable id, so a
+ * judgment row can be attributed to the session (and the floor) that actually judged it. The short
+ * hash keeps ids distinct across a Host restart, where the counter starts over.
+ */
+let hearingInstanceSeq = 0;
+const shortHash = (value) => {
+  let hash = 0;
+  for (const char of String(value)) hash = (hash * 31 + char.codePointAt(0)) | 0;
+  return (hash >>> 0).toString(36).padStart(4, '0').slice(0, 4);
+};
+
+/**
  * Default silence point of the endpoint-continuation probe (shadow, observation only). At this
  * trailing silence the probe freezes a candidate; a resumption before the real endpoint becomes a
  * `hearing.endpoint.continuation` row. The host may override it per capture session.
@@ -363,6 +375,11 @@ export function startHearing({
   const inputSource = typeof device === 'string' && device.length > 0
     ? (isLoopbackDevice(device) ? 'loopback' : 'mic')
     : 'unknown';
+  /**
+   * This capture instance. `hearing.instance.*` and every judgment row carry it, so evidence from
+   * an old instance (or an in-flight fragment) is never read as the replacement's.
+   */
+  const instanceId = `h${(hearingInstanceSeq += 1)}-${shortHash(`${Date.now()}|${device}|${hearingInstanceSeq}`)}`;
 
   let lastError = null;
   // Final pass is optional: a missing model just means "use the streaming text".
@@ -766,6 +783,7 @@ export function startHearing({
   child.on('close', (code, signal) => {
     // The capture loop is over for good: no pending decode may still deliver a transcript.
     stopped = true;
+    emitInstanceStopped('exit');
     // A buffered group dies with the capture session; it is never delivered late.
     dropGroup('stopped');
     // The last dialogue segment is closed too, so a later session cannot splice onto it.
@@ -779,6 +797,7 @@ export function startHearing({
   });
   child.on('error', (error) => {
     lastError = `ffmpeg 启动失败: ${error?.message ?? error}`;
+    emitInstanceStopped('error');
     rejectDone(error);
   });
 
@@ -978,10 +997,10 @@ export function startHearing({
    * back, and `text` is delivered exactly as before. Whether a later round filters on any of this
    * depends on the comparison data collected from these rows.
    *
-   * Payload: `{ utteranceId, segmentIds, decodeTaskId, deliveryId, endpointReason, durationMs,
-   * maxDurationMs, voicedMs, voicedRatio, vadSpeechMs, vadSpeechRatio, vadRatioSource,
-   * energyVoicedRatio, energySource, onlineText, offlineText, onlineOfflineAgree, playing,
-   * device, rmsDb, peakDb, tags, suspect, text, delivered, wouldDrop, wouldDropReason }`.
+   * Payload: `{ utteranceId, instanceId, effectiveMinRmsDb, segmentIds, decodeTaskId, deliveryId,
+   * endpointReason, durationMs, maxDurationMs, voicedMs, voicedRatio, vadSpeechMs, vadSpeechRatio,
+   * vadRatioSource, energyVoicedRatio, energySource, onlineText, offlineText, onlineOfflineAgree,
+   * playing, device, rmsDb, peakDb, tags, suspect, text, delivered, wouldDrop, wouldDropReason }`.
    *  - `voicedMs`/`voicedRatio` are the energy meter's row from round 1; `energyVoicedRatio` is the
    *    same number under the name that says which method produced it. `vadSpeechRatio` is the real
    *    VAD (Silero) and `vadRatioSource` is `'silero'` or `null` (not measured) — the two are never
@@ -1044,6 +1063,9 @@ export function startHearing({
       onEvent?.('hearing.noise.shadow', {
         level: 'debug',
         utteranceId: snapshot.id,
+        // Which capture instance judged this clip, and the floor it actually compared against.
+        instanceId,
+        effectiveMinRmsDb: Number.isFinite(snapshot.effectiveMinRmsDb) ? snapshot.effectiveMinRmsDb : null,
         segmentIds: Array.isArray(outcome.segmentIds) ? outcome.segmentIds : [],
         decodeTaskId: outcome.decodeTaskId ?? null,
         deliveryId: snapshot.id,
@@ -1240,21 +1262,27 @@ export function startHearing({
   /** Last resolved floor: the change detector of `hearing.threshold.updated`, never a gate value. */
   let reportedMinRmsDb = STARTUP_MIN_RMS_DB;
   /**
+   * Resolve the floor *now* without the change detector: a status/evidence read must not write a
+   * threshold event. A throwing getter or a non-finite reading falls back to the startup value.
+   */
+  const resolveMinRmsDb = () => {
+    if (typeof minRmsDb !== 'function') return STARTUP_MIN_RMS_DB;
+    try {
+      const read = Number(minRmsDb());
+      if (Number.isFinite(read)) return read;
+    } catch {
+      /* a throwing getter keeps the startup value */
+    }
+    return STARTUP_MIN_RMS_DB;
+  };
+  /**
    * Resolve the floor *now*: 3 judgment sites (two frame-level, one utterance-level) call this
    * instead of reading a startup constant, so `asrMinRmsDb` changed in settings takes effect on
    * the next chunk. A throwing getter or a non-finite reading falls back to the startup value and
    * capture continues; a real change writes one debug `hearing.threshold.updated { from, to }`.
    */
   const currentMinRmsDb = () => {
-    let value = STARTUP_MIN_RMS_DB;
-    if (typeof minRmsDb === 'function') {
-      try {
-        const read = Number(minRmsDb());
-        if (Number.isFinite(read)) value = read;
-      } catch {
-        value = STARTUP_MIN_RMS_DB;
-      }
-    }
+    const value = resolveMinRmsDb();
     if (value !== reportedMinRmsDb) {
       const from = reportedMinRmsDb;
       reportedMinRmsDb = value;
@@ -1266,6 +1294,31 @@ export function startHearing({
     }
     return value;
   };
+  /**
+   * Instance lifecycle. These two rows are the only evidence of which capture session judged a
+   * clip and with which floor. Same contract as `hearing.asr.*`: the synchronous fallback keeps its
+   * event log empty, so they are written by a worker session only. `stopped` is emitted once: an
+   * explicit stop and the child's own close race by design.
+   */
+  let instanceStoppedReported = false;
+  const emitInstanceStopped = (reason) => {
+    if (!asrWorkerRequested || instanceStoppedReported) return;
+    instanceStoppedReported = true;
+    try {
+      onEvent?.('hearing.instance.stopped', { instanceId, reason: reason || 'stopped' });
+    } catch {
+      /* the end of a session must never throw */
+    }
+  };
+  if (asrWorkerRequested) {
+    try {
+      onEvent?.('hearing.instance.started', {
+        instanceId, minRmsDb: STARTUP_MIN_RMS_DB, device, source: inputSource,
+      });
+    } catch {
+      /* an event sink must never break capture */
+    }
+  }
   /**
    * Low-evidence gate switch, resolved per final. A boolean is the session value; a getter is the
    * live `voice.lowEvidenceGate` setting, and a throw falls back to the startup value (off), so a
@@ -1630,6 +1683,9 @@ export function startHearing({
         text: outcome.text,
         durationMs: snapshot.durationMs,
         rmsDb: snapshot.rmsDb,
+        // Same instance and same floor as the gate: `rmsDb` above is this segment's utterance RMS.
+        instanceId,
+        effectiveMinRmsDb: Number.isFinite(snapshot.effectiveMinRmsDb) ? snapshot.effectiveMinRmsDb : null,
         bargein: voiceSounding(),
       });
       // The host may refuse an utterance it was handed (a playback echo, a filler, a duplicate).
@@ -1979,6 +2035,10 @@ export function startHearing({
         loudEnough: snapshots.some((item) => item.loudEnough === true),
         rmsDb: maxOf('rmsDb'),
         peakDb: maxOf('peakDb'),
+        // Each fragment was judged against its own floor; the merged row reports the deciding one
+        // (the fragment that passed `loudEnough`) so the logged value is the value that passed.
+        effectiveMinRmsDb: snapshots.find((item) => item.loudEnough === true)?.effectiveMinRmsDb
+          ?? base.effectiveMinRmsDb,
         truncated: snapshots.some((item) => item.truncated === true),
         truncations: last.truncations,
         durationMs,
@@ -2186,9 +2246,11 @@ export function startHearing({
         }
         utteranceRms = Math.sqrt(sumSquares / utteranceSamples);
       }
-      // The floor is resolved at the judgment itself: a settings change applies to this utterance
-      // even when it arrived while the audio was already being captured.
-      const loudEnough = utteranceRms > 0 && 20 * Math.log10(utteranceRms) >= currentMinRmsDb();
+      // The floor is resolved **once per segment**, at the judgment itself: `loudEnough` below and
+      // the `effectiveMinRmsDb` every row reports are the same snapshot, so a later settings write
+      // can never relabel (or re-judge) a clip that was already decided.
+      const effectiveMinRmsDb = currentMinRmsDb();
+      const loudEnough = utteranceRms > 0 && 20 * Math.log10(utteranceRms) >= effectiveMinRmsDb;
       // Energy VAD over the buffered audio, for the shadow row only: null when there is no audio to
       // measure, and an energy measurement — not a voice/speech classifier.
       const voiced = voicedMetrics(utterance, { sampleRate: 16000 });
@@ -2203,7 +2265,12 @@ export function startHearing({
         onlineText,
         audible,
         loudEnough,
-        /** Measured level of this utterance, for the delivery observation only (never a gate). */
+        /** The floor this segment was compared against — the same number its rows report. */
+        effectiveMinRmsDb,
+        /**
+         * This segment's utterance RMS in dB (rounded for the log): the *same* `utteranceRms` the
+         * gate compared, never the frame meter and never the session level.
+         */
         rmsDb: utteranceRms > 0 ? Math.round(20 * Math.log10(utteranceRms)) : -100,
         /** This utterance's own peak (the session-wide `peak` is a different meter). */
         peakDb: utterancePeak > 0 ? Math.round(20 * Math.log10(utterancePeak)) : -100,
@@ -2363,6 +2430,13 @@ export function startHearing({
 
   return {
     device,
+    /** This session's capture-instance id (`hearing.instance.*`, judgment rows, status). */
+    instanceId,
+    /**
+     * The floor this instance resolves *now*, without the change detector: the status card and the
+     * evidence rows must be able to read the effective value without inventing an event.
+     */
+    minRmsDb: () => resolveMinRmsDb(),
     /**
      * Force the current utterance to finalize: feed just enough silence to satisfy the
      * endpoint rule, so a caller can hand over the held utterance without waiting.
@@ -2409,6 +2483,8 @@ export function startHearing({
       // Terminal for this session: an in-flight worker decode must not deliver a transcript after
       // the user stopped listening, and the thread is terminated right away.
       stopped = true;
+      // One stopped row per instance, carrying why the capture ended (the close handler is second).
+      emitInstanceStopped(reason);
       // Explicit cancel / mute / session switch drops the buffered group; no late delivery follows.
       dropGroup(reason);
       // The capture is over: close the last dialogue segment, so no later session continues it.

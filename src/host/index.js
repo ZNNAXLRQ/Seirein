@@ -450,7 +450,7 @@ import {
 
 import { createStatusBuilder } from './runtime/http/status.js';
 import { createSettingsRoutes } from './runtime/http/routes.js';
-import { ACTIONS as hearingActions, createHearingSettingsActions } from './hearing/settings-actions.js';
+import { ACTIONS as hearingActions, createHearingSettingsActions, projectHearingStatus } from './hearing/settings-actions.js';
 import { ACTIONS as memoryActions, createMemorySettingsActions } from './memory/settings-actions.js';
 import { ACTIONS as speechActions, createSpeechSettingsActions } from './speech/settings-actions.js';
 import {
@@ -9756,6 +9756,11 @@ export function apply(ctx, config) {
   // ---- hearing (microphone -> streaming ASR) ---------------------------
   let hearing = null;
   const heard = { partial: '', finals: [] };
+  /**
+   * Last threshold-save restart outcome, projected into `status.hearing.thresholdRestart`: the
+   * action reply is transient, so a failed restart must stay readable. `ok: null` = not attempted.
+   */
+  let hearingThresholdRestart = { lastAt: null, ok: null, error: '' };
 
   // Merge window: a final is held briefly so a pause mid-sentence does not produce two
   // separate replies. It never cuts the user off — it only delays delivery.
@@ -12405,7 +12410,7 @@ export function apply(ctx, config) {
     if (!features.enabled('hearing')) {
       return { ok: false, running: false, device: '', devices: [], error: '听觉组件已关闭' };
     }
-    if (hearing !== null) return { ok: true, running: true, device: hearing.device, devices: [], error: '' };
+    if (hearing !== null) return { ok: true, running: true, device: hearing.device, devices: [], error: '', instanceId: hearing.instanceId ?? '' };
     const ffmpegPath = resolveFfmpeg(root, config);
     if (ffmpegPath === null) return { ok: false, running: false, device: '', devices: [], error: '未找到 ffmpeg' };
     const paths = hearingPaths();
@@ -12594,7 +12599,7 @@ export function apply(ctx, config) {
       avatarStatus('listening', 'hearing.start');
       // A manual start (hotkey / tool / settings page) also clears an autostart failure note.
       hearingAutostart?.clearDeferred();
-      return { ok: true, running: true, device, devices, error: '' };
+      return { ok: true, running: true, device, devices, error: '', instanceId: hearing?.instanceId ?? '' };
     } catch (error) {
       hearing = null;
       return { ok: false, running: false, device: '', devices: [], error: error?.message ?? String(error) };
@@ -13124,6 +13129,24 @@ export function apply(ctx, config) {
   });
 
   /**
+   * `status.hearing` = the builder's own block plus the live capture evidence: the running
+   * instance's id, the floor that instance resolves *now*, and the last threshold-save restart
+   * outcome. Projected here because the hearing domain owns these fields (see
+   * `projectHearingStatus`); the status builder itself is unchanged.
+   */
+  const buildHearingStatus = async () => {
+    const status = await buildStatus();
+    return {
+      ...status,
+      hearing: projectHearingStatus(status?.hearing, {
+        session: hearing,
+        restart: hearingThresholdRestart,
+        fallbackMinRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
+      }),
+    };
+  };
+
+  /**
    * Read-only view for the「人设库」card: capacity, the auto-maintain switch, last round and the
    * live entries. Never instantiates the organizer, so status has no scheduling side effect.
    */
@@ -13491,6 +13514,9 @@ export function apply(ctx, config) {
     get stopAmbient() { return stopAmbient; },
     get stopListening() { return stopListening; },
     get storedVoice() { return storedVoice; },
+    // Threshold save owns the restart; the Host only keeps its outcome for `status.hearing`.
+    get thresholdRestart() { return hearingThresholdRestart; },
+    set thresholdRestart(value) { hearingThresholdRestart = value; },
     get writeSettings() { return writeSettings; }
   }) },
 { actions: memoryActions, handle: createMemorySettingsActions({
@@ -13642,7 +13668,7 @@ export function apply(ctx, config) {
   };
 
   const registerRoutes = createSettingsRoutes({
-    get buildStatus() { return buildStatus; },
+    get buildStatus() { return buildHearingStatus; },
     get handleUiAction() { return handleUiAction; },
     get root() { return root; },
     get vision() { return vision; },
