@@ -38,6 +38,7 @@ import {
   createDialogueSummaryRunner,
   dialogueSummaryRequest,
   normalizeDialogueSummary,
+  voiceSessionTarget,
 } from '../src/host/index.js';
 import { createDialogueContext } from '../src/host/session/conversation/dialogueContext.js';
 import { startHearing } from '../src/host/hearing/hearing.js';
@@ -109,8 +110,11 @@ function mount(root, config = {}) {
     }),
   };
   apply(ctx, { root, enabled: true, ...config });
-  // The section text functions judge the workspace from the calling agent's session cwd.
-  const promptContext = { agent: { session: { header: { cwd: join(root, 'workspace') } } } };
+  // The section text functions judge the workspace from the calling agent's session cwd; the
+  // conversation observations additionally require the companion session identity for that root.
+  const promptContext = {
+    agent: { id: voiceSessionTarget({ root }).sessionId, session: { header: { cwd: join(root, 'workspace') } } },
+  };
   const sectionText = (name) => {
     const section = sections.get(name);
     return typeof section?.text === 'function' ? section.text(promptContext) : '';
@@ -447,8 +451,8 @@ test('4. 摘要成功后 summaryThrough 推进、注入含摘要；失败保留 
 // ---------------------------------------------------------------------------
 
 test('5. 同一实例跨设备重启：注入文本保持连续', async (t) => {
-  const context = createDialogueContext({ source: 'mic' });
   let clockValue = 1_000;
+  const context = createDialogueContext({ source: 'mic', now: () => clockValue });
 
   const first = startSession({ clock: () => clockValue, device: MIC, texts: ['第一段：门是开着的。'], context });
   await speak(first);

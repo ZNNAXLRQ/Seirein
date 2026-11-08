@@ -6,10 +6,23 @@
  * rolls older utterances into a bounded pending queue, and lets the caller generate the rolling
  * summary asynchronously and write it back through `applySummary`.
  *
+ * Time is read, not scheduled: `snapshot()` and `render()` compare every entry against the injected
+ * clock and hide anything with `now - at > maxWindowMs` (recent and pending alike). A quiet buffer
+ * therefore stops injecting old observations even though no timer fires and nothing is mutated on
+ * read; `snapshot().active === false` with `reason: 'idle'` is the observable "went quiet" signal.
+ *
+ * Every budget in this file is counted in CHARACTERS (Unicode code points), never in UTF-8 bytes:
+ * a 3.7K character snapshot is roughly 2.6x that in UTF-8 bytes for Chinese text. Render output is
+ * hard-capped at `maxRenderChars` characters (default 3600) so one long utterance or a flood of
+ * tiny fragment lines cannot push a single snapshot past the host's 3700-character acceptance
+ * budget (the host adds its own ~94-character runtime-context header). When the cap bites, the
+ * oldest transcript characters are omitted and the block starts with an explicit `已省略 N 字符`
+ * marker; `snapshot().truncated` / `snapshot().truncatedChars` report it.
+ *
  * It is the buffering + summary skeleton only:
  *  - no model call and no prompt building; `applySummary` stores what the caller produced;
  *  - no memory write, no database, no audio and no file I/O;
- *  - no timer and no promise: a quiet moment changes nothing, and `snapshot()` is read-only.
+ *  - no timer and no promise: expiry is computed on read, and `snapshot()` is read-only.
  *
  * Sentence continuity: an utterance that does not end in `。！？!?` is unfinished. The next
  * utterance of the SAME segment is rendered on the same line, keeping its comma/connector, and a
@@ -41,11 +54,12 @@
  * before the clear is rejected with no side effect, so it can never erase the new pending text.
  *
  * @example
- * const ctx = createDialogueContext({ now: Date.now, source: 'loopback' });
- * ctx.push({ text: '钥匙在柜子里，', at: 1000, utteranceId: 'u1' });
- * ctx.push({ text: '你去拿吧。', at: 4000, utteranceId: 'u2' });
- * ctx.render();                       // system paragraph with both utterances
- * ctx.push({ text: '很久以后……', at: 200_000 });   // u1/u2 roll out into pending
+ * let now = 1_000;
+ * const ctx = createDialogueContext({ now: () => now, maxChars: 10, summaryEveryChars: 5 });
+ * ctx.push({ text: '钥匙在柜子里，', at: now, utteranceId: 'u1' });
+ * now = 4_000;
+ * ctx.push({ text: '你去拿吧。', at: now, utteranceId: 'u2' });
+ * ctx.render();                       // both utterances; u1 already rolled into pending
  * if (ctx.needsSummary()) {
  *   const request = ctx.snapshot();
  *   summarize(request.pending).then((s) => ctx.applySummary(s, {
@@ -56,10 +70,21 @@
  */
 
 export const DIALOGUE_CONTEXT_DEFAULTS = Object.freeze({
+  /** Time span kept verbatim, in milliseconds. Read-time: no timer is created. */
   maxWindowMs: 120_000,
+  /** Character budget of the verbatim window (characters, not bytes). */
   maxChars: 1_200,
+  /** Newly rolled-out characters that warrant one summary call. */
   summaryEveryChars: 200,
+  /** Hard cap of the stored rolling summary, in characters. */
   maxSummaryChars: 400,
+  /**
+   * Hard cap of one rendered observation block, in characters. 3600 leaves room for the host's
+   * ~94-character runtime-context header inside the 3700-character per-snapshot acceptance budget.
+   * This is a render-side backstop: a single long utterance or thousands of fragment lines cannot
+   * bypass it by carrying only a small amount of "body" text.
+   */
+  maxRenderChars: 3_600,
   source: 'mic',
 });
 
@@ -84,6 +109,9 @@ const BOUNDARY_FALLBACK = '—— 边界：来源切换，新的一段；上文�
 const SOURCE_LABELS = Object.freeze({ mic: '麦克风', loopback: '系统声音' });
 const UNKNOWN_SOURCE_LABEL = '未知来源';
 
+/** Rendered when the read-time cap removes older transcript characters (character counts, not bytes). */
+const OMITTED_HEAD = (dropped, limit) => `…（已省略 ${dropped} 字符：本块按 ${limit} 字符上限截断）`;
+
 /* ---------------------------------------------------------------------------------------------
  * Small helpers
  * ------------------------------------------------------------------------------------------- */
@@ -100,6 +128,11 @@ function positiveInt(value, fallback) {
 function cleanText(value) {
   if (typeof value !== 'string') return '';
   return value.replace(/\s*\n+\s*/gu, ' ').replace(/[ \t]+/gu, ' ').trim();
+}
+
+/** Unicode code-point count: one character is one code point, never one UTF-8 byte. */
+function charsOf(value) {
+  return Array.from(typeof value === 'string' ? value : '').length;
 }
 
 /**
@@ -268,6 +301,67 @@ function groupBySource(items) {
   return Object.freeze([...groups.values()].map(({ previous, ...rest }) => Object.freeze(rest)));
 }
 
+/**
+ * Last-resort cap for any rendered text that is not transcript (e.g. a summary configured larger
+ * than the whole block budget). Keeps the head and appends an explicit marker; the marker's own
+ * character count is included so the result never exceeds `limit` characters.
+ *
+ * @param {string} text
+ * @param {number} limit character budget
+ * @returns {{text: string, truncated: boolean, droppedChars: number, chars: number}}
+ */
+function clampWholeText(text, limit) {
+  const total = charsOf(text);
+  if (total <= limit) return { text, truncated: false, droppedChars: 0, chars: total };
+  let dropped = total - Math.max(1, limit - 24);
+  let out = '';
+  for (let pass = 0; pass < 6; pass += 1) {
+    const marker = `\n${OMITTED_HEAD(dropped, limit)}`;
+    const keep = Math.max(0, limit - charsOf(marker));
+    out = `${Array.from(text).slice(0, keep).join('')}${marker}`;
+    const actual = total - keep;
+    if (actual === dropped) break;
+    dropped = actual;
+  }
+  return { text: out, truncated: true, droppedChars: dropped, chars: charsOf(out) };
+}
+
+/**
+ * Cap one transcript body while keeping the NEWEST characters (the oldest lines are the ones that
+ * leave the visible window). The omission marker is part of the trick: its digit count depends on
+ * how much is dropped, so it is recomputed until it is stable. Cuts prefer a line boundary, which
+ * is why thousands of fragment lines lose whole rows instead of half tags.
+ *
+ * @param {string} transcript rendered transcript lines (joined, with source tags/dividers)
+ * @param {number} budget characters available for marker + retained transcript
+ * @param {number} limit whole-block limit used in the marker text
+ * @returns {{text: string, truncated: boolean, droppedChars: number}}
+ */
+function clampTranscript(transcript, budget, limit) {
+  const total = charsOf(transcript);
+  if (total <= budget) return { text: transcript, truncated: false, droppedChars: 0 };
+  let dropped = total - Math.max(0, budget - 24);
+  let out = '';
+  for (let pass = 0; pass < 6; pass += 1) {
+    const marker = `${OMITTED_HEAD(dropped, limit)}\n`;
+    const keep = budget - charsOf(marker);
+    if (keep <= 0) {
+      out = marker;
+      dropped = total;
+      break;
+    }
+    const chars = Array.from(transcript);
+    let start = chars.length - keep;
+    const newline = transcript.indexOf('\n', start);
+    if (newline >= 0 && newline - start <= 120) start = newline + 1;
+    out = `${marker}${chars.slice(start).join('')}`;
+    if (start === dropped) break;
+    dropped = start;
+  }
+  return { text: out, truncated: true, droppedChars: dropped };
+}
+
+
 
 /* ---------------------------------------------------------------------------------------------
  * Factory
@@ -278,14 +372,16 @@ function groupBySource(items) {
  *
  * @param {object} [options]
  * @param {number|Function} [options.now] timestamp or clock returning epoch ms (default Date.now)
- * @param {number} [options.maxWindowMs=120000] time span kept verbatim
+ * @param {number} [options.maxWindowMs=120000] time span kept visible (read-time expiry)
  * @param {number} [options.maxChars=1200] character budget of the verbatim window
- * @param {number} [options.summaryEveryChars=200] newly rolled-out chars that warrant a summary
- * @param {number} [options.maxSummaryChars=400] hard cap of the stored rolling summary
+ * @param {number} [options.summaryEveryChars=200] newly rolled-out characters that warrant a summary
+ * @param {number} [options.maxSummaryChars=400] hard cap of the stored rolling summary (characters)
+ * @param {number} [options.maxRenderChars=3600] hard cap of one rendered block (characters)
  * @param {'mic'|'loopback'} [options.source='mic'] default source of pushed utterances
  * @returns {{
  *   push: (utterance: {text: string, at?: number, source?: string, utteranceId?: string}) => object|null,
  *   snapshot: () => object,
+ *   stats: () => object,
  *   markBoundary: (options?: {reason?: string}) => object,
  *   clear: () => void,
  *   needsSummary: () => boolean,
@@ -299,6 +395,9 @@ export function createDialogueContext(options = {}) {
   const maxChars = positiveInt(settings.maxChars, DIALOGUE_CONTEXT_DEFAULTS.maxChars);
   const summaryEveryChars = positiveInt(settings.summaryEveryChars, DIALOGUE_CONTEXT_DEFAULTS.summaryEveryChars);
   const maxSummaryChars = positiveInt(settings.maxSummaryChars, DIALOGUE_CONTEXT_DEFAULTS.maxSummaryChars);
+  // The omission marker and the fixed header must fit inside the cap; a smaller configured value is
+  // clamped up instead of silently producing an over-budget string.
+  const maxRenderChars = Math.max(256, positiveInt(settings.maxRenderChars, DIALOGUE_CONTEXT_DEFAULTS.maxRenderChars));
   const defaultSource = SOURCES.has(settings.source) ? settings.source : DIALOGUE_CONTEXT_DEFAULTS.source;
   const clock = createClock(settings.now);
 
@@ -335,13 +434,21 @@ export function createDialogueContext(options = {}) {
   let updatedAt = clock();
   const stats = { pushed: 0, rolledOut: 0, summaries: 0, droppedPendingChars: 0 };
 
-  function recentChars() {
-    return entries.reduce((total, entry) => total + entry.text.length, 0);
+  /**
+   * Read-time expiry: an entry is stale once the injected clock has moved more than maxWindowMs
+   * past it. A timestamp in the future (a caller injecting a session clock) is never stale.
+   */
+  function isExpiredAt(at, now) {
+    return Number.isFinite(at) && now - at > maxWindowMs;
   }
 
-  function currentOpenSentence() {
-    const last = entries.length > 0 ? entries[entries.length - 1] : null;
-    return last !== null && last.segment === segment && isUnfinishedSentence(last.text);
+  /** Characters of the pending text that is still inside the time window (what may be summarized). */
+  function activePendingChars(now = clock()) {
+    let chars = 0;
+    for (const item of pending) {
+      if (!isExpiredAt(item.at, now)) chars += item.text.length;
+    }
+    return chars;
   }
 
   function trimPending() {
@@ -470,9 +577,9 @@ export function createDialogueContext(options = {}) {
     updatedAt = clock();
   }
 
-  /** True once enough newly rolled-out text has accumulated for one summary call. */
+  /** True once enough still-in-window rolled-out text has accumulated for one summary call. */
   function needsSummary() {
-    return pendingChars >= summaryEveryChars;
+    return activePendingChars() >= summaryEveryChars;
   }
 
   /**
@@ -529,7 +636,9 @@ export function createDialogueContext(options = {}) {
     summaryThrough = through;
     const kept = [];
     let keptChars = 0;
+    let keptActiveChars = 0;
     let clearedSegment = -1;
+    const now = clock();
     /** The summary describes the old summary's text too, so its captures stay attached to it. */
     const nextSources = [...summarySources];
     for (const item of pending) {
@@ -540,37 +649,67 @@ export function createDialogueContext(options = {}) {
       }
       kept.push(item);
       keptChars += item.text.length;
+      if (!isExpiredAt(item.at, now)) keptActiveChars += item.text.length;
     }
     pending = kept;
     pendingChars = keptChars;
     summarySources = nextSources;
     if (clearedSegment >= 0) summarySegment = Math.max(summarySegment, clearedSegment);
     stats.summaries += 1;
-    updatedAt = clock();
-    return { ok: true, applied: true, summary, truncated, pendingChars };
+    updatedAt = now;
+    return { ok: true, applied: true, summary, truncated, pendingChars: keptActiveChars };
   }
 
+  /**
+   * Read-only request-facing view.
+   *
+   * Expiry happens here (and in `render()`), never in a timer: entries older than `maxWindowMs`
+   * relative to the injected clock are omitted from `recent`/`pending`, from the summary request
+   * payload and from `needsSummary`. The internal records are kept until `prune()`/`applySummary()`
+   * housekeeping removes them, so a read never mutates the buffer. When everything that used to be
+   * visible has gone quiet, `active` is false and `reason` is 'idle' (the upper layer's event signal).
+   */
   function snapshot() {
+    const now = clock();
+    const activeEntries = entries.filter((entry) => !isExpiredAt(entry.at, now));
+    const activePending = pending.filter((item) => !isExpiredAt(item.at, now));
+    const expired = (entries.length - activeEntries.length) + (pending.length - activePending.length);
     const latest = boundaries.length > 0 ? boundaries[boundaries.length - 1] : null;
-    const recent = Object.freeze(entries.map((entry) => Object.freeze({
+    const recent = Object.freeze(activeEntries.map((entry) => Object.freeze({
       text: entry.text,
       at: entry.at,
       utteranceId: entry.utteranceId,
       source: entry.source,
       segment: entry.segment,
     })));
-    const queued = Object.freeze(pending.map((item) => Object.freeze({
+    const queued = Object.freeze(activePending.map((item) => Object.freeze({
       text: item.text,
       at: item.at,
       utteranceId: item.utteranceId,
       source: item.source,
       segment: item.segment,
     })));
-    return Object.freeze({
+    let recentChars = 0;
+    for (const entry of activeEntries) recentChars += entry.text.length;
+    let visiblePendingChars = 0;
+    for (const item of activePending) visiblePendingChars += item.text.length;
+    const lastActive = activeEntries.length > 0 ? activeEntries[activeEntries.length - 1] : null;
+    const openSentence = lastActive !== null
+      && lastActive.segment === segment
+      && isUnfinishedSentence(lastActive.text);
+    /**
+     * `active` is false only for idle-expiry: the buffer held observations and every one of them is
+     * now outside maxWindowMs with no stored summary left to inject. A fresh/never-used buffer is
+     * active (it has nothing stale to report), and a partially expired buffer stays active.
+     */
+    const injectable = activeEntries.length + activePending.length + (summary.length > 0 ? 1 : 0);
+    const active = !(expired > 0 && injectable === 0);
+    const reason = active ? '' : 'idle';
+    const view = {
       recent,
       pending: queued,
       summary,
-      summaryChars: Array.from(summary).length,
+      summaryChars: charsOf(summary),
       summaryTruncated,
       summaryFromEarlierSegment: summary.length > 0 && summarySegment < segment,
       /** Captures the stored summary describes; render() tags the summary with them. */
@@ -580,7 +719,8 @@ export function createDialogueContext(options = {}) {
        * joined within its own source. This is where a summary request keeps the source clue.
        */
       pendingBySource: groupBySource(queued),
-      pendingChars,
+      /** Still-in-window pending characters (the ones a summary request would read). */
+      pendingChars: visiblePendingChars,
       /** Highest pending version covered by the stored summary; guarded against going backwards. */
       summaryThrough,
       /** Current tail of the pending queue: the largest `through` a request may cover. */
@@ -589,9 +729,14 @@ export function createDialogueContext(options = {}) {
       pendingVersion: pendingSerial,
       /** Buffer identity a summary request must carry back; see `applySummary`. */
       generation,
-      recentChars: recentChars(),
-      needsSummary: pendingChars >= summaryEveryChars,
-      openSentence: currentOpenSentence(),
+      recentChars,
+      needsSummary: visiblePendingChars >= summaryEveryChars,
+      openSentence,
+      /** Time-expired records hidden from this snapshot (recent + pending). */
+      expired,
+      /** False when all previously visible observations have idle-expired; see `reason`. */
+      active,
+      reason,
       updatedAt,
       boundaryMarked: latest ? boundaryView(latest) : null,
       boundaryMarkedAt: latest ? latest.at : null,
@@ -599,14 +744,84 @@ export function createDialogueContext(options = {}) {
       boundaries: Object.freeze(boundaries.map(boundaryView)),
       segment,
       source: defaultSource,
-      limits: Object.freeze({ maxWindowMs, maxChars, summaryEveryChars, maxSummaryChars, maxPendingChars }),
-      stats: Object.freeze({ ...stats }),
+      limits: Object.freeze({ maxWindowMs, maxChars, summaryEveryChars, maxSummaryChars, maxPendingChars, maxRenderChars }),
+    };
+    // Report the hard-cap outcome on the snapshot itself; no state is changed by this read.
+    const outcome = buildRender(view);
+    view.truncated = outcome.truncated;
+    /** Characters the current rendered block omits because of `maxRenderChars` (0 = fits). */
+    view.truncatedChars = outcome.droppedChars;
+    view.renderChars = outcome.chars;
+    view.stats = Object.freeze({
+      ...stats,
+      expired,
+      active,
+      reason,
+      pendingChars: visiblePendingChars,
+      truncatedChars: outcome.droppedChars,
+      renderChars: outcome.chars,
     });
+    return Object.freeze(view);
+  }
+
+  /**
+   * Build the prompt paragraph for one view: header, note, summary, then the transcript. The
+   * transcript is capped in CHARACTERS by `maxRenderChars`; the oldest lines are omitted and the
+   * block starts with an explicit marker, so the host never receives an unbounded observation.
+   *
+   * @param {object} view snapshot-shaped value
+   * @returns {{text: string, truncated: boolean, droppedChars: number, chars: number}}
+   */
+  function buildRender(view) {
+    const summaryText = typeof view.summary === 'string' ? view.summary : '';
+    const pendingItems = Array.isArray(view.pending) ? view.pending : [];
+    const recentItems = Array.isArray(view.recent) ? view.recent : [];
+    const boundaryList = (Array.isArray(view.boundaries) && view.boundaries.length > 0
+      ? view.boundaries
+      : (view.boundaryMarked && typeof view.boundaryMarked === 'object' ? [view.boundaryMarked] : []))
+      .filter((boundary) => boundary !== null && typeof boundary === 'object' && Number.isInteger(boundary.segment));
+    const transcript = [...pendingItems, ...recentItems];
+    if (summaryText.length === 0 && transcript.length === 0) {
+      return { text: '', truncated: false, droppedChars: 0, chars: 0 };
+    }
+    const headParts = [RENDER_HEADER, RENDER_NOTE];
+    if (summaryText.length > 0) {
+      headParts.push(
+        '',
+        summaryLabelFor(view.summarySources, view.summaryFromEarlierSegment === true),
+        summaryText,
+      );
+    }
+    const headText = headParts.join('\n').trimEnd();
+    // Pending text and the verbatim window are both transcript: render them as ONE continuous
+    // stream so an unfinished sentence stays joined across the window edge and a segment change
+    // is still separated by its boundary line.
+    const transcriptText = joinStream(transcript, boundaryList, { trailing: true });
+    if (transcriptText.length === 0) {
+      const clampedHead = clampWholeText(headText, maxRenderChars);
+      return clampedHead;
+    }
+    const label = pendingItems.length > 0 ? RECENT_LABEL_WITH_PENDING : RECENT_LABEL;
+    const prefix = `${headText}\n\n${label}\n`;
+    const budget = maxRenderChars - charsOf(prefix);
+    if (budget <= 40) {
+      // Pathological configuration (e.g. a summary bigger than the whole block): clamp the whole
+      // text, head first, with the same explicit marker.
+      return clampWholeText(`${prefix}${transcriptText}`, maxRenderChars);
+    }
+    const clamped = clampTranscript(transcriptText, budget, maxRenderChars);
+    const text = `${prefix}${clamped.text}`.trimEnd();
+    return {
+      text,
+      truncated: clamped.truncated,
+      droppedChars: clamped.droppedChars,
+      chars: charsOf(text),
+    };
   }
 
   /**
    * Render the current state (or a provided snapshot) as a system-prompt paragraph. The header
-   * says it is an observation, not a user turn; empty state renders as ''.
+   * says it is an observation, not a user turn; empty or fully idle-expired state renders as ''.
    *
    * @param {object} [snapshotValue] a value previously returned by `snapshot()`
    * @returns {string}
@@ -615,34 +830,13 @@ export function createDialogueContext(options = {}) {
     const view = snapshotValue && typeof snapshotValue === 'object' && Array.isArray(snapshotValue.recent)
       ? snapshotValue
       : snapshot();
-    const summaryText = typeof view.summary === 'string' ? view.summary : '';
-    const pendingItems = Array.isArray(view.pending) ? view.pending : [];
-    const recentItems = Array.isArray(view.recent) ? view.recent : [];
-    const boundaryList = (Array.isArray(view.boundaries) && view.boundaries.length > 0
-      ? view.boundaries
-      : (view.boundaryMarked && typeof view.boundaryMarked === 'object' ? [view.boundaryMarked] : []))
-      .filter((boundary) => boundary !== null && typeof boundary === 'object' && Number.isInteger(boundary.segment));
-    if (summaryText.length === 0 && pendingItems.length === 0 && recentItems.length === 0 && boundaryList.length === 0) {
-      return '';
-    }
-    const parts = [RENDER_HEADER, RENDER_NOTE];
-    if (summaryText.length > 0) {
-      parts.push(
-        '',
-        summaryLabelFor(view.summarySources, view.summaryFromEarlierSegment === true),
-        summaryText,
-      );
-    }
-    // Pending text and the verbatim window are both transcript: render them as ONE continuous
-    // stream so an unfinished sentence stays joined across the window edge and a segment change
-    // is still separated by its boundary line.
-    const transcript = [...pendingItems, ...recentItems];
-    const transcriptText = joinStream(transcript, boundaryList, { trailing: true });
-    if (transcriptText.length > 0) {
-      parts.push('', pendingItems.length > 0 ? RECENT_LABEL_WITH_PENDING : RECENT_LABEL, transcriptText);
-    }
-    return parts.join('\n').trimEnd();
+    return buildRender(view).text;
   }
 
-  return { push, snapshot, markBoundary, clear, needsSummary, applySummary, render };
+  /** Observability surface for the upper layer: counters plus current expiry/truncation state. */
+  function statsView() {
+    return snapshot().stats;
+  }
+
+  return { push, snapshot, stats: statsView, markBoundary, clear, needsSummary, applySummary, render };
 }

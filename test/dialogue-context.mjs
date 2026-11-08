@@ -228,15 +228,16 @@ test('5. markBoundary marks another segment: boundary time in the snapshot, divi
   assert.ok(!splitText.includes('门开着，这是新的一段。'), 'the open sentence must not continue across a boundary');
   assert.ok(splitText.includes('来源切换'));
 
-  // A long pause rolls the whole old segment out of the verbatim window; the boundary line must
-  // still separate the pending old text from the new segment instead of being lost.
+  // A small character window rolls the whole old segment out of the verbatim window (still inside
+  // maxWindowMs, so read-time idle expiry does not hide it); the boundary line must still separate
+  // the pending old text from the new segment instead of being lost.
   now += 1_000;
-  const paused = createDialogueContext({ now: () => now, maxWindowMs: 10_000 });
+  const paused = createDialogueContext({ now: () => now, maxWindowMs: 600_000, maxChars: 1 });
   paused.push({ text: '暂停前的最后一句。', at: now, utteranceId: 'p1' });
   now += 20_000;
   paused.markBoundary({ reason: 'resume' });
   paused.push({ text: '恢复后的第一句。', at: now, utteranceId: 'p2' });
-  assert.equal(paused.snapshot().recent.length, 1, 'the old segment rolled out of the window');
+  assert.equal(paused.snapshot().recent.length, 1, 'the old segment rolled out of the verbatim window');
   assert.equal(paused.snapshot().pending.length, 1);
   const pausedText = paused.render();
   const pausedOld = pausedText.indexOf('暂停前的最后一句。');

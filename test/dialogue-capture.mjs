@@ -174,8 +174,8 @@ async function speak(session, ms = 1000) {
 // ---------------------------------------------------------------------------
 
 test('1. 两段最终文本按采集顺序入缓冲；hearing.dialogue.appended 恰好两条', async () => {
-  const context = createDialogueContext({ source: 'mic' });
   let clockValue = 1_000;
+  const context = createDialogueContext({ source: 'mic', now: () => clockValue });
   const session = startSession({
     clock: () => clockValue,
     dialogueFactory: () => context,
@@ -278,9 +278,9 @@ test('3. 同一 utteranceId 重复投稿只入缓冲一次；不同 utteranceId 
 // ---------------------------------------------------------------------------
 
 test('4. 设备切换（麦克风 → 回环）→ boundary(source-switch) 事件与缓冲边界标记', async () => {
-  const shared = createDialogueContext({ source: 'mic' });
-  const factory = () => shared;
   let clockValue = 1_000;
+  const shared = createDialogueContext({ source: 'mic', now: () => clockValue });
+  const factory = () => shared;
 
   const microphone = startSession({
     clock: () => clockValue,
@@ -323,8 +323,8 @@ test('4. 设备切换（麦克风 → 回环）→ boundary(source-switch) 事�
 // ---------------------------------------------------------------------------
 
 test('5. 静默超过 30 s → boundary(idle)；恢复说话后不重复标记', async () => {
-  const context = createDialogueContext({ source: 'mic' });
   let clockValue = 1_000;
+  const context = createDialogueContext({ source: 'mic', now: () => clockValue });
   const session = startSession({
     clock: () => clockValue,
     dialogueFactory: () => context,
@@ -500,7 +500,7 @@ test('9. 播放中的回授（宿主判定 drop）→ 不入缓冲、写 hearing
 // ---------------------------------------------------------------------------
 
 test('10. 播放中真实用户说话（barge-in 接受）→ 入缓冲并照常投递', async () => {
-  const context = createDialogueContext({ source: 'mic' });
+  const context = createDialogueContext({ source: 'mic', now: () => 2_000 });
   const playing = true;
   const session = startSession({
     clock: () => 2_000,
@@ -526,7 +526,7 @@ test('10. 播放中真实用户说话（barge-in 接受）→ 入缓冲并照常
 // ---------------------------------------------------------------------------
 
 test('11. 未播放、宿主不返回判定（旧 onUpdate）→ 沿用投递判定入缓冲', async () => {
-  const context = createDialogueContext({ source: 'mic' });
+  const context = createDialogueContext({ source: 'mic', now: () => 3_000 });
   const session = startSession({
     clock: () => 3_000,
     texts: ['今天天气不错。'],

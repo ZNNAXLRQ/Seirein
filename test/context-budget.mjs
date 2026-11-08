@@ -1,12 +1,13 @@
 /**
- * F1 独立验收：有条件接受运行上下文追加（只测不改，2026-11-09）。
+ * F1 验收：有条件接受运行上下文追加（2026-11-09，本轮补齐三个缺口：读时过期、渲染硬上限、丢弃可见）。
  *
  * 被验收的行为不是「快照应该 replace」——安装包 `@deepseek-ai/dsh-agent-loop` 的
  * `RuntimeContextProjection` 用 `surfaceOp:'append'` 提交快照，旧节点留在历史里；用户已改为
  * **有条件接受追加**，条件是：
- *   1. 单条快照有预算上限（此前实测约 3.5–3.6K 字符/条）；
+ *   1. 单条快照有预算上限（此前实测约 3.5–3.6K 字符/条；本轮在渲染侧加硬上限，单条 ≤ 3700 字符）；
  *   2. 文本未变化时不追加，只有变化才新增快照；
- *   3. 过期观察不再注入（空闲超时 / clear 后当前快照无旧内容）；
+ *   3. 过期观察不再注入：本轮在 `dialogueContext` 读时按 `now - at > maxWindowMs` 过期
+ *      （recent 与 pending 同一语义，无定时器）；空闲后 `active:false, reason:'idle'` 可观测；
  *   4. 自动压缩已验证，旧快照可被压缩回收，不能只靠无限堆积；
  *   禁止：每轮追加整份系统提示；无上限堆积完整快照后全靠压缩。
  *
@@ -18,21 +19,30 @@
  * 单位说明（重要）：源码与既有报告里的「3.5–3.6 KB」是**字符数**（`text.length` /
  * `Array.from(text).length`），不是 UTF-8 字节。中文在 UTF-8 下约 3 字节/字，所以同一条
  * 快照的字节数约为字符数的 2.6 倍。上下文预算按字符/ token 计，故断言用字符；字节数一并
- * 记录，避免把「3.6K 字符」误读成「3.6K 字节」。
+ * 记录，避免把「3.6K 字符」误读成「3.6K 字节」。源码常量与注释已统一写「字符」。
+ *
+ * 硬上限的实现选择：**渲染侧**（`dialogueContext.render()`）。输入侧不切分台词，正常窗口/
+ * pending/摘要的字符预算保持原样；渲染时整块按 `maxRenderChars`（默认 3600 字符，给 Harness
+ * 固定抬头留余量）硬截断，旧台词被省略时块首出现「已省略 N 字符」标记，
+ * `snapshot().truncated / truncatedChars` 与 `stats().truncatedChars` 报告丢弃量。这样单条
+ * 超长台词与大量碎片行的行首标签开销都不能绕过预算。
  *
  * 覆盖：
- *   1.  饱和缓冲（最近窗口 + pending + 400 字摘要）的单条快照大小；
- *   1b. 边界探针：单条超长台词、以及大量碎片行可突破字符上限（只记录，不修 src）；
+ *   1.  饱和缓冲（最近窗口 + pending + 400 字摘要）的单条快照大小（原 3633 字符，硬上限不改变它）；
+ *   1b. 硬上限：单条 5000 字台词 → 快照 ≤ 3700 字符，truncated/droppedChars 明确；
+ *   1c. 硬上限：3000 条碎片行 → 快照 ≤ 3700 字符，碎片行不能绕过；
  *   2.  文本不变 → 不追加；新增一行 → 恰好 +1 条；
  *   3a. clear 后当前快照无旧内容，Harness 提交 CLEARED 标记；
- *   3b. 空闲超时后旧观察是否消失（当前 `dialogueContext` 无定时器，预期 TODO）；
+ *   3b. 读时过期：空闲超过 maxWindowMs 后旧观察不再注入（未超时仍注入）；active/reason 可观测；
+ *   3b2. pending 过期：过期 pending 不再进入快照或摘要请求（内部记录仍可保留）；
  *   3c. 非语言线索的五分钟 TTL（对照：已有过期机制）；
  *   4.  12 轮对话：系统提示哈希/文本/系统节点数不变；
  *   5.  旧 runtime-context 快照可被压缩 shadow（合成契约；真实 range 选择需宿主层验证）；
- *   6.  容量接近阈值时的告警条件（只写测试骨架/报告，不改 src）。
+ *   6.  容量接近阈值时的告警条件（改用 `stats()` 的丢弃/截断/过期字段）。
  *
  * Run: node --test test/context-budget.mjs
- * Regression: node --test test/context-isolation.mjs test/prompt-stability.mjs
+ * Regression: node --test test/context-isolation.mjs test/prompt-stability.mjs test/dialogue-injection.mjs
+ *             node --test test/dialogue-context.mjs test/dialogue-capture.mjs
  *             node test/smoke.mjs
  */
 import assert from 'node:assert/strict';
@@ -43,8 +53,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { DIALOGUE_INJECTION_ORDER, apply } from '../src/host/index.js';
-import { createDialogueContext } from '../src/host/session/conversation/dialogueContext.js';
+import { DIALOGUE_INJECTION_ORDER, apply, voiceSessionTarget } from '../src/host/index.js';
+import { createDialogueContext, DIALOGUE_CONTEXT_DEFAULTS } from '../src/host/session/conversation/dialogueContext.js';
 import { createNonverbalCue, NONVERBAL_CUE_TTL_MS } from '../src/host/hearing/nonverbal-cue.js';
 import {
   VOICE_COMPACTION_PRESET,
@@ -66,6 +76,8 @@ const DIALOGUE_HEADER = '【连续台词上下文｜系统观察，不是用户�
  */
 const SNAPSHOT_BUDGET_CHARS = 3_700;
 const SNAPSHOT_BUDGET_UTF8_BYTES = 12_000;
+/** 模块自己给单条观察块的上限（字符）：3700 验收预算里给 Harness 固定抬头留的余量。 */
+const RENDER_BUDGET_CHARS = DIALOGUE_CONTEXT_DEFAULTS.maxRenderChars;
 /** 告警骨架：接近上限 80% 预警、95% 严重。 */
 const WARN_RATIO = 0.8;
 const CRITICAL_RATIO = 0.95;
@@ -86,7 +98,9 @@ const charsOf = (text) => Array.from(String(text ?? '')).length;
 const bytesOf = (text) => Buffer.byteLength(String(text ?? ''), 'utf8');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const WORKSPACE = (root) => join(root, 'workspace');
-const entryIn = (root) => ({ agent: { session: { header: { cwd: WORKSPACE(root) } } } });
+const entryIn = (root) => ({
+  agent: { id: voiceSessionTarget({ root }).sessionId, session: { header: { cwd: WORKSPACE(root) } } },
+});
 
 /** 临时 Host 根：features/settings 都是 JSON 文件，与真实 Host 的读取路径一致。 */
 async function tempRoot(t, { features = {}, settings = null } = {}) {
@@ -288,11 +302,13 @@ const snapshotTexts = (loop) => loop.state.snapshots.map((message) => message.co
  *   - 再推一轮，让「窗口 + pending + 摘要」同时非空。
  * 所有台词约 20–26 字，避免用极端碎片行放大行首标签。
  */
-function saturateDialogue(buffer, { at = 1_000_000, rounds = 200 } = {}) {
+function saturateDialogue(buffer, clock, { at = 1_000_000, rounds = 200 } = {}) {
   let now = at;
+  if (clock !== undefined) clock.now = at;
   const line = '这是一段用于填满最近原文窗口的连续台词。';
   for (let index = 0; index < rounds; index += 1) {
     now += 500;
+    if (clock !== undefined) clock.now = now;
     buffer.push({ text: `第${index}段：${line}`, at: now, utteranceId: `u${index}` });
   }
   const before = buffer.snapshot();
@@ -304,12 +320,13 @@ function saturateDialogue(buffer, { at = 1_000_000, rounds = 200 } = {}) {
   assert.equal(applied.ok, true, '测试夹具：400 字摘要应被接受');
   for (let index = 0; index < rounds; index += 1) {
     now += 500;
+    if (clock !== undefined) clock.now = now;
     buffer.push({ text: `新第${index}段：${line}`, at: now, utteranceId: `v${index}` });
   }
   return now;
 }
 
-/** 预算告警条件（设计骨架，只存在于测试里；src 当前没有这个告警）。 */
+/** 预算告警谓词（测试内）；src 已暴露 stats()/快照统计，但本轮不接线事件。 */
 function budgetAlarm(input = {}) {
   const reasons = [];
   const snapshotChars = Number(input.snapshotChars ?? 0);
@@ -332,10 +349,11 @@ function budgetAlarm(input = {}) {
 // 1. 单条快照预算
 // ---------------------------------------------------------------------------
 
-test('1. 单条快照预算：饱和缓冲下 ≤ 3700 字符（同时记录 UTF-8 字节）', async (t) => {
+test('1. 单条快照预算：饱和缓冲下原值 3633 字符保持不变（同时记录 UTF-8 字节）', async (t) => {
   const root = await tempRoot(t);
-  const buffer = createDialogueContext();
-  saturateDialogue(buffer);
+  const clock = { now: 1_000_000 };
+  const buffer = createDialogueContext({ now: () => clock.now });
+  saturateDialogue(buffer, clock);
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
 
@@ -352,11 +370,17 @@ test('1. 单条快照预算：饱和缓冲下 ≤ 3700 字符（同时记录 UTF
   assert.ok(snapshot.recentChars <= snapshot.limits.maxChars, '最近窗口不超过 maxChars');
   assert.ok(snapshot.pendingChars <= snapshot.limits.maxPendingChars, 'pending 不超过 maxPendingChars');
   assert.ok(snapshot.summaryChars <= snapshot.limits.maxSummaryChars, '摘要不超过 maxSummaryChars');
+  assert.equal(snapshot.expired, 0, '饱和夹具没有过期项');
+  assert.equal(snapshot.active, true);
   assert.equal(assembly.snapshot.startsWith(RUNTIME_CONTEXT_HEADER), true);
   assert.equal(dialogue.startsWith(DIALOGUE_HEADER), true, '观察块带来源抬头');
   assert.equal(dialogue.includes('摘要内容'), true, '摘要进入快照');
 
-  // 验收：单条快照（含 Harness 固定抬头）不超过字符上限；字节按同单位保护。
+  // 正常饱和行为不因硬上限/读时过期而改变：仍是原来的 3633 字符，且未触发截断。
+  assert.equal(fullChars, 3_633, '正常饱和快照仍为 3633 字符（原值，不被硬上限改写）');
+  assert.equal(snapshot.truncated, false, '正常饱和不触发渲染硬上限');
+  assert.equal(snapshot.truncatedChars, 0);
+  assert.equal(snapshot.renderChars, dialogueChars, 'snapshot.renderChars 与实际渲染字符数一致');
   assert.ok(fullChars <= SNAPSHOT_BUDGET_CHARS,
     `单条快照 ${fullChars} 字符超过上限 ${SNAPSHOT_BUDGET_CHARS}`);
   assert.ok(fullBytes <= SNAPSHOT_BUDGET_UTF8_BYTES,
@@ -365,50 +389,82 @@ test('1. 单条快照预算：饱和缓冲下 ≤ 3700 字符（同时记录 UTF
   console.log(`[1] snapshotChars=${fullChars}/${SNAPSHOT_BUDGET_CHARS} snapshotUtf8Bytes=${fullBytes}/${SNAPSHOT_BUDGET_UTF8_BYTES} `
     + `dialogueChars=${dialogueChars} recentChars=${snapshot.recentChars}/${snapshot.limits.maxChars} `
     + `pendingChars=${snapshot.pendingChars}/${snapshot.limits.maxPendingChars} summaryChars=${snapshot.summaryChars}/${snapshot.limits.maxSummaryChars} `
+    + `truncated=${snapshot.truncated} truncatedChars=${snapshot.truncatedChars} expired=${snapshot.expired} `
     + `droppedPendingChars=${snapshot.stats.droppedPendingChars} lines=${dialogue.split('\n').length} `
     + `contextOrder=${host.contexts.get('assistant:dialogue')?.order} expectedOrder=${DIALOGUE_INJECTION_ORDER}`);
 });
 
 // ---------------------------------------------------------------------------
-// 1b. 边界探针：上限不是输入无关的
+// 1b/1c. 硬上限（渲染侧）：单条超长台词 / 大量碎片行都不能绕过预算
 // ---------------------------------------------------------------------------
 
-test('1b. 边界探针：单条超长台词 / 大量碎片行可突破字符上限（只记录，不修 src）', async (t) => {
-  // -- 单条超长台词：`push()` 不截断，且「最新一条即使超长也保留」。
-  const longRoot = await tempRoot(t);
-  const longBuffer = createDialogueContext();
-  longBuffer.push({ text: '长'.repeat(5_000), at: 1_000_000, utteranceId: 'long-1' });
-  const longHost = mountHost(longRoot, { dialogueContext: longBuffer });
-  t.after(() => longHost.close());
-  const longAssembly = longHost.assemble(entryIn(longRoot));
-  const longChars = charsOf(longAssembly.snapshot);
-  const longSnapshot = longBuffer.snapshot();
-  assert.ok(longChars > SNAPSHOT_BUDGET_CHARS,
-    `边界探针应记录超限：${longChars} 字符`);
-  assert.ok(longSnapshot.recentChars > longSnapshot.limits.maxChars,
-    '最新超长一条超过 maxChars 仍被保留（设计如此，但没有输入侧硬上限）');
+test('1b. 硬上限：单条 5000 字台词 → 快照 ≤ 3700 字符，truncated/droppedChars 明确', async (t) => {
+  const root = await tempRoot(t);
+  const clock = { now: 1_000_000 };
+  const buffer = createDialogueContext({ now: () => clock.now });
+  buffer.push({ text: '长'.repeat(5_000), at: clock.now, utteranceId: 'long-1' });
+  const host = mountHost(root, { dialogueContext: buffer });
+  t.after(() => host.close());
 
-  // -- 大量碎片行：字符预算只约束正文，不约束每行 5 字的来源标签；
-  //    正文各 2 字（带句号）时，约 1200 行的行首开销已远超 3.7K。
-  const tinyRoot = await tempRoot(t);
-  const tinyBuffer = createDialogueContext();
-  let at = 2_000_000;
+  const assembly = host.assemble(entryIn(root));
+  const dialogue = assembly.contextText('assistant:dialogue');
+  const dialogueChars = charsOf(dialogue);
+  const fullChars = charsOf(assembly.snapshot);
+  const snapshot = buffer.snapshot();
+
+  assert.ok(fullChars <= SNAPSHOT_BUDGET_CHARS,
+    `单条超长台词快照 ${fullChars} 字符超过上限 ${SNAPSHOT_BUDGET_CHARS}`);
+  assert.ok(dialogueChars <= RENDER_BUDGET_CHARS,
+    `观察块 ${dialogueChars} 字符超过渲染上限 ${RENDER_BUDGET_CHARS}`);
+  assert.equal(snapshot.truncated, true, '超长单条必须标记 truncated');
+  assert.ok(snapshot.truncatedChars > 0, 'truncatedChars 必须给出明确的丢弃字符数');
+  assert.equal(snapshot.renderChars, dialogueChars, 'renderChars 与实际渲染字符数一致');
+  assert.equal(snapshot.stats.truncatedChars, snapshot.truncatedChars, 'stats() 暴露同一丢弃量');
+  assert.equal(buffer.stats().truncatedChars, snapshot.truncatedChars);
+  assert.equal(dialogue.includes('已省略'), true, '截断标记必须出现在渲染文本里');
+  assert.equal(dialogue.includes('字符上限截断'), true, '标记写明这是字符上限');
+  // 渲染侧方案的语义：输入不切分，recent 仍保留完整一条；只是渲染不再全量注入。
+  assert.equal(snapshot.recentChars, 5_000, '输入侧保持原样（硬上限在渲染侧）');
+  assert.ok(snapshot.recentChars > snapshot.limits.maxChars, '设计：单条输入可以超过 maxChars');
+
+  console.log(`[1b] snapshotChars=${fullChars}/${SNAPSHOT_BUDGET_CHARS} dialogueChars=${dialogueChars}/${RENDER_BUDGET_CHARS} `
+    + `truncated=${snapshot.truncated} droppedChars=${snapshot.truncatedChars} recentChars=${snapshot.recentChars} `
+    + `renderChars=${snapshot.renderChars}`);
+});
+
+test('1c. 硬上限：3000 条碎片行 → 快照 ≤ 3700 字符，行首标签不能绕过预算', async (t) => {
+  const root = await tempRoot(t);
+  const clock = { now: 2_000_000 };
+  const buffer = createDialogueContext({ now: () => clock.now });
   for (let index = 0; index < 3_000; index += 1) {
-    at += 10;
-    tinyBuffer.push({ text: '字。', at, utteranceId: `t${index}` });
+    clock.now += 10;
+    buffer.push({ text: '字。', at: clock.now, utteranceId: `t${index}` });
   }
-  const tinyHost = mountHost(tinyRoot, { dialogueContext: tinyBuffer });
-  t.after(() => tinyHost.close());
-  const tinyAssembly = tinyHost.assemble(entryIn(tinyRoot));
-  const tinyChars = charsOf(tinyAssembly.snapshot);
-  const tinySnapshot = tinyBuffer.snapshot();
-  assert.ok(tinyChars > SNAPSHOT_BUDGET_CHARS,
-    `碎片行探针应记录超限：${tinyChars} 字符`);
-  assert.ok(tinySnapshot.recentChars <= tinySnapshot.limits.maxChars, '正文仍受 maxChars 约束');
-  assert.ok(tinySnapshot.pendingChars <= tinySnapshot.limits.maxPendingChars, 'pending 正文仍受约束');
+  const host = mountHost(root, { dialogueContext: buffer });
+  t.after(() => host.close());
 
-  console.log(`[1b] longLineChars=${longChars} (>${SNAPSHOT_BUDGET_CHARS}) longLineRecent=${longSnapshot.recentChars}/${longSnapshot.limits.maxChars} `
-    + `tinyLines=${tinyChars} (>${SNAPSHOT_BUDGET_CHARS}) tinyRecent=${tinySnapshot.recentChars} tinyPending=${tinySnapshot.pendingChars}`);
+  const assembly = host.assemble(entryIn(root));
+  const dialogue = assembly.contextText('assistant:dialogue');
+  const dialogueChars = charsOf(dialogue);
+  const fullChars = charsOf(assembly.snapshot);
+  const snapshot = buffer.snapshot();
+
+  assert.ok(fullChars <= SNAPSHOT_BUDGET_CHARS,
+    `碎片行快照 ${fullChars} 字符超过上限 ${SNAPSHOT_BUDGET_CHARS}`);
+  assert.ok(dialogueChars <= RENDER_BUDGET_CHARS,
+    `碎片行观察块 ${dialogueChars} 字符超过渲染上限 ${RENDER_BUDGET_CHARS}`);
+  assert.equal(snapshot.truncated, true, '碎片行必须触发硬上限');
+  assert.ok(snapshot.truncatedChars > 0);
+  assert.equal(snapshot.renderChars, dialogueChars);
+  assert.equal(dialogue.includes('已省略'), true);
+  assert.equal(snapshot.expired, 0, '3000 条碎片全部在时间窗内（读时过期没有介入）');
+  assert.ok(snapshot.recentChars <= snapshot.limits.maxChars, '正文仍受 maxChars 约束');
+  assert.ok(snapshot.pendingChars <= snapshot.limits.maxPendingChars, 'pending 正文仍受约束');
+  assert.ok(dialogue.split('\n').length > 100, '夹具确实是大量碎片行');
+
+  console.log(`[1c] snapshotChars=${fullChars}/${SNAPSHOT_BUDGET_CHARS} dialogueChars=${dialogueChars}/${RENDER_BUDGET_CHARS} `
+    + `truncated=${snapshot.truncated} droppedChars=${snapshot.truncatedChars} lines=${dialogue.split('\n').length} `
+    + `recent=${snapshot.recentChars}/${snapshot.limits.maxChars} pending=${snapshot.pendingChars}/${snapshot.limits.maxPendingChars}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -492,7 +548,7 @@ test('2. 文本未变化不追加；新增一行恰好 +1 条', async (t) => {
 
 test('3a. clear 后当前快照无旧内容；Harness 提交 CLEARED 标记', async (t) => {
   const root = await tempRoot(t);
-  const buffer = createDialogueContext();
+  const buffer = createDialogueContext({ now: () => 1_000 });
   buffer.push({ text: '第一段：门是开着的。', at: 1_000, utteranceId: 'u1' });
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
@@ -529,12 +585,10 @@ test('3a. clear 后当前快照无旧内容；Harness 提交 CLEARED 标记', as
 });
 
 // ---------------------------------------------------------------------------
-// 3b. 空闲超时（当前未实现；TODO 保留验收缺口）
+// 3b. 读时过期：空闲超过 maxWindowMs 后旧观察不再注入
 // ---------------------------------------------------------------------------
 
-test('3b. 空闲超时后旧观察不再注入（当前未实现，TODO）', {
-  todo: 'F1 条件 3：dialogueContext 无定时器，时间流逝不会让 render() 过期；需要 src 变更，本轮只报告',
-}, async (t) => {
+test('3b. 读时过期：空闲超过 maxWindowMs 后旧台词不再进入快照；未超时仍进入', async (t) => {
   const root = await tempRoot(t);
   const clock = { now: 1_000_000 };
   const buffer = createDialogueContext({ now: () => clock.now, maxWindowMs: 5_000 });
@@ -545,14 +599,89 @@ test('3b. 空闲超时后旧观察不再注入（当前未实现，TODO）', {
 
   const before = host.assemble(entry);
   assert.ok(before.contextText('assistant:dialogue').includes('门是开着的'), '夹具：旧观察开始可见');
+  assert.equal(buffer.snapshot().active, true);
+  assert.equal(buffer.snapshot().expired, 0);
+
+  // 未超时（4 s < 5 s）仍然注入：过期只发生在超过 maxWindowMs 之后。
+  clock.now += 4_000;
+  const within = host.assemble(entry);
+  assert.ok(within.contextText('assistant:dialogue').includes('门是开着的'), 'maxWindowMs 内旧观察仍然可见');
+  assert.equal(buffer.snapshot().expired, 0);
+  assert.equal(buffer.snapshot().active, true);
 
   // 空闲 10 分钟，远超 maxWindowMs=5s；没有新台词，也没有 clear()。
   clock.now += 10 * 60_000;
   const after = host.assemble(entry);
-  t.diagnostic('当前实现：空闲后仍渲染旧观察；这是条件 3 的未实现部分。');
-  assert.equal(after.contextText('assistant:dialogue').includes('门是开着的'), false,
-    '空闲超过 maxWindowMs 后旧观察不应再进入当前快照');
+  assert.equal(after.contextText('assistant:dialogue'), '', '空闲超过 maxWindowMs 后观察块不再注入');
   assert.equal(after.snapshot.includes('门是开着的'), false);
+  const gone = buffer.snapshot();
+  assert.equal(gone.recent.length, 0, '过期 recent 不再出现在快照里');
+  assert.equal(gone.expired, 1, 'stats/快照暴露过期数量');
+  assert.equal(gone.active, false, 'active:false 供上层发 idle 事件');
+  assert.equal(gone.reason, 'idle', "reason:'idle'");
+  assert.equal(gone.stats.expired, 1);
+  assert.equal(gone.stats.active, false);
+  assert.equal(gone.stats.reason, 'idle');
+  assert.equal(buffer.stats().active, false);
+  assert.equal(buffer.render(), '', 'render() 与 snapshot() 同语义：不再渲染旧观察');
+
+  // 新台词到达后只注入新内容：旧记录仍被隐藏，不会被新 push 带回快照。
+  clock.now += 1_000;
+  buffer.push({ text: '新的一句：灯亮了。', at: clock.now, utteranceId: 'new-1' });
+  const fresh = buffer.snapshot();
+  assert.equal(fresh.active, true, '有新内容后重新 active');
+  assert.equal(fresh.expired, 1, '旧记录仍计为过期（内部保留，但不注入）');
+  assert.equal(buffer.render().includes('门是开着的'), false);
+  assert.equal(buffer.render().includes('灯亮了'), true);
+
+  console.log(`[3b] withinWindowKept=true idleHidden=true expired=${gone.expired} active=${gone.active} `
+    + `reason=${gone.reason} afterIdleChars=${charsOf(after.snapshot)} freshExpired=${fresh.expired} `
+    + `afterNewPushHasOld=${buffer.render().includes('门是开着的')}`);
+});
+
+// ---------------------------------------------------------------------------
+// 3b2. pending 过期：已滚出窗口的 pending 同样不得注入
+// ---------------------------------------------------------------------------
+
+test('3b2. pending 过期：过期 pending 不再进入快照或摘要请求（内部记录可保留）', async () => {
+  const clock = { now: 2_000_000 };
+  const buffer = createDialogueContext({
+    now: () => clock.now,
+    maxWindowMs: 5_000,
+    maxChars: 1,
+    summaryEveryChars: 100,
+  });
+  buffer.push({ text: '先说的旧句。', at: clock.now, utteranceId: 'p-old' });
+  clock.now += 1_000;
+  buffer.push({ text: '后说的新句。', at: clock.now, utteranceId: 'p-new' });
+
+  const before = buffer.snapshot();
+  assert.deepEqual(before.pending.map((item) => item.text), ['先说的旧句。'], '夹具：旧句已滚进 pending');
+  assert.deepEqual(before.recent.map((item) => item.text), ['后说的新句。']);
+  assert.equal(before.expired, 0);
+  assert.equal(before.active, true);
+
+  // 旧句年龄 5.5 s > 5 s（过期）；新句年龄 4.5 s（仍在窗口内）。
+  clock.now += 4_500;
+  const after = buffer.snapshot();
+  assert.equal(after.pending.length, 0, '过期 pending 不进入快照');
+  assert.equal(after.pendingChars, 0);
+  assert.equal(after.expired, 1);
+  assert.equal(after.active, true, '仍有未过期的新句，所以不是 idle');
+  assert.equal(after.needsSummary, false, '过期 pending 不再触发摘要');
+  assert.equal(buffer.needsSummary(), false);
+  assert.deepEqual(after.pendingBySource, [], '摘要请求读不到过期 pending');
+  assert.equal(after.stats.expired, 1);
+  assert.equal(after.stats.pendingChars, 0);
+  assert.equal(after.pendingSerial, 1, '内部记录仍保留（版本号可观测），只是不注入');
+
+  const rendered = buffer.render();
+  assert.equal(rendered.includes('先说的旧句。'), false, '过期 pending 不得注入');
+  assert.equal(rendered.includes('后说的新句。'), true, '未过期的新句仍然注入');
+
+  console.log(`[3b2] pendingBefore=1 pendingAfter=${after.pending.length} expired=${after.expired} `
+    + `active=${after.active} needsSummary=${after.needsSummary} pendingSerial=${after.pendingSerial} `
+    + `oldInjected=${rendered.includes('先说的旧句。')} newInjected=${rendered.includes('后说的新句。')}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -585,7 +714,8 @@ test('3c. 非语言线索 TTL 到期后不再注入（对照：过期机制已�
 
 test('4. 12 轮对话不追加系统提示：哈希/文本/系统节点数稳定', async (t) => {
   const root = await tempRoot(t);
-  const buffer = createDialogueContext();
+  const clock = { now: 1_000 };
+  const buffer = createDialogueContext({ now: () => clock.now });
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
   const entry = entryIn(root);
@@ -593,7 +723,8 @@ test('4. 12 轮对话不追加系统提示：哈希/文本/系统节点数稳定
   const rounds = [];
 
   for (let index = 0; index < 12; index += 1) {
-    buffer.push({ text: `第${index}轮：这是一句会改变观察但不改变系统提示的台词。`, at: 1_000 + index * 1_000, utteranceId: `u${index}` });
+    clock.now = 1_000 + index * 1_000;
+    buffer.push({ text: `第${index}轮：这是一句会改变观察但不改变系统提示的台词。`, at: clock.now, utteranceId: `u${index}` });
     const assembly = host.assemble(entry);
     const commit = loop.step(assembly);
     rounds.push({ assembly, commit });
@@ -735,10 +866,10 @@ test('5b. 真实压缩 range/shadow 语义需要宿主层验证（跳过，不�
 }, () => {});
 
 // ---------------------------------------------------------------------------
-// 6. 上限告警条件（骨架）
+// 6. 上限告警条件（消费 stats() 的可观测字段）
 // ---------------------------------------------------------------------------
 
-test('6. 容量接近阈值时的告警条件（只写测试骨架/报告，不改 src）', async (t) => {
+test('6. 容量接近阈值时的告警条件（stats() 暴露丢弃/截断/过期）', async (t) => {
   // -- 谓词本身的行为：80% 预警、95% 严重、丢弃/满 pending/满摘要/持续满仓。
   assert.deepEqual(budgetAlarm({ snapshotChars: 1_000 }), []);
   assert.deepEqual(budgetAlarm({ snapshotChars: Math.ceil(SNAPSHOT_BUDGET_CHARS * WARN_RATIO) }), ['warn-snapshot-size']);
@@ -755,8 +886,9 @@ test('6. 容量接近阈值时的告警条件（只写测试骨架/报告，不�
 
   // -- 可观测性前提：饱和缓冲的实际值能喂给上面的谓词。
   const root = await tempRoot(t);
-  const buffer = createDialogueContext();
-  saturateDialogue(buffer);
+  const clock = { now: 1_000_000 };
+  const buffer = createDialogueContext({ now: () => clock.now });
+  saturateDialogue(buffer, clock);
   const host = mountHost(root, { dialogueContext: buffer });
   t.after(() => host.close());
   const assembly = host.assemble(entryIn(root));
@@ -774,6 +906,14 @@ test('6. 容量接近阈值时的告警条件（只写测试骨架/报告，不�
   assert.ok(actualAlarms.length > 0, '饱和缓冲至少命中一个告警条件');
   assert.equal(typeof snapshot.limits.maxChars, 'number', 'limits 可读');
   assert.equal(Number.isInteger(snapshot.stats.droppedPendingChars), true, 'stats 可读');
+  // 本轮新增的统计面：丢弃/截断/过期都能直接读到（本轮不做事件接线）。
+  const stats = buffer.stats();
+  for (const key of ['droppedPendingChars', 'truncatedChars', 'expired', 'active', 'reason', 'pendingChars', 'renderChars']) {
+    assert.equal(Object.hasOwn(stats, key), true, `stats() 缺少 ${key}`);
+  }
+  assert.equal(stats.truncatedChars, snapshot.truncatedChars);
+  assert.equal(stats.expired, 0);
+  assert.equal(stats.active, true);
 
   // 事件面：`assistant.context.refreshed` 带 name/chars/active，可作为外部告警输入。
   const events = await untilEvents(
@@ -789,6 +929,7 @@ test('6. 容量接近阈值时的告警条件（只写测试骨架/报告，不�
 
   console.log(`[6] alarms=${actualAlarms.join(',')} snapshotChars=${snapshotChars} budget=${SNAPSHOT_BUDGET_CHARS} `
     + `ratio=${(snapshotChars / SNAPSHOT_BUDGET_CHARS).toFixed(3)} dropped=${snapshot.stats.droppedPendingChars} `
+    + `truncated=${stats.truncatedChars} expired=${stats.expired} active=${stats.active} `
     + `pending=${snapshot.pendingChars}/${snapshot.limits.maxPendingChars} summary=${snapshot.summaryChars}/${snapshot.limits.maxSummaryChars} `
-    + `eventChars=${refreshed.payload.chars} srcWarningImplemented=false (design skeleton only)`);
+    + `eventChars=${refreshed.payload.chars} statsExposed=true eventWiring=false`);
 });
