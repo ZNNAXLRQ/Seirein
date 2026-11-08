@@ -143,32 +143,38 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 
 ### 2.2 安装插件
 
-#### 官方方式一：桌面端「插件」页（推荐）
+#### 面向普通用户：不需要克隆仓库
 
-1. 打开 DSH 侧栏的 **插件** 页，点 **添加插件**（或 **安装第三方插件**）。
-2. 在包名输入框填入本仓库的 **本地绝对路径**（例如 `D:\Programs\Others\Seirein`），按 Enter 或点安装。
-   输入框接受：包名（可带版本）、Git 地址、压缩包、本地绝对路径；三种来源共用同一个安装流程。
-3. 安装完成后选 **立即启用**；首次以本地开发目录安装时，DSH 会把它保存为 `link:<仓库目录>` 依赖。
-   Host 侧改动通常需要重启 DSH 生效；只改 `client.js` 时刷新页面即可。
-4. 在插件页确认 **Seirein** 组合包已出现且处于启用状态，再按 2.3 做必须设置。
+DSH 的插件安装框（侧栏 **插件** → **添加插件**）接受四种 spec，前三种都不需要用户手动克隆：
 
-> 卸载：同一插件页打开 **Seirein** 组合包 → 卸载（需要确认）。
+| 方式 | 用户操作 | 适用 | 备注 |
+| --- | --- | --- | --- |
+| **已发布包名**（最推荐） | 输入 `包名@版本` → 安装 → 立即启用 | 已发布到 npm / 插件市场 | 需要维护者先发布；见 2.2.1 |
+| **压缩包 `.tgz`** | 下载 Release 里的 `*.tgz` → 安装框填该文件绝对路径 | 尚未发布、但想“下载即装” | 不需要克隆、不需要手动 `pnpm install` |
+| **Git 地址** | 输入仓库 URL（`https://…/Seirein.git`） | 仓库公开可访问 | DSH 会自行拉取；需要 git 可用与网络；私有仓库常因禁用凭据提示而失败 |
+| **本地目录** | 填仓库绝对路径 | 开发者 / 本机已克隆 | 需要仓库在磁盘上，见下方“开发者安装” |
 
-#### 官方方式二：CLI 安装（CLI 形态的 DSH）
+> 当前仓库 `private: true`、尚未发布，也还没有公开仓库地址：普通用户暂时请用 **压缩包** 或等发布后的 **包名**；
+> 维护者打包与发布步骤见下方 2.2.1。
 
-```powershell
-dsh plugin add D:\Programs\Others\Seirein
-```
+##### 2.2.1 维护者发布（普通用户可安装的前提）
 
-`dsh plugin add` 后面接受的就是插件页安装框里的同一段 spec：包名（可带版本）、Git 地址、压缩包或本地绝对路径。
-安装后按 CLI 提示重启，再用 `dsh` 启动。
+1. 打包：`pnpm pack` 生成 `dsh-assistant-0.99.0.tgz`（`package.json.files` 已包含 `client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、图标）。
+2. 验证：在一个干净的 DSH profile 里用 tarball 安装一次，确认组合包出现、可启用、状态正常。
+3. 发布：改 `name` 为可发布 scope、去掉 `"private": true`、补 `repository`，再 `npm publish`；或把 tarball 传到 Release 页面。
+4. 之后普通用户即可用「包名」或「压缩包」安装，无需接触仓库与 pnpm。
 
-> 当前本机是桌面客户端（应用内已有插件页），所以以方式一为准；
-> 如果之后用 CLI 形态，请确认 `dsh plugin --help` 有 `add` 子命令（不同版本命令名可能略有差异）。
+#### 面向开发者：本地仓库安装
 
-#### 开发调试：手动 `link:` 方式（非官方，仅本地开发）
+1. 插件页 **添加插件** → 填仓库 **本地绝对路径**（例如 `D:\Programs\Others\Seirein`）→ 安装 → **立即启用**。
+   首次以本地目录安装时，DSH 会把它保存为 `link:<仓库目录>` 依赖。
+2. 开发中的更新：Host 代码改动 → `remove_bundle` → `install_bundle`（target 与安装 spec 相同）；
+   只改 `client.js` → 刷新页面；首次安装或组合包/服务/preset 变化后需要重启。
+3. CLI 形态的 DSH 用同一段 spec：`dsh plugin add D:\Programs\Others\Seirein`。
 
-profile 的 `package.json` 里以 `link:` 指向仓库，并把包加入 bundle 列表（下面只列与本插件相关的行，其余 bundle 省略）：
+##### 非官方调试方式：手动 `link:`
+
+profile 的 `package.json` 里以 `link:` 指向仓库，并把包加入 bundle 列表（只列相关行，其余 bundle 省略）：
 
 ```json
 {
@@ -193,19 +199,18 @@ link 方式 **不会**安装插件自己的依赖；第一次装好后要在仓�
 pnpm install
 ```
 
-首次以 link 方式安装后需要重启宿主；之后改 Host 代码用 `remove_bundle` → `install_bundle` 即可生效（无需重启 DSH）。只改 `client.js` 时刷新页面即可。
+改 Host 代码用 `remove_bundle` → `install_bundle`；只改 `client.js` 时刷新页面。
 
 #### 更新已安装的插件
 
-- 桌面端：插件页打开 **Seirein** → 重新安装/更新（或先卸载再按方式一安装）。
+- 桌面端：插件页打开 **Seirein** → 重新安装/更新（或先卸载再安装）。
 - CLI：对同一 spec 再执行一次 `dsh plugin add`。
-- 开发中：Host 代码改动 → `remove_bundle` → `install_bundle`（target 与 `dsh plugin add` 的 spec 相同）；
-  只改 `client.js` → 刷新页面。
-- 需要重启的情形：首次安装、Host 组合包变化、插件注册的服务/preset/压缩能力变更；安装结果会明确提示是否需要重启。
+- 开发中：Host 代码改动 → `remove_bundle` → `install_bundle`；只改 `client.js` → 刷新页面。
+- 需要重启：首次安装、Host 组合包变化、插件注册的服务/preset/压缩能力变更；安装结果会明确提示。
 
 #### 安装后确认
 
-- 打开 DSH 设置 → 插件 → **Seirein**（也出现在设置分区里）。
+- 打开 DSH 侧栏 → **插件**，确认 **Seirein** 组合包已出现且启用。
 - 首次使用先选「存放位置」；数据根默认是 `%LOCALAPPDATA%\Seirein`，旧目录 `%LOCALAPPDATA%\dsh-assistant` 会做一次可恢复的复制迁移。
 - `GET /assistant/status` 的 `version` 应为 `0.99.0`；工具面是 24 个（`node test/smoke.mjs` 会断言）。
 - 插件会写 `<root>/data/status.json`，可用来快速判断加载是否成功。
