@@ -528,6 +528,22 @@ function ttsErrorCode(error) {
   return code.length > 0 ? code : 'TTS_FAILED';
 }
 
+/**
+ * P-46: optional turn attribution, copied from the caller exactly as supplied.
+ *
+ * Observation only. A request that names no turn keeps `null` on all three fields: the clock is
+ * never used to guess one, and no id is derived from the text or from the queue. Adding them
+ * changes nothing about slot waiting, synthesis or caching.
+ */
+function turnAttribution(request) {
+  const id = (value) => (typeof value === 'string' && value.length > 0 ? value : null);
+  return {
+    turn: Number.isInteger(request?.turn) ? request.turn : null,
+    deliveryMessageId: id(request?.deliveryMessageId),
+    sessionId: id(request?.sessionId),
+  };
+}
+
 /** The first N requests of this provider generation, or the first one after a successful warm-up. */
 function takeTtsColdStart() {
   const cold = ttsColdAfterWarmup === true || ttsRequestsSinceStart < ttsColdStartLimit;
@@ -544,6 +560,7 @@ function takeTtsColdStart() {
  * stay separate measurements; `totalMs` is their sum, never a re-measurement of the wall clock.
  * `requestMs` is the clip's synthesis time, except for a streamed request where the provider
  * round trip ends at the FIRST audio byte (`streamed: true`); the rest of a stream is playback.
+ * Turn attribution (`turn`/`deliveryMessageId`/`sessionId`) is copied from the caller or null.
  */
 function reportTtsRequest(request, { slot = null, slotWaitMs = 0, startedAt = 0, requestMs = null,
   result, error, attempts = [], retryErrorCode = null, streamed = false } = {}) {
@@ -556,6 +573,8 @@ function reportTtsRequest(request, { slot = null, slotWaitMs = 0, startedAt = 0,
   const payload = {
     level: 'debug',
     purpose: String(request?.purpose ?? 'speech'),
+    // P-46: which turn/session this synthesis belongs to; null when the caller named none.
+    ...turnAttribution(request),
     engine: ttsEngineName(result?.provider ?? seen.at(-1)),
     chars: [...String(request?.text ?? '')].length,
     slotWaitMs: wait,
@@ -862,7 +881,13 @@ async function synthesizeEdge({ text, voice, dir, signal, maxBytes = TTS_AUDIO_M
  * clip is never called blindly: the stock API answers HTTP 400 for a missing clip, a clip outside
  * 3–10 s, or empty prompt text, so those cases skip straight to Edge.
  *
- * @param {{text: string, voice?: string, lang?: string, textLang?: string, dir: string}} options
+ * P-46: `turn`, `deliveryMessageId` and `sessionId` are optional turn attribution. They are only
+ * carried on the `voice.tts.request` row (null when omitted); they never affect which engine runs,
+ * how long a slot is held, or whether a clip is cached.
+ *
+ * @param {{text: string, voice?: string, lang?: string, textLang?: string, dir: string,
+ *   purpose?: string, turn?: number|null, deliveryMessageId?: string|null, sessionId?: string|null,
+ *   sentenceId?: number, chunkIndex?: number}} options
  * @returns {Promise<{file: string, bytes: number, durationMs: number, provider: string}>}
  */
 export function synthesize(options) {
@@ -901,6 +926,11 @@ export function synthesize(options) {
   );
 }
 
+/**
+ * The slot-owned half of a synthesis. It reads only what the provider needs, so the P-46 turn
+ * attribution rides along in the request object untouched and is reported by `synthesize()`
+ * (this function never writes the request row).
+ */
 async function synthesizeNow({ text, voice, lang = 'zh', textLang = '', dir, signal, snapshot, maxBytes = TTS_AUDIO_MAX_BYTES, observation = null }) {
   checkAbort(signal);
   if (snapshot.weightsEpoch !== weightsEpoch) throw abortError();
@@ -1027,15 +1057,21 @@ function startPlayer(command, args, { signal, piped = false, onStart = null } = 
  * `onTransport` is optional too: it reports the player's real end (`{exit, via}`), which is what a
  * caller must prefer over its own duration estimate.
  *
- * @param {{text: string, voice?: string, lang?: string, dir: string, ffplayPath?: string|null, onStart?: Function|null, onTransport?: Function|null}} options
+ * @param {{text: string, voice?: string, lang?: string, dir: string, ffplayPath?: string|null, onStart?: Function|null, onTransport?: Function|null,
+ *   turn?: number|null, deliveryMessageId?: string|null, sessionId?: string|null, sentenceId?: number, chunkIndex?: number}} options
  * @returns {Promise<{file: string, bytes: number, durationMs: number, firstChunkMs: number|null, via: string}>}
  */
 export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', dir, ffplayPath = null, onStart = null,
-  onTransport = null, purpose = 'speech', signal, snapshot = captureTtsSnapshot(), maxBytes = TTS_AUDIO_MAX_BYTES }) {
+  onTransport = null, purpose = 'speech', turn = null, deliveryMessageId = null, sessionId = null,
+  sentenceId = null, chunkIndex = null, signal, snapshot = captureTtsSnapshot(), maxBytes = TTS_AUDIO_MAX_BYTES }) {
   checkAbort(signal);
   const resolvedVoice = typeof voice === 'string' && voice.trim().length > 0 ? voice : voiceForLanguage(lang);
   if (snapshot.settings?.enabled === true || !ffplayPath) {
-    const result = await synthesize({ text, voice: resolvedVoice, lang, textLang, dir, purpose, signal, snapshot, maxBytes });
+    // P-46: the fallback path reports through `synthesize()`, so the attribution must ride along.
+    const result = await synthesize({
+      text, voice: resolvedVoice, lang, textLang, dir, purpose, turn, deliveryMessageId, sessionId,
+      sentenceId, chunkIndex, signal, snapshot, maxBytes,
+    });
     try {
       checkAbort(signal);
     } catch (error) {
@@ -1052,8 +1088,11 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
   // Public result settles when the file is complete; playback ownership lasts until child close.
   return new Promise((resolve, reject) => {
     // Observation only: the inline Edge stream owns a slot directly, so it reports its own request
-    // row (the file path above already reported one through `synthesize()`).
-    const streamRequest = { text, purpose: String(purpose ?? 'speech') };
+    // row (the file path above already reported one through `synthesize()`). P-46 attribution is
+    // copied here too, so a streamed sentence is attributable to its turn without a time window.
+    const streamRequest = {
+      text, purpose: String(purpose ?? 'speech'), turn, deliveryMessageId, sessionId, sentenceId, chunkIndex,
+    };
     // Always acquire synthesis before playback, like the model-application barrier. The legacy
     // pipe path conservatively retains synthesis ownership until player cleanup; sentence-file
     // prefetch below releases synthesis independently and still overlaps with playback.
@@ -1389,6 +1428,9 @@ export function splitFirstBlockChunks(text, {
 /**
  * Pull-based, one playing + one synthesizing/ready. The caller must supply a bounded iterable,
  * not an event callback spawning unbounded push promises. Only this invocation's files are removed.
+ *
+ * P-46: `turn`/`deliveryMessageId`/`sessionId` are optional attribution forwarded to every
+ * sentence's `synthesize()` call; omitting them keeps the old row unchanged.
  */
 export function speakSentences(sentences, options = {}) {
   const request = { ...options, snapshot: options.snapshot ?? captureTtsSnapshot() };
@@ -1396,6 +1438,7 @@ export function speakSentences(sentences, options = {}) {
 }
 
 async function speakSentencesNow(sentences, { voice, lang = 'zh', dir, ffplayPath = null,
+  turn = null, deliveryMessageId = null, sessionId = null,
   signal, snapshot = captureTtsSnapshot(), onEvent = null, maxSentenceChars = 1024 } = {}) {
   checkAbort(signal);
   const controller = new AbortController();
@@ -1424,7 +1467,10 @@ async function speakSentencesNow(sentences, { voice, lang = 'zh', dir, ffplayPat
     }
     const entry = { seq: seq++, text, queuedAt: performance.now(), audio: null };
     notify('synth-start', { seq: entry.seq, chars: [...text].length });
-    entry.audio = await synthesize({ text, voice, lang, dir, signal: ownedSignal, snapshot, maxBytes: TTS_AUDIO_MAX_BYTES });
+    entry.audio = await synthesize({
+      text, voice, lang, dir, turn, deliveryMessageId, sessionId,
+      signal: ownedSignal, snapshot, maxBytes: TTS_AUDIO_MAX_BYTES,
+    });
     if (ownedSignal.aborted) { await remove(entry); checkAbort(ownedSignal); }
     entry.readyAt = performance.now();
     notify('ready', { seq: entry.seq, bytes: entry.audio.bytes, synthMs: entry.readyAt - entry.queuedAt });
