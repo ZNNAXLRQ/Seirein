@@ -923,6 +923,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       selectorKey: '',
       active: [],
       seq: 0,
+      /** Monotonic draw counter: `presetSelect#N` links one select to the action it may start. */
+      selectSeq: 0,
       generation: 0,
       starts: 0,
       holds: 0,
@@ -945,6 +947,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         lastAt: null,
         gate: '',
         lastEmitAt: Object.create(null),
+        /** Lightweight rollup of the LAST action only (no history): commits merged by actionId. */
+        byAction: { lastActionId: null, lastCommitCount: 0, lastEvent: '' },
       },
       recent: [],
       history: [],
@@ -1850,8 +1854,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     } else if (type === 'avatar.preset.skip') {
       debug.skips += 1;
       if (typeof payload.event === 'string' && payload.event.length > 0) debug.lastEvent = payload.event;
+    } else if (type === 'avatar.preset.start') {
+      // A new action begins: the rollup moves to it and its commit trail restarts at 0.
+      // `debug.lastEvent`/`lastPresetId` keep their existing select/skip semantics.
+      debug.byAction.lastActionId = payload.actionId ?? null;
+      debug.byAction.lastCommitCount = 0;
+      debug.byAction.lastEvent = typeof payload.event === 'string' ? payload.event : '';
     } else if (type === 'avatar.preset.commit') {
       debug.lastPresetId = payload.presetId ?? debug.lastPresetId;
+      if (payload.actionId !== undefined) debug.byAction.lastActionId = payload.actionId;
+      if (Number.isFinite(payload.commitCount)) debug.byAction.lastCommitCount = payload.commitCount;
+      if (typeof payload.event === 'string') debug.byAction.lastEvent = payload.event;
     }
     if (debug.enabled !== true) return false;
     const last = debug.lastEmitAt[type];
@@ -1896,6 +1909,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     debug.gate = key;
     notePresetDebugEvent('avatar.preset.skip', {
       reason, event, state: state.status, reasons: [], droppedChannels: [],
+      /** No draw happened here, so neither identifier exists yet. */
+      selectionId: null, actionId: null,
     }, at);
   }
 
@@ -1911,6 +1926,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       state: state.status,
       reasons: Array.isArray(reasons) ? [...reasons] : [],
       droppedChannels: [...(Array.isArray(droppedChannels) ? droppedChannels : [])],
+      /** The host refused the boundary before a draw: no selection and no action exist. */
+      selectionId: null, actionId: null,
     }, at);
     return { ok: true, reason: why };
   }
@@ -1921,6 +1938,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    */
   function selectPreset(raw = {}) {
     const context = presetContext(raw);
+    state.presets.selectSeq += 1;
+    const selectionId = `presetSelect#${state.presets.selectSeq}`;
     let selection;
     try {
       selection = presetSelector().select(context);
@@ -1947,6 +1966,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     const normalized = {
       ...selection,
+      /** Correlation id of THIS draw; `startPreset` copies it, then adds the action id. */
+      selectionId,
       reasons: [...new Set(reasons)],
       /** Proof fields the trace can quote without re-reading the runtime. */
       targetVerified: context.targetVerified === true,
@@ -1972,6 +1993,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       }
     }
     state.presets.lastSelection = {
+      selectionId,
       kind: normalized.kind,
       presetId: normalized.presetId ?? null,
       family: normalized.family ?? null,
@@ -1989,6 +2011,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     state.presets.debug.gate = '';
     if (normalized.kind === 'preset') {
       notePresetDebugEvent('avatar.preset.select', {
+        selectionId,
         presetId: normalized.presetId,
         family: normalized.family ?? null,
         recipe: normalized.recipe ?? null,
@@ -2006,6 +2029,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         verifiedChannels: [...(normalized.verifiedChannels ?? [])],
         reasons: [...normalized.reasons],
         droppedChannels: [...(normalized.droppedChannels ?? [])],
+        /** The draw exists even when it held; no action was started for it. */
+        selectionId, actionId: null,
       }, context.now);
     }
     return normalized;
@@ -2423,6 +2448,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         verifiedChannels: [...(context.verifiedChannels ?? [])],
         reasons: [...(hold.reasons ?? [])],
         droppedChannels: [...(hold.droppedChannels ?? [])],
+        /** The draw this execution refused (null only when no selection was passed at all). */
+        selectionId: selection?.selectionId ?? null, actionId: null,
       }, at);
       return { ok: true, started: false, kind: 'hold', selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
     }
@@ -2438,6 +2465,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         verifiedChannels: [...(context.verifiedChannels ?? [])],
         reasons: [...(hold.reasons ?? [])],
         droppedChannels: [...(hold.droppedChannels ?? [])],
+        /** The draw this execution refused (null only when no selection was passed at all). */
+        selectionId: selection?.selectionId ?? null, actionId: null,
       }, at);
       return { ok: true, started: false, kind: 'hold', reason, selection: hold, trace: clonePresetTrace(state.presets.lastTrace) };
     }
@@ -2467,8 +2496,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (built.nativeOps.length > 0) trace.output.nativeOwned = [...built.nativeOps];
     if (built.droppedOps.length > 0) trace.output.skippedOperations = [...built.droppedOps];
     state.presets.seq += 1;
+    // Unique per STARTED trajectory, so its several commits can be merged by action id. The
+    // select id of the draw it executed is kept too (selection → action association).
+    const actionId = `presetAction#${state.presets.seq}`;
     const item = {
       seq: state.presets.seq,
+      actionId,
+      selectionId: selection.selectionId ?? null,
+      /** The context.event this action was started for (`idle` vs a dialogue phase). */
+      event: context.event ?? '',
       presetId: selection.presetId,
       family: selection.family,
       recipe: selection.recipe,
@@ -2485,6 +2521,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       written: new Set(),
       /** First acknowledged value per channel, for commit evidence only (`{at, values}`). */
       firstCommitted: null,
+      /** Acknowledgements merged by this action id; never a per-frame counter. */
+      commitCount: 0,
       trace,
     };
     state.presets.active.push(item);
@@ -2508,6 +2546,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const plannedStages = presetPlannedStages(built.stages);
     const plannedAmplitude = plannedStages.reduce((max, stage) => Math.max(max, stage.amplitude), 0);
     notePresetDebugEvent('avatar.preset.start', {
+      actionId,
+      selectionId: selection.selectionId ?? null,
       presetId: selection.presetId,
       family: selection.family,
       recipe: selection.recipe,
@@ -2524,6 +2564,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       ok: true,
       started: true,
       kind: 'preset',
+      actionId,
+      event: item.event,
+      selectionId: item.selectionId,
       presetId: selection.presetId,
       family: selection.family,
       recipe: selection.recipe,
@@ -2727,7 +2770,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         const peak = Object.values(lastValue).reduce((max, value) => (
           Number.isFinite(value) ? Math.max(max, Math.abs(value)) : max
         ), 0);
+        committedItem.commitCount += 1;
         notePresetDebugEvent('avatar.preset.commit', {
+          /** Identity of the action this acknowledgement belongs to (merge several by it). */
+          actionId: committedItem.actionId,
+          selectionId: committedItem.selectionId ?? null,
+          event: committedItem.event ?? '',
+          commitCount: committedItem.commitCount,
           presetId: committedItem.presetId,
           channels: [...committedItem.channels],
           committed: Object.keys(output.committed),
@@ -2736,6 +2785,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           peak,
           firstValue: { ...firstValue },
           lastValue,
+          /** first acknowledgement of this action → this one: the merge window. */
+          firstAt: committedItem.firstCommitted.at,
+          lastAt: now,
           spanMs: Math.max(0, now - committedItem.firstCommitted.at),
         }, now);
       }
@@ -2983,6 +3035,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         lastEvent: state.presets.debug.lastEvent,
         lastAt: state.presets.debug.lastAt,
         selectorKey: state.presets.selectorKey,
+        /** Last action only: `{lastActionId, lastCommitCount, lastEvent}` (no full history). */
+        byAction: {
+          lastActionId: state.presets.debug.byAction.lastActionId,
+          lastCommitCount: state.presets.debug.byAction.lastCommitCount,
+          lastEvent: state.presets.debug.byAction.lastEvent,
+        },
       },
       recent: state.presets.recent.map((trace) => clonePresetTrace(trace)),
     };

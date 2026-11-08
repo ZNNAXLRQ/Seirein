@@ -461,14 +461,15 @@ test('12. 被过滤的决策带原因：no-candidate / channel-unverified / hold
   assert.equal(hold.event, 'idle');
 });
 
-test('13. 状态投影随决策更新：motion.presets.debug 八个字段（index 映射）', () => {
+test('13. 状态投影随决策更新：motion.presets.debug 九个字段（index 映射）', () => {
   const runtime = makeRuntime({ enabled: true, overrides: { actionPriority: { 'idle-tilt': 100 } } });
   const decisions = decisionEvents(idleEvents(runtime, 20_000));
   const snapshot = presetSnapshot(runtime);
   const projection = snapshot.debug;
   assert.deepEqual(
     Object.keys(projection).sort(),
-    ['decisions', 'enabled', 'holds', 'lastAt', 'lastEvent', 'lastPresetId', 'selectorKey', 'skips'],
+    ['byAction', 'decisions', 'enabled', 'holds', 'lastAt', 'lastEvent', 'lastPresetId',
+      'selectorKey', 'skips'],
   );
   assert.equal(projection.enabled, true, 'the projection says preset execution is on');
   assert.ok(projection.decisions > 0, `decisions ${projection.decisions}`);
@@ -481,6 +482,14 @@ test('13. 状态投影随决策更新：motion.presets.debug 八个字段（inde
   assert.ok(lastSelect, 'a select event exists');
   assert.equal(projection.lastPresetId, lastSelect.presetId);
   assert.equal(projection.lastAt >= lastSelect.at, true, 'the projection is never older than its event');
+
+  // Lightweight by-action rollup: the LAST action only (no history), always maintained.
+  assert.deepEqual(Object.keys(projection.byAction).sort(),
+    ['lastActionId', 'lastCommitCount', 'lastEvent']);
+  assert.match(projection.byAction.lastActionId, /^presetAction#\d+$/,
+    'the idle rhythm started an action and the rollup names it');
+  assert.equal(projection.byAction.lastCommitCount, 0, 'this runtime has no transport: no commits');
+  assert.equal(projection.byAction.lastEvent, 'idle');
 
   // index.js exposes that exact object at status.live2d.runtime.motion.presets (source wiring proof,
   // the same pattern test/observability-wiring.mjs uses for index.js projections).
@@ -502,6 +511,10 @@ test('14. 关闭 presetDebugEvents：零事件，投影照常更新', () => {
   assert.ok(projection.skips >= 1, `skips ${projection.skips}`);
   assert.equal(projection.lastEvent, 'idle');
   assert.equal(typeof projection.lastAt, 'number');
+  // The by-action rollup is projection state, not an event: it updates with the switch off.
+  assert.match(projection.byAction.lastActionId, /^presetAction#\d+$/u);
+  assert.equal(projection.byAction.lastCommitCount, 0);
+  assert.equal(projection.byAction.lastEvent, 'idle');
 });
 
 test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 debug 日志', async () => {
@@ -549,11 +562,18 @@ test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 de
   const commit = commits[0];
   assert.deepEqual(
     Object.keys(commit).sort(),
-    ['at', 'channels', 'committed', 'firstValue', 'lastValue', 'peak', 'presetId',
-      'skippedByTransport', 'spanMs', 'type'],
+    ['actionId', 'at', 'channels', 'commitCount', 'committed', 'event', 'firstAt', 'firstValue',
+      'lastAt', 'lastValue', 'peak', 'presetId', 'selectionId', 'skippedByTransport', 'spanMs',
+      'type'],
   );
   assert.equal(commit.presetId, started.presetId);
   assert.deepEqual(commit.channels, started.channels);
+  assert.equal(commit.actionId, started.actionId, 'commit keeps the action identity');
+  assert.equal(commit.event, 'idle', 'the commit says which event the action was for');
+  assert.equal(commit.selectionId, started.selectionId, 'and the draw it executed');
+  assert.equal(commit.commitCount, 1, 'the first acknowledged send of this action');
+  assert.equal(commit.firstAt, commit.at, 'the merge window opens at the first acknowledgement');
+  assert.equal(commit.lastAt, commit.at);
   assert.ok(commit.committed.length > 0);
   assert.ok(commit.committed.every((channel) => commit.channels.includes(channel)));
   assert.equal(typeof commit.skippedByTransport, 'object');
@@ -755,3 +775,135 @@ test('19. commit 单独 250ms 节流：同一秒 4 次提交 = 4 条（旧实现
   }
   assert.ok(commits.every((event) => event.presetId === started.presetId));
 });
+
+// ---------------------------------------------------------------------------------------------
+// Action correlation (association only): `selectionId` links one draw to the action it executed;
+// `actionId` links that action's start/commit rows. Nothing here changes what is selected or how
+// large it is — every assertion below reads ids and counts from the existing payloads.
+// ---------------------------------------------------------------------------------------------
+test('20. select→start 关联：select 带 selectionId，start 沿用并分配唯一 actionId', () => {
+  const runtime = makeRuntime();
+  runtime.tick(0);
+  runtime.takeEvents();
+
+  let selection = null;
+  let selectEvent = null;
+  // Space the draws 2 s apart so the 1 s select throttle keeps the event of the draw we start.
+  for (let seed = 0, now = 0; seed < 96; seed += 1, now += 2000) {
+    const drawn = runtime.selectPreset({
+      state: 'idle', event: 'idle', recipe: 'idle-tilt', seed, now,
+    });
+    const events = runtime.takeEvents();
+    if (drawn.kind !== 'preset') continue;
+    selection = drawn;
+    selectEvent = events.find((event) => event.type === 'avatar.preset.select') ?? null;
+    if (selectEvent !== null) break;
+  }
+  assert.ok(selection !== null, 'a draw returned a preset');
+  assert.match(selection.selectionId, /^presetSelect#\d+$/u, 'every draw has its own selection id');
+  assert.ok(selectEvent !== null, 'the draw published its select event');
+  assert.equal(selectEvent.selectionId, selection.selectionId, 'the select event names its draw');
+  assert.equal(selectEvent.event, 'idle');
+
+  const started = runtime.startPreset(selection, { at: 0 });
+  assert.equal(started.started, true);
+  assert.match(started.actionId, /^presetAction#\d+$/u, 'start allocates a unique action id');
+  assert.equal(started.selectionId, selection.selectionId, 'the action keeps the draw it executed');
+
+  const start = runtime.takeEvents().find((event) => event.type === 'avatar.preset.start');
+  assert.ok(start, 'the start event is emitted');
+  assert.equal(start.actionId, started.actionId);
+  assert.equal(start.selectionId, selection.selectionId, 'select → start share the draw id');
+  assert.equal(start.event, 'idle');
+});
+
+test('21. 同一动作多条 commit 按 actionId 归并：commitCount 递增，firstAt/lastAt 成窗口', async () => {
+  const { runtime, tick } = await makeTransportRuntime();
+  const started = startIdleTilt(runtime);
+  assert.ok(started !== null);
+  assert.match(started.actionId, /^presetAction#\d+$/u);
+  runtime.takeEvents();
+
+  for (const at of [0, 250, 500, 750]) await tick(at);
+  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(commits.length, 4, `four acknowledgements: ${commits.length}`);
+  assert.ok(commits.every((event) => event.actionId === started.actionId),
+    'every ack of one action carries the same actionId');
+  assert.ok(commits.every((event) => event.selectionId === started.selectionId));
+  assert.deepEqual(commits.map((event) => event.commitCount), [1, 2, 3, 4],
+    'commitCount is the merge counter for this action');
+  assert.ok(commits.every((event) => event.firstAt === commits[0].at),
+    'firstAt stays the first acknowledgement of the action');
+  assert.deepEqual(commits.map((event) => event.lastAt), commits.map((event) => event.at),
+    'lastAt is the acknowledgement being reported');
+
+  const byAction = runtime.snapshot().motion.presets.debug.byAction;
+  assert.deepEqual(byAction, {
+    lastActionId: started.actionId,
+    lastCommitCount: 4,
+    lastEvent: 'idle',
+  }, 'the status projection merges the same action without keeping history');
+});
+
+test('22. idle 动作的 commit 带 event=idle；对话边界动作带自己的 event', async () => {
+  const { runtime, tick } = await makeTransportRuntime();
+  const started = startIdleTilt(runtime);
+  assert.ok(started !== null);
+  runtime.takeEvents();
+  for (const at of [0, 250, 500]) await tick(at);
+  const idleCommits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.ok(idleCommits.length >= 1);
+  assert.ok(idleCommits.every((event) => event.event === 'idle'),
+    'an idle trajectory commits with event=idle');
+  assert.ok(idleCommits.every((event) => event.actionId === started.actionId));
+
+  // A dialogue boundary is a different event, and the start payload says so.
+  const controller = makeRuntime();
+  controller.tick(0);
+  controller.takeEvents();
+  const listener = pick(controller, {
+    state: 'listening', event: 'user-speaking', recipe: 'listen-lower',
+  });
+  assert.ok(listener !== null);
+  const dialogue = controller.startPreset(listener, { at: 0 });
+  assert.equal(dialogue.started, true);
+  const dialogueStart = controller.takeEvents().find((event) => event.type === 'avatar.preset.start');
+  assert.ok(dialogueStart);
+  assert.equal(dialogueStart.event, 'user-speaking');
+  assert.match(dialogueStart.actionId, /^presetAction#\d+$/u);
+
+  // A second action on the same controller gets a different id (ids are per runtime, monotonic).
+  controller.clearPresets('next-action', { fadeMs: 0, at: 1000 });
+  const second = pick(controller, { state: 'idle', event: 'idle', recipe: 'idle-tilt' });
+  assert.ok(second !== null);
+  const secondStart = controller.startPreset(second, { at: 2000 });
+  assert.equal(secondStart.started, true);
+  assert.notEqual(secondStart.actionId, dialogue.actionId, 'each action id is unique');
+});
+
+test('23. skip 也带 event：有 draw 的 hold 带 selectionId，未 draw 的 gate/busy 两者为 null', () => {
+  const runtime = makeRuntime();
+  runtime.tick(0);
+  runtime.takeEvents();
+
+  const blind = runtime.selectPreset({
+    state: 'idle', event: 'idle', verifiedChannels: [], seed: 0, now: 10,
+  });
+  assert.equal(blind.kind, 'hold');
+  const holdSkip = runtime.takeEvents().find((event) => event.type === 'avatar.preset.skip');
+  assert.ok(holdSkip, 'a held draw is an explicit skip');
+  assert.equal(holdSkip.event, 'idle');
+  assert.equal(holdSkip.selectionId, blind.selectionId, 'the skip names the draw that held');
+  assert.equal(holdSkip.actionId, null, 'a hold started no action');
+
+  // The host refused the boundary before drawing (busy): event known, no draw/action yet.
+  runtime.notePresetSkip('busy', { event: 'user-speaking', at: 2000 });
+  const busySkip = runtime.takeEvents()
+    .filter((event) => event.type === 'avatar.preset.skip')
+    .find((event) => event.reason === 'busy');
+  assert.ok(busySkip, 'the busy boundary is reported');
+  assert.equal(busySkip.event, 'user-speaking');
+  assert.equal(busySkip.selectionId, null);
+  assert.equal(busySkip.actionId, null);
+});
+
