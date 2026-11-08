@@ -14,10 +14,10 @@
  * `voice.ack.source {turn, source, draftReadyMs}` is the throttled debug row for the choice.
  *
  * A2 checks the warm pool itself: built during an idle window, the cache key covers
- * persona/language/voice/model version, a changed voice rebuilds with an event, cached text is
- * generic (no unbacked promise), and the first start without cache never blocks chat. Under the
- * tier order a draft always starts on the delivery path; the pool is only taken at the deadline
- * when that draft is not fully ready.
+ * persona/caption language/speech language/voice/model version, a changed voice rebuilds with an
+ * event, cached text is generic (no unbacked promise), and the first start without cache never
+ * blocks chat. Under the tier order a draft always starts on the delivery path; the pool is only
+ * taken at the deadline when that draft is not fully ready.
  *
  * The acceptance comparison measures the body's first audio for a warm-backed turn against a miss
  * (and against no waiting line at all) on one serialized model/TTS resource; the difference must
@@ -25,8 +25,10 @@
  *
  * P2/P3 (tests 12-18) cover the two fixes around the warm build: a disposed/cancelled batch never
  * reaches `persist()` (no cache directory, no manifest, a `voice.ack.warm.discarded` row, no
- * partial file), and the busy test only counts the assistant's own non-delegated turns, keyed by
- * (sessionId, turn), bounded, with a throttled `voice.ack.warm.blocked` row.
+ * partial file), and cancelling a build that already had valid entries keeps them (the cancelled
+ * tail is dropped instead of clearing the whole pool). The busy test only counts the assistant's
+ * own non-delegated turns, keyed by (sessionId, turn), bounded, with a throttled
+ * `voice.ack.warm.blocked {blockedBy}` row.
  *
  * P4 (tests 20a-20d) cover batch-owned manifest files: the manifest tmp is named after the batch
  * token, the manifest records its writer, and a late batch never deletes a newer batch's manifest
@@ -298,9 +300,8 @@ function gatedScheduler(fixture, { idleMs = 10 } = {}) {
     idleMs: () => idleMs,
     activity: () => '',
     build: ({ signal }) => fixture.gate.build(fixture.pool.build, { signal }),
-    discard: ({ result } = {}) => (Number(result?.built) > 0
-      ? fixture.pool.clear('warm-cancelled')
-      : Promise.resolve()),
+    // Cancelling a build never clears the pool; the pool removes only its own cancelled batch.
+    discard: async () => {},
     emit: async (type, payload) => { fixture.events.push({ type, payload }); },
   });
 }
@@ -734,7 +735,8 @@ test('9. a user message during the warm build aborts it: cancelled=1 and no part
     idleMs: () => 20,
     activity: () => '',
     build: ({ signal }) => pool.build({ signal }),
-    discard: () => pool.clear('warm-cancelled'),
+    // Cancelling a build keeps previously valid entries: the late batch is dropped by the pool.
+    discard: async () => {},
     emit: async (type, payload) => { events.push({ type, payload }); },
   });
   const running = scheduler.run();
@@ -763,7 +765,7 @@ test('10. an idle window still builds normally: no cancelled row and capacity is
     idleMs: () => 30,
     activity: () => ackWarmActivityReason({}),
     build: ({ signal }) => fixture.pool.build({ signal }),
-    discard: () => fixture.pool.clear('warm-cancelled'),
+    discard: async () => {},
     emit: async (type, payload) => { fixture.events.push({ type, payload }); },
   });
   scheduler.schedule();
@@ -941,7 +943,7 @@ test('19. P2 a persist that already started is cleaned when the batch is cancell
     idleMs: () => 10,
     activity: () => '',
     build: ({ signal }) => gate.build(pool.build, { signal }),
-    discard: ({ result } = {}) => (Number(result?.built) > 0 ? pool.clear('warm-cancelled') : Promise.resolve()),
+    discard: async () => {},
     emit,
   });
   const running = scheduler.run();
@@ -1445,6 +1447,7 @@ test('14. P3 another workspace session never blocks the assistant warm build', a
   const blocked = events.filter((event) => event.type === 'voice.ack.warm.blocked');
   assert.ok(blocked.length >= 1, 'a busy window is reported');
   assert.equal(blocked[0].payload.reason, 'busy');
+  assert.equal(blocked[0].payload.blockedBy, 'generating', 'the deferred window names the live resource');
   assert.equal(blocked[0].payload.activeTurns, 1, 'only the assistant turn is counted');
   assert.deepEqual(meter.turns(), [{ sessionId: 's-own', turn: 8 }]);
   // It ends: only its own row goes, and the next window builds again.
@@ -1527,7 +1530,7 @@ test('18. P3 the blocked row carries the live turn count and is throttled', asyn
   assert.equal(events.length, 1);
   assert.deepEqual(events[0], {
     type: 'voice.ack.warm.blocked',
-    payload: { reason: 'busy', activeTurns: 1 },
+    payload: { reason: 'busy', blockedBy: 'generating', activeTurns: 1 },
   });
   clock += 30_000;
   assert.equal(meter.noteBlocked(), true, 'a new throttle window reports again');

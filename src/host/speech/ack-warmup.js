@@ -19,6 +19,9 @@ export function ackWarmActivityReason({
   return '';
 }
 
+/** The four live resources a warm window can yield to; the blocked row names one of them. */
+export const ACK_WARM_BLOCKED_BY = Object.freeze(new Set(['playing', 'synthesizing', 'translating', 'generating']));
+
 
 /**
  * A2 warm scheduling: one cache build per genuine idle window.
@@ -26,8 +29,9 @@ export function ackWarmActivityReason({
  * `activity()` names the live task that owns the voice resources, or `''` when idle. A busy window
  * is skipped and the low-priority timer is re-armed rather than consuming the slot; a build that
  * already started is aborted by `cancel(reason)`, which writes `voice.ack.warm.cancelled {reason}`
- * once. The aborted batch is handed to `discard({reason, result})`, so a cancelled run never
- * becomes a cache hit: whatever the pool persisted before the abort is removed, including files.
+ * once. The aborted batch is handed to `discard({reason, result})`, which is observation-only today:
+ * the pool's generation guard removes the cancelled batch's own files and leaves every entry that
+ * was already valid servable.
  */
 export function createAckWarmScheduler({
   idleMs = () => 5000,
@@ -150,13 +154,23 @@ export function createAckWarmTurnMeter({
   const active = new Map();
   let blockedAt = 0;
   const keyOf = (sessionId, turn) => `${String(sessionId ?? '')}\u0000${String(turn)}`;
-  /** One throttled row per busy window: the assistant's own live turns are still generating. */
-  const noteBlocked = () => {
+  /**
+   * One throttled row per busy window: the assistant's own live turns are still generating. The
+   * same reason the scheduler saw is reported as `blockedBy`, so a deferred window names the live
+   * resource that held it (`playing` / `synthesizing` / `translating` / `generating`) instead of
+   * only a generic "busy".
+   */
+  const noteBlocked = (blockedBy = 'generating') => {
     const at = now();
     if (at - blockedAt < throttleMs) return false;
     blockedAt = at;
+    const reason = ACK_WARM_BLOCKED_BY.has(String(blockedBy)) ? String(blockedBy) : 'generating';
     try {
-      void Promise.resolve(emit('voice.ack.warm.blocked', { reason: 'busy', activeTurns: active.size }))
+      void Promise.resolve(emit('voice.ack.warm.blocked', {
+        reason: 'busy',
+        blockedBy: reason,
+        activeTurns: active.size,
+      }))
         .catch(() => {});
     } catch {
       /* the event log is best-effort */
@@ -205,9 +219,9 @@ export function createAckWarmTurnMeter({
  * cancelled batch, creating the cache directory and `manifest.json` after `dispose()` or a newer
  * turn. Every build here runs under a fresh generation and owns the pool's write seams: once the
  * generation is cancelled, `makeDir`/`writeTextFile` refuse, so a discarded batch reaches neither
- * the directory nor the manifest. A batch that already entered `persist()` is reset through the
- * pool's own `clear`, so no partial file survives. The drop is reported as
- * `voice.ack.warm.discarded {reason:'disposed'|'cancelled'}`.
+ * the directory nor the manifest. The drop is reported as
+ * `voice.ack.warm.discarded {reason:'disposed'|'cancelled'}`. Cancelling never clears the whole
+ * pool: valid entries stay, and a late result cannot re-enter it.
  *
  * @param {{emit?: Function}} options injected seams
  * @returns {{bind: Function, makeDir: Function, writeTextFile: Function, cancel: Function,
@@ -216,7 +230,6 @@ export function createAckWarmTurnMeter({
 export function createAckWarmRunGate({ emit = async () => {} } = {}) {
   let generation = 0;
   let run = null;
-  let clear = null;
   const log = async (type, payload) => {
     try {
       await emit(type, payload);
@@ -242,8 +255,8 @@ export function createAckWarmRunGate({ emit = async () => {} } = {}) {
     return true;
   };
   return {
-    /** The pool's own reset; bound once the pool exists. */
-    bind(pool) { clear = typeof pool?.clear === 'function' ? pool.clear : null; },
+    /** Kept for the host's old wiring; cancellation no longer resets the whole pool. */
+    bind() { /* a cancelled batch is dropped by the pool itself, never by clearing the pool */ },
     makeDir: (write) => guard(write),
     writeTextFile: (write) => guard(write),
     /** A new activity aborted the batch: the result is dropped, never persisted. */
@@ -262,16 +275,13 @@ export function createAckWarmRunGate({ emit = async () => {} } = {}) {
       } finally {
         run = null;
         if (current.cancelled === true || current.generation !== generation) {
-          // Only a batch that touched the disk (or built audio) needs the pool reset: an idle
-          // window that never wrote must leave the existing cache alone.
-          if (current.touched === true || Number(result?.built) > 0) {
-            try {
-              await clear?.('warm-cancelled');
-            } catch {
-              /* cleanup is best-effort */
-            }
+          // A cancelled batch's own files are removed by the pool's generation-guarded cleanup.
+          // Valid entries that already existed stay in the pool: cancellation is not a cache clear,
+          // and a late result (even one whose clip finished) never re-enters it. The pool already
+          // reported its own drop in that case; never write a second row for the same batch.
+          if (typeof result?.discarded !== 'string' || result.discarded.length === 0) {
+            await log('voice.ack.warm.discarded', { reason: current.reason });
           }
-          await log('voice.ack.warm.discarded', { reason: current.reason });
           result = null;
         }
       }

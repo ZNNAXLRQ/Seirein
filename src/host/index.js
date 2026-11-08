@@ -9985,11 +9985,18 @@ export function apply(ctx, config) {
   // and synthesis run in parallel with the answer from the delivery instant; the clip itself only
   // plays when the two-second deadline arrives and the reply body has not started speaking. It
   // never claims the turn's voice owner: the answer keeps its own entry.
-  const synthesizeAckLine = async ({ speech, signal }) => {
+  const synthesizeAckLine = async ({ speech, signal, captionLang, speechLang }) => {
     const formatted = formatSpeech(speech);
     const text = formatted.speech.trim();
     if (formatted.empty || text.length === 0) throw new Error('候音为空');
-    const prepared = await prepareForSpeech(text, { signal });
+    // The generated line is the CAPTION (subtitle language). Only the speech outlet translates it
+    // to the voice language; the caption keeps the subtitle-language text the model produced.
+    const captionText = formatted.caption.trim() || text;
+    const prepared = await prepareForSpeech(text, {
+      signal,
+      textLang: captionLang,
+      speechLang,
+    });
     const audio = await synthesizeWatched({
       text: prepared.speechText,
       voice: typeof config?.ttsVoice === 'string' ? config.ttsVoice : undefined,
@@ -10002,10 +10009,15 @@ export function apply(ctx, config) {
       priority: ACK_SYNTH_PRIORITY,
     });
     signal?.throwIfAborted();
-    return { ...audio, caption: formatted.caption };
+    return { ...audio, captionText, speechText: prepared.speechText, speechLang: prepared.speechLang };
   };
-  const playAckLine = async ({ audio, speech, signal }) => {
-    const formatted = formatSpeech(speech);
+  const playAckLine = async ({ audio, speech, caption, signal }) => {
+    // The caption is already in the subtitle language; it is never re-derived from the translated
+    // speech text (that was the bug: a Japanese translation became the visible line).
+    const captionSource = typeof caption === 'string' && caption.length > 0
+      ? caption
+      : (typeof audio?.captionText === 'string' && audio.captionText.length > 0 ? audio.captionText : speech);
+    const formatted = formatSpeech(captionSource);
     const playing = await playAudio({
       file: audio.file,
       durationMs: audio.durationMs,
@@ -10089,12 +10101,19 @@ export function apply(ctx, config) {
       : 'edge';
     return `${route}|${tts}`;
   };
-  const ackWarmMeta = () => ({
-    persona: persona.render({ budget: 300 }),
-    language: langSettings().speech,
-    voice: typeof config?.ttsVoice === 'string' ? config.ttsVoice : '',
-    modelVersion: ackWarmModelVersion(),
-  });
+  const ackWarmMeta = () => {
+    const langs = langSettings();
+    return {
+      persona: persona.render({ budget: 300 }),
+      // Cache/key dimensions: the generated TEXT is the caption (subtitle language); only the
+      // speech translation and its audio use the voice language.
+      captionLang: langs.subtitle,
+      speechLang: langs.speech,
+      language: langs.subtitle, // legacy alias kept for the existing manifest/prompt readers
+      voice: typeof config?.ttsVoice === 'string' ? config.ttsVoice : '',
+      modelVersion: ackWarmModelVersion(),
+    };
+  };
   const draftAckWarmLines = async ({ persona: personaText, language, count, signal } = {}) => {
     if (lightweight === null) return [];
     const prompt = buildAckWarmPrompt({ persona: personaText, language, count });
@@ -10113,9 +10132,16 @@ export function apply(ctx, config) {
       return [];
     }
   };
-  const synthesizeAckWarmLine = async ({ text, signal, dir }) => {
+  const synthesizeAckWarmLine = async ({ text, signal, dir, captionLang, speechLang }) => {
+    // `text` is the caption line generated in the subtitle language. Translation to the voice
+    // language and TTS both happen here, during the idle window, never at the trigger.
     const formatted = formatSpeech(text);
-    const prepared = await prepareForSpeech(formatted.speech.trim(), { signal });
+    const captionText = formatted.caption.trim();
+    const prepared = await prepareForSpeech(captionText, {
+      signal,
+      textLang: captionLang,
+      speechLang,
+    });
     const audio = await synthesizeWatched({
       text: prepared.speechText,
       voice: typeof config?.ttsVoice === 'string' ? config.ttsVoice : undefined,
@@ -10132,7 +10158,12 @@ export function apply(ctx, config) {
       }
       return null;
     }
-    return audio;
+    return {
+      ...audio,
+      captionText: prepared.captionText,
+      speechText: prepared.speechText,
+      speechLang: prepared.speechLang,
+    };
   };
   // P2: the batch generation owns the pool's write seams, so a disposed/cancelled build can
   // never create the cache dir or manifest at the end of `persist()`.
@@ -10190,19 +10221,17 @@ export function apply(ctx, config) {
       synthesizing: ackWarmSynthInFlight > 0,
       playing: playbackHold !== null,
     });
-    // Throttled: a deferred idle window reports which live turn count held the seat.
-    if (reason.length > 0) ackWarmTurns.noteBlocked();
+    // Throttled: a deferred idle window reports which live resource held the seat.
+    if (reason.length > 0) ackWarmTurns.noteBlocked(reason);
     return reason;
   };
   const ackWarmScheduler = createAckWarmScheduler({
     idleMs: ackWarmIdleMs,
     activity: ackWarmBusy,
     build: ({ signal }) => ackWarmGate.build(ackWarm.build, { signal }),
-    discard: ({ result } = {}) => (Number(result?.built) > 0
-      // Lines finished before the abort were already persisted: clear files and manifest so the
-      // partial batch can never be taken. With nothing added the existing cache stays untouched.
-      ? ackWarm.clear('warm-cancelled')
-      : Promise.resolve()),
+    // Cancelling a build never clears the pool: the pool's own generation guard removes only the
+    // cancelled batch's files, so entries that were already valid stay servable.
+    discard: async () => {},
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
   /** Only an idle window may build; any voice activity restarts the countdown. */
@@ -10241,6 +10270,9 @@ export function apply(ctx, config) {
     // Observation only: the line's real first sound feeds the turn's firstAudible attribution.
     onFirstAudio: noteFirstAudible,
     persona: () => persona.render({ budget: 300 }),
+    // Text (draft + warm) follows the subtitle language; speech follows the voice language.
+    captionLang: () => langSettings().subtitle,
+    speechLang: () => langSettings().speech,
     enabled: () => features.enabled('voice') && shutdown.closing !== true,
     captureSignal: () => speechSignal(),
     delayMs: () => resolveAckDelayMs(readSettings(), config),

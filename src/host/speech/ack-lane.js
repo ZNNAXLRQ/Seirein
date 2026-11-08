@@ -18,7 +18,9 @@ export const ACK_FALLBACK_LINE = '我在这儿听着你慢慢说';
  * The only trigger is the clock: the lane starts preparing when the user message is delivered,
  * and at `delayMs` it plays a ready line if the reply body has not started speaking. No tool
  * name, category or task keyword is consulted. The line is drafted from the persona and this
- * turn's user message in one independent short request, and synthesized in parallel.
+ * turn's user message in one independent short request, in the CAPTION (subtitle) language;
+ * translation to the voice language and synthesis start immediately after the text is final.
+ * The caption shown to the user is always the caption-language text, never the speech translation.
  *
  * At the deadline the tier is chosen from what is ready at that instant, in this order: this
  * turn's own draft (text AND audio) first, otherwise a warm pool line, otherwise the fixed
@@ -36,8 +38,9 @@ export const ACK_FALLBACK_LINE = '我在这儿听着你慢慢说';
  * (debug, throttled), `voice.ack.body-first` with the same timing fields, `voice.ack.skipped
  * {turn, reason}`, `voice.ack.failed {turn, stage, reason, error}`, `voice.ack.cancelled
  * {turn, reason}`, `voice.ack.kept {turn, reason:'body-synthesizing', bodyPhase}` and
- * `voice.ack.cache.hit {turn, key}`. A body that is still synthesizing keeps the line (there is no
- * audio that could speak first), so no cancellation/supersede row exists for that case.
+ * `voice.ack.cache.hit {turn, key, captionLang, speechLang}`. A body that is still synthesizing
+ * keeps the line (there is no audio that could speak first), so no cancellation/supersede row
+ * exists for that case. A fire with no usable tier writes `voice.ack.silent {turn, reason}`.
  *
  * @param {object} options injected seams
  * @returns {{beginTurn: Function, answerStart: Function, bodyStarted: Function,
@@ -50,6 +53,10 @@ export function createAckLane({
   synthesize = null,
   play = null,
   persona = () => '',
+  /** The subtitle language: the draft/warm TEXT is generated in this language. */
+  captionLang = () => 'zh-CN',
+  /** The voice language: only the speech translation/synthesis uses it, never the caption. */
+  speechLang = () => 'zh-CN',
   enabled = () => true,
   captureSignal = null,
   /** A2 warm pool: the synchronous `take()` that serves tier b at the deadline, never a request. */
@@ -78,6 +85,15 @@ export function createAckLane({
     }
   };
   const keyOf = (sessionId, turn) => `${String(sessionId ?? '')}\u0000${String(turn ?? '')}`;
+  /** A language seam may be a function (read per line) or a fixed string. */
+  const langOf = (value) => {
+    try {
+      const resolved = typeof value === 'function' ? value() : value;
+      return typeof resolved === 'string' && resolved.length > 0 ? resolved : 'zh-CN';
+    } catch {
+      return 'zh-CN';
+    }
+  };
   const elapsed = (from, to) => (from > 0 && to >= from ? Math.round(to - from) : null);
   /** Observation only: report this line's real first sound for the turn's firstAudible lane. */
   const noteAudible = (record) => {
@@ -208,6 +224,9 @@ export function createAckLane({
             persona: persona(),
             userText: input.userText,
             recent: recentLines.slice(-3),
+            // The draft is the CAPTION text: generate it in the subtitle language, never in the
+            // voice language. The speech translation happens after the text is final.
+            language: langOf(captionLang),
           },
           signal: draftSignal,
         })).then((text) => ({ ok: true, text }), (error) => ({ ok: false, error }));
@@ -236,16 +255,35 @@ export function createAckLane({
         const checked = validateAckLine(draftText.trim(), { context: draftContext, userText: input.userText });
         if (!checked.ok) throw ackError('validate', checked.reason);
         record.line = checked.line;
+        record.captionText = checked.line;
+        record.speechText = checked.line;
         if (recentLines.length >= 3) recentLines.shift();
         recentLines.push(checked.line);
-        // Text is final: start TTS at once instead of waiting for the two-second deadline.
+        // Text is final: start translation + TTS at once instead of waiting for the two-second
+        // deadline. The translation is therefore never started by the trigger itself.
         record.textReadyAt = now();
         if (typeof synthesize === 'function') {
-          const audio = await synthesize({ speech: checked.line, signal: draftSignal, turn: record.turn });
+          const audio = await synthesize({
+            speech: checked.line,
+            captionText: checked.line,
+            captionLang: langOf(captionLang),
+            speechLang: langOf(speechLang),
+            signal: draftSignal,
+            turn: record.turn,
+          });
           if (record.cancelled) return false;
           if (record.source !== '') return false;
           if (audio === null || audio === undefined) throw ackError('synthesize', '候音合成失败');
           record.audio = audio;
+          // The synth outlet returns the caption it was given and the translated speech it spoke;
+          // a seam that only returns audio keeps the caption as the source line.
+          if (typeof audio.captionText === 'string' && audio.captionText.length > 0) {
+            record.captionText = audio.captionText;
+            record.line = audio.captionText;
+          }
+          if (typeof audio.speechText === 'string' && audio.speechText.length > 0) {
+            record.speechText = audio.speechText;
+          }
         }
         record.audioReadyAt = now();
         record.readyAt = record.audioReadyAt;
@@ -291,20 +329,32 @@ export function createAckLane({
         warmLine = null;
       }
     }
-    if (warmLine !== null && warmLine !== undefined && typeof warmLine.text === 'string'
-      && warmLine.text.length > 0) {
-      record.warmHit = true;
-      record.warmKey = String(warmLine.key ?? '');
-      record.line = warmLine.text;
-      record.audio = warmLine.audio ?? null;
-      record.textReadyAt = now();
-      record.audioReadyAt = record.textReadyAt;
-      void log('voice.ack.cache.hit', {
-        turn: record.turn,
-        key: record.warmKey,
-        chars: [...record.line].length,
-      });
-      return 'warm';
+    if (warmLine !== null && warmLine !== undefined) {
+      // The pool entry already carries both halves: `captionText` in the subtitle language and
+      // the pre-translated `speechText` that its audio was synthesized from.
+      const warmCaption = typeof warmLine.captionText === 'string' && warmLine.captionText.length > 0
+        ? warmLine.captionText
+        : (typeof warmLine.text === 'string' ? warmLine.text : '');
+      if (warmCaption.length > 0) {
+        record.warmHit = true;
+        record.warmKey = String(warmLine.key ?? '');
+        record.line = warmCaption;
+        record.captionText = warmCaption;
+        record.speechText = typeof warmLine.speechText === 'string' && warmLine.speechText.length > 0
+          ? warmLine.speechText
+          : warmCaption;
+        record.audio = warmLine.audio ?? null;
+        record.textReadyAt = now();
+        record.audioReadyAt = record.textReadyAt;
+        void log('voice.ack.cache.hit', {
+          turn: record.turn,
+          key: record.warmKey,
+          chars: [...record.line].length,
+          captionLang: warmLine.captionLang ?? '',
+          speechLang: warmLine.speechLang ?? '',
+        });
+        return 'warm';
+      }
     }
     return typeof synthesize === 'function' ? 'fallback' : '';
   };
@@ -344,6 +394,15 @@ export function createAckLane({
     // fallback. A failed draft already logged `voice.ack.failed`; it simply loses here.
     const source = chooseSource(record);
     if (source === '') {
+      // No tier could produce a clip. The silence is a real outcome, not a lost record: report it
+      // with the reason so a turn whose draft failed is never indistinguishable from no attempt.
+      await log('voice.ack.silent', {
+        turn: record.turn,
+        reason: record.draftFailed === true ? 'draft-failed' : 'no-tier',
+        draftFailed: record.draftFailed === true,
+        bodyPhase: record.bodyPhase,
+        ...timings(record),
+      });
       finalize(record); // no tier could produce a clip: silence, never a hung record
       return;
     }
@@ -352,22 +411,39 @@ export function createAckLane({
     if (source !== 'draft') record.draftController?.abort?.(new DOMException('tier-selected', 'AbortError'));
     noteSource(record, source);
     try {
-      let speech = record.line;
+      let speech = record.speechText || record.line;
       let audio = record.audio;
       if (source === 'fallback') {
         // Tier c has no audio ahead of time: synthesize the fixed line now. The trigger itself
         // already happened; this bridge is the fallback's own cost, never a delay of the trigger.
-        audio = await synthesize({ speech: ACK_FALLBACK_LINE, signal: record.signal, turn: record.turn });
+        audio = await synthesize({
+          speech: ACK_FALLBACK_LINE,
+          captionText: ACK_FALLBACK_LINE,
+          captionLang: langOf(captionLang),
+          speechLang: langOf(speechLang),
+          signal: record.signal,
+          turn: record.turn,
+        });
         if (record.cancelled || record.settled) return;
         if (audio === null || audio === undefined) throw ackError('fallback', '通用兜底合成失败');
-        speech = ACK_FALLBACK_LINE;
-        record.line = speech;
+        speech = typeof audio.speechText === 'string' && audio.speechText.length > 0
+          ? audio.speechText
+          : ACK_FALLBACK_LINE;
+        const caption = typeof audio.captionText === 'string' && audio.captionText.length > 0
+          ? audio.captionText
+          : ACK_FALLBACK_LINE;
+        record.line = caption;
+        record.captionText = caption;
+        record.speechText = speech;
         record.audio = audio;
         record.textReadyAt = now();
         record.audioReadyAt = record.textReadyAt;
       }
       const started = await play({
         speech,
+        // The visible line is the caption text (subtitle language); `audio` already speaks the
+        // translated speech text, so the player never has to translate on the trigger path.
+        caption: record.captionText || record.line,
         audio,
         signal: record.signal,
         turn: record.turn,
@@ -504,6 +580,8 @@ export function createAckLane({
       playing: false,
       source: '',
       line: '',
+      captionText: '',
+      speechText: '',
       audio: null,
       cancelled: false,
       settled: false,
@@ -662,6 +740,8 @@ export function createAckLane({
     phase: phaseOf(record),
     reason: record.reason ?? '',
     source: record.source ?? '',
+    captionText: record.captionText ?? record.line ?? '',
+    speechText: record.speechText ?? record.line ?? '',
     bodyPhase: record.bodyPhase ?? ACK_BODY_PHASES.idle,
     warmKey: record.warmKey ?? '',
     ackDroppedMs: droppedMs(record),

@@ -252,10 +252,11 @@ function sanitizePromptText(value, limit) {
  *
  * The request is self-contained: it carries the persona and this turn's user message, a few
  * recent lines (at most `ACK_RECENT_MAX`) to avoid repeating a line just used, and nothing else
- * from the conversation — no memory retrieval and no chat history. It asks for one short Chinese
- * spoken line that sounds like the companion reacting to what the user just said, so the line is
- * never unrelated to the persona or the request. Tool names and tool arguments deliberately never
- * enter the prompt.
+ * from the conversation — no memory retrieval and no chat history. It asks for one short line in
+ * the CAPTION language (`language`) that sounds like the companion reacting to what the user just
+ * said, so the line is never unrelated to the persona or the request. The caption language is also
+ * the source language of the speech translation that follows. Tool names and tool arguments
+ * deliberately never enter the prompt.
  *
  * @param {{persona?: string, userText?: string, language?: string, recent?: string[]}} [input]
  * @returns {{messages: Array<{role: 'system'|'user', content: string}>}}
@@ -273,7 +274,7 @@ export function buildAckPrompt({ persona, userText, language, recent } = {}) {
     '你是一个语音助手，用户刚说完话，你要先接一句很短的过渡话，表示你这就去处理。',
     personaText.length > 0 ? `人设：${personaText}` : '人设：自然、简短、口语化。',
     '规则：',
-    `1. 只输出一句中文口语，${ACK_MIN_CHARS}到${ACK_MAX_CHARS}个字，优先${ACK_PREFERRED_MIN_CHARS}到${ACK_PREFERRED_MAX_CHARS}个字。`,
+    `1. 只输出一句符合「${lang}」语言环境的短口语，${ACK_MIN_CHARS}到${ACK_MAX_CHARS}个字，优先${ACK_PREFERRED_MIN_CHARS}到${ACK_PREFERRED_MAX_CHARS}个字。`,
     '2. 必须结合人设和用户这句话的内容，说一句自然的反应，不能答非所问。',
     '3. 不要说进度、结果、耗时或完成时间。',
     '4. 不要 Markdown、表情符号、引号或编号。',
@@ -460,11 +461,11 @@ export const ACK_WARM_CAPACITY = 6;
 /** How many of the most recently used lines `take()` avoids: only a pool of these may reuse one. */
 export const ACK_WARM_RECENT_AVOID = 2;
 /**
- * The prompt revision and the identity fields form the cache key exactly as before: no group or
- * capacity field joins it. The new warm-text rules therefore fill an existing short pool up to the
- * new capacity instead of discarding audio the current identity can still serve.
+ * Prompt revision and identity fields form the cache key. The prompt/identity change is deliberate:
+ * v2 separates the caption language from the speech language, so every v1 pool (which generated in
+ * the voice language) is rebuilt instead of serving the wrong-language caption.
  */
-export const ACK_WARM_PROMPT_VERSION = 1;
+export const ACK_WARM_PROMPT_VERSION = 2;
 /** One manifest file beside the warm audio, recording the identity and the LRU entries. */
 const ACK_WARM_MANIFEST = 'manifest.json';
 
@@ -618,14 +619,26 @@ export function planWarmCandidates(lines, { capacity = ACK_WARM_CAPACITY, existi
 }
 
 /**
- * Cache key: persona hash + speech language + voice + model version, plus the prompt revision.
- * Any change must rebuild the pool instead of serving audio recorded for another persona/engine.
+ * Cache key: persona hash + CAPTION language + SPEECH language + voice + model version, plus the
+ * prompt revision. Both languages participate even when they are equal: changing either setting
+ * must rebuild the pool instead of serving text/audio recorded for the old language pair.
+ *
+ * `language` is accepted as a legacy alias for callers from before the split: it then names both
+ * languages, which is exactly what the old single-language cache meant.
  */
-export function ackWarmFingerprint({ persona = '', language = '', voice = '', modelVersion = '' } = {}) {
+export function ackWarmFingerprint({
+  persona = '', language = '', captionLang = '', speechLang = '', voice = '', modelVersion = '',
+} = {}) {
+  const caption = String(captionLang || language || '');
+  const speech = String(speechLang || language || '');
+  const personaVersion = createHash('sha256').update(String(persona ?? ''), 'utf8').digest('hex').slice(0, 16);
   return Object.freeze({
     promptVersion: ACK_WARM_PROMPT_VERSION,
-    persona: createHash('sha256').update(String(persona ?? ''), 'utf8').digest('hex').slice(0, 16),
-    language: String(language ?? ''),
+    persona: personaVersion,
+    // Kept as the legacy alias so an old reader still sees the language it knows.
+    language: caption,
+    captionLang: caption,
+    speechLang: speech,
     voice: String(voice ?? ''),
     modelVersion: String(modelVersion ?? ''),
   });
@@ -638,7 +651,8 @@ export function ackWarmKey(input = {}) {
     .update([
       fingerprint.promptVersion,
       fingerprint.persona,
-      fingerprint.language,
+      fingerprint.captionLang,
+      fingerprint.speechLang,
       fingerprint.voice,
       fingerprint.modelVersion,
     ].join('\u0000'), 'utf8')
@@ -741,7 +755,7 @@ export function parseWarmLines(text, limit = ACK_WARM_CAPACITY) {
 function warmChangedReason(previous, next) {
   if (previous === null || previous === undefined) return 'missing';
   if (previous.promptVersion !== next.promptVersion) return 'prompt-version';
-  for (const field of ['persona', 'language', 'voice', 'modelVersion']) {
+  for (const field of ['persona', 'captionLang', 'speechLang', 'voice', 'modelVersion']) {
     if (previous[field] !== next[field]) return `${field}-changed`;
   }
   return 'key-changed';
@@ -750,6 +764,12 @@ function warmChangedReason(previous, next) {
 /**
  * A2 warm pool: up to `capacity` persona-appropriate generic waiting lines, synthesized ahead of
  * time under `dir` and served from memory.
+ *
+ * Each entry is a ready triple for one language pair and persona version:
+ * `{captionText, speechText, audio, captionLang, speechLang, personaVersion}`. `captionText` is
+ * generated in the subtitle language; `speechText` is its translation into the voice language and
+ * `audio` was synthesized from that translation. The trigger only takes an entry; it never
+ * translates or synthesizes.
  *
  * The pool is deliberately passive: it never plays anything and it never starts a request on its
  * own. The host schedules `build()` only after an idle window; `take()` is a synchronous, cheap
@@ -777,6 +797,8 @@ export function createAckWarmPool({
   now = () => Date.now(),
   readTextFile = readFile,
   writeTextFile = writeFile,
+  /** Unguarded survivor-manifest rewrite used by cancellation cleanup (never a batch write). */
+  writeTextFileRaw = writeFile,
   renameFile = rename,
   removeFile = unlink,
   removeTree = rm,
@@ -848,7 +870,27 @@ export function createAckWarmPool({
     }
   };
   /** The one predicate every build checkpoint and `persist()` consult. */
-  const isStale = (run) => disposed === true || run.cancelled === true || run.token !== generation;
+  const isStale = (run) => disposed === true || run.cancelled === true
+    || run.token !== generation || run.signal?.aborted === true;
+  /** The manifest row for one in-memory entry: caption + speech text and their language pair. */
+  const manifestEntries = (list, fp) => list.map((entry) => ({
+    text: entry.captionText ?? entry.text,
+    captionText: entry.captionText ?? entry.text,
+    speechText: entry.speechText ?? entry.captionText ?? entry.text,
+    captionLang: entry.captionLang ?? fp.captionLang,
+    speechLang: entry.speechLang ?? fp.speechLang,
+    personaVersion: entry.personaVersion ?? fp.persona,
+    file: entry.file,
+    durationMs: entry.durationMs,
+    bytes: entry.bytes,
+    provider: entry.provider,
+    at: entry.at,
+    group: entry.group,
+    shape: entry.shape,
+    weight: entry.weight,
+    uses: entry.uses,
+    usedAt: entry.usedAt,
+  }));
   /**
    * Remove only the files this run owns. The manifest is shared, so a committed one is removed
    * only while the file still names this batch as its writer (`manifestOwner`) and no newer
@@ -869,8 +911,26 @@ export function createAckWarmPool({
       }
       if (owner !== null && (owner !== run.token || run.token !== generation)) {
         await log('voice.ack.warm.cleanup-skipped', { reason: 'newer-owner' });
-      } else if (owner !== null) {
+      } else if (owner !== null && entries.length === 0) {
+        // No valid entry survives: the manifest must not describe a cancelled batch.
         await removeFile(manifestPath()).catch(() => {});
+      } else if (owner !== null) {
+        // Valid entries existed before this batch: rewrite the manifest to exactly those rows, so a
+        // restart restores the pool but never the cancelled tail.
+        try {
+          const fp = fingerprint ?? ackWarmFingerprint(metaNow());
+          const body = JSON.stringify({
+            key: loadedKey || currentKey(),
+            fingerprint: fp,
+            manifestOwner: run.token,
+            entries: manifestEntries(entries, fp),
+            updatedAt: now(),
+          }, null, 2);
+          await writeTextFileRaw(manifestPath(), `${body}\n`, 'utf8');
+        } catch {
+          // A refused/failed rewrite leaves the surviving entries in memory; drop the stale file.
+          await removeFile(manifestPath()).catch(() => {});
+        }
       }
     }
     for (const entry of run.added) {
@@ -879,7 +939,10 @@ export function createAckWarmPool({
       await removeFile(entry.file).catch(() => {});
     }
     // A directory this run created (or found absent) is removable; a newer run may own it now.
-    if (building === run && (run.dirCreated === true || run.dirExisted !== true)) {
+    // A cancelled batch with NO surviving entries also removes the directory even if it pre-existed:
+    // there is no valid cache left to preserve, and a clip that was mid-synthesis may have landed.
+    if (building === run
+      && (entries.length === 0 || run.dirCreated === true || run.dirExisted !== true)) {
       await removeTree(dir, { recursive: true, force: true }).catch(() => {});
     }
   };
@@ -890,7 +953,11 @@ export function createAckWarmPool({
   const discard = async (run, startedAt, key) => {
     if (run.discarded === true) return null;
     run.discarded = true;
-    const reason = disposed === true ? 'disposed' : (run.reason || 'cancelled');
+    // Teardown and the scheduler's dispose both mean "disposed"; any other abort is a cancellation.
+    const disposedReason = run.signal?.reason?.message === 'dispose';
+    const reason = disposed === true
+      ? 'disposed'
+      : (disposedReason ? 'disposed' : (run.reason || 'cancelled'));
     await cleanupRun(run);
     await log('voice.ack.warm.discarded', { reason });
     return { built: 0, ms: Math.max(0, now() - startedAt), key, stale: true, discarded: reason };
@@ -906,19 +973,7 @@ export function createAckWarmPool({
       key,
       fingerprint: nextFingerprint,
       manifestOwner: run.token,
-      entries: nextEntries.map((entry) => ({
-        text: entry.text,
-        file: entry.file,
-        durationMs: entry.durationMs,
-        bytes: entry.bytes,
-        provider: entry.provider,
-        at: entry.at,
-        group: entry.group,
-        shape: entry.shape,
-        weight: entry.weight,
-        uses: entry.uses,
-        usedAt: entry.usedAt,
-      })),
+      entries: manifestEntries(nextEntries, nextFingerprint),
       updatedAt: now(),
     }, null, 2);
     // Batch identity is part of the temporary name: an older batch can only ever remove its own.
@@ -945,7 +1000,8 @@ export function createAckWarmPool({
     const key = ackWarmKey(currentMeta);
     if (loaded === true && loadedKey === key && fingerprint !== null
       && fingerprint.persona === nextFingerprint.persona
-      && fingerprint.language === nextFingerprint.language
+      && fingerprint.captionLang === nextFingerprint.captionLang
+      && fingerprint.speechLang === nextFingerprint.speechLang
       && fingerprint.voice === nextFingerprint.voice
       && fingerprint.modelVersion === nextFingerprint.modelVersion) {
       return { key, rebuilt: false, reason: '' };
@@ -984,8 +1040,25 @@ export function createAckWarmPool({
     const restored = [];
     for (const entry of Array.isArray(manifest.entries) ? manifest.entries : []) {
       if (typeof entry?.text !== 'string' || typeof entry?.file !== 'string') continue;
+      const captionText = typeof entry.captionText === 'string' && entry.captionText.length > 0
+        ? entry.captionText
+        : entry.text;
+      const speechText = typeof entry.speechText === 'string' && entry.speechText.length > 0
+        ? entry.speechText
+        : entry.text;
       if (await fileExists(entry.file)) restored.push({
-        text: entry.text,
+        text: captionText,
+        captionText,
+        speechText,
+        captionLang: typeof entry.captionLang === 'string' && entry.captionLang.length > 0
+          ? entry.captionLang
+          : nextFingerprint.captionLang,
+        speechLang: typeof entry.speechLang === 'string' && entry.speechLang.length > 0
+          ? entry.speechLang
+          : nextFingerprint.speechLang,
+        personaVersion: typeof entry.personaVersion === 'string' && entry.personaVersion.length > 0
+          ? entry.personaVersion
+          : nextFingerprint.persona,
         file: entry.file,
         durationMs: Number(entry.durationMs) || 0,
         bytes: Number(entry.bytes) || 0,
@@ -1024,29 +1097,50 @@ export function createAckWarmPool({
    */
   const take = () => {
     if (loaded !== true || loadedKey.length === 0) return null;
-    if (currentKey() !== loadedKey) return null;
+    const currentMeta = metaNow();
+    const currentFingerprint = ackWarmFingerprint(currentMeta);
+    // A changed setting (caption language, speech language, persona, voice, engine) never reuses
+    // the old row: `ensure()` rebuilds it, and until it does the deadline simply falls through.
+    if (ackWarmKey(currentMeta) !== loadedKey) return null;
     if (entries.length === 0) return null;
+    const currentCaption = currentFingerprint.captionLang;
+    const currentSpeech = currentFingerprint.speechLang;
+    const matchesIdentity = (entry) => (entry.captionLang ?? currentCaption) === currentCaption
+      && (entry.speechLang ?? currentSpeech) === currentSpeech
+      && (entry.personaVersion ?? currentFingerprint.persona) === currentFingerprint.persona;
     const avoid = new Set(recent.slice(-ACK_WARM_RECENT_AVOID));
-    let index = entries.findIndex((entry) => !avoid.has(warmTextKey(entry.text)));
-    if (index < 0) index = 0;
+    let index = entries.findIndex((entry) => !avoid.has(warmTextKey(entry.captionText ?? entry.text))
+      && matchesIdentity(entry));
+    // A pool of one identity may reuse its oldest line; a foreign language never may.
+    if (index < 0) index = entries.findIndex(matchesIdentity);
+    if (index < 0) return null;
     const [entry] = entries.splice(index, 1);
     const usedAt = Math.max(now(), lastUsedAt + 1);
     lastUsedAt = usedAt;
     entry.usedAt = usedAt;
     entry.uses = (Number(entry.uses) || 0) + 1;
     entries.push(entry);
-    recent.push(warmTextKey(entry.text));
+    recent.push(warmTextKey(entry.captionText ?? entry.text));
     while (recent.length > ACK_WARM_RECENT_AVOID) recent.shift();
+    const captionText = entry.captionText ?? entry.text;
+    const speechText = entry.speechText ?? captionText;
     return {
-      text: entry.text,
+      text: captionText,
+      captionText,
+      speechText,
+      captionLang: entry.captionLang ?? currentCaption,
+      speechLang: entry.speechLang ?? currentSpeech,
+      personaVersion: entry.personaVersion ?? currentFingerprint.persona,
       file: entry.file,
       key: loadedKey,
-      group: entry.group ?? classifyWarmLine(entry.text),
+      group: entry.group ?? classifyWarmLine(captionText),
       audio: {
         file: entry.file,
         durationMs: entry.durationMs,
         bytes: entry.bytes,
         provider: entry.provider,
+        captionText,
+        speechText,
       },
     };
   };
@@ -1067,6 +1161,7 @@ export function createAckWarmPool({
     }
     const run = {
       token: generation,
+      signal,
       cancelled: false,
       reason: 'cancelled',
       added: [],
@@ -1086,6 +1181,10 @@ export function createAckWarmPool({
         const ensured = await ensure();
         key = ensured.key;
         if (isStale(run) === true) return discard(run, startedAt, key);
+        // The language pair is fixed for this batch: caption text is generated in the subtitle
+        // language, its speech translation/synthesis in the voice language.
+        const buildMeta = metaNow();
+        const identity = ackWarmFingerprint(buildMeta);
         if (typeof generate !== 'function' || typeof synthesize !== 'function') {
           return { built: 0, ms: Math.max(0, now() - startedAt), key };
         }
@@ -1098,8 +1197,12 @@ export function createAckWarmPool({
           raw = await generate({
             signal,
             count: cap - entries.length,
-            persona: metaNow().persona ?? '',
-            language: metaNow().language ?? '',
+            persona: buildMeta.persona ?? '',
+            // The generated line IS the caption: it must use the subtitle language, never speech.
+            language: identity.captionLang,
+            captionLang: identity.captionLang,
+            speechLang: identity.speechLang,
+            personaVersion: identity.persona,
           });
         } catch {
           raw = [];
@@ -1109,7 +1212,7 @@ export function createAckWarmPool({
         // Wording dedupe, shape reuse only when short, and group spread happen here (pure).
         const planned = planWarmCandidates(candidates, {
           capacity: cap,
-          existing: entries.map((entry) => entry.text),
+          existing: entries.map((entry) => entry.captionText ?? entry.text),
         });
         let built = 0;
         const added = [];
@@ -1120,17 +1223,34 @@ export function createAckWarmPool({
           try {
             const audio = await synthesize({
               text: candidate.text,
+              // Caption text is the source; the host translates it to `speechLang` and synthesizes
+              // the translation, returning both texts with the clip.
+              captionText: candidate.text,
               signal,
               dir,
-              language: metaNow().language ?? '',
-              voice: metaNow().voice ?? '',
+              captionLang: identity.captionLang,
+              speechLang: identity.speechLang,
+              voice: buildMeta.voice ?? '',
+              personaVersion: identity.persona,
             });
             // The batch may have been disposed/cleared/superseded while TTS ran.
             if (isStale(run) === true) return discard(run, startedAt, key);
             if (signal?.aborted === true) break;
             if (audio === null || typeof audio?.file !== 'string') continue;
+            const captionText = typeof audio.captionText === 'string' && audio.captionText.length > 0
+              ? audio.captionText
+              : candidate.text;
+            const speechText = typeof audio.speechText === 'string' && audio.speechText.length > 0
+              ? audio.speechText
+              : candidate.text;
             const entry = {
-              text: candidate.text,
+              // Legacy alias: `text` is what a caption reader expects to show.
+              text: captionText,
+              captionText,
+              speechText,
+              captionLang: identity.captionLang,
+              speechLang: identity.speechLang,
+              personaVersion: identity.persona,
               group: candidate.group,
               shape: candidate.shape,
               weight: candidate.weight,
@@ -1209,8 +1329,12 @@ export function createAckWarmPool({
     loaded,
     capacity: cap,
     entries: entries.length,
-    texts: entries.map((entry) => entry.text),
-    groups: entries.map((entry) => entry.group ?? classifyWarmLine(entry.text)),
+    texts: entries.map((entry) => entry.captionText ?? entry.text),
+    captionTexts: entries.map((entry) => entry.captionText ?? entry.text),
+    speechTexts: entries.map((entry) => entry.speechText ?? entry.captionText ?? entry.text),
+    captionLang: entries[0]?.captionLang ?? '',
+    speechLang: entries[0]?.speechLang ?? '',
+    groups: entries.map((entry) => entry.group ?? classifyWarmLine(entry.captionText ?? entry.text)),
     weights: entries.map((entry) => (Number(entry.weight) > 0 ? Number(entry.weight) : 1)),
     recent: recent.slice(),
   });
