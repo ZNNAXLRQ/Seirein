@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "@local/dsh-assistant",
-  "version": "0.98.9",
+  "version": "0.99.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -42,3 +42,4 @@
     "ws": "^8.22.1"
   }
 }
+
