@@ -178,6 +178,21 @@ const hooks = registerHooks({
       async moveModel() {}
       setChannelInputs(inputs) { this.channels = inputs; }
       close() { this.ready = false; this.connected = false; }
+      // The status route projects the authorization block through this method.
+      authStatus() {
+        return {
+          state: this.ready ? 'ready' : 'disconnected',
+          authenticated: this.ready === true,
+          needsAuth: false,
+          authError: '',
+          lastAuthAt: 0,
+          lastAuthSuccessAt: 0,
+          retryable: this.ready !== true,
+          authorizePending: false,
+          authorizeRequests: 0,
+          freshTokenRejected: false,
+        };
+      }
     }`,
       };
     }
