@@ -13,7 +13,8 @@
  * 与 DSH 模型调用契约的对应关系：
  *   - provider/model 取自 `agentDefaultModel.currentSelection()`（直接字段或 `route` 字段）；
  *   - 只消费 `text-delta` 与 `finish` 两种分片，结束原因从 `finish.reason.kind` 读取；
- *   - 超时与外部取消都通过内部 AbortController 合并，定时器 `unref()`，不会拖住宿主退出。
+ *   - 超时与外部取消都通过内部 AbortController 合并，定时器 `unref()`，不会拖住宿主退出；
+ *   - 等待“下一片”与期限/取消竞速：provider 不响应 abort 时也不会永久占住在途锁。
  *
  * 失败策略：任何错误都不外抛，只返回机器原因码，绝不把异常 message、路径或模型正文塞进
  * `reason`。调用方拿到非 `ok` 结果时直接放弃这一条候选即可。
@@ -81,6 +82,37 @@ function codePointClip(value, max) {
   if (typeof value !== 'string') return '';
   const chars = Array.from(value);
   return chars.length <= max ? value : chars.slice(0, max).join('');
+}
+
+/**
+ * 尽力释放异步迭代器/流。这里刻意**不等待** return() 完成：provider 不响应取消时，
+ * 等待 return() 本身同样会永久挂起，与不等待 next() 的问题一样。迟到的拒绝必须自行消费，
+ * 否则会成为未处理拒绝。
+ */
+function releaseStream(stream, iterator) {
+  const candidates = [iterator, stream];
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) continue;
+    const close = candidate.return;
+    if (typeof close !== 'function') continue;
+    try {
+      const returned = close.call(candidate);
+      if (returned !== null && typeof returned === 'object' && typeof returned.then === 'function') {
+        returned.then(undefined, () => {});
+      }
+      return;
+    } catch {
+      /* 释放失败不改变已经得出的结果；继续尝试下一个候选 */
+    }
+  }
+}
+
+/** 与 for await...of 一致：优先 Symbol.asyncIterator，其次退化为同步 iterator。 */
+function streamIteratorFactory(value) {
+  if (!isObject(value)) return null;
+  if (typeof value[Symbol.asyncIterator] === 'function') return value[Symbol.asyncIterator];
+  if (typeof value[Symbol.iterator] === 'function') return value[Symbol.iterator];
+  return null;
 }
 
 /**
@@ -169,16 +201,27 @@ export function createProactiveLineGenerator({
 
       // 4. 请求阶段：内部 controller 同时承载“超时”和“外部取消”，对外只交出它的 signal。
       const controller = new AbortController();
-      let timedOut = false;
+      // 先到的原因生效：timeout / aborted 只写入一次，后到的取消不会改写已经得出的结果。
+      let terminalReason = '';
       let timer = null;
       let listening = false;
-      const onExternalAbort = () => {
+      // 与“下一片”竞速的取消令牌；期限与外部取消都只 resolve 它一次。
+      const cancelToken = Symbol('cancelled');
+      let resolveCancel;
+      const cancelWait = new Promise((resolve) => {
+        resolveCancel = resolve;
+      });
+      const abortWith = (reason) => {
+        if (terminalReason !== '') return;
+        terminalReason = reason;
         try {
           controller.abort();
         } catch {
           /* abort 不应影响结果码 */
         }
+        resolveCancel(cancelToken);
       };
+      const onExternalAbort = () => abortWith('aborted');
       if (externalSignal !== null) {
         try {
           externalSignal.addEventListener('abort', onExternalAbort, { once: true });
@@ -196,29 +239,27 @@ export function createProactiveLineGenerator({
         }
         timer = null;
       };
+      // 已到期的原因；监听器注册失败时仍用 signal.aborted 兜底。
+      const reasonNow = () => terminalReason
+        || (externalSignal?.aborted === true ? 'aborted' : '');
 
+      let stream = null;
+      let iterator = null;
       try {
+        // 外部取消可能刚好发生在 addEventListener 之前；注册后再确认一次，先于内部期限。
+        const beforeTimer = reasonNow();
+        if (beforeTimer !== '') return failure(beforeTimer);
+
         // 先登记定时器再发请求：真实 setTimeout 在本轮同步代码结束后才触发，生产路径不会
         // 出现“未发请求先超时”；测试注入的同步定时器也能稳定复核 timeout 分支。
         try {
-          timer = setTimer(() => {
-            timedOut = true;
-            try {
-              controller.abort();
-            } catch {
-              /* 同上 */
-            }
-          }, deadlineMs);
+          timer = setTimer(() => abortWith('timeout'), deadlineMs);
           timer?.unref?.();
         } catch {
           // 定时器不可用时退化：仍发请求，只是没有内部 deadline（外部 signal 仍有效）。
           timer = null;
         }
 
-        // 取消可能刚好发生在 addEventListener 之前；注册后再确认一次。
-        if (externalSignal?.aborted === true) return failure('aborted');
-
-        let stream;
         try {
           stream = llm.stream({
             provider,
@@ -233,20 +274,53 @@ export function createProactiveLineGenerator({
             signal: controller.signal,
           });
         } catch {
-          if (externalSignal?.aborted === true) return failure('aborted');
-          if (timedOut) return failure('timeout');
+          const reason = reasonNow();
+          return failure(reason || 'stream-error');
+        }
+
+        const afterStream = reasonNow();
+        if (afterStream !== '') return failure(afterStream);
+
+        // 5. 收集文本。等待“下一片”必须同时受期限与取消控制：provider 不响应 abort 时，
+        //    直接 await iterator.next() 会永久挂起并占住在途锁，所以这里与取消令牌竞速。
+        try {
+          const factory = streamIteratorFactory(stream);
+          if (factory === null) return failure('stream-error');
+          iterator = factory.call(stream);
+          if (!isObject(iterator) || typeof iterator.next !== 'function') {
+            return failure('stream-error');
+          }
+        } catch {
           return failure('stream-error');
         }
 
-        if (externalSignal?.aborted === true) return failure('aborted');
-        if (timedOut) return failure('timeout');
-
-        // 5. 收集文本。finish 是终止分片；error/aborted 立即映射为机器原因。
         let text = '';
         try {
-          for await (const chunk of stream) {
-            if (externalSignal?.aborted === true) return failure('aborted');
-            if (timedOut) return failure('timeout');
+          for (;;) {
+            const beforeNext = reasonNow();
+            if (beforeNext !== '') return failure(beforeNext);
+
+            let next;
+            try {
+              const pending = iterator.next();
+              // 竞速输掉的 next() 仍可能在之后拒绝；显式挂处理器，避免未处理拒绝。
+              if (pending !== null && typeof pending === 'object' && typeof pending.then === 'function') {
+                pending.then(undefined, () => {});
+              }
+              next = await Promise.race([pending, cancelWait]);
+            } catch {
+              const reason = reasonNow();
+              return failure(reason || 'stream-error');
+            }
+
+            // 取消先到：丢弃已经在途的迟到分片，立即返回，不再拼接任何文本。
+            if (next === cancelToken) return failure(reasonNow() || 'timeout');
+            const afterNext = reasonNow();
+            if (afterNext !== '') return failure(afterNext);
+            if (!isObject(next)) return failure('stream-error');
+            if (next.done === true) break;
+
+            const chunk = next.value;
             const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : '';
             if (type === 'text-delta') {
               if (typeof chunk.text === 'string') text += chunk.text;
@@ -258,19 +332,18 @@ export function createProactiveLineGenerator({
                 ? reason.kind.toLowerCase()
                 : (typeof reason === 'string' ? reason.toLowerCase() : '');
               if (kind === 'error') return failure('stream-error');
-              if (kind === 'aborted') return timedOut ? failure('timeout') : failure('aborted');
+              if (kind === 'aborted') return failure(reasonNow() || 'aborted');
               break;
             }
             // 其他分片（usage 等）与一句短反应无关，忽略。
           }
         } catch {
-          if (externalSignal?.aborted === true) return failure('aborted');
-          if (timedOut) return failure('timeout');
-          return failure('stream-error');
+          const reason = reasonNow();
+          return failure(reason || 'stream-error');
         }
 
-        if (externalSignal?.aborted === true) return failure('aborted');
-        if (timedOut) return failure('timeout');
+        const finalReason = reasonNow();
+        if (finalReason !== '') return failure(finalReason);
 
         // 空/纯空白不能当作“模型说了什么”：调用方会把它发进语音出口。
         const trimmed = text.trim();
@@ -278,6 +351,8 @@ export function createProactiveLineGenerator({
 
         return { ok: true, text: codePointClip(trimmed, charLimit), reason: 'ok' };
       } finally {
+        // 尽力释放：不等待 return() 完成，否则 provider 不响应时又会挂起。
+        releaseStream(stream, iterator);
         stopTimer();
         if (listening) {
           try {

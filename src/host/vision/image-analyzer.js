@@ -12,7 +12,8 @@
  *   - 图片能力必须由 `llm.resolveModelInfo(provider, model, signal)?.inputModalities` **明确**
  *     包含 `'image'`，缺省、抛错或未知一律按不支持处理（绝不“先发过去再说”）；
  *   - provider/model 取自 `agentDefaultModel.currentSelection()`（直接字段或 `route` 字段）；
- *   - 只消费 `text-delta` 与 `finish` 两种分片，结束原因从 `finish.reason.kind` 读取。
+ *   - 只消费 `text-delta` 与 `finish` 两种分片，结束原因从 `finish.reason.kind` 读取；
+ *   - 等待“下一片”与内部期限/外部取消竞速，provider 不响应 abort 也不会永久挂起。
  *
  * 失败策略：**整体失败**。只要一帧读不出来或保存失败，就不发起模型请求，返回
  * `read-failed` / `save-failed` 且 `images: 0`。少一张图却让模型按“看到全部帧”回答，会把
@@ -99,6 +100,36 @@ function providerErrorCode(value) {
 /** 流式请求同步/异步抛出的错误码，同样只取机器码字段，不读取 message。 */
 function thrownErrorCode(error) {
   return error?.code ?? error?.failure?.code;
+}
+
+/**
+ * 尽力释放异步迭代器/流。刻意**不等待** return()：provider 不响应取消时，等待 return()
+ * 同样会永久挂起。迟到的拒绝必须自行消费，避免成为未处理拒绝。
+ */
+function releaseStream(stream, iterator) {
+  const candidates = [iterator, stream];
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) continue;
+    const close = candidate.return;
+    if (typeof close !== 'function') continue;
+    try {
+      const returned = close.call(candidate);
+      if (returned !== null && typeof returned === 'object' && typeof returned.then === 'function') {
+        returned.then(undefined, () => {});
+      }
+      return;
+    } catch {
+      /* 释放失败不改变已经得出的结果；继续尝试下一个候选 */
+    }
+  }
+}
+
+/** 与 for await...of 一致：优先 Symbol.asyncIterator，其次退化为同步 iterator。 */
+function streamIteratorFactory(value) {
+  if (!isObject(value)) return null;
+  if (typeof value[Symbol.asyncIterator] === 'function') return value[Symbol.asyncIterator];
+  if (typeof value[Symbol.iterator] === 'function') return value[Symbol.iterator];
+  return null;
 }
 
 /**
@@ -240,16 +271,27 @@ export function createImageAnalyzer({
       // 6. 模型请求阶段：内部 AbortController 同时承载“超时”和“外部取消”，
       //    对外只把 controller.signal 交给 llm，避免 provider 直接依赖调用方对象。
       const controller = new AbortController();
-      let timedOut = false;
+      // 先到的原因生效：timeout / aborted 只写入一次，后到的取消不会改写已经得出的结果。
+      let terminalReason = '';
       let timer = null;
       let listening = false;
-      const onExternalAbort = () => {
+      // 与“下一片”竞速的取消令牌；期限与外部取消都只 resolve 它一次。
+      const cancelToken = Symbol('cancelled');
+      let resolveCancel;
+      const cancelWait = new Promise((resolve) => {
+        resolveCancel = resolve;
+      });
+      const abortWith = (reason) => {
+        if (terminalReason !== '') return;
+        terminalReason = reason;
         try {
           controller.abort();
         } catch {
           /* abort 不应影响结果码 */
         }
+        resolveCancel(cancelToken);
       };
+      const onExternalAbort = () => abortWith('aborted');
       const externalSignal = signal !== undefined && signal !== null && typeof signal.addEventListener === 'function'
         ? signal
         : null;
@@ -270,29 +312,27 @@ export function createImageAnalyzer({
         }
         timer = null;
       };
+      // 已到期的原因；监听器注册失败时仍用 signal.aborted 兜底。
+      const reasonNow = () => terminalReason
+        || (externalSignal?.aborted === true ? 'aborted' : '');
 
+      let stream = null;
+      let iterator = null;
       try {
+        // 外部取消可能刚好发生在 addEventListener 之前；注册后再确认一次，先于内部期限。
+        const beforeTimer = reasonNow();
+        if (beforeTimer !== '') return failure(beforeTimer, images.length);
+
         // 超时是同步定时器也要能被测试：先登记，再发请求；真实 setTimeout 会在本轮同步代码
         // 结束后才触发，所以生产路径不会出现“未发请求先超时”。
         try {
-          timer = setTimer(() => {
-            timedOut = true;
-            try {
-              controller.abort();
-            } catch {
-              /* 同上 */
-            }
-          }, deadlineMs);
+          timer = setTimer(() => abortWith('timeout'), deadlineMs);
           timer?.unref?.();
         } catch {
           // 定时器不可用时退化：仍发请求，只是没有内部 deadline（外部 signal 仍有效）。
           timer = null;
         }
 
-        // 取消可能刚好发生在 addEventListener 之前；注册后再确认一次。
-        if (externalSignal?.aborted === true) return failure('aborted', images.length);
-
-        let stream;
         try {
           stream = llm.stream({
             provider,
@@ -306,20 +346,66 @@ export function createImageAnalyzer({
             signal: controller.signal,
           });
         } catch (error) {
-          if (externalSignal?.aborted === true) return failure('aborted', images.length);
-          if (timedOut) return failure('timeout', images.length);
-          return failure('stream-error', images.length, thrownErrorCode(error));
+          const reason = reasonNow();
+          return failure(
+            reason || 'stream-error',
+            images.length,
+            reason ? '' : thrownErrorCode(error),
+          );
         }
 
-        if (externalSignal?.aborted === true) return failure('aborted', images.length);
-        if (timedOut) return failure('timeout', images.length);
+        const afterStream = reasonNow();
+        if (afterStream !== '') return failure(afterStream, images.length);
 
-        // 7. 收集文本。finish 是终止分片；error/aborted 立即映射为机器原因。
+        // 7. 收集文本。等待“下一片”必须同时受期限与取消控制：provider 不响应 abort 时，
+        //    直接 await iterator.next() 会永久挂起并占住在途锁，所以这里与取消令牌竞速。
+        try {
+          const factory = streamIteratorFactory(stream);
+          if (factory === null) return failure('stream-error', images.length);
+          iterator = factory.call(stream);
+          if (!isObject(iterator) || typeof iterator.next !== 'function') {
+            return failure('stream-error', images.length);
+          }
+        } catch (error) {
+          const reason = reasonNow();
+          return failure(
+            reason || 'stream-error',
+            images.length,
+            reason ? '' : thrownErrorCode(error),
+          );
+        }
+
         let text = '';
         try {
-          for await (const chunk of stream) {
-            if (externalSignal?.aborted === true) return failure('aborted', images.length);
-            if (timedOut) return failure('timeout', images.length);
+          for (;;) {
+            const beforeNext = reasonNow();
+            if (beforeNext !== '') return failure(beforeNext, images.length);
+
+            let next;
+            try {
+              const pending = iterator.next();
+              // 竞速输掉的 next() 仍可能在之后拒绝；显式挂处理器，避免未处理拒绝。
+              if (pending !== null && typeof pending === 'object' && typeof pending.then === 'function') {
+                pending.then(undefined, () => {});
+              }
+              next = await Promise.race([pending, cancelWait]);
+            } catch (error) {
+              const reason = reasonNow();
+              return failure(
+                reason || 'stream-error',
+                images.length,
+                reason ? '' : thrownErrorCode(error),
+              );
+            }
+
+            // 取消先到：丢弃已经在途的迟到分片，立即返回，不再拼接任何文本。
+            if (next === cancelToken) return failure(reasonNow() || 'timeout', images.length);
+            const afterNext = reasonNow();
+            if (afterNext !== '') return failure(afterNext, images.length);
+            if (!isObject(next)) return failure('stream-error', images.length);
+            if (next.done === true) break;
+
+            const chunk = next.value;
             const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : '';
             if (type === 'text-delta') {
               if (typeof chunk.text === 'string') text += chunk.text;
@@ -339,18 +425,23 @@ export function createImageAnalyzer({
             // 其他分片（usage 等）与图片分析结果无关，忽略。
           }
         } catch (error) {
-          if (externalSignal?.aborted === true) return failure('aborted', images.length);
-          if (timedOut) return failure('timeout', images.length);
-          return failure('stream-error', images.length, thrownErrorCode(error));
+          const reason = reasonNow();
+          return failure(
+            reason || 'stream-error',
+            images.length,
+            reason ? '' : thrownErrorCode(error),
+          );
         }
 
-        if (externalSignal?.aborted === true) return failure('aborted', images.length);
-        if (timedOut) return failure('timeout', images.length);
+        const finalReason = reasonNow();
+        if (finalReason !== '') return failure(finalReason, images.length);
 
         // 空文本绝不能当作“模型看懂了”：调用方会把它渲染成空的理解结果。
         if (text.trim().length === 0) return failure('stream-error', images.length, 'empty');
         return { ok: true, text, reason: 'ok', images: images.length };
       } finally {
+        // 尽力释放：不等待 return() 完成，否则 provider 不响应时又会挂起。
+        releaseStream(stream, iterator);
         stopTimer();
         if (listening) {
           try {

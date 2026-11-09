@@ -26,6 +26,37 @@ function streamOf(chunks) {
   })();
 }
 
+/**
+ * 模拟“不响应 abort”的 provider：next() 永不 resolve，只有 return() 能被调用。
+ * 这正是旧实现会永久挂起的形状。
+ */
+function hangingStream(onReturn) {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        return() {
+          if (typeof onReturn === 'function') onReturn();
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+}
+
+/** 给被测调用加一个很短的护栏，失败时测试报错而不是永久挂起。 */
+function within(promise, ms = 1_000) {
+  let timer = null;
+  const guard = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`调用在 ${ms}ms 内未返回`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => {
+    if (timer !== null) clearTimeout(timer);
+  });
+}
+
 /** 生成一个假 llm service；`onStream` 可替换返回的流或直接抛错。 */
 function makeLlm(calls, onStream = null) {
   return {
@@ -209,6 +240,98 @@ test('超时：注入定时器触发即 abort，返回 timeout', async () => {
   assert.deepEqual(result, { ok: false, text: '', reason: 'timeout' });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].signal.aborted, true, '超时必须 abort 模型请求');
+});
+
+test('假 stream 的 next() 永不 resolve：期限到即 timeout、释放流，之后仍可再次生成', async () => {
+  let fire = null;
+  let cleared = 0;
+  let released = 0;
+  let mode = 'hang';
+  const calls = [];
+  const llm = makeLlm(calls, () => {
+    if (mode === 'hang') return hangingStream(() => { released += 1; });
+    return streamOf([
+      { type: 'text-delta', text: '第二次' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]);
+  });
+  const generator = createProactiveLineGenerator({
+    getService: servicesOf({ llm, selection: ROUTE }),
+    personaText: () => '人设',
+    timeoutMs: 30_000,
+    setTimer(fn) {
+      fire = fn;
+      return { unref() {} };
+    },
+    clearTimer() {
+      cleared += 1;
+    },
+  });
+
+  // generate 的同步段会先构造请求并挂起在永不返回的 next() 上，此时期限已登记。
+  const pending = generator.generate({ event: { description: '画面变化' } });
+  assert.equal(calls.length, 1);
+  assert.equal(typeof fire, 'function');
+  fire();
+
+  const timedOut = await within(pending);
+  assert.deepEqual(timedOut, { ok: false, text: '', reason: 'timeout' });
+  assert.equal(calls[0].signal.aborted, true, '超时必须 abort 模型请求');
+  assert.equal(released, 1, '超时后应尽力调用流的 return()');
+  assert.equal(cleared, 1, '超时后应清理定时器');
+
+  // 锁已释放：同一个生成器再次调用必须正常完成，而不是沿用上一次的在途状态。
+  mode = 'ok';
+  const second = await within(generator.generate({ event: { description: '画面变化' } }));
+  assert.deepEqual(second, { ok: true, text: '第二次', reason: 'ok' });
+});
+
+test('外部 abort 能打断永不 resolve 的 next()：返回 aborted，并清理监听器与定时器', async () => {
+  let fire = null;
+  let cleared = 0;
+  let released = 0;
+  const listeners = new Set();
+  const external = {
+    aborted: false,
+    addEventListener(type, fn) {
+      if (type === 'abort') listeners.add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (type === 'abort') listeners.delete(fn);
+    },
+  };
+  const calls = [];
+  const llm = makeLlm(calls, () => hangingStream(() => { released += 1; }));
+  const generator = createProactiveLineGenerator({
+    getService: servicesOf({ llm, selection: ROUTE }),
+    personaText: () => '人设',
+    timeoutMs: 30_000,
+    setTimer(fn) {
+      fire = fn;
+      return { unref() {} };
+    },
+    clearTimer() {
+      cleared += 1;
+    },
+  });
+
+  const pending = generator.generate({
+    event: { description: '画面变化' },
+    signal: external,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(typeof fire, 'function');
+  assert.equal(listeners.size, 1, '请求期间应挂上外部 abort 监听器');
+
+  external.aborted = true;
+  for (const fn of [...listeners]) fn();
+
+  const result = await within(pending);
+  assert.deepEqual(result, { ok: false, text: '', reason: 'aborted' });
+  assert.equal(calls[0].signal.aborted, true);
+  assert.equal(released, 1, '取消后应尽力调用流的 return()');
+  assert.equal(cleared, 1, '取消后应清理定时器');
+  assert.equal(listeners.size, 0, '结束必须移除外部 abort 监听器');
 });
 
 test('外部取消：已取消的 signal 直接 aborted，流中途取消也不拼完', async () => {

@@ -27,6 +27,37 @@ const finish = (kind, code = '') => ({
 });
 
 /**
+ * 模拟“不响应 abort”的 provider：next() 永不 resolve，只有 return() 能被调用。
+ * 旧实现会在这里永久等待并占住在途锁。
+ */
+function hangingStream(onReturn) {
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        return() {
+          if (typeof onReturn === 'function') onReturn();
+          return Promise.resolve({ done: true, value: undefined });
+        },
+      };
+    },
+  };
+}
+
+/** 给被测调用加一个很短的护栏，失败时测试报错而不是永久挂起。 */
+function within(promise, ms = 1_000) {
+  let timer = null;
+  const guard = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`调用在 ${ms}ms 内未返回`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => {
+    if (timer !== null) clearTimeout(timer);
+  });
+}
+
+/**
  * 假运行时。默认成功路径：2 帧、图片能力可用、流返回两段文本后 stop。
  * 通过 overrides 替换任一依赖；calls 记录所有可观察调用。
  */
@@ -378,6 +409,111 @@ test('超时：注入 setTimer 立即触发 → timeout，且交给 stream 的 s
   assert.equal(cleared, true);
   assert.ok(seenSignal, '请求必须已经构造');
   assert.equal(seenSignal.aborted, true);
+});
+
+test('假 stream 的 next() 永不 resolve：期限到即 timeout、释放流，之后仍可再次分析', async () => {
+  let fire = null;
+  let timerReady;
+  const ready = new Promise((resolve) => { timerReady = resolve; });
+  let released = 0;
+  let cleared = 0;
+  let mode = 'hang';
+  const { analyzer, calls } = harness({
+    timeoutMs: 30_000,
+    setTimer(fn) {
+      fire = fn;
+      timerReady();
+      return { unref() {} };
+    },
+    clearTimer() {
+      cleared += 1;
+    },
+    stream() {
+      if (mode === 'hang') return hangingStream(() => { released += 1; });
+      return (async function* ok() {
+        yield { type: 'text-delta', text: '第二次理解' };
+        yield finish('stop');
+      })();
+    },
+  });
+
+  const pending = analyzer.analyze({ frames: [FRAME_A, FRAME_B] });
+  await within(ready);
+  // 定时器登记后，analyze 同步发请求并挂起在永不返回的 next() 上。
+  assert.equal(calls.stream.length, 1);
+  assert.equal(typeof fire, 'function');
+  fire();
+
+  const timedOut = await within(pending);
+  assert.deepEqual(timedOut, {
+    ok: false,
+    text: '',
+    reason: 'timeout',
+    images: 2,
+  });
+  assert.equal(calls.stream[0].signal.aborted, true, '超时必须 abort 模型请求');
+  assert.equal(released, 1, '超时后应尽力调用流的 return()');
+  assert.equal(cleared, 1, '超时后应清理定时器');
+
+  // 锁已释放：同一个分析器再次调用必须正常完成。
+  mode = 'ok';
+  const second = await within(analyzer.analyze({ frames: [FRAME_A] }));
+  assert.equal(second.ok, true);
+  assert.equal(second.text, '第二次理解');
+  assert.equal(second.images, 1);
+});
+
+test('外部 abort 能打断永不 resolve 的 next()：返回 aborted，并清理监听器与定时器', async () => {
+  let fire = null;
+  let timerReady;
+  const ready = new Promise((resolve) => { timerReady = resolve; });
+  let released = 0;
+  let cleared = 0;
+  const listeners = new Set();
+  const external = {
+    aborted: false,
+    addEventListener(type, fn) {
+      if (type === 'abort') listeners.add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (type === 'abort') listeners.delete(fn);
+    },
+  };
+  const { analyzer, calls } = harness({
+    timeoutMs: 30_000,
+    setTimer(fn) {
+      fire = fn;
+      timerReady();
+      return { unref() {} };
+    },
+    clearTimer() {
+      cleared += 1;
+    },
+    stream() {
+      return hangingStream(() => { released += 1; });
+    },
+  });
+
+  const pending = analyzer.analyze({ frames: [FRAME_A], signal: external });
+  await within(ready);
+  assert.equal(calls.stream.length, 1);
+  assert.equal(typeof fire, 'function');
+  assert.equal(listeners.size, 1, '请求期间应挂上外部 abort 监听器');
+
+  external.aborted = true;
+  for (const fn of [...listeners]) fn();
+
+  const result = await within(pending);
+  assert.deepEqual(result, {
+    ok: false,
+    text: '',
+    reason: 'aborted',
+    images: 1,
+  });
+  assert.equal(calls.stream[0].signal.aborted, true);
+  assert.equal(released, 1, '取消后应尽力调用流的 return()');
+  assert.equal(cleared, 1, '取消后应清理定时器');
+  assert.equal(listeners.size, 0, '结束必须移除外部 abort 监听器');
 });
 
 test('外部 signal 已 abort：aborted，且不读图/不保存/不请求', async () => {
