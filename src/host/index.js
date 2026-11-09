@@ -398,6 +398,7 @@ import {
 import {
   awaitSessionResult,
   createSessionSearchBudget,
+  createSubagentFailure,
   earliestAudible,
   ensureSession,
   firstSentenceOf,
@@ -6602,13 +6603,17 @@ export function apply(ctx, config) {
 
   ctx.effect(() => () => memory.close());
 
-  // ---- P-112: session_search budget ---------------------------------------
+  // ---- P-112: session_search budget / P-127: subagent launch failure --------
   // `session_search` belongs to the Harness, so the plugin cannot register or shadow it. The
-  // framework's `tools/execute` around-dispatch waterfall is the production seam: this wrapper
-  // runs the framework body under `runSessionSearch` and only replaces a timed-out result.
+  // framework's `tools/execute` around-dispatch waterfall is the production seam: the first
+  // wrapper runs the framework body under `runSessionSearch` and only replaces a timed-out result.
+  // The second only observes a failed `subagent` / `subagent_fork` launch and returns the same
+  // result object, so delegation semantics are untouched. The `session_search` wrapper stays outer.
   if (typeof ctx.on === 'function') {
     const sessionSearchBudget = createSessionSearchBudget({ config, log });
     ctx.effect(() => ctx.on('tools/execute', sessionSearchBudget));
+    const subagentFailure = createSubagentFailure({ log });
+    ctx.effect(() => ctx.on('tools/execute', subagentFailure));
   }
 
   // ---- message-level auto memory ----------------------------------------

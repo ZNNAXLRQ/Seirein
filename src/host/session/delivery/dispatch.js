@@ -1731,6 +1731,12 @@ export async function runSessionSearch({
 /** The Harness tool this plugin wraps; the plugin never registers or shadows it. */
 export const SESSION_SEARCH_TOOL_NAME = 'session_search';
 
+/**
+ * The Harness delegation tools watched for a *launch* failure. A subagent that starts and then fails
+ * is reported by `subagent-settled`, not by `tools/execute`, and intentionally does not pass here.
+ */
+export const SUBAGENT_TOOL_NAMES = Object.freeze(['subagent', 'subagent_fork']);
+
 /** The Harness tool's exact empty-result line; a changed wording only disables the hint. */
 export const SESSION_SEARCH_EMPTY_TEXT = 'No prior session matches found.';
 
@@ -1787,8 +1793,11 @@ export function toolFailureInfo(failure) {
     };
   }
   if (typeof failure === 'string') return { name: '', code: '', message: failure };
-  const name = failure?.errorName ?? failure?.name ?? failure?.error?.name;
-  const code = failure?.errorCode ?? failure?.code ?? failure?.error?.code;
+  // The Harness's own `toolErrorResult` puts name/code in `error.info`; older shapes use the
+  // top-level fields. The existing precedence is kept and `error.info` is the last fallback, so a
+  // result that already carried `errorName`/`errorCode` reads exactly as before.
+  const name = failure?.errorName ?? failure?.name ?? failure?.error?.name ?? failure?.error?.info?.name;
+  const code = failure?.errorCode ?? failure?.code ?? failure?.error?.code ?? failure?.error?.info?.code;
   const message = failure?.error?.message ?? failure?.message ?? toolResultText(failure);
   return {
     name: typeof name === 'string' ? name.trim() : '',
@@ -2362,6 +2371,60 @@ export function createSessionSearchBudget({
     } finally {
       if (restoreNow) exec.signal = upstream;
     }
+  };
+}
+
+/**
+ * The caller's delegation depth, mirroring the Harness rule: the persisted header is authoritative
+ * and the live `subagentDepth` option can only deepen it. Returns `null` when neither carries an
+ * explicit non-negative depth (or the identity cannot be read), so an unknown depth is omitted
+ * instead of guessed; an explicit top-level `0` is still reported.
+ */
+function subagentDepthOf(exec) {
+  try {
+    const header = exec?.agent?.session?.header ?? {};
+    const options = exec?.agent?.options ?? {};
+    const depths = [header.delegationDepth, options.subagentDepth]
+      .filter((value) => Number.isSafeInteger(value) && value >= 0);
+    return depths.length === 0 ? null : Math.max(...depths);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * P-127: observe a failed `subagent` / `subagent_fork` *launch* without changing what the model sees.
+ *
+ * This is a second `tools/execute` wrapper, separate from the `session_search` budget. It only reads
+ * the framework result: `isError:true` emits `subagent.error {name, code, depth?}` (machine fields
+ * only — never the error text, arguments or nested result), and the **same result object** is
+ * returned. A successful or empty result is passed through untouched and emits nothing. A subagent
+ * that starts and then fails is reported by `subagent-settled`, not here, so it never emits this
+ * event. A rejection from `next()` is not a failed result and propagates unchanged.
+ */
+export function createSubagentFailure({ log = null, names = SUBAGENT_TOOL_NAMES } = {}) {
+  const watched = new Set(
+    (Array.isArray(names) ? names : []).filter((name) => typeof name === 'string' && name.length > 0),
+  );
+  /** Best-effort telemetry: a missing, throwing or rejecting log never blocks the tool result. */
+  const emitEvent = (type, payload) => {
+    try {
+      const pending = log?.emit?.(type, payload);
+      if (pending && typeof pending.then === 'function') pending.then(undefined, () => {});
+    } catch {
+      /* observability only */
+    }
+  };
+  return async function subagentFailure(exec, next) {
+    if (!watched.has(exec?.name)) return next();
+    const result = await next();
+    if (result?.isError !== true) return result;
+    const info = toolFailureInfo(result);
+    const payload = { name: info.name, code: info.code };
+    const depth = subagentDepthOf(exec);
+    if (depth !== null) payload.depth = depth;
+    emitEvent('subagent.error', payload);
+    return result;
   };
 }
 

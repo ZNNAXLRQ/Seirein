@@ -67,8 +67,10 @@ function mount(root, config = {}) {
     disposers,
     sessionSearchBudget: () => {
       const list = listeners.get('tools/execute') ?? [];
-      assert.equal(list.length, 1, 'exactly one tools/execute wrapper');
-      return list[0];
+      assert.equal(list.length, 2, 'exactly two tools/execute wrappers (session_search + subagent)');
+      const wrapper = list.find((handler) => handler.name === 'sessionSearchBudget');
+      assert.equal(typeof wrapper, 'function', 'the session_search budget wrapper is registered');
+      return wrapper;
     },
   };
 }

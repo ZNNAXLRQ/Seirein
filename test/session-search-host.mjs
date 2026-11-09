@@ -65,11 +65,13 @@ function mount(root, config = {}) {
     listeners,
     tools,
     disposers,
-    /** The one wrapper this plugin owns; the Harness can also have its own on this event. */
+    /** The two wrappers this plugin owns; the Harness can also have its own on this event. */
     sessionSearchBudget: () => {
       const list = listeners.get('tools/execute') ?? [];
-      assert.equal(list.length, 1, 'exactly one tools/execute wrapper');
-      return list[0];
+      assert.equal(list.length, 2, 'exactly two tools/execute wrappers (session_search + subagent)');
+      const wrapper = list.find((handler) => handler.name === 'sessionSearchBudget');
+      assert.equal(typeof wrapper, 'function', 'the session_search budget wrapper is registered');
+      return wrapper;
     },
   };
 }
