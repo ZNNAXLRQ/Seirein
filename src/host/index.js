@@ -380,6 +380,17 @@ import { openAudioRetention } from './hearing/audio-retention.js';
 // Voiceprint enrollment (`<root>/data/speaker-enrollment.json`): the Host owns the one store the
 // settings card reads and writes through its four explicit actions.
 import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
+// Daily speaker candidates: metadata cache + the host's short-lived 16 kHz WAV files. This layer
+// only collects; it never creates a template, sets selfId or writes memory.
+import {
+  SPEAKER_CANDIDATE_MAX_DURATION_MS,
+  SPEAKER_CANDIDATE_MIN_DURATION_MS,
+  createSpeakerCandidatesStore,
+} from './hearing/speaker-candidates.js';
+import {
+  cleanupSpeakerCandidateAudio,
+  writeSpeakerCandidateWav,
+} from './hearing/speaker-candidate-audio.js';
 // Stage 3: attribute a NEW record/candidate to the user's CONFIRMED self only. Pure decision
 // layer — no I/O, no event, no gate — so wiring it can never change delivery, muting or barge-in.
 import { createRecordAttribution, resolveIdentityForNewRecord } from './hearing/speaker-identity.js';
@@ -11209,6 +11220,10 @@ export function apply(ctx, config) {
     visionChanging = true;
     if (mode === 'privacy') {
       if (vision.mode !== 'privacy') {
+        // Entering privacy invalidates every queued candidate callback immediately; the active
+        // check also refuses while privacy remains on (and a quick privacy->watch flip cannot
+        // revive a callback queued before the lock).
+        invalidateSpeakerCandidates();
         visionReturn = { mode: vision.mode, scene: vision.scene, capturing: wasCapturing };
       }
       vision.userSet('privacy');
@@ -16916,6 +16931,181 @@ export function apply(ctx, config) {
       loopback: { ...speakerLoopbackCounts },
     };
   };
+  // ---- daily speaker candidates (collect only) ----------------------------
+  // A separate cache from the speaker library: metadata is bounded by the store, audio files are
+  // short-lived WAVs owned by the Host, and nothing here creates a template, assigns a speakerId,
+  // sets selfId or writes memory. The hearing layer only calls back for the mic lane with an `ok`
+  // clip >=800 ms, and only while the speaker shadow is on; the checks below repeat the important
+  // gates because a callback can be queued while capture/settings/privacy are changing.
+  const speakerCandidatesStore = createSpeakerCandidatesStore({ root, log });
+  let speakerCandidateGeneration = 0;
+  const invalidateSpeakerCandidates = () => {
+    speakerCandidateGeneration += 1;
+  };
+  const noteSpeakerCandidateEvent = (type, payload) => {
+    try {
+      void log.emit(type, payload).catch(() => {});
+    } catch {
+      /* diagnostic only: the candidate cache must never change capture/delivery */
+    }
+  };
+  const skipSpeakerCandidate = (reason) => {
+    noteSpeakerCandidateEvent('speaker.candidates.skipped', { reason });
+  };
+  /** Best-effort orphan/old-file cleanup: the metadata store already bounds live candidates. */
+  const cleanupSpeakerCandidateAudioFiles = () => {
+    try {
+      const keepPaths = speakerCandidatesStore.list().map((candidate) => candidate.audioPath);
+      const result = cleanupSpeakerCandidateAudio({ root, keepPaths });
+      if (result.removed > 0 || result.failed > 0) {
+        noteSpeakerCandidateEvent('speaker.candidates.cleanup', {
+          removed: result.removed,
+          failed: result.failed,
+        });
+      }
+    } catch {
+      /* a cleanup failure is never a candidate failure */
+    }
+  };
+  /**
+   * Status projection required by the card/status route: numbers and instants only, never an
+   * embedding, transcript text or audio path. `groups` is the count of historical similarity
+   * clusters computed by the store; it is recomputed lazily so a fresh store reports a useful value
+   * (and persisted groupIds stay consistent with the rows it just returned).
+   */
+  const speakerCandidatesStatus = () => {
+    try {
+      const initial = speakerCandidatesStore.status();
+      let groups = initial.groupCount;
+      if (initial.count > 0) {
+        try {
+          groups = speakerCandidatesStore.groups().length;
+        } catch {
+          groups = initial.groupCount;
+        }
+      }
+      const latest = speakerCandidatesStore.status();
+      return {
+        count: latest.count,
+        totalDurationMs: latest.totalDurationMs,
+        groups,
+        oldestAt: latest.oldestAt,
+        newestAt: latest.newestAt,
+      };
+    } catch {
+      return { count: 0, totalDurationMs: 0, groups: 0, oldestAt: null, newestAt: null };
+    }
+  };
+  /** Empty string means the callback may still be accepted; anything else is the skip reason. */
+  const speakerCandidateDropReason = (generation) => {
+    if (shutdown.closing === true) return 'shutting-down';
+    if (features.enabled('hearing') !== true) return 'hearing-disabled';
+    if (speakerShadowEnabled() !== true) return 'shadow-disabled';
+    if (vision.mode === 'privacy') return 'privacy';
+    if (generation !== speakerCandidateGeneration) return 'stale-generation';
+    return '';
+  };
+  /**
+   * One hearing callback: validate, write the short WAV, then admit the metadata row. Failure to
+   * write audio records one reason event and stores nothing; every path is best-effort and never
+   * reaches delivery.
+   */
+  const handleSpeakerCandidate = (sample, generation) => {
+    const drop = speakerCandidateDropReason(generation);
+    if (drop !== '') {
+      skipSpeakerCandidate(drop);
+      return;
+    }
+    if (sample === null || typeof sample !== 'object') {
+      skipSpeakerCandidate('invalid-sample');
+      return;
+    }
+    if (sample.source !== 'mic') {
+      skipSpeakerCandidate('invalid-source');
+      return;
+    }
+    if (sample.quality !== 'ok') {
+      skipSpeakerCandidate('invalid-quality');
+      return;
+    }
+    const declaredRate = Number(sample.sampleRate);
+    if (Number.isFinite(declaredRate) && declaredRate !== 16000) {
+      skipSpeakerCandidate('invalid-sample-rate');
+      return;
+    }
+    const durationMs = Math.round(Number(sample.durationMs));
+    if (!Number.isFinite(durationMs)) {
+      skipSpeakerCandidate('invalid-duration');
+      return;
+    }
+    if (durationMs < SPEAKER_CANDIDATE_MIN_DURATION_MS) {
+      skipSpeakerCandidate('too-short');
+      return;
+    }
+    if (durationMs > SPEAKER_CANDIDATE_MAX_DURATION_MS) {
+      skipSpeakerCandidate('too-long');
+      return;
+    }
+    const utteranceId = typeof sample.utteranceId === 'string' ? sample.utteranceId.trim() : '';
+    if (utteranceId.length === 0) {
+      skipSpeakerCandidate('utterance-id-required');
+      return;
+    }
+    if (!(sample.embedding instanceof Float32Array) || sample.embedding.length === 0) {
+      skipSpeakerCandidate('invalid-embedding');
+      return;
+    }
+    if (!(sample.samples instanceof Float32Array) || sample.samples.length === 0) {
+      skipSpeakerCandidate('invalid-samples');
+      return;
+    }
+    try {
+      const duplicate = speakerCandidatesStore.list().find(
+        (candidate) => candidate.utteranceId === utteranceId,
+      );
+      if (duplicate !== undefined) {
+        skipSpeakerCandidate('duplicate-utterance');
+        return;
+      }
+    } catch {
+      /* a failed duplicate probe is not a reason to skip the admission; add() de-dupes again */
+    }
+    let written;
+    try {
+      written = writeSpeakerCandidateWav({ root, utteranceId, samples: sample.samples });
+    } catch (error) {
+      noteSpeakerCandidateEvent('speaker.candidates.write-failed', {
+        reason: 'write-failed',
+        code: typeof error?.code === 'string' ? error.code : '',
+      });
+      return;
+    }
+    const added = speakerCandidatesStore.add({
+      utteranceId,
+      embedding: sample.embedding,
+      durationMs,
+      audioPath: written.path,
+      text: typeof sample.text === 'string' ? sample.text : '',
+      speakerId: null,
+      source: 'mic',
+      quality: 'ok',
+    });
+    if (added.ok !== true || added.added !== true) {
+      // The freshly written file is not referenced by metadata; the cleanup pass removes it.
+      cleanupSpeakerCandidateAudioFiles();
+      skipSpeakerCandidate(added.ok === true ? 'duplicate-utterance' : (added.reason ?? 'add-failed'));
+      return;
+    }
+    cleanupSpeakerCandidateAudioFiles();
+    const totals = added.totals ?? speakerCandidatesStore.status();
+    noteSpeakerCandidateEvent('speaker.candidates.added', {
+      count: totals.count,
+      totalDurationMs: totals.totalDurationMs,
+      durationMs,
+    });
+  };
+  // Unload/teardown must invalidate callbacks that are already sitting in hearing's setImmediate.
+  ctx.effect(() => () => { invalidateSpeakerCandidates(); });
   const speakerStatus = () => {
     const status = {
       enabled: speakerShadowEnabled(),
@@ -16927,6 +17117,10 @@ export function apply(ctx, config) {
     // microphone-only; `bySource` is the only field that separates the two lanes.
     const bySource = speakerBySource();
     if (bySource !== null) status.bySource = bySource;
+    // Additive candidate block: only while the shadow is collecting, or once a previous run left
+    // rows behind. The default-off status with an empty cache therefore keeps its exact old shape.
+    const candidates = speakerCandidatesStatus();
+    if (speakerShadowEnabled() || candidates.count > 0) status.candidates = candidates;
     return status;
   };
   /** `speaker.status` is throttled: the counts change per utterance, the event must not spam. */
@@ -17340,6 +17534,13 @@ export function apply(ctx, config) {
     // The mount already started T1; this is the retry after a failed/removed model. Capture never
     // waits for it, and a failure stays local to the shadow (hearing still delivers).
     if (speakerShadowEnabled()) startSpeakerDownload();
+    // A start attempt is a new candidate generation: a callback queued by a predecessor (or by a
+    // session that is about to be replaced) must never land in the new session's cache.
+    const speakerCandidateEpoch = ++speakerCandidateGeneration;
+    const speakerShadowAtStart = speakerShadowEnabled();
+    // Best-effort: remove files a previous crash/failed add left unreferenced before this session
+    // starts writing. Nothing here touches referenced audio.
+    if (speakerShadowAtStart) cleanupSpeakerCandidateAudioFiles();
     try {
       const started = await admitSpawn({
         manager: shutdown,
@@ -17392,8 +17593,14 @@ export function apply(ctx, config) {
           decodeCapSec: tuning.decodeCapSec,
           // Observation only: the speaker shadow scores a DELIVERED utterance; it never gates,
           // reorders or rewrites one. `<root>` is the library root (`<root>/memory/speaker.db`).
-          ...(speakerShadowEnabled()
-            ? { speakerShadow: true, speakerLibraryRoot: root }
+          // The candidate callback exists only while the shadow is on and only on this mic lane;
+          // it writes a short WAV and a pending metadata row, never a template/identity/memory.
+          ...(speakerShadowAtStart
+            ? {
+                speakerShadow: true,
+                speakerLibraryRoot: root,
+                onSpeakerSample: (sample) => handleSpeakerCandidate(sample, speakerCandidateEpoch),
+              }
             : {}),
           // The Host's one dialogue buffer: a restart or a device switch continues the same text.
           dialogueContext,
@@ -17526,6 +17733,8 @@ export function apply(ctx, config) {
         isCurrent: () => hearing === session,
         onExit: (exit) => {
           hearing = null;
+          // Capture is gone: a candidate callback still queued by this session must be dropped.
+          invalidateSpeakerCandidates();
           heard.partial = '';
           // 采集已退出：还没等到终稿的开口锁必须释放，不能留到 TTL 才回收。
           dropSpeechEvidence();
@@ -17576,6 +17785,8 @@ export function apply(ctx, config) {
   const stopListening = async () => {
     // An explicit stop also ends a pending autostart retry: the user asked for quiet.
     hearingAutostart?.cancel();
+    // No candidate may be added after an explicit stop, including one hearing already queued.
+    invalidateSpeakerCandidates();
     hearing?.stop();
     hearing = null;
     heard.partial = '';
@@ -19051,7 +19262,10 @@ export function apply(ctx, config) {
           return { confirmed: true, backend: result.backend ?? null };
         },
       },
-      { name: 'hearing', kind: 'internal', stop: () => stopHearingSession(hearing) },
+      { name: 'hearing', kind: 'internal', stop: () => {
+        invalidateSpeakerCandidates();
+        return stopHearingSession(hearing);
+      } },
       { name: 'ambient', kind: 'internal', stop: () => stopHearingSession(ambient) },
       {
         name: 'speakerDownload',

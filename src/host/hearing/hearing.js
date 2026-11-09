@@ -863,15 +863,23 @@ export function startHearing({
    * state; the deferred call sits beside delivery, and a throwing or rejecting listener is swallowed.
    */
   const speakerSampleEmitted = new Set();
-  const noteSpeakerSample = (snapshot, verdict, embedding, text) => {
-    if (typeof onSpeakerSample !== 'function' || stopped) return;
+  /**
+   * Whether this utterance may be offered to the candidate listener at all. It is also checked
+   * again inside the deferred call: stopping in between must not let a queued sample reach the
+   * host. An empty (or all-disabled) speaker library does not change these gates.
+   */
+  const speakerCandidateEligible = (snapshot, verdict) => {
+    if (typeof onSpeakerSample !== 'function' || stopped) return false;
     // Only a real microphone lane: an unnamed input is not promoted to `mic`, and loopback is a
     // different person's audio far more often than not.
-    if (inputSource !== 'mic' || verdict.quality !== 'ok') return;
-    if (!(embedding instanceof Float32Array) || embedding.length === 0) return;
-    if (!(Number.isFinite(snapshot.durationMs) && snapshot.durationMs >= SPEAKER_CANDIDATE_MIN_MS)) return;
+    if (inputSource !== 'mic' || verdict.quality !== 'ok') return false;
+    if (!(Number.isFinite(snapshot.durationMs) && snapshot.durationMs >= SPEAKER_CANDIDATE_MIN_MS)) return false;
     const samples = snapshot.speakerSamples;
-    if (!(samples instanceof Float32Array) || samples.length === 0) return;
+    return samples instanceof Float32Array && samples.length > 0;
+  };
+  const noteSpeakerSample = (snapshot, verdict, embedding, text) => {
+    if (!speakerCandidateEligible(snapshot, verdict)) return;
+    if (!(embedding instanceof Float32Array) || embedding.length === 0) return;
     if (speakerSampleEmitted.has(snapshot.utteranceId)) return;
     speakerSampleEmitted.add(snapshot.utteranceId);
     if (speakerSampleEmitted.size > 64) {
@@ -881,11 +889,14 @@ export function startHearing({
     const embeddingCopy = embedding.slice();
     const utteranceText = typeof text === 'string' && text.length > 0 ? text : snapshot.onlineText;
     setImmediate(() => {
+      // The capture may have stopped while this call sat in the queue; the host also has its own
+      // generation check, but the seam must not hand out a sample after its own stop.
+      if (!speakerCandidateEligible(snapshot, verdict)) return;
       try {
         const result = onSpeakerSample({
           utteranceId: snapshot.utteranceId,
           embedding: embeddingCopy,
-          samples: samples.slice(),
+          samples: snapshot.speakerSamples.slice(),
           sampleRate: 16000,
           durationMs: Math.round(snapshot.durationMs),
           source: 'mic',
@@ -911,13 +922,28 @@ export function startHearing({
       if (embedder === null) return;
       const library = ensureSpeakerLibrary();
       if (library === null) return;
+      const baseVerdict = speakerVerdict(snapshot, {});
       if (library.list().filter((speaker) => speaker.enabled !== false).length === 0) {
-        const verdict = speakerVerdict(snapshot, {});
+        // Cold start: there is no template to score against, but a daily candidate still needs its
+        // embedding. Compute it only when a candidate listener is present and the clip qualifies;
+        // without a listener the old "empty library never embeds" behaviour is preserved. The
+        // no-speakers row below keeps its exact old shape/count semantics.
+        if (speakerCandidateEligible(snapshot, baseVerdict)) {
+          try {
+            const embedding = embedder.embed(snapshot.speakerSamples);
+            if (embedding instanceof Float32Array && embedding.length > 0) {
+              noteSpeakerSample(snapshot, baseVerdict, embedding, text);
+            }
+          } catch (error) {
+            // A failed embed must not suppress the no-speakers evidence row.
+            noteSpeakerDebug('shadow-failed', error);
+          }
+        }
         emitSpeakerShadow({
           decision: 'no-speakers',
-          class: verdict.class,
-          quality: verdict.quality,
-          source: verdict.source,
+          class: baseVerdict.class,
+          quality: baseVerdict.quality,
+          source: baseVerdict.source,
           reason: 'no-speakers',
         });
         return;
