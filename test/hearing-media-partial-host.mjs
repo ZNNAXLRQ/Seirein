@@ -14,7 +14,7 @@
  *   2. 宿主接线：partial 与终稿同 id → 时间线一条、final 状态；status 只报 1 条
  *   3. 兜底与空文本：没有 utteranceId 时才合成 `loopback-partial-<n>`；纯空白 partial 不写
  *
- * Run: node --test test/vision-media-partial-host.mjs
+ * Run: node --test test/hearing-media-partial-host.mjs
  */
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
@@ -143,7 +143,7 @@ hooks.deregister();
 const originalEmit = EventLog.prototype.emit;
 EventLog.prototype.emit = async function emit(type, payload) {
   state.events.push({ type, payload });
-  return { id: 'vision-media-partial-host', ts: new Date().toISOString(), type, payload };
+  return { id: 'hearing-media-partial-host', ts: new Date().toISOString(), type, payload };
 };
 
 after(() => {
