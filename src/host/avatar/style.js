@@ -44,7 +44,8 @@ export const AVATAR_STYLE_CHANNEL_RANGES = Object.freeze({
 export const AVATAR_GAZE_HABITS = Object.freeze(['steady', 'wandering', 'direct']);
 
 
-/** Every accepted style field (numbers, the gaze enum and the per-channel overrides). */
+/** Every accepted style field (numbers, the gaze enum, the optional expression profile and
+ *  the per-channel overrides). */
 export const AVATAR_STYLE_FIELDS = Object.freeze([
   'amplitude',
   'tempo',
@@ -53,11 +54,17 @@ export const AVATAR_STYLE_FIELDS = Object.freeze([
   'nodAmplitude',
   'nodDurationMs',
   'tiltChance',
+  'expression',
   'channels',
 ]);
 
 
-/** Default style: neutral amplitude/tempo, steady gaze, no channel override. */
+/**
+ * Default style: neutral amplitude/tempo, steady gaze, no channel override and NO expression
+ * classification. `expression:null` means "the persona text did not describe concrete behaviour",
+ * which is deliberately different from an expression of 0.5: a neutral 0.5 would still be a
+ * classification the text never made and would bias selection.
+ */
 export const DEFAULT_AVATAR_STYLE = Object.freeze({
   amplitude: 1,
   tempo: 1,
@@ -66,8 +73,122 @@ export const DEFAULT_AVATAR_STYLE = Object.freeze({
   nodAmplitude: 1,
   nodDurationMs: 450,
   tiltChance: 0.15,
+  expression: null,
   channels: Object.freeze({}),
 });
+
+
+// ---------------------------------------------------------------------------------------------
+// Expression tendencies — the SELECTION hint that sits above the numeric dimensions
+// ---------------------------------------------------------------------------------------------
+//
+// The seven numeric dimensions (`liveliness` … `texture`) are an EXECUTION vocabulary: they scale
+// amplitude, tempo, holds and variant spread. They cannot answer "which kind of gesture does this
+// persona prefer", and a broad word such as 可爱 (cute) cannot be mapped onto one of them without
+// guessing. `expression` is the missing CLASSIFICATION layer: a small, optional map of behavioural
+// tendencies derived from CONCRETE persona descriptions only.
+//
+//   tender    → gentle / warm / dreamy        (soft, warm, unhurried presence)
+//   playful   → playful / lively / curious    (teasing, quick reactions, curiosity)
+//   shy       → shy / reserved / dreamy       (looking away, holding back)
+//   composed  → composed / elegant / cool     (calm, measured delivery)
+//
+// These tags only feed the preset selector's soft `personaFit`; they never enter `amplitude`,
+// `tempo`, `deriveAvatarStyleDimensions` or the numeric seed. `null` means "not classified" and
+// must never be manufactured into a 0.5. Multiple tendencies may coexist.
+
+/** Tendency names accepted inside `style.expression`. */
+export const AVATAR_EXPRESSION_TENDENCIES = Object.freeze(['tender', 'playful', 'shy', 'composed']);
+
+/** Tendency → soft selector style tags. The preset library is unchanged; this is selector data. */
+export const AVATAR_EXPRESSION_STYLE_TAGS = Object.freeze({
+  tender: Object.freeze(['gentle', 'warm', 'dreamy']),
+  playful: Object.freeze(['playful', 'lively', 'curious']),
+  shy: Object.freeze(['shy', 'reserved', 'dreamy']),
+  composed: Object.freeze(['composed', 'elegant', 'cool']),
+});
+
+/** Tendency weights are scaled before they become soft tags: a hint must stay a hint. */
+export const AVATAR_EXPRESSION_TAG_SCALE = 0.7;
+
+
+/** Clamp one tendency weight to 0..1; a non-number is invalid (`null`), never coerced to 0. */
+const clampExpressionWeight = (value) => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.min(1, Math.max(0, number));
+};
+
+
+/** Read one expression object without inventing values. Unknown keys and bad numbers are reported.
+ *  A zero weight is a valid number but not a tendency: it is dropped, so `{shy:0}` means
+ *  "unclassified" instead of a classification with weight 0. */
+const readExpression = (input) => {
+  const values = {};
+  const ignored = [];
+  const invalid = [];
+  for (const [name, raw] of Object.entries(input)) {
+    if (!AVATAR_EXPRESSION_TENDENCIES.includes(name)) {
+      ignored.push(name);
+      continue;
+    }
+    const weight = clampExpressionWeight(raw);
+    if (weight === null) {
+      invalid.push(name);
+      continue;
+    }
+    if (weight > 0) values[name] = weight;
+  }
+  return { values, ignored, invalid };
+};
+
+
+/** Deep-copy a stored expression, dropping anything that is not a valid tendency value. */
+const cloneExpression = (input) => {
+  if (input === null || input === undefined) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) return null;
+  const { values } = readExpression(input);
+  return Object.keys(values).length > 0 ? values : null;
+};
+
+
+const sameExpression = (left, right) => {
+  const a = left ?? {};
+  const b = right ?? {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const key of keys) if (a[key] !== b[key]) return false;
+  return true;
+};
+
+
+/**
+ * Map an expression profile onto soft style tags for the preset selector. Input may be a full
+ * style (`{ expression: {...}, amplitude, ... }`) or an expression object itself. The result is
+ * `{ tag: weight }` with weight = tendency × `scale`, capped at 1; missing/unclassified input
+ * returns `{}` (no bias) instead of a fabricated middle weight.
+ *
+ * @param {object|null|undefined} input style or expression object
+ * @param {{scale?: number}} [options]
+ * @returns {Record<string, number>}
+ */
+export function avatarExpressionStyleTags(input, { scale = AVATAR_EXPRESSION_TAG_SCALE } = {}) {
+  const source = input !== null && typeof input === 'object'
+    ? (Object.hasOwn(input, 'expression') ? input.expression : input)
+    : null;
+  const expression = cloneExpression(source);
+  if (expression === null) return {};
+  const numericScale = Number(scale);
+  const factor = Number.isFinite(numericScale) && numericScale >= 0
+    ? numericScale : AVATAR_EXPRESSION_TAG_SCALE;
+  const tags = {};
+  for (const [tendency, weight] of Object.entries(expression)) {
+    for (const tag of AVATAR_EXPRESSION_STYLE_TAGS[tendency] ?? []) {
+      const scaled = Math.round(Math.min(1, weight * factor) * 10_000) / 10_000;
+      tags[tag] = Math.max(tags[tag] ?? 0, scaled);
+    }
+  }
+  return tags;
+}
 
 
 const clampStyleNumber = (key, value, fallback) => {
@@ -112,8 +233,14 @@ const styleChannelAmplitude = (style, channel) => {
 
 
 // ---------------------------------------------------------------------------------------------
-// P-139 stage 3 — persona-derived style dimensions (expression only, never intent selection)
+// P-139 stage 3 — persona-derived style dimensions (EXECUTION only, never action selection)
 // ---------------------------------------------------------------------------------------------
+//
+// The seven dimensions below are the EXECUTION vocabulary: they only scale amplitude, duration,
+// hold, transition smoothness and variant spread. They never choose a gesture, and they are not
+// the `expression` tendency map: a persona that merely says "cute" gets no tendency and no
+// fabricated 0.5. Action CHOICE comes from `style.expression` through
+// `avatarExpressionStyleTags()` (see the expression block above).
 //
 // The dimensions are a *view* of the already-cached style, NOT another model call and NOT
 // another random draw. Same persona text → same `styleVersion` → same style → same dimensions,
@@ -291,6 +418,10 @@ export function splitAvatarStyleDimensions(derived) {
  * Merge a partial style over a base style. Only mentioned fields change; every numeric value is
  * clamped and every enum is validated. An invalid value keeps the base value (never NaN).
  *
+ * `expression` is optional and whole-field: `null` clears it, a valid object replaces it, and an
+ * omitted key keeps the base. A malformed object keeps the base instead of erasing it, so old or
+ * damaged data can never silently change the numeric chain.
+ *
  * @param {object|null|undefined} input partial style (already-parsed JSON)
  * @param {{base?: object}} [options]
  * @returns {object} a complete, clamped style
@@ -306,6 +437,7 @@ export function coerceAvatarStyle(input, { base = DEFAULT_AVATAR_STYLE } = {}) {
     nodAmplitude: clampStyleNumber('nodAmplitude', prior.nodAmplitude, DEFAULT_AVATAR_STYLE.nodAmplitude),
     nodDurationMs: clampStyleNumber('nodDurationMs', prior.nodDurationMs, DEFAULT_AVATAR_STYLE.nodDurationMs),
     tiltChance: clampStyleNumber('tiltChance', prior.tiltChance, DEFAULT_AVATAR_STYLE.tiltChance),
+    expression: cloneExpression(prior.expression),
     channels: coerceStyleChannels(prior.channels),
   };
   if (input === null || input === undefined || typeof input !== 'object' || Array.isArray(input)) {
@@ -315,6 +447,19 @@ export function coerceAvatarStyle(input, { base = DEFAULT_AVATAR_STYLE } = {}) {
     if (!AVATAR_STYLE_FIELDS.includes(key)) continue;
     if (key === 'gazeHabit') {
       if (AVATAR_GAZE_HABITS.includes(value)) style.gazeHabit = value;
+      continue;
+    }
+    if (key === 'expression') {
+      if (value === null) {
+        style.expression = null;
+        continue;
+      }
+      if (typeof value !== 'object' || Array.isArray(value)) continue;
+      const { values, invalid } = readExpression(value);
+      // An explicit empty object clears; unknown-only clears; a damaged known key keeps the prior
+      // classification rather than letting bad data turn into "no tendency".
+      if (Object.keys(values).length > 0) style.expression = values;
+      else if (invalid.length === 0) style.expression = null;
       continue;
     }
     if (key === 'channels') {
@@ -371,6 +516,32 @@ export function normalizeAvatarStyle(input, { base = DEFAULT_AVATAR_STYLE } = {}
       }
       continue;
     }
+    if (key === 'expression') {
+      if (value === null) {
+        if (style.expression !== null) {
+          style.expression = null;
+          changed.push('expression');
+        }
+        continue;
+      }
+      if (typeof value !== 'object' || Array.isArray(value)) {
+        invalid.push('expression');
+        continue;
+      }
+      const read = readExpression(value);
+      for (const name of read.ignored) ignored.push(`expression.${name}`);
+      for (const name of read.invalid) invalid.push(`expression.${name}`);
+      const validCount = Object.keys(read.values).length;
+      // Damaged data never erases a classification the persona already has; an explicit empty /
+      // unknown-only object is "no tendency" and clears it.
+      if (validCount === 0 && read.invalid.length > 0) continue;
+      const next = validCount > 0 ? read.values : null;
+      if (!sameExpression(style.expression, next)) {
+        style.expression = next;
+        changed.push('expression');
+      }
+      continue;
+    }
     if (key === 'channels') {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         invalid.push('channels');
@@ -421,6 +592,11 @@ export function normalizeAvatarStyle(input, { base = DEFAULT_AVATAR_STYLE } = {}
  * (never a half-parsed object) together with `ok:false`; the caller records the event and keeps
  * chatting without waiting.
  *
+ * The prompt tells the model to OMIT `expression` when the persona has no concrete behavioural
+ * description. A persona refresh is therefore treated as a fresh classification: an omitted
+ * `expression` clears a previous profile instead of carrying a stale tendency into a new persona.
+ * The numeric fields keep their usual lazy-merge semantics.
+ *
  * @param {string} text model output, possibly wrapped in a code fence
  * @param {{base?: object}} [options]
  */
@@ -448,7 +624,12 @@ export function parseAvatarStyle(text, { base = DEFAULT_AVATAR_STYLE } = {}) {
     return failure('style output must be a JSON object');
   }
   const normalized = normalizeAvatarStyle(parsed, { base });
-  return normalized.ok === true ? normalized : failure(normalized.error ?? 'invalid style');
+  if (normalized.ok !== true) return failure(normalized.error ?? 'invalid style');
+  if (!Object.hasOwn(parsed, 'expression') && normalized.style.expression !== null) {
+    normalized.style.expression = null;
+    if (!normalized.changed.includes('expression')) normalized.changed.push('expression');
+  }
+  return normalized;
 }
 
 
@@ -473,7 +654,8 @@ export function personaStyleVersion(text) {
 const AVATAR_STYLE_SYSTEM = [
   'You translate a companion persona into Live2D motion-style parameters.',
   'Answer with ONE JSON object and nothing else: no prose, no code fence.',
-  'Only include fields you are changing; every omitted field keeps its current value.',
+  'Only include fields you are changing; every omitted NUMERIC field keeps its current value.',
+  '(expression is a classification of THIS persona: omit it when no concrete behaviour is described.)',
   'Allowed fields and ranges:',
   '- amplitude: 0.2..1.5 (overall motion size)',
   '- tempo: 0.6..1.6 (rhythm speed)',
@@ -482,6 +664,14 @@ const AVATAR_STYLE_SYSTEM = [
   '- nodAmplitude: 0.2..1.5',
   '- nodDurationMs: 250..900',
   '- tiltChance: 0..0.5',
+  '- expression: OPTIONAL object of behavioural tendencies, each 0..1. Keys: tender/playful/shy/composed.',
+  '  Give a weight ONLY for a CONCRETE behavioural description in the persona text',
+  '  (e.g. "teases people", "reacts quickly", "looks away shyly", "speaks calmly").',
+  '  Multiple tendencies may coexist; each concrete description raises its own weight.',
+  '  When the persona only uses broad labels such as cute / kind / gentle / beautiful, OMIT expression',
+  '  entirely. Do not guess a tendency from a broad word, and do not invent 0.5 for unknown.',
+  '  An omitted expression means "no specific tendency was described", not "keep the previous one".',
+  '  expression affects gesture CHOICE only; it must never change the numeric fields.',
   '- channels: optional per-channel overrides, e.g. {"headX":{"amplitude":0.6},"eyeOpenL":{"amplitude":0.3}}.',
   '  Channel keys: headX/headY/headZ (0.2..1.5), eyeOpenL/eyeOpenR (0.05..1), gazeX/gazeY/bodyX/breath (0.2..1.5).',
   '  A channel you do not mention keeps the global amplitude; omit channels you do not want to tune.',
@@ -501,9 +691,10 @@ export function buildAvatarStylePrompt({ personaText = '', currentStyle = DEFAUL
   return {
     system: AVATAR_STYLE_SYSTEM,
     prompt: [
-      `当前风格（未提及的字段保持这些值）：${JSON.stringify(style)}`,
+      `当前风格（未提及的数值字段保持这些值；expression 按本次人设重新判断）：${JSON.stringify(style)}`,
       '字段范围：amplitude 0.2..1.5, tempo 0.6..1.6, gazeHabit steady|wandering|direct,',
       'expressiveness 0.3..1.5, nodAmplitude 0.2..1.5, nodDurationMs 250..900, tiltChance 0..0.5。',
+      '可选 expression：{"tender":0..1, "playful":0..1, "shy":0..1, "composed":0..1}。只有人设文本描述了具体表现（如爱捉弄人、反应轻快、害羞常看开、说话从容）时才给对应权重，可同时有多个；只写“可爱/温柔”等宽泛词时省略 expression，不要猜测。expression 只影响动作选择，不改数值字段。',
       '可选 channels：{"headX":{"amplitude":0.2..1.5}, "eyeOpenL":{"amplitude":0.05..1}, "gazeX"|"gazeY"|"bodyX"|"breath":0.2..1.5}；未提及的通道沿用全局 amplitude。',
       persona.length > 0 ? `人设文本：\n${clipped}` : '人设文本为空：输出 {}。',
       '只输出一个 JSON 对象。',

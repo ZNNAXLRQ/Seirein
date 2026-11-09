@@ -20,6 +20,7 @@ import {
 import {
   AVATAR_STYLE_CHANNEL_RANGES,
   DEFAULT_AVATAR_STYLE,
+  avatarExpressionStyleTags,
   coerceAvatarStyle,
   deriveAvatarStyleDimensions,
   normalizeAvatarStyle,
@@ -1713,6 +1714,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       nodAmplitude: base.nodAmplitude,
       nodDurationMs: base.nodDurationMs,
       tiltChance: base.tiltChance,
+      /** Selection-only classification: passed through verbatim, never scaled by status/relax. */
+      expression: base.expression === null || base.expression === undefined
+        ? null : { ...base.expression },
       channels,
     };
   }
@@ -1853,7 +1857,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return state.presets.selector;
   }
 
-  /** Soft persona tags for the selector: tiltChance / gazeHabit have real, named consumers. */
+  /**
+   * Soft persona tags for the selector: tiltChance / gazeHabit have real, named consumers, and
+   * the optional `expression` tendencies add a SELECTION-only bias. Tags merge by `max`, so a
+   * tendency can raise a tag but never overwrite an existing tag or a higher user priority, and
+   * it never changes amplitude / tempo / the numeric dimensions.
+   */
   function presetPersona() {
     const style = state.effective ?? state.style;
     const tilt = clamp01(finite(style?.tiltChance, DEFAULT_AVATAR_STYLE.tiltChance) / 0.5);
@@ -1879,6 +1888,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       add('earnest', 0.85);
       add('confident', 0.7);
       add('composed', 0.6);
+    }
+    // Concrete-expression tendencies: soft style tags only (0.7×), max-merged with the tags above.
+    for (const [id, weight] of Object.entries(avatarExpressionStyleTags(style))) {
+      add(id, weight);
     }
     return {
       styles,
