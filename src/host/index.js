@@ -5298,6 +5298,108 @@ export function apply(ctx, config) {
     }
   };
 
+  /**
+   * One answer-body playback round.
+   *
+   * WHY THIS EXISTS: a sentence-by-sentence reply has an empty playback queue between two
+   * sentences — the next sentence's `play()` is only requested after the current clip's `done`
+   * settles. `markEnded` therefore cannot treat "queue empty" as "the answer is over": doing that
+   * reported `answer-end`/`speechEnd` after every sentence (the reported 32 ends in 2 rounds).
+   *
+   * The round stays `bodyOpen` while its producer may still hand another clip to playback. It is
+   * sealed by the producer's own end signal — the reply speaker's `finish()` resolving (voice /
+   * typed lanes) or the fast reply stream returning — and only then may the LAST natural end
+   * recorded by `markEnded` become the one answer end. A cancel/failure closes the round without
+   * ever committing it, so a barge-in never settles the pose.
+   */
+  const ANSWER_ROUND_LIMIT = 64;
+  const answerRounds = new Map();
+  /**
+   * Stable round id: one answer body = (session, turn). `0`/null are both "unknown" so a playback
+   * seam that had to fall back to 0 and its seal still meet on the same key.
+   */
+  const answerRoundKey = (sessionId, turn = null) => {
+    const id = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : 'anonymous';
+    const roundTurn = Number.isInteger(turn) && turn > 0 ? turn : 'none';
+    return `answer\u0000${id}\u0000${roundTurn}`;
+  };
+  /** Register (once) the answer-body round a reply clip belongs to. */
+  const noteAnswerRound = (key) => {
+    if (typeof key !== 'string' || key.length === 0) return null;
+    const prior = answerRounds.get(key);
+    if (prior !== undefined) return prior;
+    const parts = key.split('\u0000');
+    const turn = Number(parts[2]);
+    const round = {
+      key,
+      sessionId: parts[1] ?? '',
+      turn: Number.isInteger(turn) && turn > 0 ? turn : null,
+      /** True while another body clip may still follow; false only when the producer sealed it. */
+      bodyOpen: true,
+      cancelled: false,
+      emitted: false,
+      /** The last natural body-clip end instant (ms), 0 until a sentence completes. */
+      candidateAt: 0,
+    };
+    answerRounds.set(key, round);
+    while (answerRounds.size > ANSWER_ROUND_LIMIT) answerRounds.delete(answerRounds.keys().next().value);
+    return round;
+  };
+  /** A cancelled/interrupted body clip closes its round for good: it is not an answer end. */
+  const cancelAnswerRound = (key) => {
+    const round = answerRounds.get(key);
+    if (round === undefined) return false;
+    round.cancelled = true;
+    round.candidateAt = 0;
+    return true;
+  };
+  /**
+   * The ONE answer-end commit. It is idempotent per round and refuses while the body is still open
+   * or another clip is queued (`markEnded`'s old `playbackQueued` guard is kept as a second gate).
+   */
+  const commitAnswerEnd = (round) => {
+    if (round === null || round === undefined) return false;
+    if (round.cancelled || round.emitted) return false;
+    if (round.bodyOpen || !(round.candidateAt > 0)) return false;
+    if (playbackQueued()) return false;
+    round.emitted = true;
+    const at = round.candidateAt;
+    round.candidateAt = 0;
+    avatarSpeechEnd(at);
+    avatarIntent('answer-end', { at });
+    return true;
+  };
+  /**
+   * The producer finished its body: no further clip can join this round. Commit the answer end
+   * recorded by the last natural sentence, or nothing when it was cancelled / never played.
+   */
+  const sealAnswerRound = (key) => {
+    const round = answerRounds.get(key);
+    if (round === undefined) return false;
+    round.bodyOpen = false;
+    return commitAnswerEnd(round);
+  };
+  /** Seal every round a producer actually used (voice lane: the speaker's play seam collects them). */
+  const sealAnswerRounds = (keys) => {
+    let sealed = 0;
+    for (const key of keys) if (sealAnswerRound(key)) sealed += 1;
+    return sealed;
+  };
+  /**
+   * A relayed-result notice names only its turn (the parent session id is not in its payload), so
+   * seal the open round(s) of that turn. Used solely by an event emitted after the typed speaker's
+   * `finish()` resolved; the normal typed lane seals by its exact (session, turn) key.
+   */
+  const sealAnswerRoundsByTurn = (turn) => {
+    const wanted = Number(turn);
+    if (!Number.isInteger(wanted) || wanted <= 0) return 0;
+    let sealed = 0;
+    for (const round of [...answerRounds.values()]) {
+      if (round.turn === wanted && round.bodyOpen) sealed += sealAnswerRound(round.key) ? 1 : 0;
+    }
+    return sealed;
+  };
+
   const markEnded = (session, reason = 'end', end = null) => {
     if (session.ended) return session;
     session.ended = true;
@@ -5336,7 +5438,23 @@ export function apply(ctx, config) {
         // if the answer had finished. A cancel/interruption is not an answer end.
         const answerBody = isAnswerBodyClip(session);
         const answerEnded = session.endReason === 'end' || session.endReason === 'watchdog';
-        if (answerBody && answerEnded && !playbackQueued()) {
+        const answerRound = answerBody ? noteAnswerRound(session.answerRound) : null;
+        if (answerRound !== null) {
+          if (answerEnded) {
+            // Record the end of THIS sentence. It is only a candidate while the round is
+            // `bodyOpen`; the producer's seal later commits it once no further body clip can
+            // follow. The queue check keeps the old "nothing behind this clip" guard as well, so
+            // a sentence gap can never look like the answer's end.
+            if (!playbackQueued()) {
+              answerRound.candidateAt = session.endedAt;
+              commitAnswerEnd(answerRound);
+            }
+          } else {
+            // cancelled / interrupted / failed before the sentence completed: never an answer end.
+            cancelAnswerRound(answerRound.key);
+          }
+        } else if (answerBody && answerEnded && !playbackQueued()) {
+          // A reply clip whose producer supplied no round id keeps the old single-clip behavior.
           avatarSpeechEnd(session.endedAt);
           avatarIntent('answer-end', { at: session.endedAt });
         }
@@ -5525,6 +5643,9 @@ export function apply(ctx, config) {
     // P-139: the speech lane at the playback entrance. Only `reply` (the answer body) may report
     // the answer's end; `ack` / `say` / `tool` are incidental lines. Omitted = derive from `owner`.
     lane = null,
+    // The answer-body round this clip belongs to. A reply clip without one is a legacy single
+    // clip; a round lets `markEnded` tell a sentence gap from the end of the whole answer.
+    answerRound = '',
   }) => {
     signal?.throwIfAborted();
     // Wait for the single playback seat (FIFO). A playing sentence is never cut here; only an
@@ -5544,6 +5665,8 @@ export function apply(ctx, config) {
       session.seat = seat;
       session.owner = owner;
       session.speechLane = speechLaneFor(lane, owner);
+      session.answerRound = typeof answerRound === 'string' ? answerRound : '';
+      if (session.speechLane === ANSWER_SPEECH_LANE) noteAnswerRound(session.answerRound);
       session.sentenceId = Number.isInteger(sentenceId) ? sentenceId : null;
       session.chunkIndex = Number.isInteger(chunkIndex) && chunkIndex >= 0 ? chunkIndex : 0;
       session.chunkCount = Number.isInteger(chunkCount) && chunkCount > 0 ? chunkCount : 1;
@@ -12232,7 +12355,7 @@ export function apply(ctx, config) {
     cancelFastReply('apply-models');
     return true;
   };
-  const speakSentence = async (text, signal = undefined, sentenceId = null) => {
+  const speakSentence = async (text, signal = undefined, sentenceId = null, answerRound = '') => {
     const voice = typeof config?.ttsVoice === 'string' ? config.ttsVoice : undefined;
     const speech = speechSignal();
     const combined = signal ? AbortSignal.any([signal, speech]) : speech;
@@ -12265,6 +12388,8 @@ export function apply(ctx, config) {
         chunkCount: Number.isInteger(count) && count > 0 ? count : 1,
         // The fast path's spoken answer is the answer body: its natural end may settle the pose.
         lane: 'reply',
+        // All sentences of this fast reply share one round; only its stream end seals it.
+        answerRound,
       });
       return { audioStartedAt: session.startedAt > 0 ? session.startedAt : Date.now(), done: session.done };
     };
@@ -12323,6 +12448,8 @@ export function apply(ctx, config) {
     const controller = new AbortController();
     // One identity for the whole turn: the retry and the visible failure carry this same number.
     const turn = (fastTurnSeq += 1);
+    // One answer-body round for every sentence this stream speaks: the sentence gaps are not ends.
+    const answerRound = answerRoundKey('fastpath', turn);
     const promise = (async () => {
       // The sentence id pairs the original caption with its translated speech line, in order.
       let sentenceSeq = 0;
@@ -12332,7 +12459,7 @@ export function apply(ctx, config) {
           turn,
           onSentence: async (sentence) => {
             if (controller.signal.aborted) return;
-            await speakSentence(sentence, controller.signal, sentenceSeq);
+            await speakSentence(sentence, controller.signal, sentenceSeq, answerRound);
             sentenceSeq += 1;
           },
         });
@@ -12340,6 +12467,8 @@ export function apply(ctx, config) {
         return result;
       } catch (error) {
         if (!controller.signal.aborted) {
+          // A failed fast answer never settles the pose as if the answer had completed.
+          cancelAnswerRound(answerRound);
           const failure = error?.fastpathFailure ?? {};
           const reason = typeof failure.reason === 'string' ? failure.reason : 'error';
           await log.emit('fastpath.failed', {
@@ -12360,6 +12489,10 @@ export function apply(ctx, config) {
     try {
       return await promise;
     } finally {
+      // The stream returned: every sentence it spoke has already played to its own end. This is
+      // the fast lane's "reply body closed" signal, so the one answer end can now be committed.
+      if (controller.signal.aborted) cancelAnswerRound(answerRound);
+      else sealAnswerRound(answerRound);
       if (fastActive?.controller === controller) fastActive = null;
     }
   };
@@ -13491,6 +13624,8 @@ export function apply(ctx, config) {
         // A whole-line notice/fallback closes its own playback; with `lane:'say'` (the default)
         // it never reports the answer's end, so it cannot settle the pose.
         lane,
+        // An answer-body fallback belongs to this turn's round; its producer seals it afterwards.
+        ...(lane === 'reply' ? { answerRound: answerRoundKey(sessionId, turn) } : {}),
       });
       // Legacy metric: a synchronous host clock anchor, NOT measured speaker first audio (A1).
       return {
@@ -14047,6 +14182,13 @@ export function apply(ctx, config) {
 
   const typedVoice = createTypedVoiceRelay({
     emit: (type, payload) => {
+      // A typed/relayed answer's speaker emitted this AFTER `finish()` resolved: every sentence
+      // has played, so its body is closed. Commit the one answer end before the posture relaxes.
+      if (type === 'voice.typed.spoken') {
+        sealAnswerRound(answerRoundKey(payload?.sessionId, payload?.turn));
+      } else if (type === 'voice.result.completed') {
+        sealAnswerRoundsByTurn(payload?.turn);
+      }
       // P-139 stage 4: `voice.typed.spoken` is written only after the LAST clip finished, so this
       // is the typed answer's end with nothing queued — the one point relax may decay the posture.
       // A relayed result ends through the same outlet, so its `voice.result.completed` does the same.
@@ -14138,6 +14280,8 @@ export function apply(ctx, config) {
         owner: { sessionId, turn: Number.isInteger(turnId) ? turnId : null, lane: 'typed' },
         // The typed reply's body is the answer body; its natural end may close/settle the answer.
         lane: 'reply',
+        // The typed relay seals this round when its speaker's finish() resolves (`voice.typed.spoken`).
+        answerRound: answerRoundKey(sessionId, Number.isInteger(turnId) ? turnId : null),
         // One caption for the sentence: a block gap must not hide it; the last block holds it.
         subtitleFinal: chunkIndex >= chunkCount - 1,
         // P-54: the reply speaker's `sentenceId` names the sentence this block belongs to.
@@ -14479,6 +14623,11 @@ export function apply(ctx, config) {
       // when the first fragment arrives: mute/barge-in aborts that captured signal, so a late
       // fragment can never start speaking through the fresh post-unmute controller. Each sentence
       // plays through the one playback session, so subtitle and mouth start with that sentence.
+      // Answer-body rounds this turn's speaker really used. The speaker's `finish()` (awaited in
+      // `applySpokenVersion`) is the body-closed signal; these keys are sealed only then, so a
+      // gap between two sentences can never become an answer end. Kept per task so a lane abort
+      // closes exactly the clips this turn produced.
+      const replyRoundKeys = new Set();
       const ensureSentenceVoice = () => {
         if (sentenceVoice !== null) return sentenceVoice;
         // Gap 2: a turn whose captured signal was invalidated (mute/barge-in) may never acquire
@@ -14609,6 +14758,9 @@ export function apply(ctx, config) {
               // only content the tool already said is skipped, never the rest of the reply.
               turnOwnership?.claimAuto();
               const turnId = currentTurnBySession.get(sessionId) ?? 0;
+              // Every block of this answer shares one round; the speaker's finish seals it.
+              const answerRound = answerRoundKey(sessionId, turnId);
+              replyRoundKeys.add(answerRound);
               // One ledger record per sentence block: its own speechId/sentenceId idempotency, its
               // own events, and the single playback seat behind every other owner (FIFO). All
               // blocks carry the whole sentence text, so the text claim verdict is identical.
@@ -14654,6 +14806,7 @@ export function apply(ctx, config) {
                     owner: { speechId, sessionId, turn: turnId, lane: 'reply' },
                     // The reply's body is the only lane allowed to report the answer's end.
                     lane: 'reply',
+                    answerRound,
                     onPlaybackSession: (playing) => {
                       playingSession = playing;
                       onPlaying(playing);
@@ -14798,7 +14951,11 @@ export function apply(ctx, config) {
               return result;
             },
           });
-          const onLaneAbort = () => { sentenceVoice?.cancel('speech-invalidated'); };
+          const onLaneAbort = () => {
+            // The user's barge-in/mute ends this answer: no sentence end may become its end.
+            for (const key of replyRoundKeys) cancelAnswerRound(key);
+            sentenceVoice?.cancel('speech-invalidated');
+          };
           lane.addEventListener?.('abort', onLaneAbort, { once: true });
           detachSentenceVoice = () => lane.removeEventListener?.('abort', onLaneAbort);
           // Batch 2: exactly one speaker may sound for this group; a newer version replaces it.
@@ -15611,6 +15768,7 @@ export function apply(ctx, config) {
           }
           if (voiceRounds.get(sessionId) === voiceGroupRound) voiceRounds.delete(sessionId);
           if (interrupted) {
+            for (const key of replyRoundKeys) cancelAnswerRound(key);
             sentenceVoice?.cancel('reply-not-ok');
           } else {
             // Stop feeding a reply we know is incomplete, but let the current clip finish.
@@ -15661,6 +15819,14 @@ export function apply(ctx, config) {
           // session; this never adds a second assistant message.
           bodyEndedText = done.text ?? '';
           const streamed = await applySpokenVersion();
+          // `applySpokenVersion` awaits the reply speaker's `finish()`: every body clip has now
+          // played (or the round was cancelled). Seal the round so the last natural sentence's
+          // end becomes the ONE answer end; a cancelled round is closed without committing.
+          if (streamed?.cancelled === true) {
+            for (const key of replyRoundKeys) cancelAnswerRound(key);
+          } else {
+            sealAnswerRounds(replyRoundKeys);
+          }
           // Read-only metric: the body and the spoken version are measured, never edited. It is
           // written after the round's speech so both expressions are already final.
           emitReplyRedundancy({
@@ -16721,6 +16887,9 @@ export function apply(ctx, config) {
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
           device,
+          // 回环兜底切段：系统声音没有自然停顿，默认 20 s 上限太长；只收紧本会话的 rule 3 到
+          // 10 s，麦克风车道与 DEFAULT_ENDPOINT_RULES / 自然端点规则都不变。
+          endpointRules: { rule3MinUtteranceLength: 10 },
           // Diagnosis clips (opt-in): the Host's one store, its root and the privacy probe.
           audioRetention,
           retentionRoot: root,
