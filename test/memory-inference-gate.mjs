@@ -271,25 +271,45 @@ test('2) remember with a causal marker and no evidence -> hypothesis/unresolved,
   assert.equal(persona.text.includes('OBS'), false, 'the inference did not enter persona/profile text');
 });
 
-test('3) remember with evidence keeps the normal kind and records the evidence id', async (t) => {
+test('3) remember with verified evidence keeps the normal kind and records the evidence ref', async (t) => {
   const root = await tempRoot();
   const app = mount(root);
   t.after(() => app.close());
 
+  // A reference must name a REAL source. Seed one recorded user message in the same domain and
+  // cite it with a verbatim quote; a made-up id no longer counts as evidence.
+  const seed = new MemoryStore(root, { capacity: 2000 });
+  seed.open();
+  try {
+    const recorded = seed.addMessage({
+      role: 'user',
+      sessionId: 'inference-gate',
+      messageId: 'obs-user-1',
+      text: '我昨天把 OBS 场景切换到了浏览器',
+      domain: 'chat',
+    });
+    assert.ok(recorded.record !== null, 'the evidence source message was recorded');
+  } finally {
+    seed.close();
+  }
+
   const text = '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器';
+  const evidence = 'msg:obs-user-1#OBS 场景';
   const value = await app.call('assistant_remember', {
     text,
     kind: 'fact',
     importance: 70,
-    evidence: 'msg-obs-1',
+    evidence,
   });
-  assert.equal(value.inference, false, 'evidence suppresses automatic inference detection');
+  assert.equal(value.inference, false, 'a verified reference lifts the inference');
   assert.equal(value.kind, 'fact');
+  assert.equal(value.evidenceVerified, true, 'the tool reports the verification result');
+  assert.deepEqual(value.evidenceErrors, []);
 
   const row = readRow(root, value.id);
   assert.equal(row.kind, 'fact');
   assert.equal(row.unresolved, 0);
-  assert.equal(row.evidence, 'msg-obs-1', 'the evidence id travels with the record');
+  assert.equal(row.evidence, evidence, 'the verified reference travels with the record');
 
   const recall = await app.call('assistant_recall', { query: 'OBS 场景' });
   const hit = recall.hits.find((entry) => entry.text.includes('OBS 场景'));
@@ -468,10 +488,12 @@ test('8) memory_correct accepts inference/evidence and its render also warns on 
   const row = readRow(root, target.id);
   assert.equal(row.kind, 'hypothesis');
   assert.equal(row.unresolved, 1);
-  assert.equal(row.evidence, 'msg-correction-1');
+  assert.equal(row.evidence, null, 'an unverifiable reference is never persisted');
+  assert.equal(result.evidenceVerified, false);
+  assert.deepEqual(result.evidenceErrors.map((entry) => entry.reason), ['not-found']);
 
-  // `executeMemoryCorrect` does not project inference/kind yet, but the render must honor it as
-  // soon as a caller supplies the flag (the two tools share one warning contract).
+  // `executeMemoryCorrect` now projects the gate verdict; the render must honor inference as soon
+  // as a caller supplies the flag (the two tools share one warning contract).
   const warned = app.render('assistant_memory_correct', args, { ...result, inference: true });
   assert.ok(warned.includes('已标记为未证实推断'));
   assert.ok(warned.includes('待核验'));

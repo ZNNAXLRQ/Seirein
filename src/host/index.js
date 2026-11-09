@@ -773,6 +773,17 @@ function memoryInferenceLine(value) {
 }
 
 /**
+ * The model-facing confirmation the manual memory tools append when a supplied evidence reference
+ * actually verified against a real source. Only the verified case gets this line: an unverified
+ * inference keeps the existing warning, and a call without evidence/inference adds nothing.
+ * @param {{inference?: boolean, evidenceVerified?: boolean}} value
+ */
+function memoryEvidenceLine(value) {
+  if (value?.evidenceVerified === true) return '已由来源核验，可作为已确认记录。';
+  return memoryInferenceLine(value);
+}
+
+/**
  * The model-facing line that names the window a memory query actually covered.
  *
  * `range` is the store's actual window (after relaxation), never the wording of the query.
@@ -8098,7 +8109,7 @@ export function apply(ctx, config) {
         },
         evidence: {
           type: 'string',
-          description: 'Optional single evidence id or quote supporting the statement (for example a message id, frame id or the user\'s exact words). A non-empty evidence string suppresses automatic inference detection; an inference passed without evidence stays unverified.',
+          description: 'Optional evidence reference(s) supporting the statement: mem:<id> (a stored memory) or msg:<id> (a recorded message), optionally followed by #<来源原文片段>; multiple references are comma-separated (多个用逗号分隔). The source must exist, be visible in the same domain or session, and actually support the statement; only then is an inference lifted. An unverified reference leaves an inference unverified.',
         },
       },
       required: ['text'],
@@ -8112,6 +8123,21 @@ export function apply(ctx, config) {
           domain: { type: 'string' },
           ts: { type: 'string' },
           inference: { type: 'boolean' },
+          // Only evidence-bearing calls return these two fields (see runtime/tools.js), so they
+          // stay optional: a call without evidence keeps the original closed shape.
+          evidenceVerified: { type: 'boolean' },
+          evidenceErrors: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                ref: { type: 'string' },
+                reason: { type: 'string' },
+              },
+              required: ['ref', 'reason'],
+            },
+          },
           kind: { type: 'string' },
           timeResolved: {
             type: 'array',
@@ -8135,7 +8161,7 @@ export function apply(ctx, config) {
         const blocks = [{ type: 'text', text: `Remembered in "${value.domain}" (${value.id}).` }];
         const timeLine = memoryTimeResolvedLine(value);
         if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
-        const inferenceLine = memoryInferenceLine(value);
+        const inferenceLine = memoryEvidenceLine(value);
         if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
         return blocks;
       },
@@ -8182,7 +8208,7 @@ export function apply(ctx, config) {
         },
         evidence: {
           type: 'string',
-          description: 'Optional single evidence id or quote supporting the corrected text (for example the correction message id). A non-empty evidence string suppresses automatic inference detection; an inference without evidence stays unverified.',
+          description: 'Optional evidence reference(s) supporting the corrected text: mem:<id> (a stored memory) or msg:<id> (a recorded message), optionally followed by #<来源原文片段>; multiple references are comma-separated (多个用逗号分隔). The source must exist, be visible in the same domain or session, and actually support the correction; only then is an inference lifted. An unverified reference leaves an inference unverified.',
         },
       },
       required: ['expectedVersion', 'expectedText', 'replacement'],
@@ -8207,6 +8233,21 @@ export function apply(ctx, config) {
           supersededId: { type: 'string' },
           currentVersion: { type: 'integer' },
           text: { type: 'string' },
+          // Only evidence-bearing calls return these two fields (see runtime/tools.js), so they
+          // stay optional: a call without evidence keeps the original closed shape.
+          evidenceVerified: { type: 'boolean' },
+          evidenceErrors: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                ref: { type: 'string' },
+                reason: { type: 'string' },
+              },
+              required: ['ref', 'reason'],
+            },
+          },
           candidates: {
             type: 'array',
             items: {
@@ -8270,7 +8311,7 @@ export function apply(ctx, config) {
           const blocks = [{ type: 'text', text: `这条纠正已经应用过（记录 ${value.id}，当前第 ${value.version} 版），未重复修改。` }];
           const timeLine = memoryTimeResolvedLine(value);
           if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
-          const inferenceLine = memoryInferenceLine(value);
+          const inferenceLine = memoryEvidenceLine(value);
           if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
           return blocks;
         }
@@ -8281,7 +8322,7 @@ export function apply(ctx, config) {
         }];
         const timeLine = memoryTimeResolvedLine(value);
         if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
-        const inferenceLine = memoryInferenceLine(value);
+        const inferenceLine = memoryEvidenceLine(value);
         if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
         return blocks;
       },

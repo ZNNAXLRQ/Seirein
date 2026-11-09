@@ -121,9 +121,9 @@ function serializeSpeakerAttribution(value) {
 // (`assistant_remember` → add(), `assistant_memory_correct` → correct()) can also receive a
 // *derived* statement — a cause, an identity, a preference, a feeling — that the assistant only
 // inferred. Such a row may be useful reference, but it must not silently become a confirmed fact,
-// a fixed convention, or a profile constraint. The markers below are the deterministic trigger;
-// an explicit `inference:true` forces the same result, and a non-empty `evidence` string/ID
-// suppresses automatic detection because the caller supplied support for the statement.
+// a fixed convention, or a profile constraint. The markers below only mark a statement as
+// SUSPICIOUS; an explicit `inference:true` forces the same result. A supplied `evidence` string is
+// not trusted by itself: it must pass `verifyEvidence` below before it can lift the hypothesis.
 export const INFERENCE_MARKERS = Object.freeze([
   '因为', '所以', '导致', '说明', '推测', '可能', '估计', '应该是', '大概是', '看来',
 ]);
@@ -161,9 +161,11 @@ export function hasInferenceMarker(text) {
  * Decide whether one derived manual write is an unverified inference.
  *
  * An explicit `inference:true` always wins (the caller knows it is a guess). Automatic detection
- * only fires when a marker exists AND no evidence string/ID was supplied, so an evidence-backed
- * summary keeps its normal kind. `inference:false` does not disable automatic detection: the flag
- * records knowledge, it is not a bypass.
+ * only fires when a marker exists AND no evidence string was supplied, so the caller's own claim of
+ * support suppresses the marker check. That is only the FIRST half of the gate: `add()`/`correct()`
+ * then call `verifyEvidence`, and an unverified reference cannot lift the hypothesis.
+ * `inference:false` does not disable automatic detection: the flag records knowledge, it is not a
+ * bypass.
  *
  * @param {string} text the statement that will actually be stored
  * @param {{inference?: unknown, evidence?: unknown}} [options]
@@ -176,6 +178,124 @@ export function classifyInference(text, { inference = undefined, evidence = unde
     inference: explicit || (evidenceText === null && hasInferenceMarker(text)),
     evidence: evidenceText,
   };
+}
+
+// ---- P-127 evidence references and verification ----------------------------
+//
+// A marker only makes a derived statement SUSPICIOUS; it must never by itself turn speech into a
+// confirmed fact, nor delete what was said. The MANUAL lane may lift the hypothesis only with a
+// real, checkable source. The reference format is one string (the index schema is `string`):
+//
+//   mem:<memoryId>          an active memory row supports the claim (keyword-overlap heuristic)
+//   mem:<memoryId>#<quote>  `quote` must occur verbatim in that row's body
+//   msg:<messageId>         an active recorded message supports the claim
+//   msg:<messageId>#<quote> the same, with a verbatim quote
+//
+// Several references may be supplied by starting the next one after a comma
+// (`mem:<id>#引用,msg:<id>#引用`). A reference is provenance, never a body dump: the verifier reads
+// the source row but error reports echo only the caller-supplied reference string and a reason
+// code. Verification is deliberately conservative:
+//   - not-found     the id resolves to no active or archived row
+//   - scope         source is in another domain AND another session
+//   - stale         source was superseded/hidden/archived (no longer visible)
+//   - self-inference source is itself a hypothesis, or an assistant message that only speculates
+//   - unsupported   a quote does not occur verbatim, or the no-quote keyword overlap is too small
+// Support without a quote is a HEURISTIC (shared CJK bigrams/ASCII words); it can produce a false
+// positive, which is why a caller is encouraged to supply `#quote`.
+const EVIDENCE_REF_RE = /^(mem|msg):(.+)$/u;
+const EVIDENCE_REF_SPLIT_RE = /,(?=\s*(?:mem|msg):)/u;
+const EVIDENCE_STOP_TOKENS = new Set([
+  '用户', '现在', '之前', '已经', '这个', '那个', '就是', '还是', '因为', '所以',
+  '可能', '大概', '说明', '导致', '估计', '应该', '看来', '觉得', '认为', '然后',
+  '而且', '但是', '如果', '的话', '什么', '怎么', '我们', '你们', '他们', '自己',
+  '这样', '那样', '时候', '今天', '昨天', '明天', '一个', '一些', '没有', '不是',
+]);
+
+/**
+ * Parse one evidence reference. A malformed reference is returned as `valid:false` (rather than
+ * thrown) so the caller can report it with the same {ref, reason} shape as any other failure.
+ *
+ * @param {unknown} value
+ * @returns {{kind: string, id: string, quote: string, valid: boolean, ref: string}|null}
+ */
+function parseEvidenceRef(value) {
+  const ref = typeof value === 'string' ? value.trim() : '';
+  if (ref.length === 0) return null;
+  const hash = ref.indexOf('#');
+  const head = (hash >= 0 ? ref.slice(0, hash) : ref).trim();
+  const quote = hash >= 0 ? ref.slice(hash + 1).trim() : '';
+  const match = EVIDENCE_REF_RE.exec(head);
+  if (match === null) return { kind: '', id: '', quote, valid: false, ref };
+  const id = match[2].trim();
+  return { kind: match[1], id, quote, valid: id.length > 0, ref };
+}
+
+/**
+ * Split one stored evidence string into references. Split only at a comma that starts another
+ * `mem:`/`msg:` token, so a quote may itself contain ordinary commas.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function splitEvidenceRefs(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (text.length === 0) return [];
+  return text.split(EVIDENCE_REF_SPLIT_RE).map((part) => part.trim()).filter((part) => part.length > 0);
+}
+
+/** Content tokens used by the no-quote support heuristic: CJK bigrams + ASCII words. */
+function evidenceTokens(value) {
+  const tokens = new Set();
+  const body = typeof value === 'string' ? value : '';
+  for (const match of body.matchAll(/[\p{Script=Han}]+|[A-Za-z][A-Za-z0-9_]+/gu)) {
+    const run = match[0];
+    if (/^[A-Za-z]/u.test(run)) {
+      const word = run.toLowerCase();
+      if (word.length >= 2) tokens.add(word);
+      continue;
+    }
+    if (run.length <= 2) {
+      if (!EVIDENCE_STOP_TOKENS.has(run)) tokens.add(run);
+      continue;
+    }
+    for (let index = 0; index < run.length - 1; index += 1) {
+      const token = run.slice(index, index + 2);
+      if (!EVIDENCE_STOP_TOKENS.has(token)) tokens.add(token);
+    }
+  }
+  return tokens;
+}
+
+/**
+ * Keyword overlap between a source body and a claim. This is a heuristic, not entailment: it can
+ * only say "these two texts talk about several of the same things".
+ * @param {unknown} sourceText
+ * @param {unknown} claimText
+ * @returns {{shared: number, claim: number, coverage: number}}
+ */
+function evidenceOverlap(sourceText, claimText) {
+  const source = evidenceTokens(sourceText);
+  const claim = evidenceTokens(claimText);
+  let shared = 0;
+  for (const token of claim) if (source.has(token)) shared += 1;
+  return { shared, claim: claim.size, coverage: claim.size === 0 ? 0 : shared / claim.size };
+}
+
+/**
+ * Whether one visible source supports one claim. A quote is checked verbatim; without it the
+ * heuristic requires at least two shared content tokens (or every token of a very short claim).
+ * @param {unknown} sourceText
+ * @param {unknown} claimText
+ * @param {unknown} quote
+ * @returns {boolean}
+ */
+function evidenceSupports(sourceText, claimText, quote) {
+  const body = typeof sourceText === 'string' ? sourceText : '';
+  const needle = typeof quote === 'string' ? quote.trim() : '';
+  if (needle.length > 0) return body.includes(needle);
+  const overlap = evidenceOverlap(body, claimText);
+  if (overlap.claim === 0) return false;
+  const needed = Math.min(2, overlap.claim);
+  return overlap.shared >= needed && overlap.shared / overlap.claim >= 0.2;
 }
 
 // ---- P-67 §6: manual-lane relative time ------------------------------------
@@ -648,9 +768,10 @@ export class MemoryStore {
       // string, because the loop only emits `ALTER TABLE ... ADD COLUMN name type`.
       ['raw_text', 'TEXT'],
       ['tz_used', 'TEXT'],
-      // P-127: an evidence string/ID names the support for a derived manual statement. NULL means
-      // "no evidence supplied"; it never changes FTS, capacity, archive or existing unresolved
-      // semantics (an inference additionally enters `unresolved`, it does not replace that field).
+      // P-127: a verified evidence reference names the support for a derived manual statement.
+      // NULL means "no evidence was supplied, or none verified"; it never changes FTS, capacity,
+      // archive or existing unresolved semantics (an inference additionally enters `unresolved`,
+      // it does not replace that field).
       ['evidence', 'TEXT'],
       ['version', 'INTEGER NOT NULL DEFAULT 1'],
       ['updated_at', 'TEXT'],
@@ -1195,6 +1316,100 @@ export class MemoryStore {
   }
 
   /**
+   * Resolve one parsed evidence reference to the visible row it names.
+   *
+   * `mem:` matches an active memory id; `msg:` matches a recorded message id. A row that exists
+   * only in the archive, or that is hidden/superseded, is `stale` (it is no longer something the
+   * assistant may cite). Nothing about the row body is returned to the caller.
+   *
+   * @param {'mem'|'msg'} kind
+   * @param {string} id
+   * @returns {{state: 'found', row: object}|{state: 'stale'}|{state: 'not-found'}}
+   */
+  lookupEvidenceSource(kind, id) {
+    const column = kind === 'msg' ? 'message_id' : 'id';
+    const row = this.db
+      .prepare(`SELECT id, domain, kind, text, role, source, session_id, superseded_by, hidden
+        FROM memory_event WHERE ${column} = ? LIMIT 1`)
+      .get(id);
+    if (row !== undefined) {
+      const superseded = typeof row.superseded_by === 'string' && row.superseded_by.length > 0;
+      if (superseded || Number(row.hidden) === 1) return { state: 'stale' };
+      return { state: 'found', row };
+    }
+    const archived = this.db
+      .prepare(`SELECT 1 AS hit FROM memory_archive WHERE ${column} = ? LIMIT 1`)
+      .get(id);
+    return archived === undefined ? { state: 'not-found' } : { state: 'stale' };
+  }
+
+  /**
+   * Verify every reference in one evidence string before it may lift a hypothesis.
+   *
+   * Scope is deliberately conservative: the source is allowed when it shares the claim's domain
+   * OR the claim's session; a cross-domain, cross-session source is refused rather than treated
+   * as global. A hypothesis (or an assistant message that merely speculates) is never independent
+   * evidence. A quoted reference must occur verbatim; an unquoted one must pass the keyword
+   * overlap heuristic in `evidenceSupports`.
+   *
+   * @param {unknown} evidenceText stored-form evidence string (`mem:`/`msg:` refs)
+   * @param {{domain?: string, sessionId?: string|null, text?: string}} [context]
+   * @returns {{verified: boolean, errors: Array<{ref: string, reason: string}>}}
+   */
+  verifyEvidence(evidenceText, { domain = '', sessionId = null, text = '' } = {}) {
+    this.open();
+    const refs = splitEvidenceRefs(evidenceText);
+    if (refs.length === 0) {
+      return { verified: false, errors: [{ ref: '', reason: 'not-found' }] };
+    }
+    const claimDomain = typeof domain === 'string' ? domain : '';
+    const claimSession = typeof sessionId === 'string' ? sessionId.trim() : '';
+    const claimText = typeof text === 'string' ? text : '';
+    const errors = [];
+    for (const raw of refs) {
+      const parsed = parseEvidenceRef(raw);
+      if (parsed === null || parsed.valid !== true) {
+        errors.push({ ref: raw, reason: 'not-found' });
+        continue;
+      }
+      const lookup = this.lookupEvidenceSource(parsed.kind, parsed.id);
+      if (lookup.state === 'not-found') {
+        errors.push({ ref: raw, reason: 'not-found' });
+        continue;
+      }
+      if (lookup.state === 'stale') {
+        errors.push({ ref: raw, reason: 'stale' });
+        continue;
+      }
+      const source = lookup.row;
+      const sourceDomain = typeof source.domain === 'string' ? source.domain : '';
+      const sourceSession = typeof source.session_id === 'string' ? source.session_id.trim() : '';
+      const sameDomain = claimDomain.length > 0 && sourceDomain === claimDomain;
+      const sameSession = claimSession.length > 0
+        && sourceSession.length > 0
+        && sourceSession === claimSession;
+      if (!sameDomain && !sameSession) {
+        errors.push({ ref: raw, reason: 'scope' });
+        continue;
+      }
+      // The assistant repeating its own guess is not independent evidence, whether the guess was
+      // stored as a hypothesis or is a speculative assistant message.
+      if (
+        source.kind === 'hypothesis'
+        || (source.role === 'assistant' && hasInferenceMarker(source.text))
+      ) {
+        errors.push({ ref: raw, reason: 'self-inference' });
+        continue;
+      }
+      if (!evidenceSupports(source.text, claimText, parsed.quote)) {
+        errors.push({ ref: raw, reason: 'unsupported' });
+        continue;
+      }
+    }
+    return { verified: errors.length === 0, errors };
+  }
+
+  /**
    * Store one memory.
    *
    * The MANUAL lane resolves relative dates before the row is written (P-67 §6): the body keeps
@@ -1209,12 +1424,16 @@ export class MemoryStore {
    * @param {{importance?: number, source?: string, rawText?: string|null,
    *          unresolved?: number, tzUsed?: string|null, now?: Date|number|string,
    *          timeZone?: string, resolveTime?: boolean, inference?: boolean,
-   *          evidence?: string|string[]|null}} [extra]
+   *          evidence?: string|string[]|null, sessionId?: string|null}} [extra]
    *   `now`/`timeZone` inject the reference instant; `resolveTime:true` opts a non-manual caller
    *   in explicitly (the manual source is already opted in). `inference`/`evidence` are the P-127
-   *   gate: a marked statement without evidence is stored as `kind:'hypothesis'` + `unresolved:1`.
+   *   gate: a marked statement without a verified reference is stored as `kind:'hypothesis'` +
+   *   `unresolved:1`. `evidence` uses the `mem:<id>[#quote]` / `msg:<id>[#quote]` format and is
+   *   accepted only when every reference verifies; `sessionId` is the claim's session, used only
+   *   by the conservative evidence scope check.
    * @returns {object} the stored record plus `timeResolved` (structured report or null) and the
-   *   gate result (`inference:boolean`, `kind`, `evidence`)
+   *   gate result (`inference:boolean`, `kind`, `evidence`, `evidenceVerified:boolean`,
+   *   `evidenceErrors:Array<{ref:string, reason:string}>`)
    */
   add(domain, text, kind, extra = {}) {
     this.open();
@@ -1250,12 +1469,37 @@ export class MemoryStore {
       }
     }
     // P-127: only the MANUAL/correction lanes are gated; the automatic recorder writes through
-    // `addMessage()` and is deliberately untouched. An explicit `inference:true` also opts a
-    // direct caller in; a marker alone never changes an auto/candidate write.
+    // `addMessage()` and is deliberately untouched. A marker only flags the statement as
+    // suspicious; `inference:true` is the caller's own statement of uncertainty. Neither becomes a
+    // confirmed fact unless a supplied reference actually verifies.
     const detected = classifyInference(body, { inference: extra.inference, evidence: extra.evidence });
     const inferenceLane = extra.source === 'manual' || extra.source === 'correction' || extra.inference === true;
-    const isInference = detected.inference && inferenceLane;
     const evidenceText = detected.evidence;
+    const wouldInfer = inferenceLane && (extra.inference === true || hasInferenceMarker(body));
+    let isInference = wouldInfer;
+    let evidenceVerified = false;
+    let evidenceErrors = [];
+    let storedEvidence = null;
+    if (evidenceText !== null && inferenceLane) {
+      const verdict = this.verifyEvidence(evidenceText, {
+        domain,
+        sessionId: extra.sessionId ?? null,
+        text: body,
+      });
+      evidenceVerified = verdict.verified === true;
+      evidenceErrors = verdict.errors;
+      if (evidenceVerified) {
+        // A real, visible, independent source lifts the hypothesis: normal kind + stored ref.
+        isInference = false;
+        storedEvidence = evidenceText;
+      }
+      // Otherwise the row keeps its existing hypothesis/unresolved state and the unverified ref is
+      // NOT persisted. A plain, unmarked fact with an optional ref that failed stays a fact; only
+      // derived statements are upgraded/downgraded by this gate.
+    } else if (!inferenceLane) {
+      // The automatic/candidate lane is unchanged: it never runs the gate.
+      storedEvidence = evidenceText;
+    }
     const storedKind = isInference ? 'hypothesis' : (kind ?? 'fact');
     const record = {
       id: randomUUID(),
@@ -1268,8 +1512,10 @@ export class MemoryStore {
       raw_text: extra.rawText ?? (typeof body === 'string' && body !== original ? original : null),
       unresolved: extra.unresolved || timeUnresolved || isInference ? 1 : 0,
       tz_used: tzUsed,
-      evidence: evidenceText,
+      evidence: storedEvidence,
       inference: isInference,
+      evidenceVerified,
+      evidenceErrors,
       timeResolved,
     };
     this.insert({ ...record, clarity: 'vivid', last_seen: record.ts });
@@ -1946,13 +2192,15 @@ export class MemoryStore {
    * historical corrections rely on exact fragment replacement); prefixed forms are deterministic.
    *
    * P-127: `inference`/`evidence` gate the corrected fragment and any `extraText`. A marked
-   * replacement without evidence makes the target a `hypothesis` + `unresolved` record (unless the
-   * target is a real conversation row, whose `event` kind is preserved; only its unresolved flag
-   * changes). An evidence-backed correction keeps its normal kind and stores the evidence id.
+   * replacement without a verified reference makes the target a `hypothesis` + `unresolved` record
+   * (unless the target is a real conversation row, whose `event` kind is preserved; only its
+   * unresolved flag changes). A reference that passes `verifyEvidence` lifts the hypothesis, keeps
+   * the normal kind and is stored; an unverified reference is never persisted. `extraText` is
+   * checked independently against the same reference set.
    *
    * @param {{targetId?: string, expectedVersion: number, expectedText: string,
    *          replacement: string, sourceMessageId?: string, extraText?: string,
-   *          now?: Date|number|string|null, timeZone?: string|null,
+   *          now?: Date|number|string|null, timeZone?: string|null, sessionId?: string|null,
    *          inference?: boolean, evidence?: string|string[]|null}} [input]
    */
   correct({
@@ -1964,6 +2212,7 @@ export class MemoryStore {
     extraText = '',
     now = null,
     timeZone = null,
+    sessionId = '',
     inference = undefined,
     evidence = undefined,
   } = {}) {
@@ -1988,11 +2237,11 @@ export class MemoryStore {
         timeZone: resolveMemoryTimeZone(timeZone),
       };
     const resolvedReplacement = time.changed ? time.text : inputReplacement;
-    // P-127: a correction is a MANUAL lane write. An explicit inference flag always wins; a
-    // marker without evidence is a guess even when the caller passed `inference:false`.
-    const detectedReplacement = classifyInference(resolvedReplacement, { inference, evidence });
-    const evidenceText = detectedReplacement.evidence;
-    const replacementInference = detectedReplacement.inference;
+    // P-127: a correction is a MANUAL lane write. A marker only flags the replacement; whether it
+    // becomes (or remains) a hypothesis depends on `verifyEvidence` below, after the target and its
+    // domain/session are known.
+    const evidenceText = normalizeEvidence(evidence);
+    const replacementWouldInfer = inference === true || hasInferenceMarker(resolvedReplacement);
     // Without an injected reference a bare weekday is deliberately left alone; do not report that
     // intentional no-op as a resolution failure.
     const timeItems = time.items === null
@@ -2022,6 +2271,9 @@ export class MemoryStore {
       candidates: [],
       staleLinkIds: [],
       timeResolved: timeItems,
+      inference: false,
+      evidenceVerified: false,
+      evidenceErrors: [],
       ...extra,
     });
     if (
@@ -2043,7 +2295,7 @@ export class MemoryStore {
         if (wantedId.length > 0) {
           row = this.db
             .prepare(`SELECT id, ts, domain, version, text, kind, unresolved, evidence,
-                role, message_id FROM memory_event
+                role, message_id, session_id FROM memory_event
               WHERE id = ? AND superseded_by IS NULL AND hidden = 0`)
             .get(wantedId);
           if (row === undefined) {
@@ -2053,7 +2305,7 @@ export class MemoryStore {
         } else {
           const rows = this.db
             .prepare(`SELECT id, ts, domain, version, text, kind, unresolved, evidence,
-                role, message_id FROM memory_event
+                role, message_id, session_id FROM memory_event
               WHERE superseded_by IS NULL AND hidden = 0 AND text LIKE ? ESCAPE '\\'
               ORDER BY ts DESC LIMIT 20`)
             .all(`%${escapeLike(fragment)}%`);
@@ -2111,17 +2363,39 @@ export class MemoryStore {
         const after = `${before.slice(0, first)}${resolvedReplacement}${before.slice(first + fragment.length)}`;
         // P-127 target metadata: an inference correction cannot leave a confirmed-looking record.
         // A real conversation row keeps its `event` kind (the row is still evidence of what was
-        // said); every derived record becomes `hypothesis`. Evidence, when supplied, replaces the
-        // old support; an unsupported inference clears it because the old evidence no longer
-        // describes the rewritten text.
+        // said); every derived record becomes `hypothesis`. A supplied reference is verified
+        // against the corrected body; only a passing reference is persisted.
+        const claimSession = (typeof row.session_id === 'string' && row.session_id.length > 0)
+          ? row.session_id
+          : (typeof sessionId === 'string' ? sessionId.trim() : '');
+        let replacementInference = replacementWouldInfer;
+        let replacementEvidenceVerified = false;
+        let replacementEvidenceErrors = [];
+        if (evidenceText !== null) {
+          const verdict = this.verifyEvidence(evidenceText, {
+            domain: row.domain,
+            sessionId: claimSession,
+            text: after,
+          });
+          replacementEvidenceVerified = verdict.verified === true;
+          replacementEvidenceErrors = verdict.errors;
+          if (replacementEvidenceVerified) replacementInference = false;
+        }
         const messageRow = (typeof row.message_id === 'string' && row.message_id.length > 0)
           || row.role === 'user' || row.role === 'assistant';
         const nextKind = replacementInference
           ? (messageRow ? (row.kind ?? 'event') : 'hypothesis')
-          : (row.kind ?? 'fact');
-        const nextUnresolved = replacementInference ? 1 : (Number(row.unresolved) || 0);
+          : (replacementEvidenceVerified && row.kind === 'hypothesis'
+            // A verified correction lifts an older hypothesis. The target's normal kind was
+            // overwritten when it became a hypothesis, and correct() has no kind argument, so use
+            // the neutral confirmed kind (a conversation row stays an event).
+            ? (messageRow ? (row.kind ?? 'event') : 'fact')
+            : (row.kind ?? 'fact'));
+        const nextUnresolved = replacementInference
+          ? 1
+          : (replacementEvidenceVerified ? 0 : (Number(row.unresolved) || 0));
         const nextEvidence = evidenceText !== null
-          ? evidenceText
+          ? (replacementEvidenceVerified ? evidenceText : (replacementInference ? null : (row.evidence ?? null)))
           : (replacementInference ? null : (row.evidence ?? null));
         const stamp = nowIso();
         const updated = this.db
@@ -2189,9 +2463,19 @@ export class MemoryStore {
         const extra = typeof extraText === 'string' ? extraText.trim() : '';
         if (extra.length > 0) {
           // Same transaction, but a genuinely NEW record: this one does cost one pressure credit.
-          // P-127: the extra content is a derived write too, so it passes the same gate.
-          const detectedExtra = classifyInference(extra, { inference, evidence });
-          const extraInference = detectedExtra.inference;
+          // P-127: the extra content is a derived write too, so it passes the same gate against
+          // its OWN text (a reference that supports the replacement need not support the extra).
+          let extraInference = inference === true || hasInferenceMarker(extra);
+          let extraEvidenceVerified = false;
+          if (evidenceText !== null) {
+            const verdict = this.verifyEvidence(evidenceText, {
+              domain: row.domain,
+              sessionId: claimSession,
+              text: extra,
+            });
+            extraEvidenceVerified = verdict.verified === true;
+            if (extraEvidenceVerified) extraInference = false;
+          }
           const record = {
             id: randomUUID(),
             ts: stamp,
@@ -2203,7 +2487,7 @@ export class MemoryStore {
             source: 'correction',
             role: 'user',
             unresolved: extraInference ? 1 : 0,
-            evidence: detectedExtra.evidence,
+            evidence: extraEvidenceVerified ? evidenceText : null,
           };
           this.insert({ ...record, last_seen: stamp });
           extraId = record.id;
@@ -2228,6 +2512,9 @@ export class MemoryStore {
           candidates: [],
           staleLinkIds,
           timeResolved: timeItems,
+          inference: replacementInference,
+          evidenceVerified: replacementEvidenceVerified,
+          evidenceErrors: replacementEvidenceErrors,
         };
       });
     } catch (error) {

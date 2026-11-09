@@ -217,11 +217,14 @@ export function createHostTools(deps) {
       // wording. `add()` turns every relative word into `2026-11-10（明天）` and returns
       // `timeResolved`; both tools pass the same `now`/zone so their reports agree.
       const timeZone = resolveMemoryTimeZone(config?.memory?.timeZone);
-      // P-127: `inference`/`evidence` are passed through to the store gate. A marker without an
-      // evidence string/ID is stored as an unverified hypothesis; the automatic recorder is not
-      // on this path and is never affected. The flag is evidence for the caller's intent, not a
-      // way to force a guess back into a confirmed fact (`inference:false` does not disable the
-      // marker check).
+      // P-127: `inference`/`evidence` are passed through to the store gate. A marker without a
+      // VERIFIED evidence reference is stored as an unverified hypothesis; the automatic recorder
+      // is not on this path and is never affected. `evidence` is a reference string, never an
+      // explanation: `mem:<memoryId>` or `msg:<messageId>`, optionally followed by `#<quoted
+      // source text>` (e.g. `mem:1f0c…#用户住在杭州`). The store checks that the source exists, is
+      // visible in the same domain or session, is not itself a hypothesis/assistant speculation,
+      // and really supports this claim; only then is the hypothesis lifted. `inference:false` is
+      // not a bypass: the deterministic marker check still runs.
       const record = memory.add(domain, normalized.text, kind, {
         source: 'manual',
         importance,
@@ -230,6 +233,7 @@ export function createHostTools(deps) {
         unresolved: normalized.unresolved,
         tzUsed: normalized.tz,
         timeZone,
+        sessionId,
         inference: args.inference,
         evidence: args.evidence,
       });
@@ -260,16 +264,26 @@ export function createHostTools(deps) {
         promoted: promoted.length,
         inference: inferred,
       });
-      return {
+      const value = {
         id: record.id,
         domain,
         ts: record.ts,
         timeResolved: timeResolvedReport(record.timeResolved),
-        // P-127: the model needs to see that this row is reference, not a confirmed fact. The
-        // registered output schema/render still has to declare these two fields (see report).
+        // P-127: the model needs to see that this row is reference, not a confirmed fact, and
+        // whether a supplied reference actually verified. The registered output schema/render in
+        // index.js still has to declare evidenceVerified/evidenceErrors (see report).
         inference: inferred,
         kind: record.kind,
       };
+      // Only evidence-bearing calls add these two fields. The registered output schema is closed
+      // (additionalProperties:false) and index.js is outside this change's file scope, so the
+      // no-evidence path keeps its byte-identical shape; the gate result is always available on
+      // the store record itself.
+      if (args.evidence !== undefined && args.evidence !== null) {
+        value.evidenceVerified = record.evidenceVerified === true;
+        value.evidenceErrors = Array.isArray(record.evidenceErrors) ? record.evidenceErrors : [];
+      }
+      return value;
     },
     async executeMemoryCorrect(args, exec) {
       const {
@@ -297,6 +311,7 @@ export function createHostTools(deps) {
       };
       if (scopeBlocksTool(exec)) return { ...shape, error: SCOPE_ERROR };
       if (!features.enabled('memory')) return { ...shape, error: '记忆组件已关闭' };
+      const turnScope = memoryTurnScope(exec);
       // Host-side source completion: the model rarely knows the current message id, but the
       // session does. A caller-supplied id always wins; otherwise the turn's own user message is
       // injected so the already-recorded correction statement is merged (hidden + refunded).
@@ -318,8 +333,12 @@ export function createHostTools(deps) {
         extraText: args.extraText,
         now,
         timeZone: resolveMemoryTimeZone(config?.memory?.timeZone),
+        // Scope for a conservative evidence check. The store prefers the target row's own session
+        // when it has one; this covers a manual target that was written without a session.
+        sessionId: turnScope.sessionId,
         // P-127: the store gates a speculative replacement/extraText into an unverified
-        // `hypothesis` + `unresolved` row; a normal correction is byte-for-byte unchanged.
+        // `hypothesis` + `unresolved` row; a normal correction is byte-for-byte unchanged. A
+        // supplied `evidence` reference is verified, never trusted as an explanation.
         inference: args.inference,
         evidence: args.evidence,
       });
@@ -343,13 +362,23 @@ export function createHostTools(deps) {
           /* ledger bookkeeping only */
         }
       }
-      return {
+      const value = {
         ...shape,
         ...result,
         timeResolved: timeResolvedReport(result.timeResolved),
         sourceMerged: result.sourceMerged === true,
         mergeReason: result.mergeReason || (sourceMessageId.length > 0 ? '' : 'no-source'),
       };
+      // The store always reports the gate result; expose the two evidence fields only when a
+      // reference was supplied (closed registered schema, index.js outside this change's scope).
+      // `inference` is kept for an unresolved inference so the existing render warns; a normal
+      // correction keeps its original shape.
+      if (args.evidence === undefined || args.evidence === null) {
+        delete value.evidenceVerified;
+        delete value.evidenceErrors;
+        if (value.inference !== true) delete value.inference;
+      }
+      return value;
     },
     async executeRecall(args, exec) {
       const {
