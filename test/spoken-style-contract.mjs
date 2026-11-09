@@ -3,8 +3,9 @@
  * normalization that backs them.
  *
  * Two independent layers are asserted here:
- *   1. `SPOKEN_VERSION_GUIDE` carries a soft short-sentence / natural-phrasing contract whose
- *      priority is explicitly below facts, semantics and persona, plus two real few-shot pairs;
+ *   1. `SPOKEN_VERSION_GUIDE` carries a soft short-sentence / natural-phrasing contract that only
+ *      refines spoken writing under the existing priorities and never overrides facts, constraints
+ *      or explicit user requests, plus two real few-shot pairs that only demonstrate expression;
  *   2. `normalizeSpokenVersion` cleans presentation marks without deleting content (negation,
  *      causality, numbers/units, names, conditions, persona particles), and accepts a candidate
  *      whose length equals the body while refusing anything longer.
@@ -30,17 +31,25 @@ assert.notEqual(guideEnd, -1, 'SPOKEN_VERSION_GUIDE is a template literal');
 const guide = indexSource.slice(guideStart, guideEnd);
 
 // ---------------------------------------------------------------------------
-// 1. The hard constraint block exists, stays soft on length, and never outranks semantics/persona
+// 1. The hard constraint block exists, stays soft on length, and only refines spoken writing
+//    under the existing priorities
 // ---------------------------------------------------------------------------
-test('1. guide 含软性短句约束、两组 few-shot 与语义/人设优先', (t) => {
+test('1. guide 含软性短句约束、两组 few-shot，且不覆盖事实/限制/用户要求', (t) => {
   for (const marker of [
     '口语硬约束',
-    '优先级高于文采与结构',
-    '但低于事实、语义与人设',
+    '本次只优化口语书写，保持既有优先级',
+    '不得覆盖事实保真、限制条件与用户明确要求',
     '冲突时，以本节为准',
   ]) {
     assert.ok(guide.includes(marker), `missing priority marker "${marker}"`);
   }
+
+  // The guide never claims a top priority, a 25-character cap, fixed word substitutions or a
+  // blanket symbol purge.
+  for (const banned of ['优先级最高', '25 字', '固定替换', '固定词语替换', '全面删符号']) {
+    assert.ok(!guide.includes(banned), `the guide must not contain "${banned}"`);
+  }
+  assert.ok(!/25\s*字/u.test(guide), 'no 25-character wording');
 
   // One main idea per sentence; long attributives split out; short sentences stay a soft rule.
   for (const marker of ['一句一个主要意思', '句子长短跟着口气走', '不为了短而硬拆', '定语太长', '再拆成短句']) {
@@ -67,16 +76,28 @@ test('1. guide 含软性短句约束、两组 few-shot 与语义/人设优先', 
     assert.ok(guide.includes(marker), `missing no-structure-word rule "${marker}"`);
   }
 
-  // Persona expression survives; it is never deleted for "cleanliness".
-  for (const marker of ['人设与已有表达优先', '语气词', '轻笑', '不为了“干净”删掉']) {
-    assert.ok(guide.includes(marker), `missing persona-tone rule "${marker}"`);
+  // Persona only shapes expression: it follows the existing priorities and never overrides facts,
+  // constraints or explicit user requests.
+  for (const marker of [
+    '人设与已有表达要保留', '语气词', '轻笑', '不为了“干净”删掉',
+    '人设只作用于表达，不改变既有优先级，不得覆盖事实保真、限制条件与用户明确要求',
+  ]) {
+    assert.ok(guide.includes(marker), `missing persona rule "${marker}"`);
+  }
+
+  // Acceptance is natural, complete, in-persona expression, not the fewest symbols or shortest text.
+  for (const marker of [
+    '验收口径：答中需求、重点与条件完整、表达自然、人设保留',
+    '不是符号越少或句子越短越好',
+  ]) {
+    assert.ok(guide.includes(marker), `missing acceptance rule "${marker}"`);
   }
 
   // Written metaphors are only a preference, not a blanket rewrite rule.
   assert.ok(guide.includes('书面比喻、成语、评论腔优先考虑直说'), 'written metaphors prefer plain speech');
   assert.ok(guide.includes('人设正需要这种说法时保留'), 'a persona-required metaphor is kept');
-  assert.ok(guide.includes('只学句式') && guide.includes('不是逐字套用的模板'),
-    'the samples are examples, not absolute templates');
+  assert.ok(guide.includes('只学句式') && guide.includes('只示范表达方式') && guide.includes('不是逐字套用的模板'),
+    'the samples demonstrate expression, not absolute templates');
 
   // The two real written→spoken pairs are both present, word for word.
   assert.equal((guide.match(/书面：/gu) ?? []).length, 2, 'two written samples');
@@ -84,10 +105,22 @@ test('1. guide 含软性短句约束、两组 few-shot 与语义/人设优先', 
   for (const sample of [
     '片子好不好是外面那把尺子的事',
     '他其实在说，别人只看片子好不好',
+    '你为这个角色付出了多少',
     '这种「一开始不对付」的铺垫其实是最好的调味料',
     '一开始两个人互相看不顺眼，这个安排挺有意思',
   ]) {
     assert.ok(guide.includes(sample), `missing few-shot sample "${sample}"`);
+  }
+
+  // Few-shot samples must not supply facts the body never stated.
+  assert.ok(!guide.includes('你为这个角色花了多少时间'),
+    'the sample does not narrow 付出 to time spent');
+  for (const marker of [
+    '示例不得新增剧情解释、程度或范围',
+    '所有信息必须能在正文找到依据',
+    '注：“两个人其实一直在偷偷看对方”正文已有依据',
+  ]) {
+    assert.ok(guide.includes(marker), `missing few-shot fidelity rule "${marker}"`);
   }
 
   // The earlier five-step need-oriented structure is intact.
