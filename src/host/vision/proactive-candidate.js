@@ -1,0 +1,474 @@
+/**
+ * P-187 阶段 5 —— 主动回应仲裁（纯决策层）。
+ *
+ * 设计文档第十节只把“作品事件 -> 主动候选”作为输入，真正开口前还要过一遍时机与频率：
+ * 候选未过期、证据仍在、用户没在说话、助手没有待完成回应、不在关键台词上、离上次主动
+ * 够远、每小时没超限。第十一节又要求这些观察是短期、有界、可过期的，不能自动写进记忆。
+ *
+ * 因此本模块只做一件事：判断“现在这一步适不适合开口，如果要开口说哪一条”。
+ *   - 不截图、不读文件、不调用模型、不建定时器、不写记忆、不创建对话、不改人设；
+ *   - 不推断作品情绪，也不把作品情绪当成用户情绪；`angle` 只是原样保存的反应角度；
+ *   - 所有时间都由调用方注入，模块内只比较数字，方便逐条测试。
+ *
+ * 取舍：
+ *   - evaluate() 只读输入、不消费候选；真正开口后必须再调用 spoken() 记账。
+ *   - spoken() 会移除同 id 候选，并在 maxAgeMs 窗口内记住该 id，避免同一事件被重复说出。
+ *   - 候选过期就丢弃，不排队；淘汰/拒绝都只计数，不回报正文。
+ */
+
+/** 第一版试验参数；不是冻结值，按本机实测再调。 */
+export const PROACTIVE_DEFAULTS = Object.freeze({
+  /** 候选有效期（事件发生到可开口）。 */
+  maxAgeMs: 8_000,
+  /** 两次主动之间的最小间隔。 */
+  minGapMs: 45_000,
+  /** 每小时上限。 */
+  maxPerHour: 6,
+  /** 连续未被回应时进入的静默期。 */
+  quietAfterIgnoredMs: 120_000,
+  /** 同时保留的候选上限。 */
+  maxCandidates: 4,
+});
+
+/** 每小时按滚动窗口计算，避免整点前后出现两次突发。 */
+const HOUR_MS = 3_600_000;
+
+/** status() 里的最近主题只留截断标签，不是候选正文。 */
+const TOPIC_LABEL_MAX = 48;
+
+/** 已取消事件 id 只保留近期一段；候选本身寿命很短，无需无限增长。 */
+const CANCELED_ID_LIMIT = 256;
+
+/** 发言时间只用于滚动一小时计数；硬上限防止异常时钟/重复记账把数组撑大。 */
+const SPEAK_TIMES_LIMIT = 2_048;
+
+/** 只接受有限数字或有限数字字符串；其它值（含 null / '' / 布尔）都算缺失。 */
+function finiteNumber(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const text = typeof value === 'string' ? value.trim() : value;
+  if (text === '') return null;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : null;
+}
+
+/** 时间戳不能是负数；无效时返回 null，由调用方决定回退值。 */
+function timestamp(value) {
+  const number = finiteNumber(value);
+  return number === null || number < 0 ? null : number;
+}
+
+/** 配置里的时长/频率：有限且非负；非法时回退默认值。 */
+function nonNegative(value, fallback) {
+  const number = finiteNumber(value);
+  return number === null || number < 0 ? fallback : number;
+}
+
+/** 候选 id / 证据 id / 取消事件 id 统一成去掉首尾空白的非空字符串。 */
+function normalizeId(value) {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return '';
+}
+
+/** 证据 id 列表：非数组视为空；坏项跳过；同 id 只保留一次。 */
+function normalizeEvidence(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const ids = [];
+  value.forEach((entry) => {
+    const id = normalizeId(entry);
+    if (id.length === 0 || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  });
+  return ids;
+}
+
+/** 最近主题：id + 截断后的描述摘要，长度受限，不保留完整正文。 */
+function summarizeTopic(id, description) {
+  const raw = description.length > 0 ? `${id}: ${description}` : id;
+  const chars = Array.from(raw);
+  if (chars.length <= TOPIC_LABEL_MAX) return raw;
+  return `${chars.slice(0, TOPIC_LABEL_MAX - 1).join('')}…`;
+}
+
+/**
+ * 归一化一条候选。返回 { ok, candidate?, reason? } 而不是直接抛错：
+ * 后台理解、序列化、来源切换都可能送来残缺项，一条坏候选不该拖垮整个仲裁器。
+ */
+function normalizeCandidate(input, at, config, canceled, spokenAt) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, reason: 'malformed' };
+  }
+
+  const id = normalizeId(input.id);
+  if (id.length === 0) return { ok: false, reason: 'malformed' };
+
+  if (typeof input.description !== 'string') return { ok: false, reason: 'malformed' };
+  const description = input.description.trim();
+  if (description.length === 0) return { ok: false, reason: 'malformed' };
+
+  const to = timestamp(input.to);
+  if (to === null) return { ok: false, reason: 'malformed' };
+
+  // from 可以省略（视为一个点事件）；一旦给出就必须是合法且不晚于 to 的区间。
+  let from = to;
+  if (input.from !== undefined && input.from !== null) {
+    const parsed = timestamp(input.from);
+    if (parsed === null || parsed > to) return { ok: false, reason: 'malformed' };
+    from = parsed;
+  }
+
+  const evidenceFrameIds = normalizeEvidence(input.evidenceFrameIds);
+  const evidenceAudioIds = normalizeEvidence(input.evidenceAudioIds);
+  // 证据约束：没有画面也没有音频依据，就只是一句猜测，不能进入主动链。
+  if (evidenceFrameIds.length === 0 && evidenceAudioIds.length === 0) {
+    return { ok: false, reason: 'malformed' };
+  }
+
+  let expiresAt = null;
+  if (input.expiresAt !== undefined && input.expiresAt !== null) {
+    const parsed = timestamp(input.expiresAt);
+    if (parsed === null) return { ok: false, reason: 'malformed' };
+    expiresAt = parsed;
+  }
+
+  // “已过”按当前时刻已经到达 expiresAt 计算；到点即失效，不留半拍。
+  if (expiresAt !== null && at >= expiresAt) return { ok: false, reason: 'expired' };
+  // 错过就放弃，不积压成解说队列。
+  if (at - to > config.maxAgeMs) return { ok: false, reason: 'expired' };
+
+  // 用户先评论了同一事件：取消后即使再次送来也不恢复主动。
+  if (canceled.has(id)) return { ok: false, reason: 'canceled' };
+
+  // 重复抑制：同一事件刚说过的 maxAgeMs 内不再接受，避免后台重复理解带来重复开口。
+  const spokenAtTime = spokenAt.get(id);
+  if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) {
+    return { ok: false, reason: 'duplicate' };
+  }
+
+  const priority = finiteNumber(input.priority);
+  const angle = typeof input.angle === 'string' ? input.angle.trim() : '';
+
+  return {
+    ok: true,
+    candidate: Object.freeze({
+      id,
+      from,
+      to,
+      description,
+      evidenceFrameIds: Object.freeze(evidenceFrameIds),
+      evidenceAudioIds: Object.freeze(evidenceAudioIds),
+      angle,
+      expiresAt,
+      priority: priority === null ? 0 : priority,
+    }),
+  };
+}
+
+/**
+ * 创建一个主动回应仲裁器。
+ *
+ * @param {object} [options]
+ * @param {Function|number} [options.now] 时钟：默认 Date.now；测试可注入固定值。
+ * @param {object} [options.defaults] 覆盖 PROACTIVE_DEFAULTS 中的部分或全部参数。
+ */
+export function createProactiveArbiter(options = {}) {
+  const opts = options !== null && typeof options === 'object' && !Array.isArray(options)
+    ? options
+    : {};
+
+  const base = PROACTIVE_DEFAULTS;
+  const source = opts.defaults !== null && typeof opts.defaults === 'object' && !Array.isArray(opts.defaults)
+    ? opts.defaults
+    : {};
+  const config = {
+    maxAgeMs: nonNegative(source.maxAgeMs, base.maxAgeMs),
+    minGapMs: nonNegative(source.minGapMs, base.minGapMs),
+    maxPerHour: Math.floor(nonNegative(source.maxPerHour, base.maxPerHour)),
+    quietAfterIgnoredMs: nonNegative(source.quietAfterIgnoredMs, base.quietAfterIgnoredMs),
+    maxCandidates: Math.max(1, Math.floor(nonNegative(source.maxCandidates, base.maxCandidates))),
+  };
+
+  const clock = typeof opts.now === 'function'
+    ? opts.now
+    : (timestamp(opts.now) !== null ? () => opts.now : Date.now);
+
+  function currentTime() {
+    try {
+      const value = clock();
+      const number = timestamp(value);
+      return number === null ? Date.now() : number;
+    } catch {
+      // 时钟被外部替换成会抛错的函数时也不能让仲裁器崩掉。
+      return Date.now();
+    }
+  }
+
+  /** 候选本身的有效性：未过期、未被取消、不在“刚说过”的重复窗口里。 */
+  function isUsable(candidate, at) {
+    if (candidate.expiresAt !== null && at >= candidate.expiresAt) return false;
+    if (at - candidate.to > config.maxAgeMs) return false;
+    if (canceled.has(candidate.id)) return false;
+    const spokenAtTime = spokenAt.get(candidate.id);
+    if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) return false;
+    return true;
+  }
+
+  /** 取优先级最高者；同优先级取 to 更晚者；再同则取更晚登记的一条。 */
+  function selectCandidate(at) {
+    let chosen = null;
+    candidates.forEach((candidate, index) => {
+      if (!isUsable(candidate, at)) return;
+      if (chosen === null) {
+        chosen = { candidate, index };
+        return;
+      }
+      const better = candidate.priority > chosen.candidate.priority
+        || (candidate.priority === chosen.candidate.priority
+          && (candidate.to > chosen.candidate.to
+            || (candidate.to === chosen.candidate.to && index > chosen.index)));
+      if (better) chosen = { candidate, index };
+    });
+    return chosen === null ? null : chosen.candidate;
+  }
+
+  /** 只保留近期发言时间，滚动窗口用于每小时上限。 */
+  function recentSpeakCount(at) {
+    return speakTimes.filter((time) => at - time < HOUR_MS).length;
+  }
+
+  /** 清理过期候选与过期“刚说过”记录；只动内部状态，不涉及输入。 */
+  function prune(now) {
+    for (let i = candidates.length - 1; i >= 0; i -= 1) {
+      if (!isUsable(candidates[i], now)) candidates.splice(i, 1);
+    }
+    for (const [id, time] of spokenAt) {
+      if (now - time > config.maxAgeMs) spokenAt.delete(id);
+    }
+  }
+
+  /** 读每轮 settings：只认明确的 false / 合法非负数字，畸形字段逐个忽略。 */
+  function resolveSettings(settings) {
+    const resolved = {
+      enabled: true,
+      maxPerHour: config.maxPerHour,
+      minGapMs: config.minGapMs,
+    };
+    if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
+      return resolved;
+    }
+    if (settings.enabled === false) resolved.enabled = false;
+    const maxPerHour = finiteNumber(settings.maxPerHour);
+    if (maxPerHour !== null && maxPerHour >= 0) resolved.maxPerHour = Math.floor(maxPerHour);
+    const minGapMs = finiteNumber(settings.minGapMs);
+    if (minGapMs !== null && minGapMs >= 0) resolved.minGapMs = minGapMs;
+    return resolved;
+  }
+
+  // ---- 内部状态 -----------------------------------------------------------
+  const candidates = [];
+  const canceled = new Map();
+  const spokenAt = new Map();
+  const speakTimes = [];
+  let proposed = 0;
+  let rejected = 0;
+  let expired = 0;
+  let evicted = 0;
+  let duplicate = 0;
+  let canceledCandidates = 0;
+  let spokenCount = 0;
+  let ignoredCount = 0;
+  let consecutiveIgnored = 0;
+  let lastSpokenAt = null;
+  let quietUntil = null;
+  let lastTopic = null;
+  let lastReason = null;
+
+  return {
+    /**
+     * 登记一个主动候选。
+     * @returns 归一化候选（冻结对象），证据缺失/过期/畸形/已取消/重复时返回 null。
+     */
+    propose(input) {
+      const at = currentTime();
+      prune(at);
+
+      const result = normalizeCandidate(input, at, config, canceled, spokenAt);
+      if (!result.ok) {
+        rejected += 1;
+        if (result.reason === 'expired') expired += 1;
+        if (result.reason === 'duplicate') duplicate += 1;
+        return null;
+      }
+
+      const candidate = result.candidate;
+      // 同 id 去重：后到的版本替换旧版本，并视为最新登记。
+      const existing = candidates.findIndex((entry) => entry.id === candidate.id);
+      if (existing >= 0) candidates.splice(existing, 1);
+      candidates.push(candidate);
+      proposed += 1;
+
+      // 最多保留 maxCandidates 条：新的进来，旧的淘汰并计数。
+      while (candidates.length > config.maxCandidates) {
+        candidates.shift();
+        evicted += 1;
+      }
+      return candidate;
+    },
+
+    /**
+     * 判断现在是否适合开口；不修改参数、不消费候选。
+     * 成功时 reason 为 'ok'，candidate 为本次应说的那一条；被抑制时 candidate 为 null。
+     */
+    evaluate(input = {}) {
+      const at = currentTime();
+      const state = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {};
+      const settings = resolveSettings(state.settings);
+      lastReason = null;
+
+      if (!settings.enabled) {
+        lastReason = 'disabled';
+        return { speak: false, candidate: null, reason: 'disabled', suppressed: ['disabled'] };
+      }
+
+      const suppressed = [];
+      if (state.userSpeaking) suppressed.push('user-speaking');
+      if (state.assistantBusy) suppressed.push('assistant-busy');
+      if (state.pendingReply) suppressed.push('pending-reply');
+      if (state.keyDialogue) suppressed.push('key-dialogue');
+
+      // quiet 期还没结束，或距上次开口不足（连续 ignored 时按倍数放大），都算 too-soon。
+      const quiet = quietUntil !== null && at < quietUntil;
+      const lastGap = lastSpokenAt === null ? null : at - lastSpokenAt;
+      const tooSoon = quiet || (lastGap !== null && lastGap < settings.minGapMs
+        * (consecutiveIgnored > 0 ? consecutiveIgnored + 1 : 1));
+      if (tooSoon) suppressed.push('too-soon');
+
+      if (recentSpeakCount(at) >= settings.maxPerHour) suppressed.push('hourly-limit');
+
+      const candidate = selectCandidate(at);
+      if (candidate === null) suppressed.push('no-candidate');
+
+      const speak = suppressed.length === 0;
+      const reason = speak ? 'ok' : suppressed[0];
+      lastReason = reason;
+      return {
+        speak,
+        candidate: speak ? candidate : null,
+        reason,
+        suppressed,
+      };
+    },
+
+    /**
+     * 开口成功后记账：最近发言时间、最近主题、计数、频率窗口。
+     * @param {object} candidate evaluate 返回的候选（至少要有 id）
+     * @param {{ now?: number }} [options] 显式指定开口时刻
+     * @returns {boolean} 是否记录了一条有效候选
+     */
+    spoken(candidate, options = {}) {
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        return false;
+      }
+      const id = normalizeId(candidate.id);
+      if (id.length === 0) return false;
+
+      const at = timestamp(options !== null && typeof options === 'object' ? options.now : null)
+        ?? currentTime();
+
+      prune(at);
+      lastSpokenAt = at;
+      speakTimes.push(at);
+      // 从后往前删，既清掉一小时前的记录，也不依赖数组始终按时间递增。
+      for (let i = speakTimes.length - 1; i >= 0; i -= 1) {
+        if (at - speakTimes[i] >= HOUR_MS) speakTimes.splice(i, 1);
+      }
+      if (speakTimes.length > SPEAK_TIMES_LIMIT) {
+        speakTimes.splice(0, speakTimes.length - SPEAK_TIMES_LIMIT);
+      }
+
+      const description = typeof candidate.description === 'string'
+        ? candidate.description.trim()
+        : '';
+      lastTopic = { id, label: summarizeTopic(id, description) };
+      spokenAt.set(id, at);
+      spokenCount += 1;
+
+      // 同一事件已经说过：从待选池移除，防止紧接着再次被选中。
+      for (let i = candidates.length - 1; i >= 0; i -= 1) {
+        if (candidates[i].id === id) candidates.splice(i, 1);
+      }
+
+      consecutiveIgnored = 0;
+      quietUntil = null;
+      lastReason = 'spoken';
+      return true;
+    },
+
+    /**
+     * 用户先评论了同一事件：取消这些主动候选，转入被动讨论。
+     * 取消是持久的（有界保留），之后同 id 再送来也不会恢复。
+     * @returns {number} 本次移除的候选数
+     */
+    cancelFor(eventIds) {
+      const values = Array.isArray(eventIds) ? eventIds : [eventIds];
+      const at = currentTime();
+      let removed = 0;
+      values.forEach((value) => {
+        const id = normalizeId(value);
+        if (id.length === 0) return;
+        // 重新取消时刷新顺序，超过上限先丢掉最旧的取消记录。
+        canceled.delete(id);
+        canceled.set(id, at);
+        while (canceled.size > CANCELED_ID_LIMIT) {
+          const oldest = canceled.keys().next().value;
+          canceled.delete(oldest);
+        }
+        for (let i = candidates.length - 1; i >= 0; i -= 1) {
+          if (candidates[i].id !== id) continue;
+          candidates.splice(i, 1);
+          removed += 1;
+        }
+      });
+      canceledCandidates += removed;
+      return removed;
+    },
+
+    /** 用户没有回应上一次主动：降低频率并进入 quiet 期。 */
+    ignored() {
+      ignoredCount += 1;
+      consecutiveIgnored += 1;
+      quietUntil = currentTime() + config.quietAfterIgnoredMs;
+      lastReason = 'ignored';
+    },
+
+    /** 计数 / 最近时间 / 最近原因；不含候选描述正文，lastTopic 只是截断标签。 */
+    status() {
+      const at = currentTime();
+      const valid = candidates.reduce((count, candidate) => (isUsable(candidate, at) ? count + 1 : count), 0);
+      return {
+        pending: candidates.length,
+        valid,
+        counts: {
+          proposed,
+          rejected,
+          expired,
+          evicted,
+          duplicate,
+          canceled: canceledCandidates,
+          spoken: spokenCount,
+          ignored: ignoredCount,
+        },
+        canceledEvents: canceled.size,
+        spokenLastHour: recentSpeakCount(at),
+        consecutiveIgnored,
+        quietUntil,
+        lastSpokenAt,
+        lastTopicId: lastTopic === null ? null : lastTopic.id,
+        lastTopic: lastTopic === null ? null : lastTopic.label,
+        lastReason,
+      };
+    },
+  };
+}
