@@ -69,6 +69,8 @@ export class FeatureStore {
     this.file = join(root, 'data', 'features.json');
     this.registry = new Map();
     this.hooks = new Map();
+    /** Per-component transition counter; a reader may compare it across an await. */
+    this.revisions = new Map();
     for (const entry of DEFAULT_FEATURES) this.registry.set(entry.id, { ...entry });
     this.state = this.#load();
   }
@@ -122,6 +124,16 @@ export class FeatureStore {
     return this.state[id] === true;
   }
 
+  /**
+   * Monotonic, read-only per-component counter, bumped by every `set()` for that id (including a
+   * no-op set). A caller that awaits (e.g. a port probe) can record this before the await and
+   * refuse to act when it changed: closing, re-opening or any other transition invalidates work
+   * admitted under the previous switch state. It never changes `enabled()`, persistence or hooks.
+   */
+  revision(id) {
+    return this.revisions.get(id) ?? 0;
+  }
+
   list() {
     return [...this.registry.values()].map((entry) => ({
       id: entry.id,
@@ -143,6 +155,9 @@ export class FeatureStore {
   async set(id, enabled, { reason = '' } = {}) {
     if (!this.registry.has(id)) throw new Error(`unknown feature: ${id}`);
     const next = enabled === true;
+    // Bumped even for a no-op set: the caller's observation of "no transition yet" is what a late
+    // probe relies on, so any set() intent invalidates work admitted before it.
+    this.revisions.set(id, this.revision(id) + 1);
     if (this.state[id] === next) return next;
     this.state[id] = next;
     this.#save();

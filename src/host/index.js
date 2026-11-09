@@ -234,6 +234,7 @@ import {
 import { createCallMode, createSpeakerRegistry, detectAddress } from './hearing/interaction/callMode.js';
 import { createCallNameStore, listCallNames } from './hearing/interaction/callNames.js';
 import { SpoutLayer } from './avatar/spoutLayer.js';
+import { createVtsAutoConnect, VTS_AUTO_BOOT_MS, VTS_AUTO_TICK_MS } from './avatar/auto-connect.js';
 import { VTS_OFFSCREEN, VtsWindow } from './avatar/spout-layer/vts-window.mjs';
 import {
   admitSpawn,
@@ -2296,7 +2297,27 @@ export function apply(ctx, config) {
     }
     return null;
   };
-  const planContextLayers = (context, laneOverride = null) => {
+  /**
+   * The current effective `recent` observation, using exactly the gate the plan applies. A cached
+   * plan therefore stores this fingerprint and can prove it still describes the live buffer; an
+   * empty value (expired/cleared/different lane) is a real observation, not "unknown".
+   */
+  const currentRecentObservation = (context, lane) => {
+    try {
+      if (!inWorkspaceScope(context)) return '';
+      let companion = false;
+      try {
+        companion = isCompanionAgent(context?.agent);
+      } catch {
+        companion = false;
+      }
+      if (!companion || lane !== 'voice' || !features.enabled('hearing')) return '';
+      return dialogueSummary.render();
+    } catch {
+      return '';
+    }
+  };
+  const planContextLayers = (context, laneOverride = null, observedRecent = undefined) => {
     const lane = laneOverride ?? contextLaneOf(context);
     const inScope = inWorkspaceScope(context);
     let companion = false;
@@ -2330,14 +2351,15 @@ export function apply(ctx, config) {
       : '';
     const fixedText = inScope ? renderResources() : '';
     // The dialogue observation and the nonverbal cue are companion-only (the same gate the prompt
-    // providers use); a typed session carries the shared environment facts only.
-    const recentText = inScope && companion && lane === 'voice' && features.enabled('hearing')
-      ? dialogueSummary.render()
-      : '';
+    // providers use); a typed session carries the shared environment facts only. The raw recent
+    // text is recorded on the plan so a request-side read can detect that the buffer moved.
+    const recentText = typeof observedRecent === 'string'
+      ? observedRecent
+      : currentRecentObservation(context, lane);
     const ephemeralBlocks = [];
     if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
-    return assembleLayerPlan({
+    const plan = assembleLayerPlan({
       lane,
       budget: resolveContextBudget(
         config?.contextBudgets ? { contextBudgets: config.contextBudgets } : null,
@@ -2351,6 +2373,9 @@ export function apply(ctx, config) {
         ephemeralBlocks,
       },
     });
+    // Dynamic-layer provenance, not allocation data: only readContextPlan/measure use it.
+    plan.observation = { recent: recentText };
+    return plan;
   };
   /** Start a new assembly: the persona section is the first one the prompt service renders. */
   const computeContextPlan = (context) => {
@@ -2371,12 +2396,29 @@ export function apply(ctx, config) {
    * section), which is what real assembly always renders first. A host double that renders ONE
    * observation section directly therefore gets a fresh plan on every render instead of a stale
    * one from the previous turn.
+   *
+   * The cache is only valid while the live observation it was allocated around is unchanged. Once
+   * `dialogueSummary.render()` differs (an utterance appended between assembly and request, or the
+   * buffer expired/cleared), the WHOLE plan is recomputed from the current layers — not just the
+   * recent block patched — so every layer stays within the same lane allocation. The new plan
+   * replaces the cache for the rest of this turn.
    */
   const readContextPlan = (context) => {
     const key = planKeyOf(context);
     if (key !== null) {
       const cached = contextPlans.get(key);
-      if (cached !== undefined) return cached;
+      if (cached !== undefined) {
+        const current = currentRecentObservation(context, cached.lane ?? contextLaneOf(context));
+        if (cached.observation?.recent === current) return cached;
+        try {
+          const refreshed = planContextLayers(context, null, current);
+          contextPlans.set(key, refreshed);
+          return refreshed;
+        } catch {
+          // Never serve the stale observation when a reallocation fails.
+          return null;
+        }
+      }
     }
     return computeContextPlan(context);
   };
@@ -3962,30 +4004,36 @@ export function apply(ctx, config) {
   // The tick is short, but it dials only once the API port answers, so a starting VTS costs neither
   // an auth attempt nor a `vts.auth.failed` line. A failed attempt backs off so a broken grant or a
   // closing socket cannot be hammered every few seconds.
-  let vtsAutoNextAt = 0;
-  let vtsAutoTickRunning = false;
-  const vtsAutoTick = async () => {
-    if (!features.enabled('avatar')) return;
-    const client = vtsClient();
-    if (client.ready || client.connectPromise !== null) return;
-    if (vtsAutoNextAt > Date.now()) return;
-    if (!(await probePort('127.0.0.1', Number(config?.vtsPort ?? 8001), 400))) return;
-    // The probe awaited: another caller may have started a connection in the meantime.
-    if (client.ready || client.connectPromise !== null) return;
-    const result = await vtsConnect();
-    vtsAutoNextAt = result?.ok === true ? 0 : Date.now() + 20_000;
-  };
-  const runVtsAutoTick = () => {
-    if (vtsAutoTickRunning) return;
-    vtsAutoTickRunning = true;
-    void vtsAutoTick().catch(() => {}).finally(() => { vtsAutoTickRunning = false; });
-  };
-  const vtsAutoTimer = setInterval(runVtsAutoTick, 4_000);
+  //
+  // The probe is awaited, so the tick itself records the component switch revision and this mount's
+  // lifetime generation before the await and re-reads them (plus the switch, plugin teardown and a
+  // connection started by someone else) before any connect: a late probe from a closed component or
+  // an unloaded plugin is dropped silently. See `src/host/avatar/auto-connect.js`.
+  let vtsMountRevision = 0;
+  const vtsAutoConnect = createVtsAutoConnect({
+    probe: () => probePort('127.0.0.1', Number(config?.vtsPort ?? 8001), 400),
+    connect: () => vtsConnect(),
+    isEnabled: () => features.enabled('avatar'),
+    revision: () => features.revision('avatar'),
+    mountRevision: () => vtsMountRevision,
+    isDisposed: () => shutdown.closing === true,
+    isBusy: () => {
+      const client = vtsClient();
+      return client.ready === true || client.connectPromise !== null;
+    },
+  });
+  const runVtsAutoTick = () => { void vtsAutoConnect.run(); };
+  const vtsAutoTimer = setInterval(runVtsAutoTick, VTS_AUTO_TICK_MS);
   vtsAutoTimer.unref?.();
-  ctx.effect(() => () => clearInterval(vtsAutoTimer));
+  ctx.effect(() => () => {
+    // Bump first: an in-flight probe sees the mount generation change even if teardown's
+    // `shutdown.closing` flag has not been set in this turn yet.
+    vtsMountRevision += 1;
+    clearInterval(vtsAutoTimer);
+  });
   // The boot one-shot is the same tick: if VTS is already listening (app restart, not a machine
   // boot) it connects immediately instead of waiting for the first 4 s tick.
-  const vtsBootTimer = setTimeout(runVtsAutoTick, 8_000);
+  const vtsBootTimer = setTimeout(runVtsAutoTick, VTS_AUTO_BOOT_MS);
   vtsBootTimer.unref?.();
   // Neither the boot one-shot nor the socket it may already have opened belongs to a request:
   // closing over both ties them to this mount, so an unload cannot leave a live VTS WebSocket
@@ -10747,14 +10795,16 @@ export function apply(ctx, config) {
       lane,
     );
     const key = agent !== null && typeof agent === 'object' ? agent : null;
+    const context = key === null ? undefined : { agent: key };
     if (key !== null) {
       const cached = contextPlans.get(key);
+      const currentRecent = currentRecentObservation(context, lane);
       const sameBudget = cached !== undefined && cached.lane === lane
+        && cached.observation?.recent === currentRecent
         && ['persona', 'fixed', 'memory', 'recent', 'ephemeral', 'totalChars']
           .every((name) => cached.budget?.[name] === resolved?.[name]);
       if (sameBudget) return { plan: cached };
     }
-    const context = key === null ? undefined : { agent: key };
     let plan = null;
     try {
       plan = planContextLayers(context, lane);
