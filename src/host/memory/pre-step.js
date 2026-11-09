@@ -553,20 +553,39 @@ export async function prepareMemoryInjection({
     const completeness = sources.active === 'timeout' || sources.archive === 'timeout'
       ? 'timeout'
       : archiveTruncated ? 'budget-truncated' : 'complete';
-    const statusText = memoryRoom === 0 ? '' : composeMemoryStatus({ sources, range, timeZone: tz, complete: completeness });
+    // 检索状态块也是要放进请求的记忆内容：它必须整块计入 memory 额度，否则只剩 1 字额度时，
+    // 一份约 80 字的状态会从总预算之外溜进去。放不下就整块不注入（状态不能截断后冒充完整），
+    // 刚好等于额度是允许的边界。
+    const statusCandidate = memoryRoom === 0
+      ? ''
+      : composeMemoryStatus({ sources, range, timeZone: tz, complete: completeness });
+    const statusText = statusCandidate.length <= memoryRoom ? statusCandidate : '';
+    const statusChars = statusText.length;
+    // 只有真正注入的状态块才写进日志：命中路径的 contextLayers/文本口径保持原样。
+    const missLayers = statusChars === 0 || contextLayers === null
+      ? contextLayers
+      : {
+        ...contextLayers,
+        memory: {
+          ...(contextLayers.memory ?? {}),
+          chars: (Number(contextLayers.memory?.chars) || 0) + statusChars,
+        },
+        total: (Number(contextLayers.total) || 0) + statusChars,
+      };
     const recallPayload = {
       ...meta, hits, injected: false, status: true, completeness,
-      injectedChars: 0, requestedChars: composed.requestedChars, records: 0,
+      injectedChars: 0, statusChars, requestedChars: composed.requestedChars, records: 0,
     };
     if (now() > deadline || !(await emitWithinBudget('memory.recall', recallPayload))) {
       recallPayload.injected = false;
       recallPayload.reason = 'timeout';
       recallPayload.completeness = 'timeout';
+      recallPayload.statusChars = 0; // 请求里不会出现状态块，日志也不再声称它被注入
       emitLate('memory.recall', recallPayload);
       observeRecall(recallPayload);
       return {
         text: '', injected: false, reason: 'timeout', sources, archiveReason, hits, completeness: 'timeout',
-        injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
+        injectedChars: 0, statusChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
         contextLayers,
       };
     }
@@ -576,9 +595,9 @@ export async function prepareMemoryInjection({
     emitItemMarkers(composed);
     return {
       text: statusText, injected: false, reason: 'no-hit', status: true, sources, archiveReason, hits,
-      completeness,
+      completeness, statusChars,
       injectedChars: 0, requestedChars: composed.requestedChars, injectedIds: [], matchedIds: [], persistIds: [],
-      contextLayers,
+      contextLayers: missLayers,
     };
   }
 
