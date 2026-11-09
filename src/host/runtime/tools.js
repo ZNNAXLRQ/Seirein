@@ -188,6 +188,11 @@ export function createHostTools(deps) {
       // `2026-11-18（下周三）` bracket and to report `timeResolved`; the store never receives only
       // an already-absolute body, which would lose the original term.
       const timeZone = resolveMemoryTimeZone(config?.memory?.timeZone);
+      // P-127: `inference`/`evidence` are passed through to the store gate. A marker without an
+      // evidence string/ID is stored as an unverified hypothesis; the automatic recorder is not
+      // on this path and is never affected. The flag is evidence for the caller's intent, not a
+      // way to force a guess back into a confirmed fact (`inference:false` does not disable the
+      // marker check).
       const record = memory.add(domain, normalized.text, kind, {
         source: 'manual',
         importance,
@@ -195,7 +200,10 @@ export function createHostTools(deps) {
         unresolved: normalized.unresolved,
         tzUsed: normalized.tz,
         timeZone,
+        inference: args.inference,
+        evidence: args.evidence,
       });
+      const inferred = record.inference === true;
       if (typeof memory.addLink === 'function') {
         const referentId = memoryReferentRecord(normalized);
         if (referentId.length > 0) {
@@ -208,9 +216,11 @@ export function createHostTools(deps) {
       }
       await emitMemoryNormalize(normalized);
       // A manual entry that restates an auto original (or names its id) lifts that record out of
-      // the permanent importance-30 band; the auto source is never a life sentence.
-      if (typeof args.id === 'string' && args.id.length > 0) memory.promote(args.id, { importance });
-      const promoted = memory.promoteByText(record.text, importance);
+      // the permanent importance-30 band; the auto source is never a life sentence. An inference
+      // is deliberately excluded: an unverified guess must not promote a record, and must not be
+      // promoted into the fixed/landmark layer itself.
+      if (!inferred && typeof args.id === 'string' && args.id.length > 0) memory.promote(args.id, { importance });
+      const promoted = inferred ? [] : memory.promoteByText(record.text, importance);
       await log.emit('memory.write', {
         id: record.id,
         domain,
@@ -218,12 +228,17 @@ export function createHostTools(deps) {
         importance: record.importance,
         source: 'manual',
         promoted: promoted.length,
+        inference: inferred,
       });
       return {
         id: record.id,
         domain,
         ts: record.ts,
         timeResolved: timeResolvedReport(record.timeResolved),
+        // P-127: the model needs to see that this row is reference, not a confirmed fact. The
+        // registered output schema/render still has to declare these two fields (see report).
+        inference: inferred,
+        kind: record.kind,
       };
     },
     async executeMemoryCorrect(args, exec) {
@@ -271,6 +286,10 @@ export function createHostTools(deps) {
         sourceMessageId,
         extraText: args.extraText,
         timeZone: resolveMemoryTimeZone(config?.memory?.timeZone),
+        // P-127: the store gates a speculative replacement/extraText into an unverified
+        // `hypothesis` + `unresolved` row; a normal correction is byte-for-byte unchanged.
+        inference: args.inference,
+        evidence: args.evidence,
       });
       if (result.ok === true && result.idempotent !== true) await emitMemoryNormalize(replacement);
       // E: remember the new version for this turn. The next lookup for that id must re-query

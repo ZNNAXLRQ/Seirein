@@ -115,6 +115,69 @@ function serializeSpeakerAttribution(value) {
   return JSON.stringify({ speakerId, assigned, confidence, source: 'shadow', at });
 }
 
+// ---- P-127: unverified-inference gate --------------------------------------
+//
+// The automatic lane records what was actually said; this gate never touches it. The MANUAL lane
+// (`assistant_remember` → add(), `assistant_memory_correct` → correct()) can also receive a
+// *derived* statement — a cause, an identity, a preference, a feeling — that the assistant only
+// inferred. Such a row may be useful reference, but it must not silently become a confirmed fact,
+// a fixed convention, or a profile constraint. The markers below are the deterministic trigger;
+// an explicit `inference:true` forces the same result, and a non-empty `evidence` string/ID
+// suppresses automatic detection because the caller supplied support for the statement.
+export const INFERENCE_MARKERS = Object.freeze([
+  '因为', '所以', '导致', '说明', '推测', '可能', '估计', '应该是', '大概是', '看来',
+]);
+
+/** Evidence ids are provenance, not display text: keep them bounded and never split a string. */
+const EVIDENCE_MAX_CHARS = 2_000;
+
+/**
+ * Normalize an evidence value to the stored form: a trimmed string, or null when absent.
+ * Arrays are accepted as a convenience and joined with commas (an id list stays one field).
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function normalizeEvidence(value) {
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text.length > 0 ? text.slice(0, EVIDENCE_MAX_CHARS) : null;
+  }
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((item) => (typeof item === 'string' ? item.trim() : ''))
+      .filter((item) => item.length > 0);
+    return parts.length > 0 ? parts.join(',').slice(0, EVIDENCE_MAX_CHARS) : null;
+  }
+  return null;
+}
+
+/** True when the text contains one of the deterministic inference markers. */
+export function hasInferenceMarker(text) {
+  const body = typeof text === 'string' ? text : '';
+  return INFERENCE_MARKERS.some((marker) => body.includes(marker));
+}
+
+/**
+ * Decide whether one derived manual write is an unverified inference.
+ *
+ * An explicit `inference:true` always wins (the caller knows it is a guess). Automatic detection
+ * only fires when a marker exists AND no evidence string/ID was supplied, so an evidence-backed
+ * summary keeps its normal kind. `inference:false` does not disable automatic detection: the flag
+ * records knowledge, it is not a bypass.
+ *
+ * @param {string} text the statement that will actually be stored
+ * @param {{inference?: unknown, evidence?: unknown}} [options]
+ * @returns {{inference: boolean, evidence: string|null}}
+ */
+export function classifyInference(text, { inference = undefined, evidence = undefined } = {}) {
+  const evidenceText = normalizeEvidence(evidence);
+  const explicit = inference === true;
+  return {
+    inference: explicit || (evidenceText === null && hasInferenceMarker(text)),
+    evidence: evidenceText,
+  };
+}
+
 // ---- P-67 §6: manual-lane relative time ------------------------------------
 //
 // The MANUAL lane (`assistant_remember` → add(), `correct()`) stores a concrete calendar date
@@ -585,6 +648,10 @@ export class MemoryStore {
       // string, because the loop only emits `ALTER TABLE ... ADD COLUMN name type`.
       ['raw_text', 'TEXT'],
       ['tz_used', 'TEXT'],
+      // P-127: an evidence string/ID names the support for a derived manual statement. NULL means
+      // "no evidence supplied"; it never changes FTS, capacity, archive or existing unresolved
+      // semantics (an inference additionally enters `unresolved`, it does not replace that field).
+      ['evidence', 'TEXT'],
       ['version', 'INTEGER NOT NULL DEFAULT 1'],
       ['updated_at', 'TEXT'],
       ['unresolved', 'INTEGER NOT NULL DEFAULT 0'],
@@ -867,8 +934,8 @@ export class MemoryStore {
           .prepare(`INSERT OR IGNORE INTO memory_event
             (id, ts, domain, kind, text, importance, clarity, last_seen, recall_count, source,
              session_id, turn_id, message_id, role, truncated, raw_text, unresolved, tz_used,
-             pressure_epoch, pressure_contribution, speaker_attribution)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+             evidence, pressure_epoch, pressure_contribution, speaker_attribution)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(
             id,
             row.ts ?? nowIso(),
@@ -888,6 +955,7 @@ export class MemoryStore {
             row.raw_text ?? null,
             row.unresolved ? 1 : 0,
             row.tz_used ?? null,
+            row.evidence ?? null,
             this.pressureEpoch,
             1,
             // A restored archive row already carries the serialized text; a direct object from the
@@ -1140,10 +1208,13 @@ export class MemoryStore {
    * @param {string} kind preference | habit | fact | event | decision
    * @param {{importance?: number, source?: string, rawText?: string|null,
    *          unresolved?: number, tzUsed?: string|null, now?: Date|number|string,
-   *          timeZone?: string, resolveTime?: boolean}} [extra]
+   *          timeZone?: string, resolveTime?: boolean, inference?: boolean,
+   *          evidence?: string|string[]|null}} [extra]
    *   `now`/`timeZone` inject the reference instant; `resolveTime:true` opts a non-manual caller
-   *   in explicitly (the manual source is already opted in).
-   * @returns {object} the stored record plus `timeResolved` (structured report or null)
+   *   in explicitly (the manual source is already opted in). `inference`/`evidence` are the P-127
+   *   gate: a marked statement without evidence is stored as `kind:'hypothesis'` + `unresolved:1`.
+   * @returns {object} the stored record plus `timeResolved` (structured report or null) and the
+   *   gate result (`inference:boolean`, `kind`, `evidence`)
    */
   add(domain, text, kind, extra = {}) {
     this.open();
@@ -1178,17 +1249,27 @@ export class MemoryStore {
         timeUnresolved = 1;
       }
     }
+    // P-127: only the MANUAL/correction lanes are gated; the automatic recorder writes through
+    // `addMessage()` and is deliberately untouched. An explicit `inference:true` also opts a
+    // direct caller in; a marker alone never changes an auto/candidate write.
+    const detected = classifyInference(body, { inference: extra.inference, evidence: extra.evidence });
+    const inferenceLane = extra.source === 'manual' || extra.source === 'correction' || extra.inference === true;
+    const isInference = detected.inference && inferenceLane;
+    const evidenceText = detected.evidence;
+    const storedKind = isInference ? 'hypothesis' : (kind ?? 'fact');
     const record = {
       id: randomUUID(),
       ts: nowIso(),
       domain,
-      kind: kind ?? 'fact',
+      kind: storedKind,
       text: body,
-      importance: extra.importance ?? scoreImportance(body, kind ?? 'fact'),
+      importance: extra.importance ?? scoreImportance(body, storedKind),
       source: extra.source ?? '',
       raw_text: extra.rawText ?? (typeof body === 'string' && body !== original ? original : null),
-      unresolved: extra.unresolved || timeUnresolved ? 1 : 0,
+      unresolved: extra.unresolved || timeUnresolved || isInference ? 1 : 0,
       tz_used: tzUsed,
+      evidence: evidenceText,
+      inference: isInference,
       timeResolved,
     };
     this.insert({ ...record, clarity: 'vivid', last_seen: record.ts });
@@ -1203,7 +1284,7 @@ export class MemoryStore {
       `${prefix}importance`, `${prefix}clarity`, `${prefix}role`, `${prefix}source`,
       `${prefix}session_id AS sessionId`, `${prefix}turn_id AS turnId`,
       `${prefix}message_id AS messageId`, `${prefix}truncated`, `${prefix}recall_count`,
-      `${prefix}version`, `${prefix}unresolved`,
+      `${prefix}version`, `${prefix}unresolved`, `${prefix}evidence`,
     ].join(', ');
   }
 
@@ -1864,9 +1945,15 @@ export class MemoryStore {
    * A bare `周三` is only resolved when the caller injects `now` (otherwise it stays literal —
    * historical corrections rely on exact fragment replacement); prefixed forms are deterministic.
    *
+   * P-127: `inference`/`evidence` gate the corrected fragment and any `extraText`. A marked
+   * replacement without evidence makes the target a `hypothesis` + `unresolved` record (unless the
+   * target is a real conversation row, whose `event` kind is preserved; only its unresolved flag
+   * changes). An evidence-backed correction keeps its normal kind and stores the evidence id.
+   *
    * @param {{targetId?: string, expectedVersion: number, expectedText: string,
    *          replacement: string, sourceMessageId?: string, extraText?: string,
-   *          now?: Date|number|string|null, timeZone?: string|null}} [input]
+   *          now?: Date|number|string|null, timeZone?: string|null,
+   *          inference?: boolean, evidence?: string|string[]|null}} [input]
    */
   correct({
     targetId = '',
@@ -1877,6 +1964,8 @@ export class MemoryStore {
     extraText = '',
     now = null,
     timeZone = null,
+    inference = undefined,
+    evidence = undefined,
   } = {}) {
     this.open();
     const source = typeof sourceMessageId === 'string' ? sourceMessageId.trim() : '';
@@ -1899,6 +1988,11 @@ export class MemoryStore {
         timeZone: resolveMemoryTimeZone(timeZone),
       };
     const resolvedReplacement = time.changed ? time.text : inputReplacement;
+    // P-127: a correction is a MANUAL lane write. An explicit inference flag always wins; a
+    // marker without evidence is a guess even when the caller passed `inference:false`.
+    const detectedReplacement = classifyInference(resolvedReplacement, { inference, evidence });
+    const evidenceText = detectedReplacement.evidence;
+    const replacementInference = detectedReplacement.inference;
     // Without an injected reference a bare weekday is deliberately left alone; do not report that
     // intentional no-op as a resolution failure.
     const timeItems = time.items === null
@@ -1948,7 +2042,8 @@ export class MemoryStore {
         let row;
         if (wantedId.length > 0) {
           row = this.db
-            .prepare(`SELECT id, ts, domain, version, text FROM memory_event
+            .prepare(`SELECT id, ts, domain, version, text, kind, unresolved, evidence,
+                role, message_id FROM memory_event
               WHERE id = ? AND superseded_by IS NULL AND hidden = 0`)
             .get(wantedId);
           if (row === undefined) {
@@ -1957,7 +2052,8 @@ export class MemoryStore {
           }
         } else {
           const rows = this.db
-            .prepare(`SELECT id, ts, domain, version, text FROM memory_event
+            .prepare(`SELECT id, ts, domain, version, text, kind, unresolved, evidence,
+                role, message_id FROM memory_event
               WHERE superseded_by IS NULL AND hidden = 0 AND text LIKE ? ESCAPE '\\'
               ORDER BY ts DESC LIMIT 20`)
             .all(`%${escapeLike(fragment)}%`);
@@ -2013,13 +2109,28 @@ export class MemoryStore {
           return empty('fragment-mismatch', { id: row.id, currentVersion });
         }
         const after = `${before.slice(0, first)}${resolvedReplacement}${before.slice(first + fragment.length)}`;
+        // P-127 target metadata: an inference correction cannot leave a confirmed-looking record.
+        // A real conversation row keeps its `event` kind (the row is still evidence of what was
+        // said); every derived record becomes `hypothesis`. Evidence, when supplied, replaces the
+        // old support; an unsupported inference clears it because the old evidence no longer
+        // describes the rewritten text.
+        const messageRow = (typeof row.message_id === 'string' && row.message_id.length > 0)
+          || row.role === 'user' || row.role === 'assistant';
+        const nextKind = replacementInference
+          ? (messageRow ? (row.kind ?? 'event') : 'hypothesis')
+          : (row.kind ?? 'fact');
+        const nextUnresolved = replacementInference ? 1 : (Number(row.unresolved) || 0);
+        const nextEvidence = evidenceText !== null
+          ? evidenceText
+          : (replacementInference ? null : (row.evidence ?? null));
         const stamp = nowIso();
         const updated = this.db
           .prepare(`UPDATE memory_event
             SET raw_text = CASE WHEN raw_text IS NULL OR raw_text = '' THEN text ELSE raw_text END,
-                text = ?, version = version + 1, updated_at = ?
+                text = ?, version = version + 1, updated_at = ?,
+                kind = ?, unresolved = ?, evidence = ?
             WHERE id = ? AND version = ?`)
-          .run(after, stamp, row.id, version);
+          .run(after, stamp, nextKind, nextUnresolved, nextEvidence, row.id, version);
         if (Number(updated.changes) !== 1) {
           return empty('version-conflict', { id: row.id, currentVersion });
         }
@@ -2078,16 +2189,21 @@ export class MemoryStore {
         const extra = typeof extraText === 'string' ? extraText.trim() : '';
         if (extra.length > 0) {
           // Same transaction, but a genuinely NEW record: this one does cost one pressure credit.
+          // P-127: the extra content is a derived write too, so it passes the same gate.
+          const detectedExtra = classifyInference(extra, { inference, evidence });
+          const extraInference = detectedExtra.inference;
           const record = {
             id: randomUUID(),
             ts: stamp,
             domain: row.domain,
-            kind: 'event',
+            kind: extraInference ? 'hypothesis' : 'event',
             text: extra,
             importance: 30,
             clarity: 'vivid',
             source: 'correction',
             role: 'user',
+            unresolved: extraInference ? 1 : 0,
+            evidence: detectedExtra.evidence,
           };
           this.insert({ ...record, last_seen: stamp });
           extraId = record.id;
@@ -3670,7 +3786,7 @@ export class MemoryStore {
     this.open();
     const rows = this.db
       .prepare(`SELECT id, ts, domain, text, importance, version FROM memory_event
-        WHERE importance >= 85 AND superseded_by IS NULL
+        WHERE importance >= 85 AND superseded_by IS NULL AND kind <> 'hypothesis'
         ORDER BY importance DESC, ts DESC LIMIT ?`)
       .all(limit);
     return trimToBudget(rows, budgetChars);
@@ -3685,6 +3801,7 @@ export class MemoryStore {
     return this.db
       .prepare(`SELECT id, ts, domain, text, importance FROM memory_event
         WHERE ts >= ? AND ts < ? AND importance >= ? AND superseded_by IS NULL
+          AND kind <> 'hypothesis'
         ORDER BY importance DESC, ts ASC LIMIT ?`)
       .all(fromIso, toIso ?? nowIso(), minImportance, limit);
   }

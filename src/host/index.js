@@ -689,6 +689,17 @@ function memoryTimeResolvedLine(value) {
 }
 
 /**
+ * The model-facing warning appended by the manual memory tools when the stored row is an
+ * unverified inference. The store already prefixes recall with `[待核验]`; this line makes the
+ * write result itself say so, without repeating the memory body. Returns null for a confirmed row.
+ * @param {{inference?: boolean}} value
+ */
+function memoryInferenceLine(value) {
+  if (value?.inference !== true) return null;
+  return '已标记为未证实推断；召回时带「待核验」，不作为已确认事实。';
+}
+
+/**
  * The model-facing line that names the window a memory query actually covered.
  *
  * `range` is the store's actual window (after relaxation), never the wording of the query.
@@ -8004,6 +8015,14 @@ export function apply(ctx, config) {
           type: 'string',
           description: 'Optional auto-record id from assistant_recall. When this manual entry confirms it, that record is promoted out of importance 30.',
         },
+        inference: {
+          type: 'boolean',
+          description: 'Set true when this statement is an unverified inference (a cause, identity, preference or feeling you derived rather than one the user confirmed). It is stored as kind "hypothesis" with the existing [待核验] marker and is excluded from fixed/landmark promotion. `false` records your intent but does NOT bypass the deterministic marker check.',
+        },
+        evidence: {
+          type: 'string',
+          description: 'Optional single evidence id or quote supporting the statement (for example a message id, frame id or the user\'s exact words). A non-empty evidence string suppresses automatic inference detection; an inference passed without evidence stays unverified.',
+        },
       },
       required: ['text'],
     },
@@ -8015,6 +8034,8 @@ export function apply(ctx, config) {
           id: { type: 'string' },
           domain: { type: 'string' },
           ts: { type: 'string' },
+          inference: { type: 'boolean' },
+          kind: { type: 'string' },
           timeResolved: {
             type: 'array',
             items: {
@@ -8031,12 +8052,14 @@ export function apply(ctx, config) {
             },
           },
         },
-        required: ['id', 'domain', 'ts'],
+        required: ['id', 'domain', 'ts', 'inference', 'kind'],
       },
       render: (_args, value) => {
         const blocks = [{ type: 'text', text: `Remembered in "${value.domain}" (${value.id}).` }];
         const timeLine = memoryTimeResolvedLine(value);
         if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+        const inferenceLine = memoryInferenceLine(value);
+        if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
         return blocks;
       },
     },
@@ -8075,6 +8098,14 @@ export function apply(ctx, config) {
         extraText: {
           type: 'string',
           description: 'Optional: new content from the same utterance (e.g. "另外明天要买猫粮"). It is stored as one separate event record, never merged into the target.',
+        },
+        inference: {
+          type: 'boolean',
+          description: 'Set true when the replacement or extraText is an unverified inference rather than a user-confirmed correction. The affected row is stored as kind "hypothesis" with the existing [待核验] marker. `false` records your intent but does NOT bypass the deterministic marker check.',
+        },
+        evidence: {
+          type: 'string',
+          description: 'Optional single evidence id or quote supporting the corrected text (for example the correction message id). A non-empty evidence string suppresses automatic inference detection; an inference without evidence stays unverified.',
         },
       },
       required: ['expectedVersion', 'expectedText', 'replacement'],
@@ -8162,6 +8193,8 @@ export function apply(ctx, config) {
           const blocks = [{ type: 'text', text: `这条纠正已经应用过（记录 ${value.id}，当前第 ${value.version} 版），未重复修改。` }];
           const timeLine = memoryTimeResolvedLine(value);
           if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+          const inferenceLine = memoryInferenceLine(value);
+          if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
           return blocks;
         }
         const extra = value.extraId.length > 0 ? '；同句的新内容已另记 1 条' : '';
@@ -8171,6 +8204,8 @@ export function apply(ctx, config) {
         }];
         const timeLine = memoryTimeResolvedLine(value);
         if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+        const inferenceLine = memoryInferenceLine(value);
+        if (inferenceLine !== null) blocks.push({ type: 'text', text: inferenceLine });
         return blocks;
       },
     },
@@ -9105,8 +9140,10 @@ export function apply(ctx, config) {
    * （proactive-candidate.js）按时机/频率判断。真正决定开口时**才**调用一次短句模型，再走
    * 现成的整行语音出口 `speakLine`。这里不建用户轮次、不写记忆/人设、不新增 TTS 链路。
    *
-   * 成本/频率边界：默认每小时最多 3 句、两句至少间隔 60 秒；候选默认 8 秒过期，错过就放弃；
-   * 每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生一次 ≤120 token 的调用。
+   * 成本/频率边界：不再有默认的「每小时 3 句 / 间隔 60 秒」硬配额；是否开口由设置页保存的
+   * `proactive.rate`（0–100）在每次评估时按候选身份抽签决定，100 = 必过、0 = 不开口。候选默认
+   * 8 秒过期，错过就放弃；每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生
+   * 一次 ≤120 token 的调用。
    */
   const PROACTIVE_IGNORED_MS = 45_000;
   /**
@@ -9121,8 +9158,14 @@ export function apply(ctx, config) {
     }
     return config?.proactiveEnabled !== false;
   };
-  const proactiveMaxPerHour = () => config?.proactiveMaxPerHour ?? 3;
-  const proactiveMinGapMs = () => config?.proactiveMinGapMs ?? 60_000;
+  /**
+   * 主动回应通过率：读 `settings.proactive.rate`，只接受 0–100 的整数；缺省或畸形值一律按
+   * 100（必过）处理。设置页动作写盘后 5 秒 tick 与生成后重仲裁都读同一份值，不需要重启。
+   */
+  const proactiveRate = () => {
+    const stored = readSettings()?.proactive?.rate;
+    return Number.isInteger(stored) && stored >= 0 && stored <= 100 ? stored : 100;
+  };
   const proactive = createProactiveArbiter();
   const proactiveLine = createProactiveLineGenerator({
     getService,
@@ -9221,8 +9264,7 @@ export function apply(ctx, config) {
       keyDialogue: false,
       settings: {
         enabled: proactiveEnabled(),
-        maxPerHour: proactiveMaxPerHour(),
-        minGapMs: proactiveMinGapMs(),
+        rate: proactiveRate(),
       },
     });
     if (decision.speak !== true || decision.candidate === null) return decision;
@@ -16851,14 +16893,14 @@ export function apply(ctx, config) {
         // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
         understanding: understandingStatusView(),
         // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
-        proactive: { ...proactive.status(), enabled: proactiveEnabled() },
+        proactive: { ...proactive.status(), enabled: proactiveEnabled(), rate: proactiveRate() },
         // P-187 阶段 6：以上证据/台词/评论/理解/主动状态的数字投影；只读、无路径/正文/帧 id。
         audiovisual: summarizeAudiovisual({
           evidence: evidenceWindow.state(),
           media: mediaTimeline.state(),
           comment: commentEvidence.state(),
           understanding: understandingStatusView(),
-          proactive: { ...proactive.status(), enabled: proactiveEnabled() },
+          proactive: { ...proactive.status(), enabled: proactiveEnabled(), rate: proactiveRate() },
           uptimeMs: Date.now() - mountedAt,
         }),
       },

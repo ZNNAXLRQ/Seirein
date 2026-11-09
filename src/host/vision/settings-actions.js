@@ -95,16 +95,32 @@ export function createVisionSettingsActions(services) {
         }
       }
       case 'vision.proactive': {
-        // 契约：enabled 必须是布尔；只写 settings.json，不重启任何采集/运行时。
+        // 契约：enabled 必须是布尔；rate 可省略（0–100 整数），省略时沿用当前值，缺省 100。
+        // 只写 settings.json，不重启任何采集/运行时。
         try {
           if (typeof body.enabled !== 'boolean') {
             return { ok: false, error: 'enabled 必须是布尔值' };
           }
           const settings = (0, services.readSettings)() ?? {};
+          const stored = settings.proactive !== null && typeof settings.proactive === 'object'
+            && !Array.isArray(settings.proactive)
+            ? settings.proactive
+            : {};
+          // 旧客户端只传 enabled：rate 必须保持当前值，不能被写成 undefined。
+          let rate = Number.isInteger(stored.rate) && stored.rate >= 0 && stored.rate <= 100
+            ? stored.rate
+            : 100;
+          if (body.rate !== undefined) {
+            if (typeof body.rate !== 'number' || !Number.isInteger(body.rate)
+              || body.rate < 0 || body.rate > 100) {
+              return { ok: false, error: 'rate 必须是 0–100 的整数' };
+            }
+            rate = body.rate;
+          }
           (0, services.writeSettings)({
-            proactive: { ...(settings.proactive ?? {}), enabled: body.enabled },
+            proactive: { ...stored, enabled: body.enabled, rate },
           });
-          return { ok: true, enabled: body.enabled };
+          return { ok: true, enabled: body.enabled, rate };
         } catch (error) {
           return { ok: false, error: error?.message ?? String(error) };
         }
