@@ -7250,6 +7250,8 @@ window.__ModuleLoader__.load({
           (() => {
             // 语种：语音与字幕分开配置，来源是 /assistant/status 的 langs。
             const langOptions = [['zh', '中文'], ['ja', '日语'], ['en', '英语'], ['ko', '韩语'], ['yue', '粤语']];
+            // 用户输入时是否立即打断当前播报：缺省 true（历史行为），只有明确存过 false 才关闭。
+            const inputInterrupts = status.voiceInputInterruptsReply !== false;
             const langRow = (label, key) => settingsField(h, label,
               h('select', {
                 style: { ...styles.input, width: 140 },
@@ -7275,6 +7277,20 @@ window.__ModuleLoader__.load({
                 onClick: () => act({ action: 'voice.playback', enabled: status.tts?.playbackEnabled === false }, 'voice-playback'),
               }, status.tts?.playbackEnabled !== false ? '已开启' : '已关闭')),
             h('div', { style: styles.hint }, '「语音合成」是父组件：关闭它会先停播报，再关 GPT 音色并释放插件启动的 GPT-SoVITS；只关 GPT 音色不会关闭播报或组件。'),
+            h('div', { style: styles.row },
+              h('span', { style: styles.label }, '用户输入时打断当前回复'),
+              h('button', {
+                style: { ...(inputInterrupts ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                disabled: busy !== '',
+                onClick: async () => {
+                  const result = await act({
+                    action: 'voice.inputInterruptsReply',
+                    enabled: !inputInterrupts,
+                  }, 'voice-input-interrupt');
+                  if (result.ok) show(result.inputInterruptsReply === false ? '已关闭：输入会等当前回复播完' : '已开启：输入立即打断当前回复');
+                },
+              }, inputInterrupts ? '已开启' : '已关闭')),
+            h('div', { style: styles.hint }, '关闭后，语音和文字输入不再打断正在播放的回复（包括主动回应）：当前这句播完再播下一句，新回复排队，不叠音。停止、静音、隐私、断连和关闭组件仍会立即停止播报。'),
             ackDelayRow(h, {
               draft: ackDelayDraft,
               saved: Number(status.voiceAckDelayMs ?? 3000),

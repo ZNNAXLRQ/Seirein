@@ -10,6 +10,7 @@ export const ACTIONS = Object.freeze([
   'voice.claim',
   'voice.requeue',
   'voice.mute',
+  'voice.inputInterruptsReply',
   'voice.playback',
   'tts.config',
   'gptSovits.applyModels',
@@ -76,6 +77,19 @@ export function createSpeechSettingsActions(services) {
         if (muted) (0, services.cancelFastReply)('muted');
         await services.log.emit('voice.mute', { muted });
         return { ok: true, muted };
+      }
+      case 'voice.inputInterruptsReply': {
+        // 用户输入是否立即打断当前播报：只接受真正的布尔值，写入 settings.voice 并保留同一层
+        // 其它字段（候音等待、分块、低证据门等）。缺省 true 表示保持历史上的立即打断行为。
+        const value = body.enabled ?? body.value;
+        if (typeof value !== 'boolean') {
+          return { ok: false, error: '用户输入打断当前回复需为布尔值（true / false）' };
+        }
+        const saved = ((0, services.readSettings)() ?? {}).voice;
+        const voice = saved !== null && typeof saved === 'object' ? saved : {};
+        (0, services.writeSettings)({ voice: { ...voice, inputInterruptsReply: value } });
+        await services.log.emit('voice.inputInterruptsReply.set', { enabled: value });
+        return { ok: true, inputInterruptsReply: value, enabled: value };
       }
       case 'voice.playback': {
         // Child switch of voice: does not touch features.json and does not select a provider.

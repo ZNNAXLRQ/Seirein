@@ -7,6 +7,7 @@
  * Public re-exports preserve the plugin's original entry API. No Harness package is imported.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { copyFile, mkdir, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { cpSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1610,6 +1611,17 @@ export function apply(ctx, config) {
   const writeSettings = (patch) => {
     mkdirSync(join(root, 'data'), { recursive: true });
     writeFileSync(settingsFile, `${JSON.stringify({ ...readSettings(), ...patch }, null, 2)}\n`, 'utf8');
+  };
+  /**
+   * `voice.inputInterruptsReply` — whether the user's own next input (voice or typed) may stop the
+   * assistant speech that is already playing. Missing is the historical `true`; only a stored
+   * boolean `false` turns it off. Invalid stored values fall back to the default instead of
+   * silently changing behavior, and the settings action refuses non-booleans.
+   */
+  const voiceInputInterruptsReply = () => {
+    const saved = readSettings().voice;
+    if (saved === null || typeof saved !== 'object') return true;
+    return typeof saved.inputInterruptsReply === 'boolean' ? saved.inputInterruptsReply : true;
   };
   // User overrides for the motion preset library: data/, not the source tree, so an upgrade
   // never drops them. The file is read lazily on every list/override/reset.
@@ -4779,6 +4791,140 @@ export function apply(ctx, config) {
   let playbackReleases = [];
   let playbackPumpScheduled = false;
   let playbackSeatSeq = 0;
+  // ---- input-interrupt deferral ------------------------------------------
+  // `voice.inputInterruptsReply:false` keeps every speech producer that was already running when
+  // the user's next input arrived. Their future sentences must still go first, so a new reply is
+  // not allowed to start a clip in the middle of the old reply's sentence gap. A producer token
+  // follows the whole async speech task (through AsyncLocalStorage); the input barrier waits for
+  // those tokens, the currently sounding clip and the playback queue to drain before any producer
+  // created after the input may start playing. Explicit stops never use this barrier.
+  const speechProducerStore = new AsyncLocalStorage();
+  const activeSpeechProducers = new Set();
+  // One producer token per in-scope turn: it starts at `turn/start` and is handed to the typed /
+  // relayed-result round-end task, so an input that arrives while the old answer is still being
+  // generated (before its first clip exists) still has something concrete to wait for.
+  const speechTurnTokens = new Map();
+  const speechTurnKey = (sessionId, turn) => `${sessionId}\u0000${turn}`;
+  let speechInputBarrier = null;
+  let speechBarrierSeq = 0;
+  const beginSpeechProducer = (kind) => {
+    let resolve;
+    const done = new Promise((resolveDone) => { resolve = resolveDone; });
+    const token = { id: ++speechBarrierSeq, kind: String(kind ?? ''), done, resolve, ended: false };
+    activeSpeechProducers.add(token);
+    return token;
+  };
+  const endSpeechProducer = (token) => {
+    if (token === null || token === undefined || token.ended === true) return false;
+    token.ended = true;
+    activeSpeechProducers.delete(token);
+    token.resolve();
+    return true;
+  };
+  const runSpeechProducer = (kind, fn) => {
+    const token = beginSpeechProducer(kind);
+    return speechProducerStore.run(token, async () => {
+      try {
+        return await fn();
+      } finally {
+        endSpeechProducer(token);
+      }
+    });
+  };
+  const runWithSpeechProducer = (token, fn) => speechProducerStore.run(token, async () => {
+    try {
+      return await fn();
+    } finally {
+      endSpeechProducer(token);
+    }
+  });
+  let playbackIdleWaiters = [];
+  const playbackIsIdle = () => playbackHold === null && playbackWaiters.length === 0
+    && playback === null;
+  const resolvePlaybackIdle = () => {
+    if (!playbackIsIdle() || playbackIdleWaiters.length === 0) return 0;
+    const waiters = playbackIdleWaiters.splice(0);
+    for (const resolve of waiters) resolve();
+    return waiters.length;
+  };
+  const waitPlaybackIdle = () => (
+    playbackIsIdle() ? Promise.resolve() : new Promise((resolve) => { playbackIdleWaiters.push(resolve); })
+  );
+  /**
+   * Create (or reuse) the barrier for one user input. Reusing an unresolved barrier is deliberate:
+   * a second input that arrives while the old speech is still draining belongs behind the same
+   * old speech, not in a second, newer queue. No speech/producer at all means nothing to defer.
+   */
+  const beginUserInputSpeechBarrier = (scope = null) => {
+    if (voiceInputInterruptsReply()) return null;
+    if (speechInputBarrier !== null) return speechInputBarrier;
+    // The producer that is calling this (a reply task that has just been accepted) is the NEW
+    // speech, not the old speech to wait for: never put its own token in the barrier.
+    const currentProducer = speechProducerStore.getStore() ?? null;
+    // In some feeds `turn/start` of the new turn arrives before its `user/message`: that turn token
+    // is the input being handled, never the old speech the input must wait for.
+    const inputKey = typeof scope?.sessionId === 'string' && Number.isInteger(scope?.turn)
+      ? speechTurnKey(scope.sessionId, scope.turn)
+      : '';
+    const ownTurnToken = inputKey.length > 0 ? speechTurnTokens.get(inputKey) : undefined;
+    const tokens = [...activeSpeechProducers]
+      .filter((token) => token !== currentProducer && token !== ownTurnToken);
+    const playing = playback;
+    if (tokens.length === 0 && playing === null && playbackHold === null && !playbackQueued()) {
+      return null;
+    }
+    const barrier = {
+      id: ++speechBarrierSeq,
+      at: Date.now(),
+      oldTokens: new Set(tokens),
+      done: null,
+    };
+    const waits = tokens.map((token) => token.done);
+    // A clip from a lane without a producer token (ack / proactive / assistant_say) has no future
+    // sentence of its own: its own end is enough. The queue wait covers requests for clips that
+    // were already waiting behind it.
+    if (playing !== null) waits.push(Promise.resolve(playing.done).catch(() => {}));
+    waits.push(waitPlaybackIdle());
+    barrier.done = Promise.all(waits).then(() => {
+      if (speechInputBarrier === barrier) speechInputBarrier = null;
+    });
+    speechInputBarrier = barrier;
+    emitSeat('speech.input.deferred', {
+      barrier: barrier.id,
+      producers: tokens.length,
+      lanes: tokens.map((token) => token.kind),
+      playing: playing !== null,
+      queued: playbackWaiters.length,
+    });
+    return barrier;
+  };
+  /**
+   * A speech request may start only after the input barrier drained, unless it belongs to the old
+   * producer the barrier is waiting for (that reply must be allowed to finish its own sentences).
+   */
+  const waitForSpeechInputBarrier = async (signal = undefined) => {
+    const barrier = speechInputBarrier;
+    if (barrier === null) return;
+    const token = speechProducerStore.getStore() ?? null;
+    if (token !== null && barrier.oldTokens.has(token)) return;
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error = null) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener?.('abort', onAbort);
+        if (error !== null) reject(error);
+        else resolve();
+      };
+      const onAbort = () => finish(abortErrorOf(signal));
+      if (signal?.aborted === true) {
+        finish(abortErrorOf(signal));
+        return;
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      barrier.done.then(() => finish(), (error) => finish(error));
+    });
+  };
   const playbackOwnerNow = () => playbackHold?.owner ?? null;
   const seatSpeechId = (owner) => (typeof owner?.speechId === 'string' ? owner.speechId : '');
   const emitSeat = (type, payload) => { void log.emit(type, payload).catch(() => {}); };
@@ -4868,6 +5014,7 @@ export function apply(ctx, config) {
       waiter.resolve(hold);
       break;
     }
+    resolvePlaybackIdle();
   };
   /**
    * Wait for the single playback seat. The grant itself always comes from the pump; resolves with
@@ -4884,8 +5031,11 @@ export function apply(ctx, config) {
     // `canGrantPlaybackTurn`: `startedAt === 0` is NOT proof that the holder is inaudible (a
     // streamed clip can hold the seat while its player starts). Only a newer turn of the SAME
     // session may take the seat from an older one; every other request waits behind it. The old
-    // clip is only *marked* for release here; the pump applies it in one serial step.
-    if (playbackHold !== null && supersedesPlaybackOwner(owner, playbackHold.owner)) {
+    // clip is only *marked* for release here; the pump applies it in one serial step. When the user
+    // turned input interruption off, even that newer turn waits for the old speech to finish and
+    // the barrier (not the seat hand-over) is what eventually starts it.
+    if (voiceInputInterruptsReply()
+      && playbackHold !== null && supersedesPlaybackOwner(owner, playbackHold.owner)) {
       cancelPlayback('superseded');
     }
     if (playbackWaiters.length >= SPEECH_QUEUE_LIMIT) {
@@ -5765,6 +5915,9 @@ export function apply(ctx, config) {
     answerRound = '',
   }) => {
     signal?.throwIfAborted();
+    // Input-interrupt off: a producer created after the user's input waits until the old reply
+    // (and every clip of it) has finished. An old producer is allowed to finish its own queue.
+    await waitForSpeechInputBarrier(signal);
     // Wait for the single playback seat (FIFO). A playing sentence is never cut here; only an
     // explicit cancel/turn-start rejects this wait before a player exists.
     const seat = await acquirePlaybackSeat(signal, owner);
@@ -5928,6 +6081,8 @@ export function apply(ctx, config) {
     lane = null,
   }) => {
     signal?.throwIfAborted();
+    // Same input barrier as `playAudio`: a streamed reply may not start over the old one.
+    await waitForSpeechInputBarrier(signal);
     // FIFO: a queued sentence starts only after the sounding one finished; no mid-sentence cut.
     const seat = await acquirePlaybackSeat(signal, owner);
     let session = null;
@@ -6092,6 +6247,10 @@ export function apply(ctx, config) {
   ctx.effect(() => () => {
     speechDisposed = true;
     activeVoiceTurn = null;
+    // A turn token still open at teardown must not keep a future mount's barrier alive.
+    for (const token of [...speechTurnTokens.values()]) endSpeechProducer(token);
+    speechTurnTokens.clear();
+    for (const token of [...activeSpeechProducers]) endSpeechProducer(token);
     speechLedger.cancelAll('teardown');
     invalidateSpeech();
     cancelPlayback('teardown');
@@ -8192,7 +8351,7 @@ export function apply(ctx, config) {
       const ffplay = resolveFfplay(root, config);
       // The whole clip lives here. `speechLedger.accept` returns before this function runs, so the
       // tool reports acceptance, and the events/timings below describe what really happened.
-      const run = async ({ speechId, signal, onPlaying, onFirstAudio }) => {
+      const run = ({ speechId, signal, onPlaying, onFirstAudio }) => runSpeechProducer('say', async () => {
         const live = () => {
           try {
             return speechSignal();
@@ -8533,7 +8692,7 @@ export function apply(ctx, config) {
           to: prepared.speechLang,
         });
         return result;
-      };
+      });
       // Acceptance is the tool result; everything else is reported through the ledger's events.
       // A say line never reserves the turn's words: content is identified by sentence/identity, and
       // the reply must never skip a block because a tool line "sounded similar" (no text dedupe).
@@ -12999,13 +13158,33 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * The ONE allowed interruption: the user's own next input (an accepted voice delivery or a typed
-   * message). Every unfinished accepted speech stops, whatever lane or session produced it, and
-   * every typed round already synthesized/queued by an older turn is retired by its generation.
-   * The live speech controller is deliberately NOT invalidated: the next turn captured it at
-   * `turn/start`, and aborting it here would mute the answer the input just asked for.
+   * The user speaking still cancels PROACTIVE CANDIDATES that have not started (the "don't cut in"
+   * rule applies to their beginning). It never stops an already sounding proactive sentence here:
+   * that is ordinary assistant speech and follows `voice.inputInterruptsReply`.
+   */
+  const cancelProactiveForUserInput = (reason = 'user-input') => {
+    try {
+      abortProactive();
+      proactive.cancelAll(reason);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * The user's own next input can stop the assistant speech while the setting is on (the historical
+   * behavior). With `voice.inputInterruptsReply:false` nothing that is already sounding is touched:
+   * a barrier makes every later producer wait for it, while the input itself is still delivered.
+   * The live speech controller is deliberately NOT invalidated either way: the next turn captured it
+   * at `turn/start`, and aborting it here would mute the answer the input just asked for.
    */
   const stopSpeechForUserInput = (reason = 'user-input', scope = null) => {
+    if (!voiceInputInterruptsReply()) {
+      beginUserInputSpeechBarrier(scope);
+      // Pending proactive candidates are retired at once; a sounding proactive clip keeps playing.
+      cancelProactiveForUserInput(reason);
+      return 0;
+    }
     const cancelled = speechLedger.cancelAll(reason);
     const stopped = cancelPlayback(reason);
     const typed = stopTypedSpeechForUserInput(reason, scope);
@@ -13136,7 +13315,9 @@ export function apply(ctx, config) {
     if (!features.enabled('voice')) return null;
     if (!force && !features.enabled('fastpath')) return null;
     if (fastActive !== null) {
-      cancelFastReply('superseded');
+      // With input interruption off, the old fast answer keeps its sound: wait for it to finish
+      // instead of aborting it. The new reply then starts behind the old one.
+      if (voiceInputInterruptsReply()) cancelFastReply('superseded');
       try {
         await fastActive.promise;
       } catch {
@@ -14255,24 +14436,34 @@ export function apply(ctx, config) {
             remainderChars: cancelInput.remainder.length,
           });
           if (cancelInput.remainder.length === 0) return;
-          void handleVoiceTask(cancelInput.remainder, cancelInput.remainder, { transcriptAt: Date.now() });
+          void runSpeechProducer('voice', () => handleVoiceTask(
+            cancelInput.remainder, cancelInput.remainder, { transcriptAt: Date.now() },
+          ));
           return;
         }
+      }
+      // Input interruption off: the voice input is still accepted, but its next round starts only
+      // after the speech that was already playing (and every queued sentence of it) is done.
+      if (!voiceInputInterruptsReply()) {
+        cancelProactiveForUserInput('user-input');
+        const barrier = beginUserInputSpeechBarrier();
+        if (barrier !== null) await barrier.done;
       }
       avatarIntent(features.enabled('fastpath') ? 'user-speaking' : 'turn-start', {
         sessionId: voiceSessionId,
         turnId: currentTurnBySession.get(voiceSessionId) ?? null,
       });
-      if (features.enabled('fastpath')) void runFastReply(delivered);
-      else {
-        void handleVoiceTask(delivered, corrected, {
+      if (features.enabled('fastpath')) {
+        void runSpeechProducer('fastpath', () => runFastReply(delivered));
+      } else {
+        void runSpeechProducer('voice', () => handleVoiceTask(delivered, corrected, {
           endpointAt: Number(meta.endpointAt) || 0,
           asrMs: Number(meta.asrMs) || 0,
           transcriptAt,
           // Stage 3: the delivery keeps its utterance identity, so a NEW memory record can be
           // attributed to this exact utterance's shadow row (never to "the last one heard").
           utteranceId: typeof meta.utteranceId === 'string' ? meta.utteranceId : '',
-        });
+        }));
       }
       // Candidate extraction is observation only: it sees the ASR text BEFORE the personal-lexicon
       // replacement (so a confirmed word cannot re-enter as its own evidence) and never rewrites
@@ -15053,13 +15244,37 @@ export function apply(ctx, config) {
   });
   if (typeof ctx.on === 'function') {
     ctx.effect(() => ctx.on('session/event', (session, event) => {
-      typedVoice.observe(session, event);
-      // P-187 阶段 5：助手开始正式回应，说明这一轮内容已经进入对话。待说的画面候选立即取消，
-      // 在途短句也中止——否则它会在回答之后再补一句“刚才看到……”。
-      if (event?.type === 'turn/start') {
-        lastAssistantReplyAt = Date.now();
-        abortProactive();
-        proactive.cancelAll('assistant-reply');
+      if (event?.type === 'turn/end') {
+        const sessionId = typeof session?.id === 'string' ? session.id : '';
+        const data = event.data ?? {};
+        const turn = Number.isInteger(data.turn)
+          ? data.turn
+          : (Number.isInteger(event.turnId) ? event.turnId : null);
+        const key = sessionId.length > 0 && turn !== null ? speechTurnKey(sessionId, turn) : '';
+        const token = (key.length > 0 ? speechTurnTokens.get(key) : undefined)
+          ?? beginSpeechProducer('typed');
+        if (key.length > 0) speechTurnTokens.delete(key);
+        void runWithSpeechProducer(token, () => typedVoice.observe(session, event)).catch(() => {});
+      } else {
+        typedVoice.observe(session, event);
+        // P-187 阶段 5：助手开始正式回应，说明这一轮内容已经进入对话。待说的画面候选立即取消，
+        // 在途短句也中止——否则它会在回答之后再补一句“刚才看到……”。
+        if (event?.type === 'turn/start') {
+          const sessionId = typeof session?.id === 'string' ? session.id : '';
+          const data = event.data ?? {};
+          const turn = Number.isInteger(data.turn)
+            ? data.turn
+            : (Number.isInteger(event.turnId) ? event.turnId : null);
+          if (sessionId.length > 0 && turn !== null
+            && isSubagentAgent({ session }) !== true
+            && autoMemoryScope(session) === 'in-scope') {
+            const key = speechTurnKey(sessionId, turn);
+            if (!speechTurnTokens.has(key)) speechTurnTokens.set(key, beginSpeechProducer('turn'));
+          }
+          lastAssistantReplyAt = Date.now();
+          abortProactive();
+          proactive.cancelAll('assistant-reply');
+        }
       }
     }));
   }
@@ -15296,7 +15511,10 @@ export function apply(ctx, config) {
         // The new segment is the one accepted interruption: retire the previous version's pending
         // or sounding speech now (its event reason stays `voice`), then let that agent turn finish
         // before the unified turn is delivered. No second listener / parallel turn is opened.
-        cancelFastReply('voice');
+        // With input interruption off the old version keeps sounding; the new segment waits behind
+        // the input barrier instead of cancelling it.
+        if (voiceInputInterruptsReply()) cancelFastReply('voice');
+        else beginUserInputSpeechBarrier();
         const priorRound = voiceRounds.get(sessionId) ?? null;
         if (priorRound !== null && priorRound.group === voiceGroup
           && priorRound.version < voiceGroupVersion) {
@@ -16338,14 +16556,20 @@ export function apply(ctx, config) {
       }
       if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] prepared', { turn: prepared.stage?.turn, acceptTurn: prepared.stage?.acceptTurn });
       // The delivery was accepted (duplicate and busy checks passed): this utterance is the user's
-      // next input, so the previous round's clip stops here — BEFORE this turn captures its own
-      // speech signal. Invalidating it now is safe and also stops a clip still being synthesized;
-      // doing it later would mute the answer this utterance is about to ask for.
-      cancelFastReply('voice');
-      // A typed round is not the accepted-speech ledger: its own generation is retired here too.
-      // The typed lane names the CAUSE (the user's input), not the microphone source, so its
-      // `voice.speech.cancelled`/stale rows stay `user-input` for both input paths.
-      stopTypedSpeechForUserInput('user-input');
+      // next input. With input interruption on, the previous round's clip stops here — BEFORE this
+      // turn captures its own speech signal. Invalidating it now is safe and also stops a clip still
+      // being synthesized; doing it later would mute the answer this utterance is about to ask for.
+      // With it off, the old clip is left alone and the barrier keeps this round's speech behind it.
+      if (voiceInputInterruptsReply()) {
+        cancelFastReply('voice');
+        // A typed round is not the accepted-speech ledger: its own generation is retired here too.
+        // The typed lane names the CAUSE (the user's input), not the microphone source, so its
+        // `voice.speech.cancelled`/stale rows stay `user-input` for both input paths.
+        stopTypedSpeechForUserInput('user-input');
+      } else {
+        cancelProactiveForUserInput('user-input');
+        beginUserInputSpeechBarrier();
+      }
       const { request, resultPromise, stage } = prepared;
       // P-46: hand the round's anchors and observation buffer to the timeline emitter.
       stage.roundOpenedAt = roundOpenedAt;
@@ -16460,7 +16684,7 @@ export function apply(ctx, config) {
         releaseVoiceTurn(sessionId);
         return;
       }
-      void (async () => {
+      void runSpeechProducer('voice-speech', async () => {
         // First segment: a quick task is answered exactly like before, with no pending line.
         const early = await Promise.race([
           resultPromise,
@@ -16762,7 +16986,7 @@ export function apply(ctx, config) {
         }
         detachSentenceVoice?.();
         detachSentenceVoice = null;
-      })().catch(async (error) => {
+      }).catch(async (error) => {
         // Speech is best-effort, but a broken turn must still release its ownership.
         try {
           await log.emit('voice.reply.failed', { sessionId, error: error?.message ?? String(error) });
@@ -17449,6 +17673,16 @@ export function apply(ctx, config) {
       }).catch(() => {});
       return false;
     }
+    if (!voiceInputInterruptsReply()) {
+      // Partial-stage barge-in exists only to stop the sounding clip. With input interruption off
+      // the final still arrives and is delivered; the partial itself must not cut anything.
+      if (at - bargeInSkipLoggedAt < BARGE_IN_SKIP_LOG_MS) return false;
+      bargeInSkipLoggedAt = at;
+      void log.emit('hearing.bargein.skipped', {
+        reason: 'input-interrupt-off', source: 'partial', frames, rmsDb: Math.round(level),
+      }).catch(() => {});
+      return false;
+    }
     void log.emit('hearing.bargein', { source: 'partial', frames, rmsDb: Math.round(level) }).catch(() => {});
     cancelFastReply('voice');
     // The audio/ledger are already stopped; the motion runtime must leave the interrupted action
@@ -17509,6 +17743,15 @@ export function apply(ctx, config) {
     if (call.allow !== true) {
       noteCallUnaddressed(text, call.reason);
       return { interrupted: false, reason: 'unaddressed' };
+    }
+    // Input interruption off: the final is still a real utterance and must be delivered, but it
+    // may not cut the sounding reply. Pending proactive candidates are retired (their beginning is
+    // still "don't cut in"); the clip already playing keeps going and the next round waits.
+    if (!voiceInputInterruptsReply()) {
+      cancelProactiveForUserInput('user-input');
+      beginUserInputSpeechBarrier();
+      void log.emit('hearing.bargein.deferred', { source: 'final', reason: 'input-interrupt-off' }).catch(() => {});
+      return { interrupted: false, reason: '' };
     }
     void log.emit('hearing.bargein', { source: 'final', deduped: false }).catch(() => {});
     cancelFastReply('voice');
@@ -18554,6 +18797,9 @@ export function apply(ctx, config) {
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
+      // Voice card switch: `voice.inputInterruptsReply` (settings.voice), default true (historical
+      // barge-in behavior). The settings page reads this exact persisted value on every poll.
+      voiceInputInterruptsReply: voiceInputInterruptsReply(),
       // One authoritative self identity for the lexicon card: the explicit registration wins, a
       // speaker-shadow match is only a fallback, and `source` says which one answered.
       lexicon: resolveSelfSpeakerId({ settings: readSettings(), shadow: speakerLastShadow }),
