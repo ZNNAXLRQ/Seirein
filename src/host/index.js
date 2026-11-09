@@ -294,7 +294,12 @@ import {
 import * as sightRuntime from './vision/sight.js';
 // A black / not-yet-live virtual-camera frame is judged from its own pixels before delivery.
 import { assessFrame } from './vision/black-frame.js';
-import { ambientSourceEvent, ambientSourceOf } from './hearing/ambient.js';
+import {
+  ambientPollEntry,
+  ambientSourceEvent,
+  ambientSourceOf,
+  ambientUtteranceLabels,
+} from './hearing/ambient.js';
 import { VISION_MODES, VisionMode } from './vision/vision.js';
 import { createPreRequestVision } from './vision/pre-request.js';
 // P-186/P-187 阶段 1：持续视听证据。画面窗口只收元数据，媒体台词是独立证据流（都不是用户发言）。
@@ -15819,13 +15824,16 @@ export function apply(ctx, config) {
               const durationMs = Number(event.durationMs ?? 0);
               // Never let the assistant's own voice become context.
               if (ttsIsSpeaking()) return { accepted: false, reason: 'playback-echo' };
+              // P-57: the entry names its lane (`source:'ambient'`); the endpoint classification
+              // stays available as `endpoint` and is never confused with the microphone lane.
+              const labels = ambientUtteranceLabels(ambientSource.source);
               const entry = {
                 text: event.final,
                 durationMs,
                 // Observation time: when this utterance was finalised. The text is context only,
                 // but an old line must still be readable as old rather than as "now".
                 at: Number(event.at) > 0 ? Number(event.at) : Date.now(),
-                source: ambientSource.source,
+                ...labels,
                 joinFallback: event.joinFallback === true,
                 truncated: event.truncated === true,
                 offlineLimited: event.offlineLimited === true,
@@ -15864,6 +15872,7 @@ export function apply(ctx, config) {
               void log.emit('ambient.utterance', {
                 text: entry.text,
                 durationMs,
+                ...labels,
                 joinFallback: entry.joinFallback,
                 joinFallbacks: entry.joinFallback ? 1 : 0,
                 ...(entry.truncated
@@ -16079,6 +16088,22 @@ export function apply(ctx, config) {
           source: { type: 'string' },
           partial: { type: 'string' },
           lines: { type: 'array', items: { type: 'string' } },
+          // P-57: poll returns the bounded rows behind `lines`, each labelled with its lane.
+          entries: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                text: { type: 'string' },
+                at: { type: 'number' },
+                durationMs: { type: 'number' },
+                source: { type: 'string' },
+                endpoint: { type: 'string' },
+              },
+              required: ['text', 'at', 'durationMs', 'source', 'endpoint'],
+            },
+          },
           joinFallback: { type: 'boolean' },
           joinFallbacks: { type: 'integer' },
           error: { type: 'string' },
@@ -16096,7 +16121,16 @@ export function apply(ctx, config) {
         },
       ],
     },
-    execute: tools.executeAmbient,
+    // P-57: keep the shared tool's lossless result and add the poll entry rows. `lines` stays a
+    // plain-text array for existing callers; `source` on every entry is the ambient lane.
+    execute: async (args, exec) => {
+      const value = await tools.executeAmbient(args, exec);
+      if (args.action !== 'poll' || value?.ok !== true) return value;
+      return {
+        ...value,
+        entries: ambientState.recent.slice(-10).map((entry) => ambientPollEntry(entry)),
+      };
+    },
   });
 
   register({
@@ -16304,7 +16338,26 @@ export function apply(ctx, config) {
           uptimeMs: Date.now() - mountedAt,
         }),
       },
-      hearing: { ...hearingStatus, media: mediaTimeline.state() },
+      // P-57: the status block exposes the two capture lanes side by side without a second
+      // status source. Existing fields keep their meaning (`hearing.running`/`device` = mic;
+      // `ambient.running`/`source` = loopback session), while the new sub-blocks make the lane
+      // split explicit: `mic.source` is always 'mic', `ambient.source` always 'ambient', and
+      // `ambient.endpoint` keeps the loopback/microphone endpoint classification.
+      hearing: {
+        ...hearingStatus,
+        media: mediaTimeline.state(),
+        mic: {
+          running: hearing !== null,
+          device: hearing?.device ?? '',
+          source: 'mic',
+        },
+        ambient: {
+          running: ambient !== null,
+          device: ambient?.device ?? ambientSource.device,
+          source: 'ambient',
+          endpoint: ambient !== null ? ambientSource.source : '',
+        },
+      },
     };
   };
 
