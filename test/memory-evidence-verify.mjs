@@ -4,8 +4,10 @@
  * The gate is deliberately conservative:
  *   - the reference is `mem:<memoryId>` or `msg:<messageId>`, optionally `#<verbatim quote>`;
  *   - the source must exist, be visible (not superseded/hidden/archived), share the claim's domain
- *     or session, and not be the assistant's own speculation;
- *   - a quote must occur verbatim; without a quote a keyword-overlap HEURISTIC decides;
+ *     or session, not be the assistant's own speculation, and not itself be `unresolved=1`;
+ *   - a quote must occur verbatim; support is then DIRECT TEXT only (the source, or the sentence
+ *     holding the quote, must literally contain the claim's core assertion). Keyword overlap alone
+ *     no longer verifies, and an opposite negation state is reported as `contradiction`;
  *   - only a fully verified reference is persisted and lifts the hypothesis. A failed one keeps
  *     the row `hypothesis/unresolved`, persists no reference, and changes no original text.
  *
@@ -184,7 +186,7 @@ test('1) reference format: mem/msg ids, optional verbatim quotes, comma-separate
     role: 'user',
     sessionId: 's-format',
     messageId: 'format-2',
-    text: '第二段：浏览器窗口',
+    text: '第二段：OBS 场景，还有浏览器窗口',
     domain: 'chat',
   });
   store.addMessage({
@@ -196,10 +198,11 @@ test('1) reference format: mem/msg ids, optional verbatim quotes, comma-separate
   });
 
   // A comma that starts another mem/msg ref separates references; a comma inside a quote is kept.
+  // The second quote is not the whole claim, but its sentence literally contains the claim.
   const multiple = store.verifyEvidence('msg:format-1#OBS 场景,msg:format-2#浏览器窗口', {
     domain: 'chat',
     sessionId: 's-format',
-    text: 'OBS 浏览器窗口',
+    text: 'OBS 场景',
   });
   assert.equal(multiple.verified, true);
   assert.deepEqual(multiple.errors, []);
@@ -220,11 +223,15 @@ test('2) a real memory id + verbatim quote lifts the hypothesis and persists the
     await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   });
 
-  const source = store.add('chat', '用户把 OBS 场景切换到了浏览器', 'fact', { source: 'manual' });
+  // The source is a fuller sentence: it literally contains the claim's assertion.
+  const source = store.add('chat', '用户把 OBS 场景切换到了浏览器，昨天一整天都在看浏览器画面', 'fact', {
+    source: 'manual',
+  });
   assert.equal(source.kind, 'fact');
   const evidence = `mem:${source.id}#OBS 场景`;
-  const claim = store.add('chat', '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器', 'fact', {
+  const claim = store.add('chat', '用户把 OBS 场景切换到了浏览器', 'fact', {
     source: 'manual',
+    inference: true,
     evidence,
   });
 
@@ -252,14 +259,15 @@ test('3) a real recorded message id + quote verifies (msg: form)', async (t) => 
     role: 'user',
     sessionId: 's-obs',
     messageId: 'obs-msg-1',
-    text: '我昨天把 OBS 切换到了浏览器',
+    text: '我昨天把 OBS 切换到了浏览器，后来一直用浏览器看资料',
     domain: 'chat',
   });
   assert.ok(recorded.record !== null);
   const evidence = 'msg:obs-msg-1#OBS 切换';
-  const claim = store.add('chat', '用户可能之前切换过 OBS', 'fact', {
+  const claim = store.add('chat', '把 OBS 切换到了浏览器', 'fact', {
     source: 'manual',
     sessionId: 's-obs',
+    inference: true,
     evidence,
   });
 
@@ -269,7 +277,7 @@ test('3) a real recorded message id + quote verifies (msg: form)', async (t) => 
   assert.equal(readRow(store, claim.id).evidence, evidence);
 });
 
-test('4) without a quote, strong keyword overlap verifies; weak overlap is unsupported', async (t) => {
+test('4) without a quote, direct containment verifies; keyword overlap alone is unsupported', async (t) => {
   const root = await tempRoot();
   const store = openStore(root);
   t.after(async () => {
@@ -277,18 +285,23 @@ test('4) without a quote, strong keyword overlap verifies; weak overlap is unsup
     await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   });
 
-  const strong = store.add('chat', '用户把 OBS 切换到了浏览器场景', 'fact', { source: 'manual' });
-  const supported = store.add('chat', '用户切换过 OBS 浏览器场景，所以现在看到的是它', 'fact', {
+  const strong = store.add('chat', '用户昨天把 OBS 切换到了浏览器场景，之后一直在用', 'fact', {
     source: 'manual',
+  });
+  const supported = store.add('chat', '把 OBS 切换到了浏览器场景', 'fact', {
+    source: 'manual',
+    inference: true,
     evidence: `mem:${strong.id}`,
   });
-  assert.equal(supported.evidenceVerified, true, 'the overlap heuristic accepted a real source');
+  assert.equal(supported.evidenceVerified, true, 'literal containment is still direct support');
   assert.equal(supported.inference, false);
 
-  const weak = store.add('chat', '今天天气很好', 'fact', { source: 'manual' });
-  const unsupported = store.add('chat', '用户可能喜欢爵士乐', 'fact', {
+  // Same topic and many shared words, but the source never states the claim → NOT support.
+  const overlapOnly = store.add('chat', '用户昨天坐高铁去了杭州，逛了西湖', 'fact', { source: 'manual' });
+  const unsupported = store.add('chat', '用户昨天去了杭州', 'fact', {
     source: 'manual',
-    evidence: `mem:${weak.id}`,
+    inference: true,
+    evidence: `mem:${overlapOnly.id}`,
   });
   assert.equal(unsupported.evidenceVerified, false);
   assert.equal(unsupported.inference, true);
@@ -342,9 +355,10 @@ test('6) cross-domain/cross-session sources are refused; same domain OR same ses
     text: '我把 OBS 切换到了浏览器',
     domain: 'work',
   });
-  const foreign = store.add('chat', '用户可能切换过 OBS', 'fact', {
+  const foreign = store.add('chat', '把 OBS 切换到了浏览器', 'fact', {
     source: 'manual',
     sessionId: 's-chat',
+    inference: true,
     evidence: 'msg:work-msg#OBS',
   });
   assert.equal(foreign.inference, true);
@@ -359,9 +373,10 @@ test('6) cross-domain/cross-session sources are refused; same domain OR same ses
     text: '我把 OBS 切换到了浏览器',
     domain: 'work',
   });
-  const sameSession = store.add('chat', '用户可能切换过 OBS', 'fact', {
+  const sameSession = store.add('chat', '把 OBS 切换到了浏览器', 'fact', {
     source: 'manual',
     sessionId: 's-shared',
+    inference: true,
     evidence: 'msg:shared-msg#OBS',
   });
   assert.equal(sameSession.evidenceVerified, true);
@@ -425,7 +440,11 @@ test('8) a hypothesis or an assistant speculation is not independent evidence', 
     evidence: `mem:${hypothesis.id}#忘了会议`,
   });
   assert.equal(fromHypothesis.inference, true);
-  assert.deepEqual(fromHypothesis.evidenceErrors.map((entry) => entry.reason), ['self-inference']);
+  assert.deepEqual(
+    fromHypothesis.evidenceErrors.map((entry) => entry.reason),
+    ['unresolved-source'],
+    'a hypothesis row is still unresolved, so it cannot be independent evidence',
+  );
 
   store.addMessage({
     role: 'assistant',
@@ -492,7 +511,7 @@ test('10) correct() verifies the replacement: a passing ref lifts, a bad ref sta
     role: 'user',
     sessionId: 's-correct',
     messageId: 'correct-msg-1',
-    text: '他大概是忘了',
+    text: '用户没来，大概是忘了',
     domain: 'chat',
   });
   const target = store.add('chat', '用户没来', 'fact', { source: 'manual', sessionId: 's-correct' });
@@ -500,7 +519,7 @@ test('10) correct() verifies the replacement: a passing ref lifts, a bad ref sta
     targetId: target.id,
     expectedVersion: 1,
     expectedText: '用户没来',
-    replacement: '用户没来，所以大概是忘了',
+    replacement: '用户没来，大概是忘了',
     sessionId: 's-correct',
     evidence: 'msg:correct-msg-1#忘了',
   });
@@ -531,15 +550,22 @@ test('10) correct() verifies the replacement: a passing ref lifts, a bad ref sta
 
   // Correcting an older hypothesis with a verified reference restores a confirmed kind and clears
   // the unresolved mark (the original kind was overwritten when it became a hypothesis).
-  const oldHypothesis = store.add('chat', '用户没来，所以大概是忘了', 'fact', { source: 'manual' });
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-correct',
+    messageId: 'correct-msg-2',
+    text: '用户没来，肯定是忘了',
+    domain: 'chat',
+  });
+  const oldHypothesis = store.add('chat', '用户没来，大概是忘了', 'fact', { source: 'manual' });
   assert.equal(oldHypothesis.kind, 'hypothesis');
   const lifted = store.correct({
     targetId: oldHypothesis.id,
     expectedVersion: 1,
     expectedText: '大概是忘了',
-    replacement: '肯定是忘了，看来如此',
+    replacement: '肯定是忘了',
     sessionId: 's-correct',
-    evidence: 'msg:correct-msg-1#忘了',
+    evidence: 'msg:correct-msg-2#忘了',
   });
   assert.equal(lifted.ok, true);
   assert.equal(lifted.evidenceVerified, true);
@@ -552,15 +578,18 @@ test('10) correct() verifies the replacement: a passing ref lifts, a bad ref sta
 test('11) assistant_remember reports evidenceVerified/evidenceErrors for evidence-bearing calls', async (t) => {
   const root = await tempRoot();
   const seed = openStore(root);
-  const source = seed.add('chat', '用户把 OBS 场景切换到了浏览器', 'fact', { source: 'manual' });
+  const source = seed.add('chat', '用户把 OBS 场景切换到了浏览器，当前显示的是 OBS 场景', 'fact', {
+    source: 'manual',
+  });
   seed.close();
   const app = mount(root);
   t.after(() => app.close());
 
   const verified = await app.call('assistant_remember', {
-    text: '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器',
+    text: '用户把 OBS 场景切换到了浏览器',
     kind: 'fact',
     importance: 70,
+    inference: true,
     evidence: `mem:${source.id}#OBS 场景`,
   });
   assert.equal(verified.inference, false);
@@ -595,7 +624,7 @@ test('11) assistant_remember reports evidenceVerified/evidenceErrors for evidenc
     targetId: target.id,
     expectedVersion: 1,
     expectedText: '浏览器',
-    replacement: 'OBS 场景，因为用户切换过',
+    replacement: 'OBS 场景',
     evidence: `mem:${source.id}#OBS 场景`,
   });
   assert.equal(corrected.ok, true);
@@ -611,7 +640,9 @@ test('11) assistant_remember reports evidenceVerified/evidenceErrors for evidenc
 test('12) registered schemas accept the evidence verdict; render shows verified vs unresolved', async (t) => {
   const root = await tempRoot();
   const seed = openStore(root);
-  const source = seed.add('chat', '用户把 OBS 场景切换到了浏览器', 'fact', { source: 'manual' });
+  const source = seed.add('chat', '用户把 OBS 场景切换到了浏览器，当前显示的是 OBS 场景', 'fact', {
+    source: 'manual',
+  });
   seed.close();
   const app = mount(root);
   t.after(() => app.close());
@@ -645,9 +676,10 @@ test('12) registered schemas accept the evidence verdict; render shows verified 
 
   // A remember call with valid evidence: the strict return is accepted and names the verified state.
   const verifiedArgs = {
-    text: '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器',
+    text: '用户把 OBS 场景切换到了浏览器',
     kind: 'fact',
     importance: 70,
+    inference: true,
     evidence: `mem:${source.id}#OBS 场景`,
   };
   const verified = await app.call('assistant_remember', verifiedArgs);
@@ -693,7 +725,7 @@ test('12) registered schemas accept the evidence verdict; render shows verified 
     targetId: target.id,
     expectedVersion: 1,
     expectedText: '浏览器',
-    replacement: 'OBS 场景，因为用户切换过',
+    replacement: 'OBS 场景',
     evidence: `mem:${source.id}#OBS 场景`,
   };
   const corrected = await app.call('assistant_memory_correct', correctArgs);
@@ -709,4 +741,122 @@ test('12) registered schemas accept the evidence verdict; render shows verified 
     '$.evidenceErrors');
   const correctedText = app.render('assistant_memory_correct', correctArgs, corrected);
   assert.ok(correctedText.includes('已由来源核验，可作为已确认记录。'));
+});
+
+test('13) a verbatim quote cannot invert a negation: 喜欢 vs 不喜欢 is contradiction', async (t) => {
+  const root = await tempRoot();
+  const store = openStore(root);
+  t.after(async () => {
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  });
+
+  const source = store.add('chat', '用户不喜欢恐怖片', 'fact', { source: 'manual' });
+  const claimText = '用户喜欢恐怖片，因为刺激';
+  const claim = store.add('chat', claimText, 'fact', {
+    source: 'manual',
+    evidence: `mem:${source.id}#不喜欢恐怖片`,
+  });
+
+  // The quote really occurs in the source and shares most words with the claim; neither is enough.
+  assert.equal(claim.evidenceVerified, false);
+  assert.equal(claim.inference, true);
+  assert.equal(claim.kind, 'hypothesis');
+  assert.equal(claim.unresolved, 1);
+  assert.deepEqual(claim.evidenceErrors.map((entry) => entry.reason), ['contradiction']);
+  const stored = readRow(store, claim.id);
+  assert.equal(stored.text, claimText, 'the original claim is stored unchanged');
+  assert.equal(stored.evidence, null, 'the failed reference is not persisted');
+
+  // Same source, same polarity: direct text support still verifies.
+  const honest = store.add('chat', '用户不喜欢恐怖片', 'fact', {
+    source: 'manual',
+    inference: true,
+    evidence: `mem:${source.id}#不喜欢恐怖片`,
+  });
+  assert.equal(honest.evidenceVerified, true);
+  assert.equal(honest.inference, false);
+});
+
+test('14) an added cause/evaluation is unsupported; only the source stating it verifies', async (t) => {
+  const root = await tempRoot();
+  const store = openStore(root);
+  t.after(async () => {
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  });
+
+  const bare = store.add('chat', '用户喜欢恐怖片', 'fact', { source: 'manual' });
+  const causal = store.add('chat', '用户喜欢恐怖片，因为刺激', 'fact', {
+    source: 'manual',
+    evidence: `mem:${bare.id}#喜欢恐怖片`,
+  });
+  assert.equal(causal.evidenceVerified, false, 'the quote covers the premise, not the added cause');
+  assert.equal(causal.inference, true);
+  assert.equal(causal.kind, 'hypothesis');
+  assert.equal(causal.unresolved, 1);
+  assert.deepEqual(causal.evidenceErrors.map((entry) => entry.reason), ['unsupported']);
+
+  const evaluation = store.add('chat', '用户把票退了，说明不想去', 'fact', {
+    source: 'manual',
+    evidence: `mem:${bare.id}#恐怖片`,
+  });
+  assert.equal(evaluation.evidenceVerified, false);
+  assert.deepEqual(evaluation.evidenceErrors.map((entry) => entry.reason), ['unsupported']);
+
+  // When the source itself states the whole claim, the same causal sentence is direct support.
+  const full = store.addMessage({
+    role: 'user',
+    sessionId: 's-causal',
+    messageId: 'causal-msg',
+    text: '用户喜欢恐怖片，因为刺激',
+    domain: 'chat',
+  });
+  assert.ok(full.record !== null);
+  const verified = store.add('chat', '用户喜欢恐怖片，因为刺激', 'fact', {
+    source: 'manual',
+    sessionId: 's-causal',
+    inference: true,
+    evidence: 'msg:causal-msg#因为刺激',
+  });
+  assert.equal(verified.evidenceVerified, true);
+  assert.equal(verified.inference, false);
+  assert.equal(verified.kind, 'fact');
+
+  // The quote's own sentence is enough even when another sentence carries a negation.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-multi',
+    messageId: 'multi-msg',
+    text: '用户不喜欢恐怖片。不过用户喜欢喜剧。',
+    domain: 'chat',
+  });
+  const withinSentence = store.add('chat', '用户喜欢喜剧', 'fact', {
+    source: 'manual',
+    sessionId: 's-multi',
+    inference: true,
+    evidence: 'msg:multi-msg#喜欢喜剧',
+  });
+  assert.equal(withinSentence.evidenceVerified, true);
+  assert.equal(withinSentence.inference, false);
+
+  // Legacy-shaped case: the source states the action (and the quote is verbatim), but the claim
+  // adds a cause and a conclusion it never states. That is exactly the extra-tail case and stays
+  // an unresolved hypothesis, even though most keywords overlap.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-partial',
+    messageId: 'partial-msg',
+    text: '我昨天把 OBS 场景切换到了浏览器',
+    domain: 'chat',
+  });
+  const partial = store.add('chat', '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器', 'fact', {
+    source: 'manual',
+    sessionId: 's-partial',
+    evidence: 'msg:partial-msg#OBS 场景',
+  });
+  assert.equal(partial.evidenceVerified, false);
+  assert.equal(partial.inference, true);
+  assert.equal(partial.kind, 'hypothesis');
+  assert.deepEqual(partial.evidenceErrors.map((entry) => entry.reason), ['unsupported']);
 });

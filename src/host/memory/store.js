@@ -186,9 +186,9 @@ export function classifyInference(text, { inference = undefined, evidence = unde
 // confirmed fact, nor delete what was said. The MANUAL lane may lift the hypothesis only with a
 // real, checkable source. The reference format is one string (the index schema is `string`):
 //
-//   mem:<memoryId>          an active memory row supports the claim (keyword-overlap heuristic)
+//   mem:<memoryId>          an active memory row directly supports the claim (literal containment)
 //   mem:<memoryId>#<quote>  `quote` must occur verbatim in that row's body
-//   msg:<messageId>         an active recorded message supports the claim
+//   msg:<messageId>         an active recorded message supports the claim (same direct check)
 //   msg:<messageId>#<quote> the same, with a verbatim quote
 //
 // Several references may be supplied by starting the next one after a comma
@@ -199,17 +199,17 @@ export function classifyInference(text, { inference = undefined, evidence = unde
 //   - scope         source is in another domain AND another session
 //   - stale         source was superseded/hidden/archived (no longer visible)
 //   - self-inference source is itself a hypothesis, or an assistant message that only speculates
-//   - unsupported   a quote does not occur verbatim, or the no-quote keyword overlap is too small
-// Support without a quote is a HEURISTIC (shared CJK bigrams/ASCII words); it can produce a false
-// positive, which is why a caller is encouraged to supply `#quote`.
+//   - unresolved-source source is still `unresolved=1` (a pending hypothesis/correction), so it
+//                   cannot serve as independent evidence even when its kind is event/assistant
+//   - unsupported   the quote does not occur verbatim, the claim's core assertion is not contained
+//                   in the source (keyword overlap alone is NOT support), or the claim adds a
+//                   cause/evaluation the source does not state
+//   - contradiction the source states the same predicate with the opposite negation polarity
+// Support is DIRECT TEXT only: after normalization the source (or the sentence holding the quote)
+// must literally contain the claim's core assertion. No model-based entailment is attempted, so
+// ambiguity fails closed to `unsupported`.
 const EVIDENCE_REF_RE = /^(mem|msg):(.+)$/u;
 const EVIDENCE_REF_SPLIT_RE = /,(?=\s*(?:mem|msg):)/u;
-const EVIDENCE_STOP_TOKENS = new Set([
-  '用户', '现在', '之前', '已经', '这个', '那个', '就是', '还是', '因为', '所以',
-  '可能', '大概', '说明', '导致', '估计', '应该', '看来', '觉得', '认为', '然后',
-  '而且', '但是', '如果', '的话', '什么', '怎么', '我们', '你们', '他们', '自己',
-  '这样', '那样', '时候', '今天', '昨天', '明天', '一个', '一些', '没有', '不是',
-]);
 
 /**
  * Parse one evidence reference. A malformed reference is returned as `valid:false` (rather than
@@ -242,60 +242,154 @@ function splitEvidenceRefs(value) {
   return text.split(EVIDENCE_REF_SPLIT_RE).map((part) => part.trim()).filter((part) => part.length > 0);
 }
 
-/** Content tokens used by the no-quote support heuristic: CJK bigrams + ASCII words. */
-function evidenceTokens(value) {
-  const tokens = new Set();
-  const body = typeof value === 'string' ? value : '';
-  for (const match of body.matchAll(/[\p{Script=Han}]+|[A-Za-z][A-Za-z0-9_]+/gu)) {
-    const run = match[0];
-    if (/^[A-Za-z]/u.test(run)) {
-      const word = run.toLowerCase();
-      if (word.length >= 2) tokens.add(word);
-      continue;
-    }
-    if (run.length <= 2) {
-      if (!EVIDENCE_STOP_TOKENS.has(run)) tokens.add(run);
-      continue;
-    }
-    for (let index = 0; index < run.length - 1; index += 1) {
-      const token = run.slice(index, index + 2);
-      if (!EVIDENCE_STOP_TOKENS.has(token)) tokens.add(token);
+// Causal/evaluative heads: text from the first such marker on is an ADDED assertion, not support.
+const EVIDENCE_EXTRA_MARKERS = Object.freeze([
+  '因为', '所以', '导致', '说明', '推测', '可能', '估计', '应该是', '大概是', '看来',
+]);
+const EVIDENCE_NEGATION_RE = /(?:并不|并没有|没有|从未|从不|未曾|毫无|不|没|未|无)/gu;
+const EVIDENCE_NEGATION_TEST_RE = /(?:并不|并没有|没有|从未|从不|未曾|毫无|不|没|未|无)/u;
+// Words that merely CONTAIN a negation character but do not negate the predicate. They must not
+// turn a discourse contrast ("不过…") into a polarity flip.
+const EVIDENCE_NON_NEGATION_RE = /(?:不得不|不过|不同|不断|不少|不久|不管|不论|不仅|不但|不如|差不多)/gu;
+const EVIDENCE_SENTENCE_BREAKS = new Set(['。', '！', '？', '!', '?', '；', ';', '\n']);
+
+/** Normalize for literal comparison: NFKC, lower-case, no whitespace/punctuation/symbols. */
+function normalizeSupportText(value) {
+  return (typeof value === 'string' ? value : '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+/** True when the text carries a real Chinese negation marker (not 不过/不同/…). */
+function hasNegation(value) {
+  return EVIDENCE_NEGATION_TEST_RE.test(value.replace(EVIDENCE_NON_NEGATION_RE, ''));
+}
+
+/** Remove negation markers, so a predicate can be compared across opposite polarity. */
+function stripNegation(value) {
+  return value
+    .replace(EVIDENCE_NON_NEGATION_RE, '')
+    .replace(EVIDENCE_NEGATION_RE, '');
+}
+
+/**
+ * Split a normalized claim at its first causal/evaluative marker. `core` is the main assertion the
+ * source must state; anything from `extras` on is an additional cause/evaluation that also has to
+ * appear in the source before the claim may be verified.
+ * @param {string} claimNorm
+ * @returns {{core: string, extras: string}}
+ */
+function claimParts(claimNorm) {
+  let first = -1;
+  for (const marker of EVIDENCE_EXTRA_MARKERS) {
+    const index = claimNorm.indexOf(marker);
+    if (index >= 0 && (first < 0 || index < first)) first = index;
+  }
+  return first < 0
+    ? { core: claimNorm, extras: '' }
+    : { core: claimNorm.slice(0, first), extras: claimNorm.slice(first) };
+}
+
+/** The sentence around one character index (split on CJK/ASCII sentence punctuation). */
+function sentenceAround(text, index) {
+  let start = 0;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    if (EVIDENCE_SENTENCE_BREAKS.has(text[cursor])) {
+      start = cursor + 1;
+      break;
     }
   }
-  return tokens;
+  let end = text.length;
+  for (let cursor = index; cursor < text.length; cursor += 1) {
+    if (EVIDENCE_SENTENCE_BREAKS.has(text[cursor])) {
+      end = cursor + 1;
+      break;
+    }
+  }
+  return text.slice(start, end);
 }
 
 /**
- * Keyword overlap between a source body and a claim. This is a heuristic, not entailment: it can
- * only say "these two texts talk about several of the same things".
- * @param {unknown} sourceText
- * @param {unknown} claimText
- * @returns {{shared: number, claim: number, coverage: number}}
+ * Whether one normalized text contains `needle` as an UNNEGATED assertion. A positive claim is not
+ * supported by a negated occurrence (`喜欢` vs `不喜欢`), and every occurrence is inspected.
+ * @param {string} haystack
+ * @param {string} needle
+ * @returns {boolean}
  */
-function evidenceOverlap(sourceText, claimText) {
-  const source = evidenceTokens(sourceText);
-  const claim = evidenceTokens(claimText);
-  let shared = 0;
-  for (const token of claim) if (source.has(token)) shared += 1;
-  return { shared, claim: claim.size, coverage: claim.size === 0 ? 0 : shared / claim.size };
+function containsUnnegated(haystack, needle) {
+  if (needle.length === 0) return false;
+  let index = haystack.indexOf(needle);
+  while (index >= 0) {
+    const prefix = haystack.slice(Math.max(0, index - 6), index);
+    if (!hasNegation(prefix)) return true;
+    index = haystack.indexOf(needle, index + 1);
+  }
+  return false;
 }
 
 /**
- * Whether one visible source supports one claim. A quote is checked verbatim; without it the
- * heuristic requires at least two shared content tokens (or every token of a very short claim).
+ * Whether one normalized source contradicts the claim's core assertion: same predicate, opposite
+ * negation polarity. This is not entailment; it only recognizes the deterministic 喜欢/不喜欢
+ * class of flip, so a different predicate stays merely `unsupported`.
+ * @param {string} haystack normalized source
+ * @param {string} core normalized claim core
+ * @returns {boolean}
+ */
+function contradictsSource(haystack, core) {
+  if (core.length === 0) return false;
+  if (haystack.includes(core)) {
+    if (hasNegation(core)) return false;
+    let index = haystack.indexOf(core);
+    while (index >= 0) {
+      const prefix = haystack.slice(Math.max(0, index - 6), index);
+      if (!hasNegation(prefix)) return false;
+      index = haystack.indexOf(core, index + 1);
+    }
+    return true;
+  }
+  const strippedCore = stripNegation(core);
+  if (strippedCore.length === 0) return false;
+  if (!stripNegation(haystack).includes(strippedCore)) return false;
+  return hasNegation(haystack) !== hasNegation(core);
+}
+
+/**
+ * Conservative direct-support verdict for one source/claim/quote triple.
+ *
+ * A quote (when supplied) must occur verbatim. Then the normalized source, or the sentence that
+ * contains the quote, must literally contain the claim (or its core assertion before a causal /
+ * evaluative tail). Keyword overlap, shared entities and general topical similarity are not
+ * enough. Returns `'supported' | 'contradiction' | 'unsupported'`.
  * @param {unknown} sourceText
  * @param {unknown} claimText
  * @param {unknown} quote
- * @returns {boolean}
+ * @returns {'supported'|'contradiction'|'unsupported'}
  */
-function evidenceSupports(sourceText, claimText, quote) {
-  const body = typeof sourceText === 'string' ? sourceText : '';
+function evidenceSupportVerdict(sourceText, claimText, quote) {
+  const source = typeof sourceText === 'string' ? sourceText : '';
+  const claimNorm = normalizeSupportText(claimText);
+  if (claimNorm.length === 0) return 'unsupported';
+  const { core, extras } = claimParts(claimNorm);
   const needle = typeof quote === 'string' ? quote.trim() : '';
-  if (needle.length > 0) return body.includes(needle);
-  const overlap = evidenceOverlap(body, claimText);
-  if (overlap.claim === 0) return false;
-  const needed = Math.min(2, overlap.claim);
-  return overlap.shared >= needed && overlap.shared / overlap.claim >= 0.2;
+  let candidates = [source];
+  if (needle.length > 0) {
+    const at = source.indexOf(needle);
+    if (at < 0) return 'unsupported';
+    const sentence = sentenceAround(source, at);
+    if (sentence !== source) candidates = [sentence, source];
+  }
+  const normalized = candidates
+    .map((candidate) => normalizeSupportText(candidate))
+    .filter((candidate) => candidate.length > 0);
+  for (const candidate of normalized) {
+    if (containsUnnegated(candidate, claimNorm)) return 'supported';
+    if (extras.length === 0 && containsUnnegated(candidate, core)) return 'supported';
+  }
+  for (const candidate of normalized) {
+    if (contradictsSource(candidate, core)) return 'contradiction';
+  }
+  return 'unsupported';
 }
 
 // ---- P-67 §6: manual-lane relative time ------------------------------------
@@ -1329,7 +1423,8 @@ export class MemoryStore {
   lookupEvidenceSource(kind, id) {
     const column = kind === 'msg' ? 'message_id' : 'id';
     const row = this.db
-      .prepare(`SELECT id, domain, kind, text, role, source, session_id, superseded_by, hidden
+      .prepare(`SELECT id, domain, kind, text, role, source, session_id, superseded_by, hidden,
+          unresolved
         FROM memory_event WHERE ${column} = ? LIMIT 1`)
       .get(id);
     if (row !== undefined) {
@@ -1349,8 +1444,9 @@ export class MemoryStore {
    * Scope is deliberately conservative: the source is allowed when it shares the claim's domain
    * OR the claim's session; a cross-domain, cross-session source is refused rather than treated
    * as global. A hypothesis (or an assistant message that merely speculates) is never independent
-   * evidence. A quoted reference must occur verbatim; an unquoted one must pass the keyword
-   * overlap heuristic in `evidenceSupports`.
+   * evidence. A source still marked `unresolved=1` is refused for the same reason. A quoted
+   * reference must occur verbatim, and every reference must pass the direct-support check in
+   * `evidenceSupportVerdict` (literal containment of the claim, not keyword overlap).
    *
    * @param {unknown} evidenceText stored-form evidence string (`mem:`/`msg:` refs)
    * @param {{domain?: string, sessionId?: string|null, text?: string}} [context]
@@ -1382,6 +1478,12 @@ export class MemoryStore {
         continue;
       }
       const source = lookup.row;
+      // A pending hypothesis/correction is not independent evidence, whatever its `kind` says.
+      // Conversation corrections keep `kind:'event'`; only the unresolved flag marks them.
+      if (Number(source.unresolved) === 1) {
+        errors.push({ ref: raw, reason: 'unresolved-source' });
+        continue;
+      }
       const sourceDomain = typeof source.domain === 'string' ? source.domain : '';
       const sourceSession = typeof source.session_id === 'string' ? source.session_id.trim() : '';
       const sameDomain = claimDomain.length > 0 && sourceDomain === claimDomain;
@@ -1401,8 +1503,9 @@ export class MemoryStore {
         errors.push({ ref: raw, reason: 'self-inference' });
         continue;
       }
-      if (!evidenceSupports(source.text, claimText, parsed.quote)) {
-        errors.push({ ref: raw, reason: 'unsupported' });
+      const support = evidenceSupportVerdict(source.text, claimText, parsed.quote);
+      if (support !== 'supported') {
+        errors.push({ ref: raw, reason: support });
         continue;
       }
     }

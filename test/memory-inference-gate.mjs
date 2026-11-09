@@ -285,7 +285,7 @@ test('3) remember with verified evidence keeps the normal kind and records the e
       role: 'user',
       sessionId: 'inference-gate',
       messageId: 'obs-user-1',
-      text: '我昨天把 OBS 场景切换到了浏览器',
+      text: '因为用户之前切换过 OBS 场景，所以现在看到的是浏览器',
       domain: 'chat',
     });
     assert.ok(recorded.record !== null, 'the evidence source message was recorded');
