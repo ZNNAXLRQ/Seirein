@@ -53,6 +53,8 @@ export const UNDERSTANDING_RUNTIME_DEFAULTS = Object.freeze({
 const DEFAULT_MIN_INTERVAL_MS = 15_000;
 /** 原因只作为状态标签：单行、限长，避免长文本/控制字符进入 status。 */
 const MAX_REASON_CHARS = 80;
+/** 定向分析的关注点上限；只作为提示词上下文，不进入状态/status 正文。 */
+const MAX_FOCUS_CHARS = 200;
 /** 单个描述/场景的渲染预算上限（仍受总 maxChars 兜底）。 */
 const MAX_SCENE_CHARS = 320;
 const MAX_EVENT_CHARS = 180;
@@ -111,6 +113,16 @@ function flattenText(value) {
     .replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * 归一化可选关注点：非字符串忽略；换行/控制字符压成单行空格；按 UTF-16 长度截到
+ * MAX_FOCUS_CHARS（用 clipText，超限时留省略号，结果 length 不超过上限）。
+ * 它只是提示词上下文，不写入状态，也不进入 status 正文。
+ */
+function focusText(value) {
+  if (typeof value !== 'string') return '';
+  return clipText(flattenText(value), MAX_FOCUS_CHARS);
 }
 
 /**
@@ -265,6 +277,8 @@ export function createUnderstandingRuntime(options = {}) {
   let lastAt = null;
   let lastWindowReason = '';
   let lastClearReason = '';
+  /** 最近一次进入执行的分析请求的 focus 长度；只留长度，不留正文。 */
+  let lastFocusChars = 0;
 
   const clock = () => {
     try {
@@ -370,7 +384,7 @@ export function createUnderstandingRuntime(options = {}) {
     });
   }
 
-  async function performRun({ window, reason, runGeneration, signal }) {
+  async function performRun({ window, reason, focus, runGeneration, signal }) {
     if (isStale(runGeneration) || signal?.aborted) return staleOutcome();
 
     // 过期状态不参与 previousScene；过期清空不改变代次，故先于取证据执行。
@@ -400,6 +414,7 @@ export function createUnderstandingRuntime(options = {}) {
         frames: frameList,
         audioLines: Array.isArray(rawAudio) ? rawAudio : [],
         previousScene,
+        focus,
         maxFrames,
         maxAudioLines: UNDERSTANDING_DEFAULTS.maxAudioLines,
       });
@@ -516,6 +531,9 @@ export function createUnderstandingRuntime(options = {}) {
   /**
    * 立即分析一个窗口（测试/手动入口）。仍受单在途与 isBlocked 约束；返回的 Promise 永远
    * resolve，不会 reject。
+   *
+   * 可选 `focus` 是一次定向分析的具体问题：非字符串忽略，换行压平，截到 200 字符，只随
+   * 本次请求进入提示词的【本次关注点】；不会写进连续状态，`status()` 只记录其长度。
    */
   function runNow(request = {}) {
     if (stopped) return Promise.resolve({ ok: false, reason: 'stopped' });
@@ -542,16 +560,19 @@ export function createUnderstandingRuntime(options = {}) {
     const at = clock();
     const window = windowOf(request, at);
     const reason = reasonText(isObject(request) ? request.reason : '');
+    const focus = focusText(isObject(request) ? request.focus : '');
     const runGeneration = generation;
     const controller = typeof AbortController === 'function' ? new AbortController() : null;
     activeController = controller;
     busy = true;
+    lastFocusChars = focus.length;
 
     const work = (async () => {
       try {
         return await performRun({
           window,
           reason,
+          focus,
           runGeneration,
           signal: controller === null ? undefined : controller.signal,
         });
@@ -698,7 +719,7 @@ export function createUnderstandingRuntime(options = {}) {
     scheduler.stop();
   }
 
-  /** 只读诊断：调度器状态 + 运行时分析计数；不含素材正文。 */
+  /** 只读诊断：调度器状态 + 运行时分析计数；不含素材正文（focus 只给长度）。 */
   function status() {
     const scheduled = scheduler.status();
     return {
@@ -711,6 +732,7 @@ export function createUnderstandingRuntime(options = {}) {
       failures,
       droppedEvents,
       lastEventCount,
+      lastFocusChars,
       lastClearReason,
       stopped,
       hasState: state !== null,

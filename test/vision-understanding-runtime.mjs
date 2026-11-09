@@ -160,6 +160,157 @@ test('正常：帧与台词进入提示词，analyze 收到带 file 的帧，解
   assert.equal(runtime.status().lastEventCount, 1);
 });
 
+test('runNow({focus})：关注文本进入分析器 user 的【本次关注点】', async () => {
+  const clock = createFakeClock();
+  const received = [];
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => {
+      received.push(input);
+      return defaultReply(input.interval);
+    },
+  });
+
+  const focus = '角色为什么突然回头？';
+  const result = await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'focus',
+    focus,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(received.length, 1);
+  assert.match(received[0].user, /【本次关注点】/, '提示词必须有明确的关注点小节');
+  assert.ok(received[0].user.includes(focus), '关注文本必须出现在 user 里');
+  assert.equal(runtime.render().includes(focus), false, 'focus 只进提示词，不进被动渲染块');
+  assert.equal(runtime.status().lastFocusChars, focus.length);
+});
+
+test('focus 超长/带换行：压成单行空格并截断到 200', async () => {
+  const clock = createFakeClock();
+  let received = null;
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => {
+      received = input;
+      return defaultReply(input.interval);
+    },
+  });
+
+  const head = '长'.repeat(150);
+  const tail = '尾'.repeat(100);
+  const result = await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'long-focus',
+    focus: `${head}\n${tail}`,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(runtime.status().lastFocusChars, 200, '运行时把 focus 截到 200 字符');
+
+  // 提示词层还会把关注点截到 160（含“已截断”标记）；这里只断言它仍是单行且前缀正确。
+  const section = received.user
+    .split('【本次关注点】\n')[1]
+    .split('\n\n【覆盖缺口】')[0];
+  assert.ok(!section.includes('\n'), '换行必须被压平，不能伪造出新的结构行');
+  assert.ok(section.startsWith(`${head} `), '换行应压成空格并保留前缀');
+  assert.ok(section.includes('尾'), '关注点本身的内容仍要保留');
+  assert.ok(!section.includes('尾'.repeat(10)), '超出上限的尾部不得出现');
+});
+
+test('focus 非字符串：忽略且不影响运行', async () => {
+  const clock = createFakeClock();
+  const received = [];
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => {
+      received.push(input);
+      return defaultReply(input.interval);
+    },
+  });
+
+  for (const focus of [12345, null, { text: '不是字符串' }, ['数组']]) {
+    // eslint-disable-next-line no-await-in-loop
+    const result = await runtime.runNow({
+      from: 1_000_000,
+      to: 1_020_000,
+      reason: 'bad-focus',
+      focus,
+    });
+    assert.equal(result.ok, true);
+    assert.match(
+      received[received.length - 1].user,
+      /【本次关注点】\n无特别关注点。/,
+      '非字符串 focus 必须按“无关注点”处理',
+    );
+    assert.equal(runtime.status().lastFocusChars, 0);
+  }
+});
+
+test('status().lastFocusChars：只保留最近一次请求的长度，不含正文', async () => {
+  const clock = createFakeClock();
+  const runtime = makeRuntime(clock);
+
+  assert.equal(runtime.status().lastFocusChars, 0, '尚未分析时为 0');
+
+  const shortFocus = '看主角的手';
+  assert.equal((await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'short',
+    focus: shortFocus,
+  })).ok, true);
+  assert.equal(runtime.status().lastFocusChars, shortFocus.length);
+  assert.equal(JSON.stringify(runtime.status()).includes(shortFocus), false);
+
+  assert.equal((await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'long',
+    focus: `  ${'注'.repeat(250)}  `,
+  })).ok, true);
+  assert.equal(runtime.status().lastFocusChars, 200);
+  assert.equal(JSON.stringify(runtime.status()).includes('注'), false, 'status 只能带长度，不能带正文');
+});
+
+test('失败轮（bad-json）不改变既有状态/计数语义', async () => {
+  const clock = createFakeClock();
+  let mode = 'ok';
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => (mode === 'ok' ? defaultReply(input.interval) : '{坏输出'),
+  });
+
+  assert.equal((await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'first',
+    focus: '成功轮关注点',
+  })).ok, true);
+  const before = runtime.current();
+  const statusBefore = runtime.status();
+  const renderedBefore = runtime.render();
+
+  mode = 'bad';
+  const failed = await runtime.runNow({
+    from: 1_000_000,
+    to: 1_020_000,
+    reason: 'second',
+    focus: '失败轮关注点',
+  });
+
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, 'bad-json');
+  assert.deepEqual(runtime.current(), before, '失败轮不得改写既有状态');
+  assert.equal(runtime.render(), renderedBefore, '失败轮不得改写渲染块');
+
+  const statusAfter = runtime.status();
+  assert.equal(statusAfter.runs, statusBefore.runs + 1);
+  assert.equal(statusAfter.failures, statusBefore.failures + 1);
+  assert.equal(statusAfter.lastReason, 'bad-json');
+  assert.equal(statusAfter.lastEventCount, 0, '失败轮把上一轮事件计数归零');
+  assert.equal(statusAfter.droppedEvents, statusBefore.droppedEvents);
+  assert.equal(statusAfter.lastFocusChars, '失败轮关注点'.length);
+});
+
 test('onAdvance：成功并入状态后调用一次，参数含 events/sceneSummary 且是副本', async () => {
   const clock = createFakeClock();
   const calls = [];
