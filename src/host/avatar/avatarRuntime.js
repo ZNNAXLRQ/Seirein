@@ -591,6 +591,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     index: -1,
     startedAt: null,
     endedAt: null,
+    /**
+     * Where `startedAt` came from (P-139 stage 2 P1): `player-ready` for the file transport's
+     * process-spawn anchor, `first-data` for the streamed transport's first chunk handed to the
+     * player, or `fallback` when the transport never reported a start. It is a diagnostic, never
+     * a claim of a measured speaker sample.
+     */
+    anchor: null,
     starts: 0,
     ends: 0,
     /** Waiting CANDIDATE started at a clip start (legacy `timed`; never an intent release). */
@@ -619,6 +626,21 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     /** Conversation identity: `intentEvent({sessionId, turnId})` replaces it (turn switch). */
     sessionId: 0,
     turnId: 0,
+    /**
+     * P-139 stage 2 P1: the reply that owns this intent generation. The host opens one reply for
+     * the user's accepted input (a voice final or a typed turn) and shares that id with the
+     * pre-turn phase and the later Harness `turn/start`; only then may a turn change be a soft
+     * continuation instead of a hard switch. `null` means "no reply identity supplied" and keeps
+     * the historical hard turn/session switch.
+     */
+    replyId: null,
+    /**
+     * How many times `interrupt()` cut the pose. A reply continuation refuses to keep an action
+     * whose `interruptSeq` predates the last interrupt (a real barge-in must never be softened).
+     */
+    interruptSeq: 0,
+    /** Set by `interrupt()`; the next turn claim is hard instead of a same-reply continuation. */
+    afterInterrupt: false,
     /** Clip index that already started an intent: at most one intent per sentence. */
     servedClip: -1,
     staged: 0,
@@ -2148,6 +2170,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function interrupt({ reason = 'interrupt' } = {}) {
     if (state.disposed) return disposedResult();
     const at = clockNow();
+    // A real interruption is never a same-reply continuation: the next turn claim must stay hard
+    // until a new user input opens the next reply (`turn-start` / `user-speaking`).
+    intentState.interruptSeq += 1;
+    intentState.afterInterrupt = true;
     // A barge-in is a soft stop: the action fades (interrupted), but the output epoch is not
     // bumped. The pending intent of this generation is dropped with a recorded reason.
     const cut = actionState.current !== null;
@@ -2840,6 +2866,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       durationSource: timed ? 'intent' : 'fallback',
       animationStartedAt: null,
       capped: false,
+      /** P-139 identity: the interrupt counter in force when this action began. */
+      interruptSeq: intentState.interruptSeq,
+      replyId: null,
     };
     beginActionTrace(actionState.current, { release, info: intentInfo });
     applyActionCap(actionState.current);
@@ -3059,7 +3088,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * waiting candidate is kept (never queued) and released at the next start; `end` only marks the
    * pause, so no action is dropped into the middle of a sentence.
    */
-  function speechClip(event, { index = null, at = null } = {}) {
+  function speechClip(event, { index = null, at = null, anchor = null } = {}) {
     if (state.disposed) return disposedResult();
     const phase = String(event ?? '');
     const time = Number.isFinite(at) ? at : clockNow();
@@ -3074,6 +3103,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       clipState.starts += 1;
       clipState.index = Number.isInteger(index) ? index : clipState.index + 1;
       clipState.startedAt = time;
+      // P-139 stage 2 P1: the anchor is the transport's real start callback. `first-data` is the
+      // closest evidence the streamed transport can give; neither it nor `player-ready` is a
+      // measured speaker sample, so the source is recorded instead of pretending precision.
+      clipState.anchor = typeof anchor === 'string' && anchor.length > 0 ? anchor : null;
+      recordIdleEvent('avatar.speech.anchor', {
+        index: clipState.index, at: time, anchor: clipState.anchor,
+      });
       // The sentence boundary is the ONE release point for a staged communication intent. At most
       // one intent starts per clip, and an action still running simply defers it to the next clip —
       // EXCEPT the answer's opening intent, which was staged for THIS boundary and never waits.
@@ -3125,6 +3161,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         active: true,
         clipIndex: clipState.index,
         at: time,
+        anchor: clipState.anchor,
         actionId: actionState.current?.actionId ?? null,
       };
     }
@@ -3133,7 +3170,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       clipState.awaitingStart = clipState.session === true;
       clipState.ends += 1;
       clipState.endedAt = time;
-      return { ok: true, code: null, phase, active: false, clipIndex: clipState.index, at: time };
+      return { ok: true, code: null, phase, active: false, clipIndex: clipState.index, at: time, anchor: clipState.anchor };
     }
     return {
       ok: false,
@@ -3164,6 +3201,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     clipState.session = false;
     clipState.active = false;
     clipState.awaitingStart = false;
+    clipState.anchor = null;
     // The next reply starts a fresh sentence identity (its first clip may reuse index 0).
     intentState.servedClip = -1;
     return {
@@ -3279,7 +3317,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * The core's one-shot trajectories are stopped HERE, not left running out their remaining time:
    * an old tilt must not keep adding to the same axis target as a new gesture of the next one.
    */
-  function invalidateIntents(reason, { at = clockNow(), interrupted = false, clearClip = false, hard = false } = {}) {
+  function invalidateIntents(reason, { at = clockNow(), interrupted = false, clearClip = false, hard = false, endRunning = true } = {}) {
     const staleGeneration = intentState.generation;
     // A turn/session switch expires the answer's opening intent (its boundary belongs to the old
     // answer); every other staged phase keeps the historical `stale-generation` reason.
@@ -3295,12 +3333,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // Only the generation that is being replaced is cleared; anything started after this call is
     // tagged with the new generation and is never touched by this invalidation.
     inner.clearIntents({ reason, throughGeneration: staleGeneration, at });
-    if (actionState.current !== null) endAction(at, { interrupted, by: reason });
+    // A same-reply turn continuation keeps the running gesture (it is this reply's gesture) and
+    // only advances the generation, so the old staged intent can never start later. Every real
+    // switch still ends it here.
+    if (endRunning !== false && actionState.current !== null) endAction(at, { interrupted, by: reason });
     actionState.waiting.length = 0;
     if (clearClip === true) {
       clipState.session = false;
       clipState.active = false;
       clipState.awaitingStart = false;
+      clipState.anchor = null;
     }
     // A turn/session switch must stop the old generation's writes NOW, not at the next fade: the
     // output epoch invalidates every staged/slow frame, exactly like a lock or model switch.
@@ -3423,6 +3465,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           intentGeneration: pending.generation,
           sessionId: pending.sessionId,
           turnId: pending.turnId,
+          replyId: pending.replyId ?? null,
           event: pending.event,
           profile: null,
           presetId: drawn.presetId,
@@ -3515,6 +3558,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       intentGeneration: pending.generation,
       sessionId: pending.sessionId,
       turnId: pending.turnId,
+      replyId: pending.replyId ?? null,
       event: pending.event,
       profile: pending.profile ?? null,
     });
@@ -3532,17 +3576,62 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * the sentence-boundary release are identical, only the source of the intent differs.
    */
   function stageIntent({ event, mapped, profile = null, at = null, sessionId = null, turnId = null,
-    holdForClipStart = false }) {
+    holdForClipStart = false, replyId = null, continuation = false }) {
     const name = String(event ?? '');
     const time = Number.isFinite(at) ? at : clockNow();
     const nextSession = Number.isInteger(sessionId) ? sessionId : intentState.sessionId;
     const nextTurn = Number.isInteger(turnId) ? turnId : intentState.turnId;
-    if (nextSession !== intentState.sessionId || nextTurn !== intentState.turnId) {
-      // A new turn/session is a new generation: the old turn's staged intent is dropped here,
-      // before this event is staged, so its ticket can never start.
-      invalidateIntents('turn-switch', { at: time, interrupted: true, clearClip: true, hard: true });
+    const nextReply = Number.isInteger(replyId) ? replyId : intentState.replyId;
+    // A new user input (`turn-start` / `user-speaking`) opens a fresh reply: a barge-in from the
+    // previous reply must not force the next reply's own turn claim to stay hard.
+    if (name === 'turn-start' || name === 'user-speaking') intentState.afterInterrupt = false;
+    const sessionSwitch = nextSession !== intentState.sessionId;
+    const turnSwitch = nextTurn !== intentState.turnId;
+    if (sessionSwitch || turnSwitch) {
+      // P-139 stage 2 P1: a voice turn reports its pre-turn phase with the PREVIOUS turn id and
+      // the Harness `turn/start` then names the new one. That is the SAME reply, not a real turn
+      // switch: the running gesture must not be hard-cleared at 0 ms. It is soft only when the
+      // host explicitly marks the claim as a continuation of the same reply, the session did not
+      // change, no interrupt cut the pose since the action started, and the action belongs to
+      // that reply. Everything else keeps the historical immediate hard stop.
+      const current = actionState.current;
+      const sameReply = continuation === true
+        && sessionSwitch !== true
+        && turnSwitch === true
+        && intentState.afterInterrupt !== true
+        && (current === null || (current.sessionId === nextSession
+          && current.interruptSeq === intentState.interruptSeq
+          && (nextReply === null || current.replyId == null || current.replyId === nextReply)));
+      recordIdleEvent('avatar.intent.turn', {
+        mode: sameReply === true ? 'continued' : 'hard',
+        fromSession: intentState.sessionId,
+        fromTurn: intentState.turnId,
+        sessionId: nextSession,
+        turnId: nextTurn,
+        replyId: nextReply,
+        previousReplyId: intentState.replyId,
+        actionId: current?.actionId ?? null,
+        at: time,
+      });
+      if (sameReply === true) {
+        // Same reply: advance the generation and drop the old staged intent (late writes and a
+        // deferred ticket can never start), but let the reply's own running gesture finish and
+        // keep the clip identity the next sentence still belongs to.
+        invalidateIntents('turn-continued', {
+          at: time, interrupted: false, clearClip: false, hard: false, endRunning: false,
+        });
+      } else {
+        // A real turn/session switch: the old generation stops NOW (hard epoch, interrupted end).
+        invalidateIntents('turn-switch', { at: time, interrupted: true, clearClip: true, hard: true });
+        intentState.afterInterrupt = false;
+      }
       intentState.sessionId = nextSession;
       intentState.turnId = nextTurn;
+      intentState.replyId = nextReply;
+    } else if (Number.isInteger(replyId)) {
+      // Same turn, new reply: a new utterance may start before its Harness turn id is known. The
+      // action of the next reply must carry the new reply id so the later turn claim can match it.
+      intentState.replyId = replyId;
     }
     // Existing rule: only a real target with a verified gaze mapping may be called "looking at
     // the user"; otherwise the event degrades to the neutral `settle` and is recorded.
@@ -3564,6 +3653,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       generation: intentState.generation,
       sessionId: intentState.sessionId,
       turnId: intentState.turnId,
+      replyId: nextReply,
       at: time,
       /** The host staged this for a clip start it is about to report: that boundary releases it. */
       holdForClipStart: holdForClipStart === true,
@@ -3590,6 +3680,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       generation: next.generation,
       sessionId: next.sessionId,
       turnId: next.turnId,
+      replyId: next.replyId,
+      continuation: continuation === true,
       at: time,
     });
     // Sentence-level release: a `holdForClipStart` admission waits for the boundary the host is
@@ -3639,7 +3731,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * `sessionId` / `turnId` identify the conversation generation: passing a new value is a turn
    * switch, which invalidates the previous generation before this event is staged.
    */
-  function intentEvent(event, { at = null, sessionId = null, turnId = null, holdForClipStart = false } = {}) {
+  function intentEvent(event, {
+    at = null, sessionId = null, turnId = null, holdForClipStart = false, replyId = null,
+    continuation = false,
+  } = {}) {
     if (state.disposed) return disposedResult();
     const name = String(event ?? '');
     if (!MOTION_EVENTS.includes(name)) {
@@ -3664,6 +3759,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       sessionId,
       turnId,
       holdForClipStart,
+      replyId,
+      continuation,
     });
     // The autonomous expression layer follows the same phase edge. It runs AFTER staging because a
     // turn/session switch invalidates (and clears) the old generation's expressions inside
@@ -4692,6 +4789,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           intentGeneration: actionState.current.intentGeneration ?? null,
           sessionId: actionState.current.sessionId ?? null,
           turnId: actionState.current.turnId ?? null,
+          /** P-139 reply identity carried by the intent that started this action. */
+          replyId: actionState.current.replyId ?? null,
+          /** Interrupt counter at action start; a later cut moves it. */
+          interruptSeq: actionState.current.interruptSeq ?? null,
           event: actionState.current.event ?? '',
           /** Stage 4: the expression profile the action carries ('conclusion' | 'confused' | null). */
           profile: actionState.current.profile ?? null,
@@ -4737,6 +4838,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           index: clipState.index,
           startedAt: clipState.startedAt,
           endedAt: clipState.endedAt,
+          /**
+           * P-139 stage 2 P1: where `startedAt` came from (`player-ready` / `first-data` /
+           * `fallback`). The host reports the player's real start callback, never the pre-spawn
+           * scheduling instant.
+           */
+          anchor: clipState.anchor,
           starts: clipState.starts,
           ends: clipState.ends,
           /**
@@ -4762,12 +4869,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         generation: intentState.generation,
         sessionId: intentState.sessionId,
         turnId: intentState.turnId,
+        /** P-139 reply identity of the current intent generation (null = not supplied). */
+        replyId: intentState.replyId,
+        /** Real interruptions seen; a same-reply continuation never crosses one. */
+        interruptSeq: intentState.interruptSeq,
         pending: intentState.pending === null ? null : {
           event: intentState.pending.event,
           intent: intentState.pending.intent,
           mapped: intentState.pending.mapped,
           actionId: intentState.pending.ticket,
           generation: intentState.pending.generation,
+          replyId: intentState.pending.replyId ?? null,
           since: intentState.pendingSince,
         },
         servedClip: intentState.servedClip,

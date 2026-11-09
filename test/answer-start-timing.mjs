@@ -272,7 +272,23 @@ test('3. 错过/取消/过期：边界释放失败即 dropped，不延迟到 spe
 // Host mounting: real `apply`, fake VTS/clock, scripted TTS. The waiting line / synthesis /
 // queueing surfaces are proven not to trigger the opening gesture.
 // =============================================================================================
-const hostState = { players: [], synthCalls: [], playerMs: 4000, bodyGates: [] };
+const hostState = {
+  players: [],
+  synthCalls: [],
+  playerMs: 4000,
+  bodyGates: [],
+  /** P-139 P1: delayed start callback + its exact anchor (file path). */
+  playerStartDelayMs: 0,
+  anchorAt: 0,
+  playerScheduled: [],
+  /** P-139 P1: streamed transport (say lane) first-chunk callback. */
+  ffplay: null,
+  streamStartDelayMs: 0,
+  streamAnchorAt: 0,
+  streamScheduled: [],
+  /** Failure injection for the file player. */
+  playThrows: false,
+};
 globalThis.__answerStartTiming = hostState;
 
 const ttsUrl = new URL('../src/host/speech/tts.js', import.meta.url).href;
@@ -302,13 +318,49 @@ const hooks = registerHooks({
       }
       return { file: 'as-' + s.synthCalls.length + '.mp3', bytes: 16, durationMs: 80, provider: 'fake' };
     };
-    export const speakStreaming = async () => { throw new Error('streaming not expected'); };
+    export const speakStreaming = async (options) => {
+      const s = globalThis.__answerStartTiming;
+      const scheduledAt = Date.now();
+      const firstDataAt = s.streamAnchorAt > 0 ? s.streamAnchorAt : Date.now();
+      s.streamScheduled.push({ scheduledAt, firstDataAt });
+      const fire = () => {
+        try {
+          options?.onStart?.({
+            startedAt: firstDataAt,
+            firstDataAt,
+            firstDataIsAudible: false,
+            firstPcmAt: null,
+            firstAudibleAt: null,
+          });
+        } catch { /* observation only */ }
+      };
+      if (s.streamStartDelayMs > 0) {
+        const timer = setTimeout(fire, s.streamStartDelayMs);
+        timer.unref?.();
+      } else {
+        fire();
+      }
+      return { file: 'as-stream.mp3', bytes: 16, durationMs: 500, firstChunkMs: s.streamStartDelayMs, via: 'ffplay-stream' };
+    };
     export const play = (file, options) => {
+      const s = globalThis.__answerStartTiming;
+      if (s.playThrows === true) throw new Error('fake player failed');
       let resolve;
       const done = new Promise((r) => { resolve = r; });
-      const player = { file, startedAt: Date.now(), resolve };
+      const scheduledAt = Date.now();
+      const anchorAt = s.anchorAt > 0 ? s.anchorAt : scheduledAt;
+      s.playerScheduled.push({ file, scheduledAt, anchorAt });
+      const player = { file, startedAt: anchorAt, resolve };
       s.players.push(player);
-      options?.onStart?.({ startedAt: player.startedAt });
+      const fire = () => {
+        try { options?.onStart?.({ startedAt: anchorAt }); } catch { /* observation only */ }
+      };
+      if (s.playerStartDelayMs > 0) {
+        const timer = setTimeout(fire, s.playerStartDelayMs);
+        timer.unref?.();
+      } else {
+        fire();
+      }
       options?.onTransport?.({ exit: done, via: 'fake-player' });
       const timer = setTimeout(() => resolve(), s.playerMs);
       timer.unref?.();
@@ -324,8 +376,8 @@ const hooks = registerHooks({
         shortCircuit: true,
         source: `
     const forbidden = () => { throw new Error('real capture forbidden'); };
-    export const resolveFfmpeg = () => null;
-    export const resolveFfplay = () => null;
+    export const resolveFfmpeg = () => 'ffmpeg-fake';
+    export const resolveFfplay = () => globalThis.__answerStartTiming.ffplay ?? null;
     export const capture = forbidden, captureDesktop = forbidden, captureDevice = forbidden, startStoryboard = forbidden;
     export const OBSERVATION_TTL_MS = 30000;
     export function readObservation() { return { at: null, ageMs: null, stale: true, hint: '' }; }`,
@@ -444,9 +496,18 @@ async function mountHost(t, { settings = {}, extra = {} } = {}) {
   hostState.synthCalls = [];
   hostState.playerMs = 4000;
   hostState.bodyGates = [];
+  hostState.playerStartDelayMs = 0;
+  hostState.anchorAt = 0;
+  hostState.playerScheduled = [];
+  hostState.ffplay = null;
+  hostState.streamStartDelayMs = 0;
+  hostState.streamAnchorAt = 0;
+  hostState.streamScheduled = [];
+  hostState.playThrows = false;
   const handlers = [];
   const cleanups = [];
   const routes = new Map();
+  const tools = new Map();
   const effect = (fn) => { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup); return cleanup; };
   const on = (type, handler) => {
     const entry = { type, handler };
@@ -459,7 +520,7 @@ async function mountHost(t, { settings = {}, extra = {} } = {}) {
     effect,
     on,
     get: () => undefined,
-    tools: { register: () => () => {} },
+    tools: { register(tool) { tools.set(tool.name, tool); return () => tools.delete(tool.name); } },
     inject: (_deps, register) => register(scope),
     webServer: { register: registerRoute },
   }, { root, enabled: true, ...extra });
@@ -499,7 +560,15 @@ async function mountHost(t, { settings = {}, extra = {} } = {}) {
   assert.equal(connected.ok, true, `live2d.connect succeeds (${connected.error ?? ''})`);
   await waitUntil(async () => ((await runtime())?.channels?.controlled ?? []).includes('headY'),
     'the runtime verified the head channels');
-  return { root, emit, status, runtime, events, players: () => hostState.players, synthCalls: () => hostState.synthCalls };
+  return {
+    root, emit, status, runtime, events, players: () => hostState.players, synthCalls: () => hostState.synthCalls,
+    tools,
+    say: async (args) => {
+      const tool = tools.get('assistant_say');
+      assert.ok(tool !== undefined, 'assistant_say is registered');
+      return tool.execute(args);
+    },
+  };
 }
 
 // =============================================================================================
@@ -677,4 +746,143 @@ test('6. 候音（ack）结束不触发 answer-end；reply 正文自然结束恰
   assert.equal(stagedAnswerStart.length, 1, 'the ack still never staged an opening intent');
   console.log(`[lane] ack: answerEnd=0 settled=${settledBeforeAck} session=${ackSession} `
     + `reply: answerEnd=${view.intentEvents.calls['answer-end']} players=${app.players().length}`);
+});
+
+// =============================================================================================
+// 7. Anchor source: the file path marks the clip at the player's start callback, not at play().
+// =============================================================================================
+test('7. 文件路径：answer-start/clip 锚点取播放器 start 回调，不早于 play() 调度', async (t) => {
+  const app = await mountHost(t, { settings: { voice: { ackDelayMs: 60000 } } });
+  hostState.playerStartDelayMs = 300;
+  hostState.anchorAt = Date.now() + 500;
+  const anchor = hostState.anchorAt;
+
+  app.emit(turnStart(1));
+  app.emit(userMessage(1, '帮我查一下明天的天气'));
+  app.emit(assistantBody(1, '明天上海多云，出门带件外套。'));
+  app.emit(turnEnd(1));
+  await waitUntil(() => hostState.playerScheduled.length >= 1, 'the body player was scheduled');
+  const scheduledAt = hostState.playerScheduled[0].scheduledAt;
+
+  // The player exists but its start callback has not fired: nothing may claim an audible start.
+  let view = await app.runtime();
+  assert.equal(view.intentEvents.calls['answer-start'], 0,
+    'no answer-start before the player start callback');
+  assert.equal(view.speech.clip.starts, 0, 'no clip boundary before the player start callback');
+  assert.equal(hostState.playerScheduled[0].anchorAt, anchor, 'the fake start anchor is the future one');
+
+  await waitUntil(async () => (await app.runtime()).intentEvents.calls['answer-start'] === 1,
+    'the player start callback reported answer-start', 5000);
+  view = await app.runtime();
+  assert.equal(view.speech.clip.startedAt, anchor, 'the clip boundary uses the player start anchor');
+  assert.equal(view.speech.clip.anchor, 'player-ready',
+    'the anchor source is recorded as the player-ready callback, never called audible');
+  assert.ok(scheduledAt > 0 && anchor > scheduledAt, `the anchor follows the schedule (${scheduledAt} -> ${anchor})`);
+
+  await waitUntil(async () => (await app.events()).some((entry) => entry.type === 'avatar.intent.staged'
+    && entry.payload?.event === 'answer-start'), 'the answer-start staged event');
+  const staged = (await app.events()).filter((entry) => entry.type === 'avatar.intent.staged'
+    && entry.payload?.event === 'answer-start');
+  assert.equal(staged.length, 1, 'exactly one opening intent');
+  assert.equal(staged[0].payload.at, anchor, 'the staged intent carries the player start anchor');
+  await waitUntil(async () => (await app.events()).some((entry) => entry.type === 'avatar.speech.anchor'
+    && entry.payload?.anchor === 'player-ready'), 'the player-ready anchor event');
+  const anchors = (await app.events()).filter((entry) => entry.type === 'avatar.speech.anchor'
+    && entry.payload?.anchor === 'player-ready');
+  assert.equal(anchors.length, 1, 'the anchor source is also recorded as a runtime event');
+  assert.equal(anchors[0].payload.at, anchor);
+  console.log(`[anchor-file] scheduled=${scheduledAt} anchor=${anchor} `
+    + `startedAt=${view.speech.clip.startedAt} source=${view.speech.clip.anchor}`);
+});
+
+// =============================================================================================
+// 8. Streamed transport: the first-chunk callback is the anchor; the tool lane never opens an
+//    answer-start. (In this build the streamed transport serves the `say` lane, not the body.)
+// =============================================================================================
+test('8. 流式路径：clip 锚点取首块起播回调；工具 say lane 不产生 answer-start', async (t) => {
+  const app = await mountHost(t, { settings: { voice: { ackDelayMs: 60000 } } });
+  hostState.ffplay = 'ffplay-fake';
+  hostState.streamStartDelayMs = 500;
+  hostState.streamAnchorAt = Date.now() + 700;
+  const anchor = hostState.streamAnchorAt;
+
+  const said = await app.say({ text: '我先去查一下稍等。', purpose: 'explicit' });
+  assert.equal(said?.accepted, true, `the streamed line was accepted (${said?.reason ?? ''})`);
+  // The tool reports acceptance before its background playback starts: wait for the stream.
+  await waitUntil(() => hostState.streamScheduled.length >= 1, 'the streamed transport was scheduled');
+  await waitUntil(async () => (await app.runtime()).speech.clip.starts >= 1, 'the streamed clip started');
+  assert.equal(hostState.streamScheduled.length, 1,
+    `the streamed transport was used (synth=${JSON.stringify(hostState.synthCalls)} players=${app.players().length})`);
+  const scheduledAt = hostState.streamScheduled[0].scheduledAt;
+  assert.ok(anchor > scheduledAt, `the first chunk follows the schedule (${scheduledAt} -> ${anchor})`);
+
+  const view = await app.runtime();
+  assert.equal(view.speech.clip.startedAt, anchor, 'the streamed clip uses the first-chunk anchor');
+  assert.equal(view.speech.clip.anchor, 'first-data',
+    'the anchor source is the first chunk handed to the player, never called audible');
+  assert.equal(view.intentEvents.calls['answer-start'], 0,
+    'the tool say lane never opens the answer body');
+  await waitUntil(async () => (await app.events()).some((entry) => entry.type === 'avatar.speech.anchor'
+    && entry.payload?.anchor === 'first-data'), 'the streamed anchor event');
+  const anchors = (await app.events()).filter((entry) => entry.type === 'avatar.speech.anchor'
+    && entry.payload?.anchor === 'first-data');
+  assert.equal(anchors.length, 1, 'the streamed anchor source is recorded once');
+  assert.equal(anchors[0].payload.at, anchor);
+  const starts = (await app.events()).filter((entry) => entry.type === 'avatar.action.start'
+    && entry.payload?.event === 'answer-start');
+  assert.deepEqual(starts, [], 'no answer-start action from the tool lane');
+  console.log(`[anchor-stream] scheduled=${scheduledAt} anchor=${anchor} `
+    + `startedAt=${view.speech.clip.startedAt} source=${view.speech.clip.anchor}`);
+});
+
+// =============================================================================================
+// 9. A body clip cancelled before its player starts never produces answer-start.
+// =============================================================================================
+test('9. 取消：起播前取消的文件路径 clip 不产生 answer-start', async (t) => {
+  const app = await mountHost(t, { settings: { voice: { ackDelayMs: 60000 } } });
+  hostState.playerStartDelayMs = 1500;
+  hostState.anchorAt = Date.now() + 1700;
+
+  app.emit(turnStart(1));
+  app.emit(userMessage(1, '帮我查一下明天的天气'));
+  app.emit(assistantBody(1, '明天上海多云，出门带件外套。'));
+  app.emit(turnEnd(1));
+  await waitUntil(() => hostState.playerScheduled.length >= 1, 'the body player was scheduled');
+  assert.equal((await app.runtime()).intentEvents.calls['answer-start'], 0,
+    'still no answer-start while the player is unstarted');
+
+  // The user's next typed input is the interruption; the pending clip must not start.
+  app.emit(userMessage(2, '换一句'));
+  await waitUntil(async () => (await app.events()).some((entry) => entry.type === 'speech.cancelled'),
+    'the pending clip was cancelled');
+  await tick(1800); // past the fake start delay: a cancelled clip must not resurrect the boundary
+  const view = await app.runtime();
+  assert.equal(view.intentEvents.calls['answer-start'], 0,
+    'a cancelled-before-start clip never produced answer-start');
+  assert.equal(view.speech.clip.starts, 0, 'no clip boundary was opened for the cancelled clip');
+  console.log(`[cancel] answerStart=${view.intentEvents.calls['answer-start']} `
+    + `clipStarts=${view.speech.clip.starts} scheduled=${hostState.playerScheduled.length}`);
+});
+
+// =============================================================================================
+// 10. A body player that fails to start never produces answer-start.
+// =============================================================================================
+test('10. 失败：播放器启动失败不产生 answer-start', async (t) => {
+  const app = await mountHost(t, { settings: { voice: { ackDelayMs: 60000 } } });
+  hostState.playThrows = true;
+
+  app.emit(turnStart(1));
+  app.emit(userMessage(1, '帮我查一下明天的天气'));
+  app.emit(assistantBody(1, '明天上海多云，出门带件外套。'));
+  app.emit(turnEnd(1));
+  await tick(900); // let the typed lane try its own fallback too (all file players fail)
+  const view = await app.runtime();
+  assert.equal(view.intentEvents.calls['answer-start'], 0,
+    'a player that never started never produced answer-start');
+  assert.equal(view.speech.clip.starts, 0, 'no clip boundary for a failed start');
+  const starts = (await app.events()).filter((entry) => entry.type === 'avatar.action.start'
+    && entry.payload?.event === 'answer-start');
+  assert.deepEqual(starts, [], 'no answer-start action from a failed start');
+  console.log(`[failed] answerStart=${view.intentEvents.calls['answer-start']} `
+    + `clipStarts=${view.speech.clip.starts} players=${app.players().length}`);
 });

@@ -32,7 +32,7 @@ import { createAvatarRuntime } from '../src/host/avatar/avatarRuntime.js?barge-i
 const HEAD_ROWS = ['headX', 'headY', 'headZ', 'gazeX', 'gazeY']
   .map((channel) => ({ channel, inputName: `P_${channel}`, injectable: true, verified: true }));
 
-function createRig() {
+function createRig({ presetExecution = true } = {}) {
   let clock = 0;
   const frames = [];
   const transport = {
@@ -57,7 +57,7 @@ function createRig() {
       idleActions: [],
       idleSwayScale: 0,
       motionWrites: false,
-      presetExecution: true,
+      presetExecution,
     },
   });
   return {
@@ -189,6 +189,47 @@ test('2. 隐私锁/断连仍立即停写：0 帧移除，无淡出写入', async
     rig.runtime.dispose();
   }
   console.log(`[hard-stop] ${outcomes.join(' ')}`);
+});
+
+// =============================================================================================
+// 4. A barge-in refuses the later same-reply continuation: identity never softens a real cut.
+// =============================================================================================
+test('4. barge-in 后的同一 reply continuation 仍 hard，旧 actionId 不复活', async () => {
+  const rig = createRig({ presetExecution: false });
+  await connect(rig);
+  rig.setClock(0);
+  const first = rig.runtime.intentEvent('answer-start', {
+    at: 0, sessionId: 1, turnId: 1, replyId: 11,
+  });
+  assert.equal(first.released, true, 'the pre-barge-in gesture started');
+  const before = rig.runtime.snapshot();
+  const actionId = before.actions.current?.actionId;
+  assert.equal(typeof actionId, 'number', 'one action owns the pose');
+  rig.runtime.takeEvents();
+
+  rig.setClock(300);
+  rig.runtime.interrupt({ reason: 'barge-in' });
+  assert.equal(rig.runtime.snapshot().actions.current, null, 'the barge-in stops the action');
+
+  // The same utterance's real turn/start still arrives and claims the same reply. It must stay a
+  // hard switch: the interruption is not softened by the new reply-continuity path.
+  rig.setClock(320);
+  rig.runtime.intentEvent('thinking', {
+    at: 320, sessionId: 1, turnId: 2, replyId: 11, continuation: true,
+  });
+  const after = rig.runtime.snapshot();
+  const events = rig.runtime.takeEvents();
+  const turn = events.find((event) => event.type === 'avatar.intent.turn');
+  assert.equal(turn?.mode, 'hard', 'the continuation claim is refused after a barge-in');
+  assert.equal(after.actions.interrupted, before.actions.interrupted + 1,
+    'only the real barge-in counts as the interruption');
+  assert.notEqual(after.actions.current?.actionId, actionId, 'the old action never owns the pose again');
+  const revival = events.filter((event) => event.actionId === actionId
+    && (event.type === 'avatar.action.start' || event.type === 'avatar.preset.action'));
+  assert.deepEqual(revival, [], 'the barge-in actionId is never started again');
+  console.log(`[barge-in-continuation] action=${actionId} mode=${turn?.mode} `
+    + `interrupted=${after.actions.interrupted} revived=0`);
+  rig.runtime.dispose();
 });
 
 // =============================================================================================

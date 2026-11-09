@@ -3333,6 +3333,15 @@ export function apply(ctx, config) {
       void log.emit(message, payload).catch(() => {});
       return;
     }
+    // P-139 stage 2 P1: one row per turn/session identity decision (continued vs hard) and one
+    // per clip start carrying the anchor source. These are the evidence that a normal voice turn
+    // was not a fake hard switch and that the gesture starts at the player's own callback.
+    if (message === 'avatar.intent.turn' || message === 'avatar.speech.anchor') {
+      const payload = { ...data };
+      delete payload.level;
+      void log.emit(message, payload).catch(() => {});
+      return;
+    }
     const level = typeof data?.level === 'string' ? data.level : 'debug';
     if (level !== 'warn' && level !== 'error') return;
     void log.emit('avatar.runtime.log', { level, message: String(message ?? '') }).catch(() => {});
@@ -4018,18 +4027,38 @@ export function apply(ctx, config) {
     }
   };
   /**
+   * P-139 stage 2 P1: one reply identity per accepted user input. A voice final reports its
+   * pre-turn phase before the Harness `turn/start` knows the new turn id; the claim recorded here
+   * lets that later `turn/start` be recognized as the SAME reply (soft continuation) instead of a
+   * hard turn switch. A typed turn has no claim and therefore keeps the historical hard switch.
+   */
+  let avatarReplySeq = 0;
+  const avatarReplyClaims = new Map();
+  /** A claim that no matching turn/start resolves is stale after this long. */
+  const AVATAR_REPLY_CLAIM_MS = 15_000;
+  /**
    * P-139: a verified user barge-in is a real interruption of the motion runtime, not only of the
    * audio. One stable reason vocabulary (`barge-in`) lets the runtime take the same smooth fade as
    * `interrupt`; a turn/model switch never comes through here and keeps its immediate hard stop.
    */
-  const avatarInterrupt = (reason = 'barge-in') => avatarCall(
-    'interrupt',
-    (current) => current.interrupt({ reason }),
-  );
+  const avatarInterrupt = (reason = 'barge-in') => {
+    // The barge-in utterance never becomes a same-reply continuation: if its turn/start still
+    // arrives, it is a real turn switch and must keep the immediate hard stop.
+    avatarReplyClaims.clear();
+    return avatarCall(
+      'interrupt',
+      (current) => current.interrupt({ reason }),
+    );
+  };
   /** One sentence-level clip boundary (P-54): `start` opens the sentence, `end` closes it. */
   const avatarClip = (phase, session) => avatarCall(`speechClip.${phase}`, (current) => current.speechClip(
     phase === 'end' ? 'end' : 'start',
-    { index: session.sentenceId ?? 0, at: phase === 'end' ? session.endedAt : session.startedAt },
+    {
+      index: session.sentenceId ?? 0,
+      at: phase === 'end' ? session.endedAt : session.avatarStartedAt,
+      // P-139 stage 2 P1: echo the transport anchor source into the runtime/diagnostics.
+      anchor: phase === 'end' ? null : (session.anchor ?? null),
+    },
   ));
   /** The whole speech session finished: the runtime may resume its idle rhythm (P-54). */
   const avatarSpeechEnd = (at) => avatarCall('speechEnd', (current) => current.speechEnd({ at }));
@@ -4047,13 +4076,48 @@ export function apply(ctx, config) {
     // Wiring counter: proves which phases the host really reported, even when the runtime itself
     // refuses/defers them. Observation only, never consulted by the host.
     if (avatarIntentCalls[event] !== undefined) avatarIntentCalls[event] += 1;
+    const rawSession = typeof sessionId === 'string' ? sessionId : '';
+    const knownTurn = Number.isInteger(turnId) ? turnId : null;
+    // P-139 stage 2 P1: the voice final opens the reply before its real turn id exists. The later
+    // Harness turn/start for the SAME session is that reply's claim, not a new turn. A typed turn
+    // (no claim) and a barge-in (claims cleared) keep the hard switch.
+    let replyId = null;
+    let continuation = false;
+    if (rawSession.length > 0) {
+      const now = Date.now();
+      if (event === 'turn-start' || event === 'user-speaking') {
+        // A new accepted input (or the fast path's user phase) opens exactly one reply.
+        avatarReplySeq += 1;
+        replyId = avatarReplySeq;
+        avatarReplyClaims.set(rawSession, { replyId, at: now });
+      } else {
+        const claim = avatarReplyClaims.get(rawSession);
+        if (claim !== undefined) {
+          if (now - claim.at <= AVATAR_REPLY_CLAIM_MS) {
+            replyId = claim.replyId;
+            if (event === 'thinking' && knownTurn !== null) {
+              // The Harness turn/start claiming the utterance that just opened this reply.
+              continuation = true;
+              avatarReplyClaims.delete(rawSession);
+            } else if (event === 'answer-start' || event === 'answer-end' || event === 'idle') {
+              // The reply either sounded or ended: the claim can never be reused.
+              avatarReplyClaims.delete(rawSession);
+            }
+          } else {
+            avatarReplyClaims.delete(rawSession);
+          }
+        }
+      }
+    }
     return avatarCall(
       `intentEvent.${event}`,
       (current) => current.intentEvent(event, {
         at,
-        sessionId: avatarIntentSessionId(sessionId),
-        turnId: Number.isInteger(turnId) ? turnId : null,
+        sessionId: avatarIntentSessionId(rawSession),
+        turnId: knownTurn,
         holdForClipStart,
+        replyId,
+        continuation,
       }),
     );
   };
@@ -4469,6 +4533,14 @@ export function apply(ctx, config) {
   // A watchdog expiry can only end the session once the player is proven gone; this is the
   // longest a kill is waited on before the clip is recorded as a failed, unconfirmed end.
   const PLAYBACK_STALL_KILL_WAIT_MS = 1_000;
+  /**
+   * P-139 P1: how long a streamed transport may take to report its first-chunk callback before the
+   * host records the explicit `fallback` anchor. Long enough not to pre-empt a real callback that
+   * is still in flight; short enough that a silent transport still gets a clock.
+   */
+  const START_FALLBACK_GRACE_MS = 1_000;
+  /** Whole-file players report start on spawn; this bounded grace keeps a silent player honest. */
+  const FILE_START_FALLBACK_GRACE_MS = 1_000;
 
   let playbackToken = 0; // monotonic: bumped on every start and every cancel
   // True from the moment the runtime accepted this clip's speech intent until it is stopped.
@@ -4822,9 +4894,14 @@ export function apply(ctx, config) {
     void (async () => {
       const levels = await mouthEnvelope(file);
       if (token !== playbackToken || levels.length === 0) return;
+      // P-139 stage 2 P1: the mouth follows the transport's real start callback, never the
+      // pre-spawn schedule instant. The decode above already ran in parallel; this wait is only
+      // for a player that has not reported its start yet.
+      let startedAt = session.avatarStartedAt > 0 ? session.avatarStartedAt : 0;
+      if (startedAt === 0) startedAt = await session.startAnchor;
+      if (!(startedAt > 0) || token !== playbackToken) return;
       const current = avatarRuntime;
       if (current === null || current.snapshot().connected !== true) return;
-      const startedAt = session.startedAt > 0 ? session.startedAt : Date.now();
       const submitted = await current.speak({
         levels,
         stepMs: MOUTH_WINDOW_MS,
@@ -4917,8 +4994,9 @@ export function apply(ctx, config) {
 
   /**
    * Playback session: the single owner of the clock and of cancellation.
-   * `startedAt` is a host/player clock anchor, not a measured sound-card first-audio instant.
-   * Streaming sessions wait for a transport start notification before setting this anchor.
+   * `startedAt` is set from the transport's own start callback (`player-ready` for a whole-file
+   * player, `first-data` for a streamed one), not from the scheduling instant. It remains a
+   * host/player clock anchor, not a measured sound-card first-audio instant.
    */
   const createPlayback = ({ file = '', durationMs = 0, subtitle = '', speechText = '' } = {}) => {
     const token = ++playbackToken;
@@ -4936,6 +5014,22 @@ export function apply(ctx, config) {
        */
       speechText: typeof speechText === 'string' ? speechText : '',
       startedAt: 0,
+      /**
+       * P-139 stage 2 P1: the avatar gesture/mouth anchor, set only by the transport's real start
+       * callback. It is separate from `startedAt`: the ledger may use the old scheduling
+       * approximation, but no gesture/lip/answer-start may run before this anchor exists.
+       */
+      avatarStartedAt: 0,
+      /**
+       * Where `avatarStartedAt` came from. `player-ready` is the file transport's child-spawn
+       * callback (`playAudio`'s `info.startedAt`), `first-data` is the streamed transport's first
+       * chunk handed to the player, and `fallback` is the last-resort approximation. None of them
+       * is a measured speaker sample; the source is exposed instead of guessed.
+       */
+      anchor: null,
+      /** Resolves with the player-start anchor, or 0 when the clip ended before it started. */
+      startAnchor: null,
+      resolveStart: null,
       endedAt: 0,
       cancelled: false,
       ended: false,
@@ -4954,6 +5048,12 @@ export function apply(ctx, config) {
        * before the real start; the first chunk or the end clears it.
        */
       transportPending: false,
+      /**
+       * True once the whole-file transport has been asked to start. Barge-in/echo protection may
+       * treat the short player launch as "speaking" (the historical approximation), while the
+       * avatar anchor still waits for the real start callback: the two questions are separate.
+       */
+      playerExpected: false,
       /** true once the watchdog owns the end: a later process exit is not a natural end. */
       stalled: false,
       startHooks: [],
@@ -4993,6 +5093,17 @@ export function apply(ctx, config) {
     session.done = new Promise((resolveDone) => {
       session.settle = resolveDone;
     });
+    // The mouth decoder starts before the player so it is ready at the anchor; it must not submit
+    // a frame until the transport proves the start. A clip that ends unstarted resolves 0.
+    session.startAnchor = new Promise((resolveStart) => {
+      let settled = false;
+      session.resolveStart = (at) => {
+        if (settled) return;
+        settled = true;
+        const value = Number(at);
+        resolveStart(Number.isFinite(value) && value > 0 ? value : 0);
+      };
+    });
     return session;
   };
 
@@ -5000,10 +5111,32 @@ export function apply(ctx, config) {
   const playbackQueued = () => playbackWaiters.some((waiter) => waiter.done !== true
     && waiter.cancelled !== true && waiter.signal?.aborted !== true);
 
-  const markStarted = (session, at = Date.now()) => {
+  /**
+   * Playback/ledger clock only. It may be the scheduling approximation the ledger has always used
+   * (a whole-file player is already launching); it is NOT the avatar anchor and it never stages a
+   * gesture. `markAvatarStarted` below is the one avatar boundary.
+   */
+  const markPlaybackStarted = (session, at = Date.now()) => {
     if (playback !== session || session.ended || session.startedAt > 0 || session.cancelled) return session;
+    if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[playback] start', { file: session.file, at });
     session.startedAt = at;
     avatarStatus('speaking', 'playback.start');
+    emitSessionHooks(session.startHooks, session, 'start');
+    return session;
+  };
+
+  /**
+   * Open the avatar clip boundary AT the transport's start callback. `at` is that callback's
+   * `startedAt` (`player-ready` for a whole-file player, `first-data` for the streamed transport) —
+   * never the moment this host scheduled the player. The anchor source travels with the session so
+   * the runtime/status can say which approximation was used; no caller may present it as measured
+   * speaker audio.
+   */
+  const markAvatarStarted = (session, at = Date.now(), anchor = 'fallback') => {
+    if (playback !== session || session.ended || session.avatarStartedAt > 0 || session.cancelled) return session;
+    session.avatarStartedAt = at;
+    session.anchor = typeof anchor === 'string' && anchor.length > 0 ? anchor : 'fallback';
+    session.resolveStart?.(at);
     // P-54: one clip boundary per SENTENCE, never per intra-sentence block: only block 0 opens it.
     if ((session.chunkIndex ?? 0) === 0) {
       // P-139: the answer's first body block stages its opening intent BEFORE the boundary that
@@ -5019,7 +5152,6 @@ export function apply(ctx, config) {
         avatarConclusionAt(owner.sessionId, owner.turn, session.sentenceId ?? 0, session.subtitle, at);
       }
     }
-    emitSessionHooks(session.startHooks, session, 'start');
     return session;
   };
 
@@ -5040,11 +5172,14 @@ export function apply(ctx, config) {
     session.ended = true;
     session.endedAt = Date.now();
     session.transportPending = false;
+    // A clip that failed/cancelled before its player started never gets an avatar anchor; release
+    // the mouth decoder waiting on it instead of letting that promise hang.
+    session.resolveStart?.(session.avatarStartedAt > 0 ? session.avatarStartedAt : 0);
     // A cancel carries its detail ('muted', 'superseded', …); it is still a cancel, never an end.
     session.endReason = reason === 'end' || reason === 'watchdog' || reason === 'failed' ? reason : 'cancelled';
     // P-139: the answer's first body clip was cancelled/failed before its first sound, so its
     // opening intent never got a boundary to run at. Report that once here; it is never revived.
-    if (session.sentenceId === 0 && (session.chunkIndex ?? 0) === 0 && session.startedAt === 0
+    if (session.sentenceId === 0 && (session.chunkIndex ?? 0) === 0 && session.avatarStartedAt === 0
       && (session.endReason === 'cancelled' || session.endReason === 'failed')) {
       avatarAnswerStartDropped('cancelled', session.endedAt);
     }
@@ -5266,6 +5401,7 @@ export function apply(ctx, config) {
     const seat = await acquirePlaybackSeat(signal, owner);
     let session = null;
     let transport;
+    if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[playAudio] seat', { file, sentenceId, chunkIndex });
     /** This clip's caption line; declared outside the try so a failed start can take it down. */
     let subtitleLine = null;
     try {
@@ -5311,15 +5447,26 @@ export function apply(ctx, config) {
           onShown: (shown) => { if (typeof onSubtitle === 'function') onSubtitle(shown === true); },
         })
         : null;
-      markStarted(session);
+      // P-139 stage 2 P1: the PLAYBACK ledger may keep its scheduling approximation (the player is
+      // already launching), but the avatar gesture/mouth anchor is the real start callback below.
+      // `markAvatarStarted` must not run before `play()`: the 200–400 ms launch would then become
+      // a gesture that leads the sound. The caption still goes up first.
+      markPlaybackStarted(session);
       followMouth(session);
+      // Barge-in may cut the launching player exactly as before (the old approximation); this
+      // flag is NOT the avatar clock — `markAvatarStarted` still waits for `onStart`.
+      session.playerExpected = true;
+      const scheduledAt = Date.now();
+      if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[playAudio] play', { file, sentenceId, chunkIndex, lane: session.speechLane });
       transport = play(file, {
         ffplayPath,
         signal,
         onStart: (info) => {
           session.audible = true;
           // Process-ready anchor (tts.js): the player process is up. That is neither decoded PCM
-          // nor speaker sound, so it is stored under its own name and never as firstPcmAt.
+          // nor speaker sound, so it is stored under its own name and never as firstPcmAt. It is,
+          // however, the earliest transport-proved start the file path can give: mark the AVATAR
+          // boundary HERE, with that anchor, never before the spawn.
           const playerReadyAt = Number(info?.playerReadyAt) || 0;
           if (playerReadyAt > 0) {
             session.spawnAt = Number(info?.spawnAt) || 0;
@@ -5327,6 +5474,8 @@ export function apply(ctx, config) {
             const readyMs = Number(info?.playerReadyMs);
             session.playerReadyMs = Number.isFinite(readyMs) && readyMs >= 0 ? Math.round(readyMs) : null;
           }
+          const anchorAt = Number(info?.startedAt) || playerReadyAt || Date.now();
+          markAvatarStarted(session, anchorAt, Number(info?.startedAt) > 0 ? 'player-ready' : 'fallback');
           // First audible: only a real read-back may attest sound. Spawn/data never stands in.
           const firstAudibleAt = Number(info?.firstAudibleAt) || 0;
           if (firstAudibleAt > 0) {
@@ -5354,7 +5503,20 @@ export function apply(ctx, config) {
           repaintFromCaptionStream(captionStream, session, subtitleText, subtitleLine);
         },
       });
+      // A transport that never reports `onStart` still gets the old, documented approximation —
+      // but only after a bounded grace, so a real (delayed) start callback is never pre-empted.
+      // The anchor source says `fallback`; the avatar never pretends this was measured audio.
+      if (session.avatarStartedAt === 0 && session.ended !== true && session.cancelled !== true) {
+        const startFallback = setTimeout(() => {
+          if (playback === session && session.avatarStartedAt === 0 && session.ended !== true
+            && session.cancelled !== true) {
+            markAvatarStarted(session, scheduledAt, 'fallback');
+          }
+        }, FILE_START_FALLBACK_GRACE_MS);
+        startFallback.unref?.();
+      }
     } catch (error) {
+      if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[playAudio] catch', { file, error: error?.message });
       const endReason = error?.name === 'AbortError' ? 'cancelled' : 'failed';
       if (session !== null) {
         if (playback === session) playback = null;
@@ -5372,6 +5534,7 @@ export function apply(ctx, config) {
     // shutdown may treat as "playback ended".
     session.transport = watchSpeech(transport);
     armPlaybackEnd(session);
+    if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[playAudio] return', { file, startedAt: session.startedAt, avatarStartedAt: session.avatarStartedAt });
     return session;
   };
 
@@ -5477,7 +5640,17 @@ export function apply(ctx, config) {
           } catch {
             /* observation cannot break playback */
           }
-          markStarted(session, info?.startedAt ?? Date.now());
+          // P-139 stage 2 P1: the streamed transport's first chunk is its real start evidence.
+          // `info.startedAt` is that first-data instant; it is not speaker sound, so the anchor
+          // source is recorded and an absent callback falls back honestly. The playback ledger
+          // clock and the avatar anchor both start here (this transport has no pre-start clock).
+          const anchorAt = Number(info?.startedAt) || Date.now();
+          markPlaybackStarted(session, anchorAt);
+          markAvatarStarted(
+            session,
+            anchorAt,
+            Number(info?.startedAt) > 0 ? 'first-data' : 'fallback',
+          );
           if (subtitleText.length > 0) {
             void showSubtitle(subtitleText, Math.max(1500, subtitleText.length * 180), session, { line: subtitleLine })
               .then((shown) => { if (typeof onSubtitle === 'function') onSubtitle(shown === true); })
@@ -5523,7 +5696,21 @@ export function apply(ctx, config) {
     }
     session.file = result.file;
     session.durationMs = Math.max(0, Number(result.durationMs) || 0);
-    markStarted(session); // fallbacks that never report a start still get a clock
+    // A streamed transport normally calls `onStart` with the first chunk DURING `speakStreaming`.
+    // Do not pre-empt a callback that is still in flight: if none has landed yet, wait a bounded
+    // grace before recording the explicit `fallback` anchor. This keeps the anchor at the
+    // transport's real callback whenever one exists, and says `fallback` when one does not.
+    if (session.avatarStartedAt === 0 && session.ended !== true && session.cancelled !== true) {
+      const fallbackTimer = setTimeout(() => {
+        if (playback === session && session.avatarStartedAt === 0 && session.ended !== true
+          && session.cancelled !== true) {
+          const at = Date.now();
+          markPlaybackStarted(session, at);
+          markAvatarStarted(session, at, 'fallback');
+        }
+      }, START_FALLBACK_GRACE_MS);
+      fallbackTimer.unref?.();
+    }
     followMouth(session);
     // `speakStreaming` resolves once the clip is fully piped, not when it stops playing. The
     // player exit is the end; the estimate is only the fallback watchdog (see armPlaybackEnd).
@@ -6971,10 +7158,12 @@ export function apply(ctx, config) {
   const ttsIsSpeaking = () => {
     const session = playback;
     return session !== null
-      && session.startedAt > 0
       && session.ended !== true
       && session.cancelled !== true
-      && session.transportPending !== true;
+      && session.transportPending !== true
+      // A whole-file player is already launching; that is the old, preserved barge-in window.
+      // The avatar gesture anchor is still the transport's real start callback (never this flag).
+      && (session.startedAt > 0 || session.playerExpected === true);
   };
 
   const obsOptions = () => ({
@@ -13953,6 +14142,7 @@ export function apply(ctx, config) {
    * @param {string} [spoken] - the bare transcript; the memory query uses the user's own words.
    */
   const handleVoiceTask = async (text, spoken = text, timing = {}) => {
+    if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] start', { text: String(text).slice(0, 20) });
     // P-46: the round's own clock. Every timeline stamp below is taken in this round; a stamp that
     // is never taken stays 0 and becomes null in the payload (never a fabricated 0).
     const roundOpenedAt = Date.now();
@@ -14319,6 +14509,7 @@ export function apply(ctx, config) {
                   if (!answerCurrent()) {
                     throw Object.assign(new Error('Answer superseded'), { code: 'REPLY_SUPERSEDED' });
                   }
+                  if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] reply play', { sentenceId, chunkIndex, turn: turnId });
                   const session = await playAudio({
                     file: audio.file,
                     durationMs: audio.durationMs,
@@ -14816,7 +15007,10 @@ export function apply(ctx, config) {
         });
         return speaker.finish({ fullText: plan.text });
       };
-      const applyWholeSpokenVersion = async () => speakWholePlan(await decideSpokenVersion('apply'));
+      const applyWholeSpokenVersion = async () => {
+        if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] applyWholeSpokenVersion');
+        return speakWholePlan(await decideSpokenVersion('apply'));
+      };
 
       /**
        * Speak the spoken version AS IT STREAMS.
@@ -15045,11 +15239,14 @@ export function apply(ctx, config) {
         if (full.length === 0) return false;
         if (requestsFullRead(spoken)) return false;
         // Length is only one condition: a list/table/code answer is never read verbatim.
-        return shouldSkipSpokenVersion(raw, full).skip !== true;
+        const stream = shouldSkipSpokenVersion(raw, full).skip !== true;
+        if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] canStream', { stream, full: full.slice(0, 20), lightweight: lightweight !== null });
+        return stream;
       };
       /** Speak the decided version once; a later finish shares the same promise (never a replay). */
       const applySpokenVersion = async () => {
         if (spokenApplied !== null) return spokenApplied;
+        if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] applySpokenVersion');
         spokenApplied = (async () => {
           if (spokenMarks.spokenStartedAt === 0) spokenMarks.spokenStartedAt = Date.now();
           return canStreamSpokenVersion() ? streamSpokenRewrite() : applyWholeSpokenVersion();
@@ -15087,6 +15284,7 @@ export function apply(ctx, config) {
         // buffered here; the one spoken version is decided once, never streamed sentence by
         // sentence, so a long answer is not read twice (body + rewritten version).
         onAssistantText: (info) => {
+          if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] assistantText', { delta: String(info?.delta ?? info?.text ?? '').slice(0, 12), turn: info?.turn });
           if (turnOwnership === null) return;
           if (!turnOwnership.canSpeak()) return;
           // The first body frame arrives after the delivery is acknowledged: capture the bound
@@ -15100,7 +15298,11 @@ export function apply(ctx, config) {
           armSpokenDecision();
         },
       });
-      if (prepared.refused) return;
+      if (prepared.refused) {
+        if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] refused', prepared);
+        return;
+      }
+      if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[voiceTask] prepared', { turn: prepared.stage?.turn, acceptTurn: prepared.stage?.acceptTurn });
       // The delivery was accepted (duplicate and busy checks passed): this utterance is the user's
       // next input, so the previous round's clip stops here — BEFORE this turn captures its own
       // speech signal. Invalidating it now is safe and also stops a clip still being synthesized;
@@ -16004,6 +16206,7 @@ export function apply(ctx, config) {
    */
   const noteBargeInFinal = (text) => {
     resetBargeInPartial();
+    if (process.env.DSH_DEBUG_ANCHOR === '1') console.error('[bargeIn] final', { speaking: ttsIsSpeaking(), file: playback?.file ?? '', expected: playback?.playerExpected === true });
     if (ttsIsSpeaking() !== true) return { interrupted: false, reason: 'not-speaking' };
     const reason = bargeInFinalReason(text);
     if (reason.length > 0) {
