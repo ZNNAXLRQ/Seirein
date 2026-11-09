@@ -3360,8 +3360,287 @@ window.__ModuleLoader__.load({
       return { list, shadow, error: '' };
     }
 
+    // ---- 声纹候选（客户端） -------------------------------------------------------------
+    // 候选只是「听见过的话」：渲染与试听不写库、不确认、不把候选 speakerId 当成本人。只有用户
+    // 勾选后点「建立基础声纹」才调用一次宿主 build；失败时保留勾选并显示受控原因，不自动重试。
+    const SPEAKER_CANDIDATE_READ_TIMEOUT_MS = 4000;
+    const SPEAKER_CANDIDATE_LABEL_MAX_CHARS = 40;
+    const SPEAKER_CANDIDATE_NOTICE =
+      '只有你确认后才生效：试听后勾选候选，点「建立基础声纹」才会写入本人声纹；不会自动认领。';
+
+    /** 一条候选：字段缺失只降级这一行；embedding / audioPath 根本不会到达客户端。 */
+    function speakerCandidateOf(value, index) {
+      const entry = speakerEnrollObject(value);
+      if (entry === null) return null;
+      const id = speakerEnrollText(entry.id, entry.candidateId, entry.utteranceId);
+      if (id === '') return null;
+      return {
+        key: `${id}#${index}`,
+        id,
+        durationMs: Math.max(0, Math.round(speakerEnrollNumber(entry.durationMs, entry.totalDurationMs) ?? 0)),
+        at: speakerEnrollText(entry.at),
+        text: typeof entry.text === 'string' ? entry.text.trim() : '',
+        groupId: speakerEnrollText(entry.groupId),
+        // Older hosts may omit the flag; only an explicit false disables retry/试听.
+        audioAvailable: entry.audioAvailable !== false,
+      };
+    }
+
+    /** 候选按宿主给的 groupId 分组；没有 groupId 的行放进「未分组」。只做展示。 */
+    function speakerCandidateGroupsOf(candidates) {
+      const groups = new Map();
+      for (const candidate of candidates) {
+        const key = candidate.groupId === '' ? '__ungrouped' : candidate.groupId;
+        if (!groups.has(key)) groups.set(key, { key, candidates: [] });
+        groups.get(key).candidates.push(candidate);
+      }
+      return [...groups.values()].map((group, index) => ({
+        ...group,
+        label: group.key === '__ungrouped' ? '未分组' : `分组 ${index + 1}`,
+      }));
+    }
+
+    /** 读取结果 → 候选视图。列表不可用与「确实 0 条」必须区分。 */
+    function speakerCandidateView(data) {
+      const list = speakerEnrollObject(data?.list);
+      const available = list !== null && list.ok === true;
+      const candidates = (Array.isArray(list?.candidates) ? list.candidates : [])
+        .map((value, index) => speakerCandidateOf(value, index))
+        .filter((candidate) => candidate !== null);
+      const groups = speakerCandidateGroupsOf(candidates);
+      const library = speakerEnrollObject(list?.library);
+      const listCount = speakerEnrollNumber(list?.count);
+      const listedGroups = speakerEnrollNumber(list?.groupCount);
+      const error = speakerEnrollText(list?.error, list?.reason, data?.error);
+      return {
+        available,
+        loading: data === null || data === undefined || data.loading === true,
+        error: error === '' ? '' : speakerEnrollMissingText(error),
+        count: listCount === null || listCount < 0 ? candidates.length : Math.round(listCount),
+        groupCount: listedGroups === null || listedGroups < 0 ? groups.length : Math.round(listedGroups),
+        candidates,
+        groups,
+        selfId: speakerEnrollText(list?.selfId),
+        libraryPresent: library?.present === true,
+        libraryLabel: speakerEnrollText(library?.label),
+        libraryEnabled: library?.enabled === true,
+      };
+    }
+
+    /** 一次显式候选动作的结果文案；inconsistent 会点名疑似异常的候选 id。 */
+    function speakerCandidateOutcome(op, result) {
+      if (result?.ok === true) {
+        if (op === 'audio') return { ok: true, message: '试听已加载。' };
+        if (op === 'remove') return { ok: true, message: '已删除这个候选（含试听音频）。' };
+        if (op === 'clear') {
+          const removed = speakerEnrollNumber(result.removed);
+          return { ok: true, message: `已清空候选${removed === null ? '' : `（${removed} 条）`}。` };
+        }
+        if (op === 'build') {
+          const count = speakerEnrollNumber(result.sampleCount);
+          const total = speakerEnrollNumber(result.totalDurationMs);
+          return {
+            ok: true,
+            message: `已建立基础声纹${count === null ? '' : `：${count} 条候选`}`
+              + `${total === null ? '' : ` · ${speakerEnrollDurationText(total)}`}。${SPEAKER_CANDIDATE_NOTICE}`,
+          };
+        }
+        if (op === 'rename') return { ok: true, message: '已重命名；speakerId 不变。' };
+        if (op === 'preview') {
+          const count = speakerEnrollNumber(result.sampleCount);
+          const total = speakerEnrollNumber(result.totalDurationMs);
+          const floor = speakerEnrollNumber(result.minPairCosine);
+          return {
+            ok: true,
+            message: '一致性预览通过'
+              + (count === null ? '' : `：${count} 条`)
+              + (total === null ? '' : ` · ${speakerEnrollDurationText(total)}`)
+              + (floor === null ? '' : ` · 最低相似度 ${floor.toFixed(2)}`)
+              + '。',
+          };
+        }
+        return { ok: true, message: '已完成。' };
+      }
+      const reason = speakerEnrollText(result?.reason, result?.error, result?.code);
+      if (reason === 'inconsistent') {
+        const outliers = (Array.isArray(result?.outlierIds) ? result.outlierIds : [])
+          .map((id) => speakerEnrollText(id))
+          .filter((id) => id !== '')
+          .slice(0, 5);
+        return {
+          ok: false,
+          message: `候选不一致，未写入${outliers.length === 0 ? '' : `：疑似异常 ${outliers.join('、')}`}。`,
+        };
+      }
+      if (reason === 'insufficient-samples') {
+        const total = speakerEnrollNumber(result?.totalDurationMs) ?? 0;
+        return {
+          ok: false,
+          message: `样本总时长不足 3 秒（已 ${speakerEnrollDurationText(total)}），未写入。`,
+        };
+      }
+      if (reason === 'already-confirmed') {
+        return { ok: false, message: '已有已确认的本人声纹；如需重建，请先在条目里拒绝或删除。' };
+      }
+      if (reason === 'label-required') return { ok: false, message: '名称不能为空。' };
+      if (reason === 'label-too-long') {
+        return { ok: false, message: `名称最多 ${SPEAKER_CANDIDATE_LABEL_MAX_CHARS} 个字符。` };
+      }
+      if (reason === 'audio-missing') return { ok: false, message: '这个候选的试听音频已不存在。' };
+      if (reason === 'audio-too-large') return { ok: false, message: '试听音频太大，无法在页面播放。' };
+      if (reason === 'audio-unreadable') return { ok: false, message: '试听音频读取失败。' };
+      if (reason === 'candidate-not-found' || reason === 'not-found') {
+        return { ok: false, message: '候选或库条目已不存在，请刷新后再试。' };
+      }
+      if (reason === 'library-failed' || reason === 'enrollment-failed' || reason === 'store-failed'
+        || reason === 'read-failed' || reason === 'write-failed') {
+        return { ok: false, message: `读取或写入失败（${reason}），未完成。` };
+      }
+      if (reason === 'unavailable') return { ok: false, message: '需要宿主支持声纹候选。' };
+      if (reason === '') return { ok: false, message: '操作失败' };
+      const missing = speakerEnrollMissingText(reason);
+      const base = missing === reason ? `操作失败：${reason}` : missing;
+      return {
+        ok: false,
+        message: result?.rolledBack === true ? `${base}（已回滚，未留下半套数据）` : base,
+      };
+    }
+
+    /** 设置页候选子块：数量/分组、逐个试听/选择/删除、清空、一致性预览、建库与重命名。 */
+    function speakerCandidateSection(h, props) {
+      const view = speakerCandidateView(props?.candidateData);
+      const locked = props?.busy === true || props?.candidateBusy === true;
+      const selected = Array.isArray(props?.candidateSelection) ? props.candidateSelection : [];
+      const selectedSet = new Set(selected);
+      const label = speakerEnrollText(props?.label);
+      const audioMap = speakerEnrollObject(props?.candidateAudio) ?? {};
+      const preview = speakerEnrollObject(props?.candidatePreview);
+      const previewText = preview === null ? '' : speakerCandidateOutcome('preview', preview).message;
+      const notice = speakerEnrollObject(props?.candidateNotice);
+      const noticeText = speakerEnrollText(notice?.message);
+      const noSelection = selected.length === 0;
+      const candidateRow = (candidate) => {
+        const checked = selectedSet.has(candidate.id);
+        const audioUrl = speakerEnrollText(audioMap[candidate.id]);
+        const text = candidate.text.length > 24
+          ? `${candidate.text.slice(0, 24)}…`
+          : candidate.text;
+        return h('div', { key: candidate.key, style: { marginTop: 6 } },
+          h('div', { style: { ...styles.row, alignItems: 'flex-start' } },
+            h('input', {
+              type: 'checkbox',
+              checked,
+              disabled: locked,
+              title: '选择这个候选',
+              onChange: () => props?.onCandidateToggle?.(candidate.id, !checked),
+            }),
+            h('span', { style: { ...styles.value, flex: 1 } },
+              `${speakerEnrollDurationText(candidate.durationMs)}`
+              + `${candidate.at === '' ? '' : ` · ${candidate.at}`}`
+              + `${text === '' ? '' : ` · ${text}`}`),
+            h('span', { style: { display: 'flex', gap: 6 } },
+              h('button', {
+                style: { ...styles.btn, ...(locked || candidate.audioAvailable === false ? styles.off : {}) },
+                disabled: locked || candidate.audioAvailable === false,
+                title: candidate.audioAvailable === false ? '候选音频不存在' : '试听候选音频',
+                onClick: () => props?.onCandidateAudio?.(candidate.id),
+              }, '试听'),
+              h('button', {
+                style: { ...styles.btnDanger, ...(locked ? styles.off : {}) },
+                disabled: locked,
+                onClick: () => props?.onCandidateRemove?.(candidate.id),
+              }, '删除'))),
+          audioUrl === ''
+            ? null
+            : h('audio', {
+                controls: true,
+                src: audioUrl,
+                style: { width: '100%', height: 28, marginTop: 4 },
+              }));
+      };
+      return h('div', {
+        style: { ...styles.group, marginTop: 10 },
+        'data-settings-group': 'speaker-candidates',
+        'data-seirein-speaker-candidates': 'client',
+      },
+        h('div', { style: styles.groupTitle }, '声纹候选'),
+        h('div', { style: styles.hint }, SPEAKER_CANDIDATE_NOTICE),
+        h('div', { style: styles.row },
+          h('span', { style: styles.label }, '候选数'),
+          h('span', { style: styles.value },
+            view.available ? `${view.count} 条 · 分组 ${view.groupCount}` : '不可用')),
+        h('div', { style: styles.row },
+          h('span', { style: styles.label }, '库名称'),
+          h('span', { style: styles.value },
+            view.available
+              ? (view.libraryPresent
+                  ? `${view.libraryLabel === '' ? '未命名' : view.libraryLabel}${view.libraryEnabled ? '' : '（已停用）'}`
+                  : '未建立')
+              : '不可用')),
+        h('div', { style: styles.row },
+          h('span', { style: styles.label }, '已选'),
+          h('span', { style: styles.value }, `${selected.length} 条`)),
+        view.error === ''
+          ? null
+          : h('div', { style: { ...styles.hint, color: DANGER } }, `候选读取失败：${view.error}`),
+        view.loading ? h('div', { style: styles.hint }, '正在读取声纹候选…') : null,
+        view.available && view.count === 0 && !view.loading
+          ? h('div', { style: styles.hint },
+              '还没有声纹候选：先在语音页对着麦克风说几句话（3–5 秒），再点「刷新」。')
+          : null,
+        view.available
+          ? h('div', { style: { marginTop: 6 } },
+              view.groups.map((group) => h('div', { key: group.key },
+                h('div', { style: { ...styles.label, fontWeight: 600 } },
+                  `${group.label} · ${group.candidates.length} 条`),
+                group.candidates.map(candidateRow))))
+          : null,
+        h('div', { style: { ...styles.row, marginTop: 8 } },
+          h('input', {
+            style: styles.input,
+            value: label,
+            maxLength: SPEAKER_CANDIDATE_LABEL_MAX_CHARS,
+            placeholder: '本人声纹名称（留空使用「本人」）',
+            disabled: locked,
+            onChange: (event) => props?.onCandidateLabel?.(event?.target?.value ?? ''),
+          }),
+          h('button', {
+            style: { ...styles.btn, ...(locked || label === '' ? styles.off : {}) },
+            disabled: locked || label === '',
+            title: label === '' ? '名称不能为空' : '只改库里的显示名称，不改 speakerId',
+            onClick: () => props?.onCandidateRename?.(label),
+          }, '重命名')),
+        h('div', { style: { ...styles.row, marginTop: 6, justifyContent: 'flex-end' } },
+          h('button', {
+            style: { ...styles.btn, ...(locked || !view.available || noSelection ? styles.off : {}) },
+            disabled: locked || !view.available || noSelection,
+            onClick: () => props?.onCandidatePreview?.(selected),
+          }, '预览一致性'),
+          h('button', {
+            style: { ...styles.btnPrimary, ...(locked || !view.available || noSelection ? styles.off : {}) },
+            disabled: locked || !view.available || noSelection,
+            title: '只有你点这里才会写入本人声纹；不会自动确认',
+            onClick: () => props?.onCandidateBuild?.(selected, label === '' ? '本人' : label),
+          }, '建立基础声纹'),
+          h('button', {
+            style: { ...styles.btnDanger, ...(locked || !view.available || view.count === 0 ? styles.off : {}) },
+            disabled: locked || !view.available || view.count === 0,
+            onClick: () => props?.onCandidateClear?.(),
+          }, '清空候选')),
+        previewText === ''
+          ? null
+          : h('div', {
+              style: { ...styles.hint, color: preview?.ok === true ? '#2b8a3e' : DANGER },
+            }, previewText),
+        noticeText === ''
+          ? null
+          : h('div', {
+              style: { ...styles.hint, color: notice?.ok === true ? '#2b8a3e' : DANGER },
+            }, noticeText));
+    }
+
     /**
-     * 设置页「声纹」卡片：登记状态 + 显式确认/拒绝/删除 + 影子观测。
+     * 设置页「声纹」卡片：登记状态 + 显式确认/拒绝/删除 + 影子观测 + 候选建库。
      * 卡片本身不发请求也不自动改状态：只有按钮才会写，刷新只由用户点。
      */
     function speakerEnrollSection(h, props) {
@@ -3474,6 +3753,7 @@ window.__ModuleLoader__.load({
                 view.shadow.error === ''
                   ? '影子状态不可用：需要宿主支持 speaker.status.shadow。'
                   : `影子状态不可用：${view.shadow.error}（需要宿主支持 speaker.status.shadow）`)),
+        speakerCandidateSection(h, props),
         props?.notice
           ? h('div', { style: { ...styles.hint, color: '#2b8a3e' } }, String(props.notice))
           : null);
@@ -4946,6 +5226,14 @@ window.__ModuleLoader__.load({
       // 声纹登记：一次读取的结果 + 最近一次显式动作的提示（不自动确认、不自动拒绝）。
       const [speakerEnroll, setSpeakerEnroll] = useState(null);
       const [speakerEnrollNotice, setSpeakerEnrollNotice] = useState('');
+      // 声纹候选：一次读取 + 用户勾选/试听/预览/建库。所有写操作只在按钮回调里发生。
+      const [speakerCandidates, setSpeakerCandidates] = useState(null);
+      const [speakerCandidateSelection, setSpeakerCandidateSelection] = useState([]);
+      const [speakerCandidateAudio, setSpeakerCandidateAudio] = useState({});
+      const [speakerCandidatePreview, setSpeakerCandidatePreview] = useState(null);
+      const [speakerCandidateNotice, setSpeakerCandidateNotice] = useState(null);
+      const [speakerCandidateLabel, setSpeakerCandidateLabel] = useState('');
+      const [speakerCandidateBusy, setSpeakerCandidateBusy] = useState('');
       // 存放位置：当前 root 只读来自 status；保存只写设置，需重启 DSH 生效（不自动重启/迁移）。
       const [rootDialog, setRootDialog] = useState(null);
       const [rootNotice, setRootNotice] = useState(null);
@@ -5114,6 +5402,126 @@ window.__ModuleLoader__.load({
         setSpeakerEnrollNotice(SPEAKER_ENROLL_RECORD_HINT);
         show(SPEAKER_ENROLL_RECORD_HINT);
       }, [show]);
+
+      // ---- 声纹候选 handlers ---------------------------------------------------------------
+      // 读取只读 list；所有写动作都是「一次点击 = 一次请求」，没有定时器、重试或自动确认。
+      const loadSpeakerCandidates = useCallback(async () => {
+        setSpeakerCandidates((current) => ({
+          list: current?.list ?? null,
+          loading: true,
+          error: '',
+          at: current?.at ?? 0,
+        }));
+        const result = await runSettingsAction(
+          { action: 'speaker.candidates.list' },
+          { timeoutMs: SPEAKER_CANDIDATE_READ_TIMEOUT_MS },
+        );
+        const list = result !== null && typeof result === 'object'
+          ? result
+          : { ok: false, error: '没有返回' };
+        const data = { list, loading: false, error: '', at: Date.now() };
+        setSpeakerCandidates(data);
+        const view = speakerCandidateView(data);
+        if (view.available) {
+          const ids = new Set(view.candidates.map((candidate) => candidate.id));
+          setSpeakerCandidateSelection((current) => current.filter((id) => ids.has(id)));
+        }
+        setSpeakerCandidateLabel((current) => (
+          current.trim() === '' ? view.libraryLabel : current
+        ));
+      }, []);
+
+      const runSpeakerCandidateAction = useCallback(async (body, tag) => {
+        setSpeakerCandidateBusy(tag);
+        try {
+          return await runSettingsAction(body);
+        } finally {
+          setSpeakerCandidateBusy('');
+        }
+      }, []);
+
+      const toggleSpeakerCandidate = useCallback((id, checked) => {
+        setSpeakerCandidateSelection((current) => {
+          if (checked === true) return current.includes(id) ? current : [...current, id];
+          return current.filter((value) => value !== id);
+        });
+      }, []);
+
+      const loadSpeakerCandidateAudio = useCallback(async (id) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.candidates.audio', id },
+          'speaker-candidate-audio',
+        );
+        const outcome = speakerCandidateOutcome('audio', result);
+        setSpeakerCandidateNotice(outcome);
+        if (outcome.ok && typeof result?.dataUrl === 'string' && result.dataUrl !== '') {
+          setSpeakerCandidateAudio((current) => ({ ...current, [id]: result.dataUrl }));
+        }
+      }, [runSpeakerCandidateAction]);
+
+      const removeSpeakerCandidate = useCallback(async (id) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.candidates.remove', id },
+          'speaker-candidate-remove',
+        );
+        const outcome = speakerCandidateOutcome('remove', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return; // A failure must not silently drop the user's selection.
+        setSpeakerCandidateSelection((current) => current.filter((value) => value !== id));
+        setSpeakerCandidateAudio((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
+
+      const clearSpeakerCandidates = useCallback(async () => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.candidates.clear' },
+          'speaker-candidate-clear',
+        );
+        const outcome = speakerCandidateOutcome('clear', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return;
+        setSpeakerCandidateSelection([]);
+        setSpeakerCandidateAudio({});
+        setSpeakerCandidatePreview(null);
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
+
+      const previewSpeakerCandidates = useCallback(async (ids) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.candidates.preview', ids },
+          'speaker-candidate-preview',
+        );
+        setSpeakerCandidatePreview(result);
+        setSpeakerCandidateNotice(null);
+      }, [runSpeakerCandidateAction]);
+
+      const buildSpeakerBase = useCallback(async (ids, label) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.candidates.build', ids, label },
+          'speaker-candidate-build',
+        );
+        const outcome = speakerCandidateOutcome('build', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return; // keep the selection so a corrected set can be retried
+        setSpeakerCandidateSelection([]);
+        setSpeakerCandidatePreview(null);
+        await Promise.all([loadSpeakerCandidates(), loadSpeakerEnroll()]);
+      }, [loadSpeakerCandidates, loadSpeakerEnroll, runSpeakerCandidateAction]);
+
+      const renameSpeakerLibrary = useCallback(async (label) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.rename', speakerId: 'self', label },
+          'speaker-rename',
+        );
+        const outcome = speakerCandidateOutcome('rename', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return;
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
 
       /** 只复制脱敏后的状态摘要：没有标签文本、样本 id、路径或转写。 */
       const copySpeakerEnroll = useCallback(async () => {
@@ -5639,6 +6047,11 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         void loadSpeakerEnroll();
       }, [loadSpeakerEnroll]);
+
+      // 候选与登记各读一次；只有显式动作或「刷新」会让处理器再读。没有新增轮询。
+      useEffect(() => {
+        void loadSpeakerCandidates();
+      }, [loadSpeakerCandidates]);
 
       // A queued round is finished by the host later: the 3 s status poll is what releases the
       // silent button, so the card can never stay on 「已排队…」 after the queue drained.
@@ -7241,6 +7654,21 @@ window.__ModuleLoader__.load({
             onReject: (speakerId) => void runSpeakerEnroll('reject', speakerId),
             onRemove: (speakerId) => void runSpeakerEnroll('remove', speakerId),
             onCopy: () => void copySpeakerEnroll(),
+            candidateData: speakerCandidates,
+            candidateBusy: speakerCandidateBusy !== '',
+            candidateSelection: speakerCandidateSelection,
+            candidateAudio: speakerCandidateAudio,
+            candidatePreview: speakerCandidatePreview,
+            candidateNotice: speakerCandidateNotice,
+            label: speakerCandidateLabel,
+            onCandidateToggle: toggleSpeakerCandidate,
+            onCandidateAudio: (id) => void loadSpeakerCandidateAudio(id),
+            onCandidateRemove: (id) => void removeSpeakerCandidate(id),
+            onCandidateClear: () => void clearSpeakerCandidates(),
+            onCandidatePreview: (ids) => void previewSpeakerCandidates(ids),
+            onCandidateBuild: (ids, label) => void buildSpeakerBase(ids, label),
+            onCandidateRename: (label) => void renameSpeakerLibrary(label),
+            onCandidateLabel: setSpeakerCandidateLabel,
           }),
           settingsGroup(h, 'speaker-shadow', '',
             speakerShadowRow(h, { status, busy, act }),

@@ -382,12 +382,15 @@ import { openAudioRetention } from './hearing/audio-retention.js';
 // settings card reads and writes through its four explicit actions.
 import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
 // Daily speaker candidates: metadata cache + the host's short-lived 16 kHz WAV files. This layer
-// only collects; it never creates a template, sets selfId or writes memory.
+// only collects; the explicit settings actions below are the only path that can turn a selection
+// into a template / enrollment / self.
 import {
   SPEAKER_CANDIDATE_MAX_DURATION_MS,
   SPEAKER_CANDIDATE_MIN_DURATION_MS,
   createSpeakerCandidatesStore,
 } from './hearing/speaker-candidates.js';
+import { createSpeakerCandidateActions } from './hearing/speaker-candidate-actions.js';
+import { createSpeakerLibrary } from './hearing/speakerVoice.js';
 import {
   cleanupSpeakerCandidateAudio,
   writeSpeakerCandidateWav,
@@ -17340,6 +17343,24 @@ export function apply(ctx, config) {
   // clip >=800 ms, and only while the speaker shadow is on; the checks below repeat the important
   // gates because a callback can be queued while capture/settings/privacy are changing.
   const speakerCandidatesStore = createSpeakerCandidatesStore({ root, log });
+  const speakerCandidateActions = createSpeakerCandidateActions({
+    store: speakerCandidatesStore,
+    root,
+  });
+  // One library for the whole Host: the hearing shadow reads it and the settings actions write it,
+  // so the live match and a freshly built base voiceprint can never be two different
+  // `<root>/memory/speaker.db` connections. It opens lazily; only a library read/write touches the
+  // database file.
+  const speakerLibrary = createSpeakerLibrary({
+    root,
+    onEvent: (type, payload) => {
+      try {
+        void log.emit(type, payload).catch(() => {});
+      } catch {
+        /* a library event must never break a capture or a settings action */
+      }
+    },
+  });
   let speakerCandidateGeneration = 0;
   const invalidateSpeakerCandidates = () => {
     speakerCandidateGeneration += 1;
@@ -17506,8 +17527,16 @@ export function apply(ctx, config) {
       durationMs,
     });
   };
-  // Unload/teardown must invalidate callbacks that are already sitting in hearing's setImmediate.
-  ctx.effect(() => () => { invalidateSpeakerCandidates(); });
+  // Unload/teardown must invalidate callbacks that are already sitting in hearing's setImmediate,
+  // then close the Host-owned library connection (a hearing session borrows it and never owns it).
+  ctx.effect(() => () => {
+    invalidateSpeakerCandidates();
+    try {
+      speakerLibrary.close();
+    } catch {
+      /* closing on unload is best-effort */
+    }
+  });
   const speakerStatus = () => {
     const status = {
       enabled: speakerShadowEnabled(),
@@ -18019,6 +18048,8 @@ export function apply(ctx, config) {
           ...(speakerShadowAtStart
             ? {
                 speakerShadow: true,
+                // The same instance the settings build writes through; hearing borrows it.
+                speakerLibrary,
                 speakerLibraryRoot: root,
                 onSpeakerSample: (sample) => handleSpeakerCandidate(sample, speakerCandidateEpoch),
               }
@@ -18332,7 +18363,7 @@ export function apply(ctx, config) {
           // Loopback diagnostic shadow (default OFF, its own switch): research-only scoring of the
           // media lane. `<root>` is the same read-only library the microphone lane scores against.
           ...(speakerShadowLoopbackEnabled()
-            ? { speakerShadow: true, speakerLibraryRoot: root }
+            ? { speakerShadow: true, speakerLibrary, speakerLibraryRoot: root }
             : {}),
           // The loopback lane feeds the same continuous dialogue (boundaries separate the sources).
           dialogueContext,
@@ -19441,6 +19472,10 @@ export function apply(ctx, config) {
     get retentionStore() { return audioRetention; },
     get runtime() { return runtime; },
     get saveCallNames() { return saveCallNames; },
+    get speakerCandidateActions() { return speakerCandidateActions; },
+    get speakerCandidatesStore() { return speakerCandidatesStore; },
+    get speakerEnrollmentStore() { return speakerEnrollmentStore; },
+    get speakerLibrary() { return speakerLibrary; },
     get speakerModelState() { return speakerModelState; },
     get speakerShadowEnabled() { return speakerShadowEnabled; },
     get startAmbient() { return startAmbient; },

@@ -38,7 +38,53 @@ export const ACTIONS = Object.freeze([
   'call.names.remove',
   'call.names.toggle',
   'hearing.stop',
+  /** Candidate → base voiceprint. Only an explicit build writes the library/enrollment/self. */
+  'speaker.candidates.list',
+  'speaker.candidates.audio',
+  'speaker.candidates.remove',
+  'speaker.candidates.clear',
+  'speaker.candidates.preview',
+  'speaker.candidates.build',
+  'speaker.rename',
 ]);
+
+/** The one speaker id this host may create for the user's own base voiceprint. */
+export const SPEAKER_BASE_ID = 'self';
+/** Required total candidate audio before `speaker.candidates.build` may write anything. */
+export const SPEAKER_BUILD_MIN_TOTAL_MS = 3000;
+/** Library labels are display-only and bounded; the speakerId is never part of a rename. */
+export const SPEAKER_LABEL_MAX_CHARS = 40;
+const SPEAKER_BASE_LABEL = '本人';
+
+function speakerActionText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/** One bounded label. `fallback` is only for the build path; a rename stays non-empty. */
+function prepareSpeakerLabel(value, { fallback = '', required = false } = {}) {
+  const raw = speakerActionText(value);
+  const label = raw.length > 0 ? raw : fallback;
+  if (label.length === 0 && required) return { ok: false, reason: 'label-required' };
+  if ([...label].length > SPEAKER_LABEL_MAX_CHARS) {
+    return { ok: false, reason: 'label-too-long', max: SPEAKER_LABEL_MAX_CHARS };
+  }
+  return { ok: true, label };
+}
+
+/** Metadata only: the vector, active timestamps and file paths never reach a settings card. */
+function speakerLibraryEntryView(entry) {
+  if (entry === null || entry === undefined) {
+    return { present: false, speakerId: SPEAKER_BASE_ID, label: '', enabled: false, activeCount: 0, dim: 0 };
+  }
+  return {
+    present: true,
+    speakerId: speakerActionText(entry.speakerId),
+    label: typeof entry.label === 'string' ? entry.label : '',
+    enabled: entry.enabled === true,
+    activeCount: Number.isFinite(Number(entry.activeCount)) ? Math.max(0, Math.round(Number(entry.activeCount))) : 0,
+    dim: Number.isFinite(Number(entry.dim)) ? Math.max(0, Math.round(Number(entry.dim))) : 0,
+  };
+}
 
 export function createHearingSettingsActions(services) {
   /**
@@ -63,6 +109,45 @@ export function createHearingSettingsActions(services) {
     code: 'LEXICON_UNAVAILABLE',
     error: '共享语言库尚未接线：需要 Host 提供 lexicon 存储',
   });
+  /**
+   * Candidate → voiceprint depends on three host-owned pieces: the candidate store/actions, the
+   * one shared SpeakerLibrary (`<root>/memory/speaker.db`) and the enrollment store. A missing one
+   * is a controlled refusal before any file or database write.
+   */
+  const candidateActions = () => services.speakerCandidateActions ?? null;
+  const candidateStore = () => services.speakerCandidatesStore ?? null;
+  const speakerLibrary = () => services.speakerLibrary ?? null;
+  const enrollmentStore = () => services.speakerEnrollmentStore ?? null;
+  const SPEAKER_CANDIDATES_UNAVAILABLE = Object.freeze({
+    ok: false,
+    reason: 'unavailable',
+    error: '声纹候选尚未接线：需要 Host 提供候选、声纹库与登记存储',
+  });
+  const speakerEvent = async (type, payload) => {
+    try {
+      await services.log?.emit?.(type, payload);
+    } catch {
+      /* diagnostics must never change the action result */
+    }
+  };
+  const librarySelfView = () => {
+    const library = speakerLibrary();
+    if (library === null || typeof library.get !== 'function') return null;
+    try {
+      return speakerLibraryEntryView(library.get(SPEAKER_BASE_ID));
+    } catch {
+      return null;
+    }
+  };
+  const enrollmentSelfId = () => {
+    const store = enrollmentStore();
+    if (store === null || typeof store.getConfirmedSelf !== 'function') return '';
+    try {
+      return speakerActionText(store.getConfirmedSelf()?.speakerId);
+    } catch {
+      return '';
+    }
+  };
   const handler = async (body) => {
     switch (body.action) {
       case 'hearing.start': {
@@ -262,6 +347,316 @@ export function createHearingSettingsActions(services) {
           );
         }
         return result;
+      }
+      case 'speaker.candidates.list': {
+        const actions = candidateActions();
+        const store = candidateStore();
+        if (actions === null || store === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        // Grouping is a view, not an identity decision; it never touches speakerId or the library.
+        let groupCount = 0;
+        try {
+          groupCount = store.groups().length;
+        } catch {
+          try {
+            groupCount = Math.max(0, Math.round(Number(store.status()?.groupCount) || 0));
+          } catch {
+            groupCount = 0;
+          }
+        }
+        const listed = actions.list();
+        if (listed?.ok !== true) return listed;
+        return {
+          ...listed,
+          groupCount,
+          selfId: enrollmentSelfId(),
+          library: librarySelfView(),
+        };
+      }
+      case 'speaker.candidates.audio': {
+        const actions = candidateActions();
+        if (actions === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        const result = actions.audio(body.id);
+        if (result?.ok !== true) return result;
+        return {
+          ...result,
+          dataUrl: `data:${result.mime};base64,${result.base64}`,
+        };
+      }
+      case 'speaker.candidates.remove': {
+        const actions = candidateActions();
+        if (actions === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        return actions.remove(body.id);
+      }
+      case 'speaker.candidates.clear': {
+        const actions = candidateActions();
+        if (actions === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        return actions.clear();
+      }
+      case 'speaker.candidates.preview': {
+        const actions = candidateActions();
+        if (actions === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        // The UI gets decision evidence only; the vector stays host-side (`includeVector` omitted).
+        const result = actions.preview(body.ids);
+        if (result?.ok === false && result.reason === 'inconsistent') {
+          await speakerEvent('speaker.candidates.preview.inconsistent', {
+            sampleCount: Number(result.sampleCount) || 0,
+            outlierCount: Array.isArray(result.outlierIds) ? result.outlierIds.length : 0,
+          });
+        }
+        return result;
+      }
+      case 'speaker.candidates.build': {
+        const actions = candidateActions();
+        const store = candidateStore();
+        const library = speakerLibrary();
+        const enrollment = enrollmentStore();
+        if (actions === null || store === null || library === null || enrollment === null) {
+          return SPEAKER_CANDIDATES_UNAVAILABLE;
+        }
+        const labelResult = prepareSpeakerLabel(body.label, { fallback: SPEAKER_BASE_LABEL });
+        if (labelResult.ok !== true) return labelResult;
+        const label = labelResult.label;
+
+        // 1) Consistency + duration first, with the vector kept host-side. An inconsistent set or a
+        // too-short set returns before the library, enrollment file or `self` is touched.
+        const previewed = actions.preview(body.ids, { includeVector: true });
+        if (previewed?.ok !== true) return previewed;
+        const totalDurationMs = Math.max(0, Math.round(Number(previewed.totalDurationMs) || 0));
+        if (totalDurationMs < SPEAKER_BUILD_MIN_TOTAL_MS) {
+          return {
+            ok: false,
+            reason: 'insufficient-samples',
+            sampleCount: Math.max(0, Math.round(Number(previewed.sampleCount) || 0)),
+            totalDurationMs,
+            requiredMs: SPEAKER_BUILD_MIN_TOTAL_MS,
+          };
+        }
+        if (!Array.isArray(previewed.vector) || previewed.vector.length === 0
+          || !previewed.vector.every((value) => Number.isFinite(Number(value)))) {
+          return { ok: false, reason: 'template-failed' };
+        }
+
+        // Normalized ids (same trim/de-duplicate order the preview uses) for sample references.
+        const ids = [];
+        const seen = new Set();
+        if (Array.isArray(body.ids)) {
+          for (const raw of body.ids) {
+            if (typeof raw !== 'string') continue;
+            const id = raw.trim();
+            if (id.length === 0 || seen.has(id)) continue;
+            seen.add(id);
+            ids.push(id);
+          }
+        }
+        if (ids.length === 0) return { ok: false, reason: 'invalid-ids' };
+
+        // An already-confirmed self is never overwritten by a candidate build.
+        let beforeEnrollment = null;
+        let currentSelf = null;
+        try {
+          beforeEnrollment = enrollment.read();
+          currentSelf = enrollment.getConfirmedSelf();
+        } catch {
+          return { ok: false, reason: 'enrollment-failed' };
+        }
+        if (currentSelf !== null && currentSelf !== undefined) {
+          return {
+            ok: false,
+            reason: 'already-confirmed',
+            selfId: speakerActionText(currentSelf.speakerId),
+          };
+        }
+
+        // The library row is read before any write; a broken library fails closed.
+        try {
+          if (typeof library.get !== 'function' || typeof library.register !== 'function'
+            || typeof library.open !== 'function') {
+            return { ok: false, reason: 'library-unavailable' };
+          }
+          library.get(SPEAKER_BASE_ID);
+        } catch {
+          return { ok: false, reason: 'library-failed' };
+        }
+
+        // 2) Candidate durations become the enrollment samples (one reference per candidate id).
+        let candidates;
+        try {
+          candidates = store.list();
+        } catch {
+          return { ok: false, reason: 'store-failed' };
+        }
+        const byId = new Map();
+        for (const candidate of candidates) {
+          const id = speakerActionText(candidate?.id);
+          if (id.length > 0 && !byId.has(id)) byId.set(id, candidate);
+        }
+        const samples = [];
+        for (const id of ids) {
+          const candidate = byId.get(id);
+          if (candidate === undefined) return { ok: false, reason: 'candidate-not-found', id };
+          const durationMs = Math.round(Number(candidate.durationMs));
+          if (!Number.isFinite(durationMs) || durationMs <= 0) {
+            return { ok: false, reason: 'invalid-duration', id };
+          }
+          samples.push({
+            durationMs,
+            source: 'mic',
+            sampleRef: id,
+            at: typeof candidate.at === 'string' ? candidate.at : undefined,
+          });
+        }
+
+        const vector = Float32Array.from(previewed.vector.map((value) => Number(value)));
+        if (vector.length !== previewed.vector.length) return { ok: false, reason: 'template-failed' };
+
+        // 3) Library + enrollment are one unit: a SQLite savepoint rolls the template back and the
+        // enrollment snapshot restores the JSON file byte-for-byte on any later failure.
+        let db = null;
+        try {
+          db = library.open();
+        } catch {
+          return { ok: false, reason: 'library-failed' };
+        }
+        if (db === null || typeof db.exec !== 'function') return { ok: false, reason: 'library-unavailable' };
+        const beforeFile = beforeEnrollment;
+        let enrollmentTouched = false;
+        let registered = null;
+        try {
+          db.exec('SAVEPOINT speaker_candidates_build');
+          registered = library.register(SPEAKER_BASE_ID, vector, { label, enabled: true });
+          if (registered?.ok !== true) {
+            throw Object.assign(new Error('register failed'), {
+              speakerReason: typeof registered?.reason === 'string' ? registered.reason : 'library-failed',
+            });
+          }
+          const merged = enrollment.mergeSamples({ speakerId: SPEAKER_BASE_ID, samples });
+          if (merged?.ok !== true) {
+            throw Object.assign(new Error('merge failed'), {
+              speakerReason: typeof merged?.reason === 'string' ? merged.reason : 'merge-failed',
+            });
+          }
+          enrollmentTouched = true;
+          const confirmed = enrollment.confirm({ speakerId: SPEAKER_BASE_ID });
+          if (confirmed?.ok !== true) {
+            throw Object.assign(new Error('confirm failed'), {
+              speakerReason: typeof confirmed?.reason === 'string' ? confirmed.reason : 'confirm-failed',
+              speakerExtra: {
+                ...(Number.isFinite(Number(confirmed?.totalDurationMs))
+                  ? { totalDurationMs: Number(confirmed.totalDurationMs) }
+                  : {}),
+                ...(Number.isFinite(Number(confirmed?.requiredMs))
+                  ? { requiredMs: Number(confirmed.requiredMs) }
+                  : {}),
+              },
+            });
+          }
+          db.exec('RELEASE speaker_candidates_build');
+        } catch (error) {
+          let rolledBack = false;
+          try {
+            db.exec('ROLLBACK TO speaker_candidates_build');
+            db.exec('RELEASE speaker_candidates_build');
+            rolledBack = true;
+          } catch {
+            rolledBack = false;
+          }
+          let enrollmentRestored = enrollmentTouched !== true;
+          if (enrollmentTouched) {
+            try {
+              enrollment.write(beforeFile);
+              enrollmentRestored = true;
+            } catch {
+              try {
+                enrollment.removeEntry({ speakerId: SPEAKER_BASE_ID });
+                enrollmentRestored = true;
+              } catch {
+                enrollmentRestored = false;
+              }
+            }
+          }
+          const reason = typeof error?.speakerReason === 'string'
+            ? error.speakerReason
+            : 'write-failed';
+          await speakerEvent('speaker.candidates.build.failed', {
+            reason,
+            rolledBack: rolledBack === true,
+            enrollmentRestored: enrollmentRestored === true,
+          });
+          return {
+            ok: false,
+            reason,
+            ...(error?.speakerExtra ?? {}),
+            rolledBack: rolledBack === true,
+            enrollmentRestored: enrollmentRestored === true,
+          };
+        }
+
+        // 4) The action itself is the user's explicit confirmation; nothing here is automatic.
+        let selfId = '';
+        let stats = null;
+        try {
+          const confirmedSelf = enrollment.getConfirmedSelf();
+          selfId = speakerActionText(confirmedSelf?.speakerId);
+          stats = typeof enrollment.stats === 'function'
+            ? enrollment.stats({ speakerId: SPEAKER_BASE_ID })
+            : null;
+        } catch {
+          selfId = '';
+          stats = null;
+        }
+        const libraryView = librarySelfView();
+        await speakerEvent('speaker.candidates.built', {
+          speakerId: SPEAKER_BASE_ID,
+          sampleCount: samples.length,
+          totalDurationMs,
+          created: registered?.created === true,
+        });
+        return {
+          ok: true,
+          speakerId: SPEAKER_BASE_ID,
+          label,
+          selfId: selfId === '' ? SPEAKER_BASE_ID : selfId,
+          sampleCount: samples.length,
+          totalDurationMs,
+          created: registered?.created === true,
+          library: libraryView,
+          enrollment: stats === null ? null : {
+            speakerId: SPEAKER_BASE_ID,
+            status: typeof stats.status === 'string' ? stats.status : 'confirmed',
+            sampleCount: Math.max(0, Math.round(Number(stats.sampleCount) || 0)),
+            totalDurationMs: Math.max(0, Math.round(Number(stats.totalDurationMs) || 0)),
+          },
+        };
+      }
+      case 'speaker.rename': {
+        const library = speakerLibrary();
+        if (library === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        const speakerId = speakerActionText(body.speakerId) || SPEAKER_BASE_ID;
+        const labelResult = prepareSpeakerLabel(body.label, { required: true });
+        if (labelResult.ok !== true) return { ...labelResult, speakerId };
+        try {
+          if (typeof library.get !== 'function' || typeof library.open !== 'function') {
+            return { ok: false, reason: 'unavailable', speakerId };
+          }
+          if (library.get(speakerId) === null) return { ok: false, reason: 'not-found', speakerId };
+          const result = library.open()
+            .prepare('UPDATE speaker_template SET label = ?, updated_at = ? WHERE speaker_id = ?')
+            .run(labelResult.label, new Date().toISOString(), speakerId);
+          if (Number(result?.changes) < 1) return { ok: false, reason: 'not-found', speakerId };
+          const updated = library.get(speakerId);
+          await speakerEvent('speaker.renamed', {
+            speakerId,
+            labelChars: [...labelResult.label].length,
+          });
+          return {
+            ok: true,
+            speakerId,
+            label: labelResult.label,
+            library: speakerLibraryEntryView(updated),
+          };
+        } catch {
+          return { ok: false, reason: 'write-failed', speakerId };
+        }
       }
       case 'hearing.threshold': {
         // Noise floor in dB: anything quieter than this counts as silence. Lower = more sensitive.
