@@ -234,7 +234,16 @@ import {
 import { createCallMode, createSpeakerRegistry, detectAddress } from './hearing/interaction/callMode.js';
 import { createCallNameStore, listCallNames } from './hearing/interaction/callNames.js';
 import { SpoutLayer } from './avatar/spoutLayer.js';
-import { createVtsAutoConnect, VTS_AUTO_BOOT_MS, VTS_AUTO_TICK_MS } from './avatar/auto-connect.js';
+import {
+  createVtsAutoConnect,
+  planVtsQuietAuth,
+  VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS,
+  VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS_CAP,
+  VTS_AUTH_AUTO_RETRY_MS,
+  VTS_AUTO_BOOT_MS,
+  VTS_AUTO_TICK_MS,
+  vtsAuthPhase,
+} from './avatar/auto-connect.js';
 import { VTS_OFFSCREEN, VtsWindow } from './avatar/spout-layer/vts-window.mjs';
 import {
   admitSpawn,
@@ -4405,25 +4414,70 @@ export function apply(ctx, config) {
     }
   };
 
+  // Host-owned automatic re-authorization state. The client's `lastAuthAt` only advances when a
+  // grant attempt settles (a popup may wait a full grant timeout), so the host timestamp covers the
+  // in-flight window and an authorize() result that never recorded a failure. `attempts` is the
+  // quiet-episode budget: it forbids a cooldown from becoming an endless popup timer.
+  let vtsAuthRetryInFlight = false;
+  let vtsAuthAutoRetryAt = 0;
+  let vtsAuthAutoRetryAttempts = 0;
+
+  /**
+   * `avatar.vtsAuthAutoRetryMs` opts in to automatic re-authorization; unset/invalid/<= 0 means OFF.
+   * The default is deliberately 0: an expired popup must not create another popup on its own.
+   */
+  const vtsAuthAutoRetryCooldownMs = () => {
+    const raw = config?.avatar?.vtsAuthAutoRetryMs;
+    if (raw === undefined || raw === null) return VTS_AUTH_AUTO_RETRY_MS;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return value;
+  };
+
+  /** Opt-in only: 1 (default) or 2 automatic grants per quiet episode, hard-capped at 2. */
+  const vtsAuthAutoRetryMaxAttempts = () => {
+    const raw = config?.avatar?.vtsAuthAutoRetryMaxAttempts;
+    if (raw === undefined || raw === null) return VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS;
+    const value = Math.floor(Number(raw));
+    if (!Number.isFinite(value)) return VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS;
+    return Math.min(VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS_CAP, Math.max(1, value));
+  };
+
   /**
    * Authorization projections for `/assistant/status` (`live2d` plus the top-level `vtsAuth`).
    * Reads the client only and never dials: the settings card shows the「重新授权」button when
-   * `needsAuth` is true, and `authError`/`retryable` explain why it is offered.
+   * `needsAuth` is true, and `authError`/`retryable` explain why it is offered. `autoRetry` makes
+   * the opt-in budget and its in-flight state observable, so an enabled auto attempt is never a
+   * silent background popup.
    */
-  const vtsAuthStatus = () => (vts === null
-    ? {
-      state: 'disconnected',
-      authenticated: false,
-      needsAuth: false,
-      authError: '',
-      lastAuthAt: 0,
-      lastAuthSuccessAt: 0,
-      retryable: false,
-      authorizePending: false,
-      authorizeRequests: 0,
-      freshTokenRejected: false,
-    }
-    : vts.authStatus());
+  const vtsAuthStatus = () => {
+    const status = vts === null
+      ? {
+        state: 'disconnected',
+        authenticated: false,
+        needsAuth: false,
+        authError: '',
+        lastAuthAt: 0,
+        lastAuthSuccessAt: 0,
+        retryable: false,
+        authorizePending: false,
+        authorizeRequests: 0,
+        freshTokenRejected: false,
+      }
+      : vts.authStatus();
+    const cooldownMs = vtsAuthAutoRetryCooldownMs();
+    return {
+      ...status,
+      authPhase: vtsAuthPhase(status),
+      autoRetry: {
+        enabled: cooldownMs > 0,
+        cooldownMs,
+        maxAttempts: vtsAuthAutoRetryMaxAttempts(),
+        attempts: vtsAuthAutoRetryAttempts,
+        inFlight: vtsAuthRetryInFlight === true,
+      },
+    };
+  };
 
   /**
    * Explicit user re-authorization (`vts.authorize`). The client is idempotent and owns the single
@@ -4458,6 +4512,77 @@ export function apply(ctx, config) {
   // connection started by someone else) before any connect: a late probe from a closed component or
   // an unloaded plugin is dropped silently. See `src/host/avatar/auto-connect.js`.
   let vtsMountRevision = 0;
+
+  /**
+   * Post-grant wiring for an automatic re-authorization. `authorize()` authenticates the client,
+   * but only `vtsConnect()`'s ready branch attaches the behavior runtime, adopts the mouth input and
+   * starts capability discovery. That call cannot dial: `client.ready` is already true. A component
+   * close or plugin unload that happened while the popup was open drops the late wiring instead.
+   */
+  const vtsFinishAutoAuthorize = async (result, mountAt) => {
+    if (result?.ok !== true) return;
+    vtsAuthAutoRetryAt = 0;
+    vtsAuthAutoRetryAttempts = 0;
+    if (vtsMountRevision !== mountAt || shutdown.closing === true) return;
+    if (features.enabled('avatar') !== true) return;
+    await vtsConnect();
+  };
+
+  /**
+   * Quiet authorization is a wait for a user decision, not a transport failure. `client.connect()`
+   * rejects `requesting-grant` / `token-invalid` before touching the socket, and treating that
+   * rejection as a connect failure only set a pointless 20 s backoff (the silent `AWAITING_GRANT`
+   * loop). This preflight runs before the probe:
+   *
+   *  - `authorizePending:true`: a popup is still open — never send a second request;
+   *  - `token-invalid` / any other needs-user rejection: the user must click「重新授权」;
+   *  - `grant-timeout`: the authorization was not completed — do not pop again on a cooldown;
+   *  - opt-in only (`avatar.vtsAuthAutoRetryMs` > 0): at most `maxAttempts` (1–2) automatic grants
+   *    per quiet episode, then the budget is exhausted until a success or a new mount.
+   *
+   * Every quiet path returns without `vtsConnect()`. Non-quiet states keep the normal probe/connect
+   * path, including saved-token reconnects after an ordinary disconnect.
+   */
+  const vtsAuthQuietPreflight = () => {
+    if (features.enabled('avatar') !== true || shutdown.closing === true) return null;
+    const client = vtsClient();
+    const auth = client.authStatus();
+    if (client.ready === true) {
+      // A successful authorization ends the episode; a later quiet episode may use a fresh budget.
+      vtsAuthAutoRetryAt = 0;
+      vtsAuthAutoRetryAttempts = 0;
+      return null;
+    }
+    const now = Date.now();
+    // The host timestamp keeps the cooldown while a slow grant has not updated `lastAuthAt` yet.
+    const lastAuthAt = Math.max(Number(auth.lastAuthAt) || 0, vtsAuthAutoRetryAt);
+    const maxAttempts = vtsAuthAutoRetryMaxAttempts();
+    const decision = planVtsQuietAuth({
+      status: auth,
+      cooldownMs: vtsAuthAutoRetryCooldownMs(),
+      attempts: vtsAuthAutoRetryAttempts,
+      maxAttempts,
+      inFlight: vtsAuthRetryInFlight,
+      lastAuthAt,
+      now,
+    });
+    if (decision.handled !== true) return null;
+    if (decision.authorize !== true) return decision;
+    vtsAuthRetryInFlight = true;
+    vtsAuthAutoRetryAt = now;
+    vtsAuthAutoRetryAttempts += 1;
+    const mountAt = vtsMountRevision;
+    void log.emit('vts.auth.auto-retry', {
+      state: auth.state,
+      lastAuthAt: auth.lastAuthAt,
+    }).catch(() => {});
+    void vtsAuthorize({ reason: 'auto-retry' })
+      .then((result) => vtsFinishAutoAuthorize(result, mountAt))
+      .catch(() => {})
+      .finally(() => { vtsAuthRetryInFlight = false; });
+    return decision;
+  };
+
   const vtsAutoConnect = createVtsAutoConnect({
     probe: () => probePort('127.0.0.1', Number(config?.vtsPort ?? 8001), 400),
     connect: () => vtsConnect(),
@@ -4470,7 +4595,13 @@ export function apply(ctx, config) {
       return client.ready === true || client.connectPromise !== null;
     },
   });
-  const runVtsAutoTick = () => { void vtsAutoConnect.run(); };
+  const runVtsAutoTick = () => {
+    // Quiet authorization waits for the user; probing/dialing it is the empty AWAITING_GRANT loop.
+    const quiet = vtsAuthQuietPreflight();
+    if (quiet !== null) return quiet;
+    void vtsAutoConnect.run();
+    return null;
+  };
   const vtsAutoTimer = setInterval(runVtsAutoTick, VTS_AUTO_TICK_MS);
   vtsAutoTimer.unref?.();
   ctx.effect(() => () => {

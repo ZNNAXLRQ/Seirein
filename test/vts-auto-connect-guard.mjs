@@ -163,3 +163,27 @@ test('5. 探测不通不连接；探测失败不设退避，连接失败按现�
   assert.equal(state.connectCalls, 2, 'the retry after the backoff connects');
   assert.equal(app.nextAttemptAt(), 0, 'success resets the backoff');
 });
+
+test('6. run() 并发只跑一次；成功 tick 后关闭/重开守卫仍然生效', async () => {
+  const { app, state, probes } = makeApp();
+  const first = app.run();
+  const second = app.run();
+  assert.equal(await second, null, 'a concurrent timer callback is a no-op');
+  await flush();
+  assert.equal(probes.length, 1, 'the concurrent run did not start a second probe');
+  probes[0].resolve(true);
+  const outcome = await first;
+  assert.equal(outcome.connected, true);
+  assert.equal(state.connectCalls, 1, 'normal success still connects exactly once');
+  assert.equal(app.nextAttemptAt(), 0, 'normal success still resets the backoff');
+
+  // The auth preflight lives in the Host, not in this factory: a closed component must still drop a
+  // successful late probe exactly as before.
+  const closed = makeApp();
+  const closedTask = closed.app.tick();
+  await flush();
+  closed.state.enabled = false;
+  closed.probes[0].resolve(true);
+  await closedTask;
+  assert.equal(closed.state.connectCalls, 0, 'closing the component still blocks the late probe');
+});

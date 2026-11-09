@@ -23,6 +23,146 @@
 export const VTS_AUTO_TICK_MS = 4_000;
 export const VTS_AUTO_BOOT_MS = 8_000;
 export const VTS_AUTO_BACKOFF_MS = 20_000;
+/**
+ * Host-side cooldown before a quiet authorization state may be retried automatically. The default
+ * is 0, i.e. automatic re-authorization is OFF unless the user opts in
+ * (`avatar.vtsAuthAutoRetryMs` > 0), so an expired popup never produces another popup on its own.
+ */
+export const VTS_AUTH_AUTO_RETRY_MS = 0;
+/** Even when opted in, one quiet episode may trigger at most this many automatic grants. */
+export const VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS = 1;
+/** Hard ceiling for `avatar.vtsAuthAutoRetryMaxAttempts`; more than two is a popup loop. */
+export const VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS_CAP = 2;
+
+/** The two states that wait for a user decision; a dial from either is a no-op (AWAITING_GRANT). */
+const VTS_AUTH_AUTO_RETRY_STATES = new Set(['requesting-grant', 'token-invalid']);
+
+/**
+ * Decide whether the HOST's cooldown/budget would allow one automatic re-authorization.
+ *
+ * This is a pure predicate: it never reads the clock, the client or the config. The host passes
+ * `lastAuthAt` from `client.authStatus()` (or the host's own in-flight timestamp, whichever is
+ * newer) and its `cooldownMs`; every malformed input fails closed so a broken projection can never
+ * turn into a popup storm. Callers must still apply their own policy on top: the host refuses
+ * `token-invalid` and `grant-timeout` (user action / incomplete authorization), and enforces the
+ * attempt budget. A `cooldownMs` of 0 is the default and disables the predicate entirely.
+ *
+ * @param {{
+ *   state?: string,
+ *   authorizePending?: boolean,
+ *   lastAuthAt?: number,
+ *   now?: number,
+ *   cooldownMs?: number,
+ * }} [options]
+ * @returns {boolean} true only for a quiet, non-pending state whose cooldown has elapsed.
+ */
+export function shouldAutoReauthorize(options = {}) {
+  const input = options !== null && typeof options === 'object' ? options : {};
+  const cooldownMs = Number(input.cooldownMs ?? VTS_AUTH_AUTO_RETRY_MS);
+  // `<= 0` is the documented disable switch, not an immediate retry.
+  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return false;
+  if (!VTS_AUTH_AUTO_RETRY_STATES.has(input.state)) return false;
+  if (input.authorizePending === true) return false;
+  const lastAuthAt = Number(input.lastAuthAt);
+  const now = Number(input.now);
+  // 0 means "this process never completed an authorization attempt"; it is not a usable clock.
+  if (!Number.isFinite(lastAuthAt) || lastAuthAt <= 0) return false;
+  if (!Number.isFinite(now)) return false;
+  return now - lastAuthAt >= cooldownMs;
+}
+
+/**
+ * The Host's quiet-authorization policy, pure and side-effect free. It decides what one auto tick
+ * should do with a non-ready auth projection:
+ *
+ *  - `not-quiet`: keep the normal probe/connect path (an ordinary disconnect may use its token);
+ *  - `auth-pending`: a popup is still open, never ask again;
+ *  - `auth-incomplete`: the last grant timed out; show it, never re-request from a cooldown;
+ *  - `auth-user-action-required`: token-invalid / needs-user; only the user's button may retry;
+ *  - `auto-retry-disabled`: the default (cooldown 0) or an explicit <= 0 override;
+ *  - `auth-retry-exhausted`: the quiet-episode budget is spent;
+ *  - `auth-cooldown`: opted in, but the cooldown has not elapsed;
+ *  - `auth-retry`: exactly one automatic grant may now be sent.
+ *
+ * @param {{
+ *   status?: object,
+ *   cooldownMs?: number,
+ *   attempts?: number,
+ *   maxAttempts?: number,
+ *   inFlight?: boolean,
+ *   lastAuthAt?: number,
+ *   now?: number,
+ * }} [options]
+ * @returns {{handled: boolean, reason: string, authorize: boolean}}
+ */
+export function planVtsQuietAuth(options = {}) {
+  const input = options !== null && typeof options === 'object' ? options : {};
+  const status = input.status !== null && typeof input.status === 'object' ? input.status : {};
+  const quiet = status.state === 'requesting-grant' || status.state === 'token-invalid';
+  if (!quiet) return { handled: false, reason: 'not-quiet', authorize: false };
+  // A popup that still exists is the evidence that asking again would be a duplicate request.
+  if (status.authorizePending === true) return { handled: true, reason: 'auth-pending', authorize: false };
+  // A timeout is not a denial and not a reason to pop again when the cooldown expires.
+  if (status.authError === 'grant-timeout') return { handled: true, reason: 'auth-incomplete', authorize: false };
+  if (status.state === 'token-invalid' || status.needsAuth === true) {
+    return { handled: true, reason: 'auth-user-action-required', authorize: false };
+  }
+  const cooldownMs = Number(input.cooldownMs ?? VTS_AUTH_AUTO_RETRY_MS);
+  if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) {
+    return { handled: true, reason: 'auto-retry-disabled', authorize: false };
+  }
+  if (input.inFlight === true) return { handled: true, reason: 'auth-retry-in-flight', authorize: false };
+  const requestedMax = Math.floor(Number(input.maxAttempts));
+  const maxAttempts = Number.isFinite(requestedMax)
+    ? Math.min(VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS_CAP, Math.max(1, requestedMax))
+    : VTS_AUTH_AUTO_RETRY_MAX_ATTEMPTS;
+  const requestedAttempts = Math.floor(Number(input.attempts));
+  const attempts = Number.isFinite(requestedAttempts) ? Math.max(0, requestedAttempts) : 0;
+  if (attempts >= maxAttempts) return { handled: true, reason: 'auth-retry-exhausted', authorize: false };
+  const now = Number(input.now);
+  const lastAuthAt = Math.max(
+    Number(input.lastAuthAt ?? status.lastAuthAt) || 0,
+    Number(input.hostRetryAt) || 0,
+  );
+  if (!shouldAutoReauthorize({
+    state: status.state,
+    authorizePending: status.authorizePending,
+    lastAuthAt,
+    now,
+    cooldownMs,
+  })) {
+    return { handled: true, reason: 'auth-cooldown', authorize: false };
+  }
+  return { handled: true, reason: 'auth-retry', authorize: true };
+}
+
+/**
+ * The Host-facing authorization phase. This keeps three stories apart that used to collapse into
+ * "not connected": an ordinary disconnect may reconnect with the saved token, a rejected token
+ * needs a deliberate user click, and a timed-out popup is an incomplete authorization that must
+ * never be re-requested by a cooldown. Pure: it only reads the auth projection.
+ *
+ * @param {{
+ *   state?: string,
+ *   authenticated?: boolean,
+ *   needsAuth?: boolean,
+ *   authError?: string,
+ *   authorizePending?: boolean,
+ * }} [status]
+ * @returns {'ready'|'authorization-incomplete'|'needs-reauthorization'|'authorization-pending'
+ *          |'reconnecting'|'connecting'|'unknown'}
+ */
+export function vtsAuthPhase(status = {}) {
+  const input = status !== null && typeof status === 'object' ? status : {};
+  if (input.state === 'ready' || input.authenticated === true) return 'ready';
+  // A timeout is an observation, not a re-request: show it as incomplete, never as "denied".
+  if (input.authError === 'grant-timeout') return 'authorization-incomplete';
+  if (input.state === 'token-invalid' || input.needsAuth === true) return 'needs-reauthorization';
+  if (input.authorizePending === true) return 'authorization-pending';
+  if (input.state === 'error' || input.state === 'disconnected') return 'reconnecting';
+  if (input.state === 'connecting' || input.state === 'requesting-grant') return 'connecting';
+  return 'unknown';
+}
 
 /**
  * @param {{
