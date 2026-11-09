@@ -94,6 +94,12 @@ export const STAGE2_MIN_FPS = 30;
 const VERSION_TIMEOUT_MS = 3000;
 const CREATED_TOLERANCE_MS = 1000;
 /**
+ * Two reads of one process's `StartTime` agree far more tightly than two different processes can:
+ * a reused PID that starts even a second later must not match. This is deliberately much smaller
+ * than the 1 s attribution window used for orphan cleanup.
+ */
+const IDENTITY_MATCH_TOLERANCE_MS = 100;
+/**
  * Host dispose budget used when `stop()` is called without an explicit `deadlineAt`: the Host
  * force-exits at 5 s (`PROCESS_SHUTDOWN_TIMEOUT_MS`), leaving 4 s for this item plus its exit
  * path. Never append a per-phase budget on top of this — every phase spends from the same deadline.
@@ -108,6 +114,16 @@ const STOP_FORCE_RESERVE_MAX_MS = 1000;
 const STOP_FORCE_RESERVE_MIN_MS = 100;
 /** Runtime descendant scan (a slow WMI call), deliberately done while the layer is running. */
 const OWNERSHIP_SCAN_TIMEOUT_MS = 5000;
+/**
+ * Identity probes during `stop()` spend at most this long. A reused PID is only excluded from the
+ * stop after its creation time has been read; the rest of the shared budget still belongs to the
+ * force-kill and the confirmation. A probe that cannot finish is "unconfirmed", never "gone".
+ */
+const STOP_IDENTITY_PROBE_MAX_MS = 1200;
+/** Keep this much of the stop budget for the verdict itself; probes never spend all of it. */
+const STOP_IDENTITY_PROBE_RESERVE_MS = 50;
+/** Upper bound for the second creation-time read performed immediately before a kill. */
+const STOP_KILL_RECHECK_MAX_MS = 600;
 /** How long `setEditMode()` waits for the layer's enter/exit diagnostic before reporting a timeout. */
 const EDIT_ACK_TIMEOUT_MS = 750;
 const DEFAULT_MAIN = fileURLToPath(new URL('./spout-layer/main.js', import.meta.url));
@@ -194,6 +210,78 @@ function sameInstant(left, right, toleranceMs = CREATED_TOLERANCE_MS) {
   return Math.abs(a - b) <= toleranceMs;
 }
 
+/**
+ * PID from an ownership entry. The record started life as a bare number; newer records may carry
+ * `{ pid, created }`. Both shapes are accepted so a record written by another version still parses.
+ */
+function ownershipPid(value) {
+  const raw = value !== null && typeof value === 'object' ? (value.pid ?? value.id) : value;
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : 0;
+}
+
+/** Normalize any mix of bare PIDs and ownership entries to unique positive integer PIDs. */
+function normalizePids(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const id = ownershipPid(value);
+    if (id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+/**
+ * Ownership descendants as `[{ pid, created }]`.
+ *
+ * The authoritative store is `ownership.children` (PIDs) plus `ownership.childCreated`
+ * (PID to that process's own OS creation time, `''` when the read failed). A `{ pid, created }`
+ * object in `children` is accepted too, so a record upgraded in place remains readable. A missing
+ * creation time is preserved as `''` (unconfirmed) — never silently dropped, because a PID alone
+ * must not authorize a kill.
+ */
+function ownershipRecords(ownership) {
+  const records = [];
+  const position = new Map();
+  const map = ownership?.childCreated !== null && typeof ownership?.childCreated === 'object'
+    ? ownership.childCreated
+    : {};
+  for (const value of Array.isArray(ownership?.children) ? ownership.children : []) {
+    const pid = ownershipPid(value);
+    if (pid <= 0) continue;
+    const recorded = value !== null && typeof value === 'object'
+      ? String(value.created ?? '').trim()
+      : '';
+    const created = recorded || String(map[String(pid)] ?? '').trim();
+    if (position.has(pid)) {
+      const existing = records[position.get(pid)];
+      if (existing.created === '' && created !== '') existing.created = created;
+      continue;
+    }
+    position.set(pid, records.length);
+    records.push({ pid, created });
+  }
+  return records;
+}
+
+/** Normalize caller-supplied identities to `[{ pid, created }]`, preserving input order. */
+function normalizeIdentities(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const pid = ownershipPid(value);
+    if (pid <= 0 || seen.has(pid)) continue;
+    seen.add(pid);
+    out.push({
+      pid,
+      created: String(value !== null && typeof value === 'object' ? (value.created ?? '') : '').trim(),
+    });
+  }
+  return out;
+}
+
 export class SpoutLayer {
   /**
    * @param {object} options
@@ -266,6 +354,12 @@ export class SpoutLayer {
     this.pid = 0;
     this.lastPid = 0;
     this.created = '';
+    /**
+     * True when the start-time probe failed and `created` is only the host-side spawn clock. Such
+     * an estimate is useful for the session record but is not an OS identity: a stop treats the
+     * root as unconfirmed instead of comparing two different clocks and then "proving" a reuse.
+     */
+    this.createdProvisional = false;
     this.startedAt = 0;
     this.stoppedAt = 0;
     this.readyPhase = '';
@@ -1591,6 +1685,40 @@ export class SpoutLayer {
     }
   }
 
+  /**
+   * Creation times for several PIDs in one PowerShell call: `{ [pid]: iso }`, with `''` for a PID
+   * whose StartTime could not be read. Used only while the layer is running, so the ownership scan
+   * pays one helper start instead of one per descendant; `stop()` never runs this query.
+   */
+  async processCreatedTimes(pids, timeoutMs = 5000) {
+    const ids = normalizePids(pids);
+    const times = {};
+    for (const id of ids) times[id] = '';
+    if (ids.length === 0) return times;
+    const script = [
+      `$ids = @(${ids.join(',')});`,
+      '$rows = foreach ($id in $ids) {',
+      "  try { $p = [System.Diagnostics.Process]::GetProcessById($id); [pscustomobject]@{ pid = $id; created = $p.StartTime.ToUniversalTime().ToString('o') } }",
+      "  catch { [pscustomobject]@{ pid = $id; created = '' } }",
+      '};',
+      '@($rows) | ConvertTo-Json -Compress',
+    ].join(' ');
+    try {
+      const output = await this.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], timeoutMs);
+      const parsed = JSON.parse(output || '[]');
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      const wanted = new Set(ids);
+      for (const row of rows) {
+        const id = Number(row?.pid);
+        if (!wanted.has(id)) continue;
+        times[id] = String(row?.created ?? '').trim();
+      }
+    } catch {
+      /* all entries stay unconfirmed; a failed batch is never read as "nothing is alive" */
+    }
+    return times;
+  }
+
   /** Resolve with the promise's value, or `null` when it does not settle within `timeoutMs`. */
   async awaitWithin(promise, timeoutMs) {
     let timer = null;
@@ -1610,28 +1738,55 @@ export class SpoutLayer {
   /**
    * Capture descendant ownership *while the layer is running* (one WMI call, best effort).
    * `stop()` must never start this query: on a cold Windows box it costs 1.5–5.5 s by itself.
+   *
+   * The scan records each discovered descendant's own creation time, not just its PID: after the
+   * root exits, Windows can hand the same PID to a system process, and only the creation time can
+   * prove the difference. `children` stays a PID array (the historical shape) while `childCreated`
+   * holds the parallel identity map; both are merged, never replaced, across scans.
    */
-  refreshOwnership(reason = 'runtime') {
+  async refreshOwnership(reason = 'runtime') {
     const ownership = this.ownership;
-    if (ownership === null || ownership.pid !== this.pid || ownership.pid <= 0) return Promise.resolve(null);
+    if (ownership === null || ownership.pid !== this.pid || ownership.pid <= 0) return null;
     if (this.ownershipScan !== null) return this.ownershipScan;
-    this.ownershipScan = this.descendantPids(ownership.pid, OWNERSHIP_SCAN_TIMEOUT_MS)
-      .then((pids) => {
+    this.ownershipScan = (async () => {
+      try {
+        const discovered = await this.descendantPids(ownership.pid, OWNERSHIP_SCAN_TIMEOUT_MS);
         if (this.ownership !== ownership) return null;
-        const merged = new Set([...(ownership.children ?? []), ...pids]);
+        const ids = normalizePids(discovered).filter((id) => id !== ownership.pid);
+        let created = {};
+        if (ids.length > 0) {
+          try {
+            created = await this.processCreatedTimes(ids, OWNERSHIP_SCAN_TIMEOUT_MS);
+          } catch {
+            created = {};
+          }
+        }
+        if (this.ownership !== ownership) return null;
+        const previous = ownershipRecords(ownership);
+        const merged = new Set([...previous.map((entry) => entry.pid), ...ids]);
         merged.delete(ownership.pid);
-        ownership.children = [...merged].filter((id) => Number.isInteger(id) && id > 0);
+        const childCreated = {};
+        for (const entry of previous) {
+          if (entry.pid !== ownership.pid && entry.created !== '') childCreated[entry.pid] = entry.created;
+        }
+        for (const id of ids) {
+          const value = String(created[id] ?? '').trim();
+          // A later failed read must not erase an earlier good one.
+          if (value !== '' || childCreated[id] === undefined) childCreated[id] = value;
+        }
+        for (const id of merged) if (childCreated[id] === undefined) childCreated[id] = '';
+        ownership.children = [...merged];
+        ownership.childCreated = childCreated;
         ownership.scannedAt = Date.now();
         ownership.scans = (ownership.scans ?? 0) + 1;
         this.appendDiagnostics(
-          `[ownership] scan=${reason} pid=${ownership.pid} children=${ownership.children.join(',')}`,
+          `[ownership] scan=${reason} pid=${ownership.pid} children=${[...merged].map((id) => `${id}@${childCreated[id] || '?'}`).join(',')}`,
         );
         return ownership.children;
-      })
-      .catch(() => null)
-      .finally(() => {
+      } finally {
         if (this.ownershipScan !== null) this.ownershipScan = null;
-      });
+      }
+    })().catch(() => null);
     return this.ownershipScan;
   }
 
@@ -1639,20 +1794,61 @@ export class SpoutLayer {
   ownedChildren() {
     const ownership = this.ownership;
     if (ownership === null || ownership.pid !== this.pid) return [];
-    return [...new Set((ownership.children ?? []).map((value) => Number(value)))]
-      .filter((id) => Number.isInteger(id) && id > 0 && id !== ownership.pid);
+    return ownershipRecords(ownership).map((entry) => entry.pid).filter((id) => id !== ownership.pid);
+  }
+
+  /** Root identity `{ pid, created }` for this run; `pid` is 0 when nothing was recorded. */
+  rootIdentity() {
+    const ownership = this.ownership;
+    const pid = this.pid > 0 ? this.pid : Number(ownership?.pid ?? 0);
+    if (!Number.isInteger(pid) || pid <= 0) return { pid: 0, created: '' };
+    // A spawn-clock estimate is not an OS identity. Returning '' makes the root unconfirmed, which
+    // blocks a kill and a successful stop instead of comparing two different clocks.
+    const provisional = this.createdProvisional === true || ownership?.createdProvisional === true;
+    return {
+      pid,
+      created: provisional ? '' : String(this.created || ownership?.created || '').trim(),
+    };
   }
 
   /**
-   * Every PID this controller attributed at runtime, even after the close handler cleared
-   * `child`/`pid`. The ownership record is the only evidence left when the main process exits
-   * first; an empty child slot must never be read as "the whole tree is gone".
+   * Every PID+creation-time identity this controller recorded, even after the close handler
+   * cleared `child`/`pid`. An empty child slot must never be read as "the whole tree is gone".
+   * Legacy descendants with no stored creation time appear with `created: ''` (unconfirmed).
    */
-  attributedPids() {
+  attributedIdentities() {
+    const out = [];
+    const seen = new Set();
+    const push = (pid, created) => {
+      const id = Number(pid);
+      if (!Number.isInteger(id) || id <= 0 || seen.has(id)) return;
+      seen.add(id);
+      out.push({ pid: id, created: String(created ?? '').trim() });
+    };
+    const root = this.rootIdentity();
+    if (root.pid > 0) push(root.pid, root.created);
     const ownership = this.ownership;
-    if (ownership === null) return [];
-    return [...new Set([ownership.pid, ...(ownership.children ?? [])].map((value) => Number(value)))]
-      .filter((id) => Number.isInteger(id) && id > 0);
+    if (ownership !== null) {
+      const recordRootPid = ownershipPid(ownership.pid);
+      if (recordRootPid > 0 && recordRootPid !== root.pid) push(recordRootPid, ownership.created);
+      for (const entry of ownershipRecords(ownership)) {
+        if (entry.pid !== root.pid && entry.pid !== recordRootPid) push(entry.pid, entry.created);
+      }
+    }
+    return out;
+  }
+
+  /** Every PID this controller attributed at runtime (compatibility view of the identities). */
+  attributedPids() {
+    return this.attributedIdentities().map((entry) => entry.pid);
+  }
+
+  /** The recorded identity for one PID, or an unconfirmed `{ pid, created: '' }` fallback. */
+  identityFor(pid) {
+    const id = Number(pid);
+    const found = this.attributedIdentities().find((entry) => entry.pid === id);
+    if (found !== undefined) return found;
+    return { pid: Number.isInteger(id) && id > 0 ? id : 0, created: '' };
   }
 
   /** Merge stage timestamps reported by the display process into the active stop record. */
@@ -1675,7 +1871,169 @@ export class SpoutLayer {
     }
   }
 
-  /** Wait until every PID is gone or the absolute deadline; returns the survivors. */
+  /**
+   * How long identity probes may spend inside a stop: capped by `STOP_IDENTITY_PROBE_MAX_MS` and
+   * never allowed to spend the last reserve of the shared deadline. `0` means "no probe budget";
+   * every still-alive candidate is then unconfirmed instead of being killed on a stale PID.
+   */
+  identityProbeBudget(deadlineAt = 0) {
+    const absolute = Number(deadlineAt);
+    if (!Number.isFinite(absolute) || absolute <= 0) return STOP_IDENTITY_PROBE_MAX_MS;
+    const remaining = Math.max(0, absolute - Date.now());
+    if (remaining <= STOP_IDENTITY_PROBE_RESERVE_MS) return 0;
+    return Math.max(1, Math.min(STOP_IDENTITY_PROBE_MAX_MS, remaining - STOP_IDENTITY_PROBE_RESERVE_MS));
+  }
+
+  /**
+   * Compare each recorded identity with the process that currently owns its PID.
+   *
+   *   alive + same creation time (within the identity tolerance) → `owned` (real leftover);
+   *   alive + different creation time                           → `reused` (unrelated, never kill);
+   *   alive + unreadable/absent recorded creation time           → `unconfirmed` (blocks success);
+   *   not alive                                                  → `gone`.
+   *
+   * `survivors` is the conservative subset (`owned` + `unconfirmed`) in input order. A reused PID
+   * is deliberately absent: it is neither waited for nor killed.
+   */
+  async verifyIdentities(identities, timeoutMs = STOP_IDENTITY_PROBE_MAX_MS) {
+    const list = normalizeIdentities(identities);
+    const budget = Math.max(0, Math.round(Number(timeoutMs) || 0));
+    const verdicts = new Map();
+    const probes = [];
+    for (const entry of list) {
+      if (!this.alive(entry.pid)) {
+        verdicts.set(entry.pid, { ...entry, status: 'gone' });
+        continue;
+      }
+      if (entry.created === '') {
+        verdicts.set(entry.pid, { ...entry, status: 'unconfirmed', reason: 'no-created' });
+        continue;
+      }
+      if (budget <= 0) {
+        verdicts.set(entry.pid, { ...entry, status: 'unconfirmed', reason: 'no-probe-budget' });
+        continue;
+      }
+      probes.push((async () => {
+        let actual = '';
+        try {
+          actual = String(await this.processCreatedAt(entry.pid, budget) ?? '').trim();
+        } catch {
+          actual = '';
+        }
+        if (actual === '') {
+          verdicts.set(entry.pid, { ...entry, status: 'unconfirmed', reason: 'created-unreadable' });
+        } else if (!sameInstant(actual, entry.created, IDENTITY_MATCH_TOLERANCE_MS)) {
+          verdicts.set(entry.pid, { ...entry, status: 'reused', actual });
+        } else {
+          verdicts.set(entry.pid, { ...entry, status: 'owned', actual });
+        }
+      })());
+    }
+    if (probes.length > 0) {
+      // The per-call timeout already bounds each probe; this bounds the group as well.
+      const settled = await this.awaitWithin(Promise.all(probes), budget + 25);
+      if (settled === null) {
+        for (const entry of list) {
+          if (verdicts.has(entry.pid)) continue;
+          verdicts.set(entry.pid, {
+            ...entry,
+            status: this.alive(entry.pid) ? 'unconfirmed' : 'gone',
+            reason: 'probe-timeout',
+          });
+        }
+      }
+    }
+    const rows = list.map((entry) => verdicts.get(entry.pid)).filter(Boolean);
+    return {
+      owned: rows.filter((row) => row.status === 'owned'),
+      unconfirmed: rows.filter((row) => row.status === 'unconfirmed'),
+      reused: rows.filter((row) => row.status === 'reused'),
+      gone: rows.filter((row) => row.status === 'gone'),
+      survivors: rows.filter((row) => row.status === 'owned' || row.status === 'unconfirmed'),
+    };
+  }
+
+  /**
+   * The second identity read, performed immediately before termination. A PID that was verified a
+   * moment ago can exit and be reused in the gap; a mismatch (or an unreadable identity) skips the
+   * kill instead of terminating an unrelated process. Returns `{ targets, skipped }`, where
+   * `skipped` carries `action: 'gone' | 'reused' | 'unconfirmed'` and, when read, `actual`.
+   */
+  async recheckBeforeKill(identities, timeoutMs = STOP_KILL_RECHECK_MAX_MS) {
+    const list = normalizeIdentities(identities);
+    const budget = Math.max(0, Math.round(Number(timeoutMs) || 0));
+    const verdicts = new Map();
+    const probes = [];
+    for (const entry of list) {
+      if (!this.alive(entry.pid)) {
+        verdicts.set(entry.pid, { ...entry, action: 'gone' });
+        continue;
+      }
+      if (entry.created === '') {
+        verdicts.set(entry.pid, { ...entry, action: 'unconfirmed', reason: 'no-created' });
+        continue;
+      }
+      if (budget <= 0) {
+        verdicts.set(entry.pid, { ...entry, action: 'unconfirmed', reason: 'no-recheck-budget' });
+        continue;
+      }
+      probes.push((async () => {
+        let actual = '';
+        try {
+          actual = String(await this.processCreatedAt(entry.pid, budget) ?? '').trim();
+        } catch {
+          actual = '';
+        }
+        if (actual === '') {
+          verdicts.set(entry.pid, { ...entry, action: 'unconfirmed', reason: 'created-unreadable' });
+        } else if (!sameInstant(actual, entry.created, IDENTITY_MATCH_TOLERANCE_MS)) {
+          verdicts.set(entry.pid, { ...entry, action: 'reused', actual });
+        } else {
+          verdicts.set(entry.pid, { ...entry, action: 'kill', actual });
+        }
+      })());
+    }
+    if (probes.length > 0) {
+      const settled = await this.awaitWithin(Promise.all(probes), budget + 25);
+      if (settled === null) {
+        for (const entry of list) {
+          if (verdicts.has(entry.pid)) continue;
+          verdicts.set(entry.pid, {
+            ...entry,
+            action: this.alive(entry.pid) ? 'unconfirmed' : 'gone',
+            reason: 'probe-timeout',
+          });
+        }
+      }
+    }
+    const rows = list.map((entry) => verdicts.get(entry.pid)).filter(Boolean);
+    return {
+      targets: rows.filter((row) => row.action === 'kill'),
+      skipped: rows.filter((row) => row.action !== 'kill'),
+    };
+  }
+
+  /**
+   * Conservative compatibility helper: PIDs that are alive and not proven to be a reused PID.
+   * Unconfirmed PIDs are retained on purpose — an unreadable creation time must never turn into
+   * "the process is gone" or into a successful stop.
+   */
+  async ownedSurvivors(pids, options = {}) {
+    const timeoutMs = Number.isFinite(Number(options?.timeoutMs))
+      ? Math.max(0, Number(options.timeoutMs))
+      : STOP_IDENTITY_PROBE_MAX_MS;
+    const identities = normalizePids(pids).map((id) => this.identityFor(id));
+    const verified = await this.verifyIdentities(identities, timeoutMs);
+    return verified.survivors.map((entry) => entry.pid);
+  }
+
+  /**
+   * Wait until every PID is gone or the absolute deadline; returns the survivors.
+   *
+   * Callers on the stop path pass only identities that were just verified as this layer's own
+   * (plus any unconfirmed PIDs they report separately); a reused PID is never in `pids`, so the
+   * confirmation can neither wait for nor "confirm" an unrelated process.
+   */
   async waitForPidsGone(pids, deadlineAt) {
     const ids = [...new Set((pids ?? []).map((value) => Number(value)))]
       .filter((value) => Number.isInteger(value) && value > 0);
@@ -2127,6 +2485,7 @@ export class SpoutLayer {
     this.ownership = null;
     this.ownershipScan = null;
     this.created = '';
+    this.createdProvisional = false;
     this.receiverMs = 0;
     this.receiver = null;
     this.sharedTextureRegistered = false;
@@ -2159,6 +2518,10 @@ export class SpoutLayer {
       pid: spawnedPid,
       created: this.created,
       children: [],
+      /** PID to that descendant's own creation time; `''` means it could not be read. */
+      childCreated: {},
+      /** `created` is the spawn clock, not the OS StartTime, when this is true. */
+      createdProvisional: false,
       capturedAt: Date.now(),
       scans: 0,
     };
@@ -2167,6 +2530,11 @@ export class SpoutLayer {
     if (actualCreated !== '') {
       this.created = actualCreated;
       this.ownership.created = actualCreated;
+    } else if (spawnedPid > 0) {
+      // The probe failed: keep the spawn clock for the session record, but never use it as an OS
+      // identity. A stop will report the root as unconfirmed rather than fake a reuse.
+      this.createdProvisional = true;
+      this.ownership.createdProvisional = true;
     }
     if (spawnedPid <= 0 || this.child !== child || child.exitCode !== null
       || child.signalCode !== null || this.readyPhase === 'failed') {
@@ -2245,8 +2613,13 @@ export class SpoutLayer {
    * while the layer was running (`ownership`).
    *
    * A successful `taskkill` is not evidence that the process exited. `confirmed`/`processTreeGone`
-   * are true only after every recorded PID is observed gone; otherwise `{ ok: false,
+   * are true only after every recorded PID is verified gone; otherwise `{ ok: false,
    * confirmed: false }` is returned and the ownership record + `session.json` stay on disk.
+   *
+   * Every recorded PID is checked against the creation time captured for that process. A PID that
+   * now belongs to a system process (same number, different creation time) is a reuse: it is not a
+   * survivor, is never waited for, and is never killed. An unreadable identity is unconfirmed and
+   * keeps the stop a failure; it is never treated as gone and never authorizes a kill by PID alone.
    */
   async stop(options = {}) {
     const child = this.child;
@@ -2276,9 +2649,28 @@ export class SpoutLayer {
 
     if (child === null) {
       // The close handler clears `child`/`pid` as soon as the main process exits, so an empty slot
-      // is not evidence that the tree is gone. Verify the runtime-recorded ownership PIDs instead;
-      // a live one keeps the stop unconfirmed and keeps the attribution record on disk.
-      const survivors = this.attributedPids().filter((id) => this.alive(id));
+      // is not evidence that the tree is gone. Verify the runtime-recorded identities instead: a
+      // reused PID is not a survivor, while an unconfirmed or still-owned PID keeps the stop
+      // unconfirmed and keeps the attribution record on disk.
+      const verification = await this.verifyIdentities(
+        this.attributedIdentities(),
+        this.identityProbeBudget(deadlineAt),
+      );
+      for (const entry of verification.reused) {
+        this.appendDiagnostics(
+          `[identity] reused pid=${entry.pid} expected=${entry.created} actual=${entry.actual ?? ''}`,
+        );
+        void this.emitEvent('spoutLayer.pid.reused', {
+          pid: entry.pid,
+          generation,
+          expected: entry.created,
+          actual: entry.actual ?? '',
+          phase: 'stop-idle',
+        });
+      }
+      const survivors = verification.survivors.map((entry) => entry.pid);
+      const reused = verification.reused.map((entry) => entry.pid);
+      const unconfirmed = verification.unconfirmed.map((entry) => entry.pid);
       stages.confirmedAt = Date.now();
       if (survivors.length > 0) {
         this.stopFailed = true;
@@ -2298,6 +2690,8 @@ export class SpoutLayer {
           confirmed: false,
           processTreeGone: false,
           survivors,
+          reused,
+          unconfirmed,
           stages: finalStages,
           ownership: this.ownership,
         });
@@ -2321,10 +2715,13 @@ export class SpoutLayer {
           stopFailed: true,
           sessionRetained: true,
           survivors,
+          reused,
+          unconfirmed,
           ownership: this.ownership,
         };
       }
-      // Every recorded PID is gone: only now may the evidence file go, still inside the deadline.
+      // Every recorded PID is gone or provably reused: only now may the evidence file go, still
+      // inside the deadline. Reused system PIDs are never waited for or killed.
       const ownership = this.ownership;
       const expected = ownership === null
         ? {}
@@ -2335,6 +2732,7 @@ export class SpoutLayer {
       this.child = null;
       this.pid = 0;
       this.created = '';
+      this.createdProvisional = false;
       this.ownership = null;
       this.stoppedAt = Date.now();
       this.readyPhase = 'stopped';
@@ -2347,6 +2745,20 @@ export class SpoutLayer {
       const vts = await this.restoreVts(null, { raise: options?.raiseVts === true });
       const finalStages = { ...stages };
       this.stopStages = null;
+      void this.emitEvent('spoutLayer.stopped', {
+        pid: ownership?.pid ?? 0,
+        how: 'idle',
+        killed: false,
+        elapsedMs,
+        deadlineAt,
+        budgetMs,
+        confirmed: true,
+        processTreeGone: true,
+        hostTeardownFinished: elapsedMs <= budgetMs + STOP_DEADLINE_SLACK_MS,
+        reused,
+        unconfirmed,
+        stages: finalStages,
+      });
       return {
         ...this.snapshot(),
         ok: true,
@@ -2355,6 +2767,7 @@ export class SpoutLayer {
         hostTeardownFinished: elapsedMs <= budgetMs + STOP_DEADLINE_SLACK_MS,
         stopped: false,
         killed: false,
+        how: 'idle',
         running: false,
         elapsedMs,
         deadlineAt,
@@ -2362,13 +2775,19 @@ export class SpoutLayer {
         stages: finalStages,
         ackReceived: false,
         sessionRetained: released.cleared !== true && released.reason !== 'no-session',
+        survivors: [],
+        reused,
+        unconfirmed,
         vts,
       };
     }
 
     const pid = this.pid;
     const created = this.created;
-    const owned = this.ownedChildren();
+    // Candidate identities: the root plus every descendant captured while the layer was running.
+    // Each entry carries that process's own creation time; a PID alone is never trusted.
+    const identities = this.attributedIdentities();
+    const owned = identities.filter((entry) => entry.pid !== pid).map((entry) => entry.pid);
     const ackPromise = new Promise((resolvePromise) => {
       this.pendingAck = resolvePromise;
     });
@@ -2438,34 +2857,99 @@ export class SpoutLayer {
       // A timeout is not an exit: leave childExitAt null until liveness confirms the process gone.
       if (['exit', 'close', 'already-exited'].includes(outcome.how)) stages.childExitAt = outcome.at;
 
-      // 3. Force kill only with the time that is actually left. A recorded tree that is still
-      //    alive is a failure even when the root itself is gone.
-      let survivors = [pid, ...owned].filter((id) => this.alive(id));
-      if (survivors.length > 0 && Date.now() < deadlineAt) {
-        stages.forceKillAt = Date.now();
-        const killBudgetMs = Math.max(0, deadlineAt - Date.now());
-        const rootTarget = survivors.includes(pid) ? pid : 0;
-        const childTargets = survivors.filter((id) => id !== pid);
-        const work = [];
-        if (rootTarget > 0) {
-          work.push(this.killTree(rootTarget, killBudgetMs).then(
-            (value) => { if (value === true) killed = true; return value; },
-            () => false,
-          ));
-        }
-        if (childTargets.length > 0) {
-          work.push(this.killPids(childTargets, killBudgetMs).then(
-            (ids) => { if (Array.isArray(ids) && ids.length > 0) killed = true; return ids; },
-            () => [],
-          ));
-        }
-        // A wedged taskkill must not consume the confirmation time.
-        await this.awaitWithin(Promise.all(work), Math.max(0, deadlineAt - Date.now()));
-        stages.forceKillDoneAt = Date.now();
+      // 3. Identity-gated survivors. A recorded PID is only a survivor when the process now holding
+      //    it still has the creation time recorded for it; a reused PID is neither waited on nor
+      //    killed, and an unreadable identity is never treated as gone.
+      const verification = await this.verifyIdentities(identities, this.identityProbeBudget(deadlineAt));
+      const reused = new Map(verification.reused.map((entry) => [entry.pid, entry]));
+      const unconfirmed = new Map(verification.unconfirmed.map((entry) => [entry.pid, entry]));
+      const ownedAlive = new Map(verification.owned.map((entry) => [entry.pid, entry]));
+      const killSkipped = [];
+      for (const entry of verification.reused) {
+        this.appendDiagnostics(
+          `[identity] reused pid=${entry.pid} expected=${entry.created} actual=${entry.actual ?? ''} gen=${generation}`,
+        );
+        void this.emitEvent('spoutLayer.pid.reused', {
+          pid: entry.pid,
+          generation,
+          expected: entry.created,
+          actual: entry.actual ?? '',
+          phase: 'stop',
+        });
+      }
+      for (const entry of verification.unconfirmed) {
+        this.appendDiagnostics(
+          `[identity] unconfirmed pid=${entry.pid} reason=${entry.reason ?? ''} expected=${entry.created}`,
+        );
       }
 
-      // 4. Confirmation by liveness only. `taskkill` success is deliberately not enough.
-      survivors = await this.waitForPidsGone([pid, ...owned], deadlineAt);
+      let killTargets = [];
+      if (ownedAlive.size > 0 && Date.now() < deadlineAt) {
+        // The second read closes the check→kill race: a PID reused in between is skipped, not
+        // terminated. An unreadable second read is also a skip — it cannot authorize a kill.
+        stages.forceKillAt = Date.now();
+        const killBudgetMs = Math.max(0, deadlineAt - Date.now());
+        const recheckBudget = Math.max(
+          0,
+          Math.min(STOP_KILL_RECHECK_MAX_MS, killBudgetMs - STOP_IDENTITY_PROBE_RESERVE_MS),
+        );
+        const recheck = await this.recheckBeforeKill([...ownedAlive.values()], recheckBudget);
+        for (const entry of recheck.skipped) {
+          ownedAlive.delete(entry.pid);
+          killSkipped.push({ pid: entry.pid, reason: entry.reason ?? entry.action });
+          if (entry.action === 'reused') reused.set(entry.pid, entry);
+          if (entry.action === 'unconfirmed') unconfirmed.set(entry.pid, entry);
+          this.appendDiagnostics(
+            `[kill-skip] pid=${entry.pid} reason=${entry.action} expected=${entry.created} actual=${entry.actual ?? ''}`,
+          );
+          void this.emitEvent('spoutLayer.kill.skipped', {
+            pid: entry.pid,
+            generation,
+            reason: entry.reason ?? entry.action,
+            expected: entry.created,
+            actual: entry.actual ?? '',
+          });
+        }
+        killTargets = recheck.targets;
+        if (killTargets.length > 0) {
+          const rootTarget = killTargets.some((entry) => entry.pid === pid) ? pid : 0;
+          const childTargets = killTargets.map((entry) => entry.pid).filter((id) => id !== pid);
+          const work = [];
+          if (rootTarget > 0) {
+            work.push(this.killTree(rootTarget, killBudgetMs).then(
+              (value) => { if (value === true) killed = true; return value; },
+              () => false,
+            ));
+          }
+          if (childTargets.length > 0) {
+            work.push(this.killPids(childTargets, killBudgetMs).then(
+              (ids) => { if (Array.isArray(ids) && ids.length > 0) killed = true; return ids; },
+              () => [],
+            ));
+          }
+          // A wedged taskkill must not consume the confirmation time.
+          await this.awaitWithin(Promise.all(work), Math.max(0, deadlineAt - Date.now()));
+          stages.forceKillDoneAt = Date.now();
+        }
+      } else if (ownedAlive.size > 0) {
+        // The deadline left no room for the second read. Never kill on the first reading: the PIDs
+        // stay unconfirmed survivors and the stop reports failure instead of guessing.
+        for (const entry of ownedAlive.values()) {
+          unconfirmed.set(entry.pid, { ...entry, status: 'unconfirmed', reason: 'no-time-to-recheck' });
+        }
+        ownedAlive.clear();
+      }
+
+      // 4. Confirmation by liveness, over the verified subset only. Reused PIDs are absent here;
+      //    an unconfirmed PID can block success but is never counted as gone.
+      const leftoverOwned = await this.waitForPidsGone(
+        killTargets.map((entry) => entry.pid),
+        deadlineAt,
+      );
+      const leftoverUnconfirmed = [...unconfirmed.values()]
+        .filter((entry) => this.alive(entry.pid))
+        .map((entry) => entry.pid);
+      const survivors = [...new Set([...leftoverOwned, ...leftoverUnconfirmed])];
       const processTreeGone = survivors.length === 0;
       // If the graceful wait timed out but the forced kill then landed, the confirmed liveness is
       // the exit evidence. A still-unconfirmed tree keeps childExitAt null.
@@ -2474,8 +2958,10 @@ export class SpoutLayer {
       const elapsedMs = Date.now() - requestedAt;
       const hostTeardownFinished = elapsedMs <= budgetMs + STOP_DEADLINE_SLACK_MS;
       const ackReceived = Number(stages.ackReceivedAt ?? 0) > 0;
+      const reusedPids = [...reused.keys()];
+      const unconfirmedPids = [...unconfirmed.keys()];
       this.appendDiagnostics(
-        `[stop] how=${how} killed=${String(killed)} confirmed=${String(processTreeGone)} elapsedMs=${elapsedMs} budgetMs=${budgetMs} owned=${owned.join(',')} survivors=${survivors.join(',')} stages=${JSON.stringify(stages)}`,
+        `[stop] how=${how} killed=${String(killed)} confirmed=${String(processTreeGone)} elapsedMs=${elapsedMs} budgetMs=${budgetMs} owned=${owned.join(',')} reused=${reusedPids.join(',')} unconfirmed=${unconfirmedPids.join(',')} survivors=${survivors.join(',')} stages=${JSON.stringify(stages)}`,
       );
 
       if (!processTreeGone) {
@@ -2500,6 +2986,9 @@ export class SpoutLayer {
           processTreeGone: false,
           hostTeardownFinished,
           survivors,
+          reused: reusedPids,
+          unconfirmed: unconfirmedPids,
+          killSkipped,
           stages: finalStages,
           ownership: this.ownership,
         });
@@ -2522,6 +3011,10 @@ export class SpoutLayer {
           running: true,
           stopFailed: true,
           sessionRetained: true,
+          survivors,
+          reused: reusedPids,
+          unconfirmed: unconfirmedPids,
+          killSkipped,
           ownership: this.ownership,
         };
       }
@@ -2531,6 +3024,7 @@ export class SpoutLayer {
       this.child = null;
       this.pid = 0;
       this.created = '';
+      this.createdProvisional = false;
       this.ownership = null;
       this.stoppedAt = Date.now();
       this.readyPhase = 'stopped';
@@ -2555,6 +3049,9 @@ export class SpoutLayer {
         confirmed: true,
         processTreeGone: true,
         hostTeardownFinished: finalHostTeardownFinished,
+        reused: reusedPids,
+        unconfirmed: unconfirmedPids,
+        killSkipped,
         stages: finalStages,
       });
       return {
@@ -2573,6 +3070,9 @@ export class SpoutLayer {
         ackReceived,
         running: false,
         sessionRetained: released.cleared !== true && released.reason !== 'no-session',
+        reused: reusedPids,
+        unconfirmed: unconfirmedPids,
+        killSkipped,
         vts,
       };
     } finally {
@@ -3114,6 +3614,9 @@ export class SpoutLayer {
           created: this.ownership.created,
           root: this.ownership.root,
           children: [...(this.ownership.children ?? [])],
+          /** PID to that descendant's own creation time (`''` when the read failed). */
+          childCreated: { ...(this.ownership.childCreated ?? {}) },
+          createdProvisional: this.ownership.createdProvisional === true,
           capturedAt: this.ownership.capturedAt,
         },
       lastCleanup: this.cleanup,

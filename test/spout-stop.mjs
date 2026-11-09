@@ -180,6 +180,8 @@ test('1. a successful taskkill is not a confirmed stop while liveness still says
   let killCalls = 0;
   let descendantCalls = 0;
   layer.alive = () => true; // the fake lives forever
+  // Identity is verified before the kill: the root's recorded creation time matches.
+  layer.processCreatedAt = async () => layer.created;
   layer.killTree = async () => {
     killCalls += 1;
     return true; // taskkill "succeeds"
@@ -370,6 +372,8 @@ test('4. deadline 500 ms with a 2 s receiver cleanup returns at ~500 ms with con
   });
   attachFake(layer, child);
   layer.alive = (id) => alive.has(Number(id));
+  // Keep the wedged-kill path under test: the root identity still matches, so the force kill runs.
+  layer.processCreatedAt = async () => layer.created;
   layer.killTree = async () => new Promise(() => {}); // a wedged taskkill, never settles
   layer.killPids = async () => new Promise(() => {});
   let descendantCalls = 0;
@@ -396,8 +400,12 @@ test('4. deadline 500 ms with a 2 s receiver cleanup returns at ~500 ms with con
 test('5. a descendant that outlives the root keeps the tree unconfirmed', async (t) => {
   const rootPid = 800005;
   const childPid = 800006;
+  const childCreated = '2026-11-06T00:00:01.000Z';
   const alive = new Set([childPid]); // root is already gone, GPU/renderer child is not
   const layer = makeLayer({ pid: rootPid, children: [childPid] });
+  // The descendant's own identity was captured while the layer was running; it still matches.
+  layer.ownership.childCreated = { [childPid]: childCreated };
+  layer.processCreatedAt = async (id) => (Number(id) === childPid ? childCreated : '');
   const child = makeFakeChild({ pid: rootPid });
   child.exitCode = 0; // main process already exited
   attachFake(layer, child);
@@ -421,6 +429,7 @@ test('5. a descendant that outlives the root keeps the tree unconfirmed', async 
   assert.equal(result.ok, false);
   assert.equal(result.stopFailed, true);
   assert.deepEqual(result.ownership?.children, [childPid], 'ownership survives the failed stop');
+  assert.deepEqual(result.ownership?.childCreated, { [childPid]: childCreated });
   assert.equal(existsSync(sessionFile), true, 'session.json survives the failed stop');
   assert.ok(result.elapsedMs <= 300 + 150);
 });
