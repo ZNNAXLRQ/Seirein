@@ -241,6 +241,13 @@ const ENDPOINT_SILENCE_SAMPLE_EVERY = 10;
 const DELIVERY_SKIP_SUMMARY_MAX = 100;
 
 /**
+ * Daily speaker-candidate floor: a clip shorter than this is still scored by the shadow (600 ms is
+ * the embedding floor) but is never offered to the host's `onSpeakerSample` seam. The candidate
+ * requires an `ok` quality clip on the mic lane at or above this duration; nothing else changes.
+ */
+const SPEAKER_CANDIDATE_MIN_MS = 800;
+
+/**
  * Start streaming recognition.
  * @param {{ffmpegPath: string, modelDir: string, finalModelDir?: string, device: string,
  *          gainDb?: number, streamThreads?: number, finalThreads?: number, decodeCapSec?: number,
@@ -400,6 +407,16 @@ export function startHearing({
   speakerLibraryRoot = '',
   speakerModelDownloader = null,
   speakerModelMirrors = [],
+  /**
+   * Daily speaker-candidate seam (listener only; the host is not wired to it in this round). The
+   * shadow offers one sample per qualifying utterance: microphone lane, `quality: 'ok'`, at least
+   * `SPEAKER_CANDIDATE_MIN_MS` long, and only after the embedder actually produced an embedding.
+   * `embedding` and `samples` are fresh copies (the second is the utterance's 16 kHz mono PCM), the
+   * call is deferred off the delivery path, and a listener that throws or rejects is ignored.
+   * Nothing here creates a template, writes the speaker library or changes delivery, memory or the
+   * lexicon.
+   */
+  onSpeakerSample = null,
   /**
    * Continuous dialogue capture (capture + boundary only; the rendered context is not injected).
    * `dialogueContext` is an instance the host may keep across capture sessions and `dialogueFactory`
@@ -839,8 +856,55 @@ export function startHearing({
   });
   /** The annotated three-state verdict for one row; the classifier is the one source of truth. */
   const speakerVerdict = (snapshot, input) => classifyShadow({ ...speakerContext(snapshot), ...input });
+  /**
+   * Daily speaker-candidate seam (listener only). One qualifying utterance yields at most one call:
+   * mic lane, `quality: 'ok'`, at least `SPEAKER_CANDIDATE_MIN_MS`, and only after the shadow
+   * computed a real embedding. Both buffers are copied so the host can never hold or mutate capture
+   * state; the deferred call sits beside delivery, and a throwing or rejecting listener is swallowed.
+   */
+  const speakerSampleEmitted = new Set();
+  const noteSpeakerSample = (snapshot, verdict, embedding, text) => {
+    if (typeof onSpeakerSample !== 'function' || stopped) return;
+    // Only a real microphone lane: an unnamed input is not promoted to `mic`, and loopback is a
+    // different person's audio far more often than not.
+    if (inputSource !== 'mic' || verdict.quality !== 'ok') return;
+    if (!(embedding instanceof Float32Array) || embedding.length === 0) return;
+    if (!(Number.isFinite(snapshot.durationMs) && snapshot.durationMs >= SPEAKER_CANDIDATE_MIN_MS)) return;
+    const samples = snapshot.speakerSamples;
+    if (!(samples instanceof Float32Array) || samples.length === 0) return;
+    if (speakerSampleEmitted.has(snapshot.utteranceId)) return;
+    speakerSampleEmitted.add(snapshot.utteranceId);
+    if (speakerSampleEmitted.size > 64) {
+      speakerSampleEmitted.delete(speakerSampleEmitted.values().next().value);
+    }
+    // Copy the small vector now: an embedder may reuse its output buffer on the next call.
+    const embeddingCopy = embedding.slice();
+    const utteranceText = typeof text === 'string' && text.length > 0 ? text : snapshot.onlineText;
+    setImmediate(() => {
+      try {
+        const result = onSpeakerSample({
+          utteranceId: snapshot.utteranceId,
+          embedding: embeddingCopy,
+          samples: samples.slice(),
+          sampleRate: 16000,
+          durationMs: Math.round(snapshot.durationMs),
+          source: 'mic',
+          quality: verdict.quality,
+          decision: verdict.decision,
+          text: utteranceText,
+        });
+        if (result !== null && typeof result?.then === 'function') {
+          result.then(undefined, () => {
+            /* an async listener failure never reaches delivery or the shadow */
+          });
+        }
+      } catch {
+        /* a listener failure never reaches delivery or the shadow */
+      }
+    });
+  };
   /** Score one utterance against the library. Runs after delivery and never touches its update. */
-  const runSpeakerShadow = (snapshot) => {
+  const runSpeakerShadow = (snapshot, text = '') => {
     if (stopped) return;
     try {
       const embedder = ensureSpeakerEmbedder();
@@ -881,6 +945,7 @@ export function startHearing({
         runnerUpScore: result.runnerUpScore,
         margin: result.margin,
       });
+      noteSpeakerSample(snapshot, verdict, embedding, text);
       emitSpeakerShadow({
         decision: verdict.decision,
         score: result.score,
@@ -897,7 +962,7 @@ export function startHearing({
     }
   };
   /** Called only from the delivered branch: too-short is recorded without loading/computing. */
-  const maybeSpeakerShadow = (snapshot) => {
+  const maybeSpeakerShadow = (snapshot, text = '') => {
     if (!speakerShadowOn || stopped) return;
     const samples = snapshot.speakerSamples;
     if (!(samples instanceof Float32Array) || samples.length < SPEAKER_SHADOW_MIN_SAMPLES) {
@@ -911,7 +976,7 @@ export function startHearing({
       });
       return;
     }
-    setImmediate(() => runSpeakerShadow(snapshot));
+    setImmediate(() => runSpeakerShadow(snapshot, text));
   };
 
   const args = [
@@ -2045,9 +2110,11 @@ export function startHearing({
         });
       }
       // A merged group keeps each fragment's own PCM, so every fragment is scored on its own audio.
+      // The candidate seam receives the delivered text for a single final, and each fragment's own
+      // streaming text inside a group (there is no per-fragment delivered text to report).
       const shadowTargets = Array.isArray(snapshot.groupSegments) ? snapshot.groupSegments : null;
-      if (shadowTargets === null) maybeSpeakerShadow(snapshot);
-      else for (const entry of shadowTargets) maybeSpeakerShadow(entry.snapshot);
+      if (shadowTargets === null) maybeSpeakerShadow(snapshot, outcome.text);
+      else for (const entry of shadowTargets) maybeSpeakerShadow(entry.snapshot, entry.snapshot.onlineText);
       return true;
     }
     if (!audible || !loudEnough) {
