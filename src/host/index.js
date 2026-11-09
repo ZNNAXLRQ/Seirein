@@ -461,6 +461,7 @@ import {
   requestsFullRead,
   sentenceEndIndex,
   speechCharCount,
+  spokenLint,
   splitSentences,
   stripMemoryInjection,
   takeSentences,
@@ -1037,13 +1038,20 @@ const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不�
 提炼核心回应，不逐段复述正文；不要重复正文里已经说过的铺陈与例子；
 输出一段连贯口语，一句话说清一个意思。
 
-口语硬约束（优先级高于文采与结构；与上面各步冲突时，以本节为准）：
-- 一句一个意思，尽量短句（约 25 字以内）；长定语拆成短句，不把从句套从句。
-- 不输出 Markdown、标题、编号、括号、引号、破折号或表情符号；停顿只用逗号和句号。
-- 少用书面连接词堆叠（其实、所以、正是、这种、并且、而）；需要时用自然口语，但不要过量。
-- 不念“第一、第二、总之”这类结构词，也不做结尾总结。
-- 保留人设语气，但不堆语气词，不靠撒娇或铺垫。
-- 示例（书面长句 → 两句口语）：书面“正是这种言外之意，才是两个人之间最难说清的部分。”改成口语“有些话没说出来。那才是最难说清的。”`;
+口语硬约束（优先级高于文采与结构，但低于事实、语义与人设；与上面各步的措辞偏好冲突时，以本节为准，但不得删改任何语义）：
+- 一句一个主要意思。句子长短跟着口气走，不为了短而硬拆；定语太长、从句套从句时再拆成短句。
+- 不朗读 Markdown、标题、编号、列表符号、emoji 或装饰符号。括号补充、引号里的原话、破折号停顿，生成时尽量改成自然口语；引号里的原话可以改成间接引语。不要为了躲符号而删掉内容、引用对象或必要停顿。
+- 连接词按口气自然使用，不堆砌，也不禁用“其实”“所以”这类承担纠正或因果的词。
+- 不念“第一、第二、总之”这类结构词，不写文章式结尾或总结。
+- 人设与已有表达优先：保留语气、称呼、语气词、轻笑等自然表达，不为了“干净”删掉；也不要额外堆语气词、撒娇或铺垫。
+- 书面比喻、成语、评论腔优先考虑直说，但人设正需要这种说法时保留。
+- 真实样本（只学句式，不要照抄内容，也不是逐字套用的模板）：
+  样本一
+  书面：片子好不好是外面那把尺子的事，他想看的是你在里面熬了多少日子，所以不管成品被骂成什么样，他都会收下。
+  口语：他其实在说，别人只看片子好不好。他更想知道，你为这个角色花了多少时间。所以片子被骂成什么样，他都认。
+  样本二
+  书面：这种「一开始不对付」的铺垫其实是最好的调味料：先让你习惯她们互相看不顺眼，再让你发现，其实两人一直在偷偷观察对方。
+  口语：一开始两个人互相看不顺眼，这个安排挺有意思。你先觉得她们不对付，后来才发现，两个人其实一直在偷偷看对方。`;
 
 /**
  * The current user question, appended to every spoken-version request. The guide's first step is
@@ -14126,6 +14134,29 @@ export function apply(ctx, config) {
     }).catch(() => {});
   };
   /**
+   * One `voice.spoken.lint` row for a successfully generated spoken version. Observation only:
+   * it runs after adoption, never edits the text, never blocks or retries, and never adds a model
+   * call. The row deliberately carries COUNTS + hint words, never the spoken text itself. A
+   * non-zero quote/em-dash/emoji count is not an error (persona may use them); `copyRisk` only
+   * says the spoken version kept ≥95% of the body's characters.
+   */
+  const emitSpokenLint = ({ turn = null, text = '', bodyChars = 0 } = {}) => {
+    try {
+      const lint = spokenLint(text, { bodyChars });
+      void log.emit('voice.spoken.lint', {
+        turn: Number.isSafeInteger(turn) ? turn : null,
+        maxSentenceChars: lint.maxSentenceChars,
+        quoteMarks: lint.quoteMarks,
+        emDashes: lint.emDashes,
+        emoji: lint.emoji,
+        writtenStyleHints: lint.writtenStyleHints,
+        copyRisk: lint.copyRisk,
+      }).catch(() => {});
+    } catch {
+      /* observation only: a lint failure must never affect what is spoken */
+    }
+  };
+  /**
    * The typed round gets the same speech treatment as a voice round: the session keeps the full
    * body, the voice outlet says a short, need-organized spoken version (`source:'condensed'`).
    * Short answers and explicit "read it all" requests are spoken verbatim; a failed rewrite falls
@@ -14179,6 +14210,7 @@ export function apply(ctx, config) {
           turn: null, purpose: 'typed', replyVersion: 0, chars: checked.chars,
           source: 'condensed', ms: Number(result?.doneMs) || 0, adopted: true, refused: false,
         }).catch(() => {});
+        emitSpokenLint({ turn: boundTurn, text: checked.text, bodyChars: speechCharCount(full) });
         return finish({ text: checked.text, caption: checked.text, source: 'condensed' });
       }
       void log.emit('voice.spoken.fallback', { turn: null, purpose: 'typed', reason: checked.reason }).catch(() => {});
@@ -15192,6 +15224,9 @@ export function apply(ctx, config) {
               plan.feedText = checked.text;
               plan.ms = ms;
               await emitSpokenVersion(plan, 'condensed', plan.chars, ms);
+              emitSpokenLint({
+                turn: plan.turn, text: checked.text, bodyChars: speechCharCount(speechSource),
+              });
               return plan;
             }
             failure = checked.reason;
@@ -15491,6 +15526,9 @@ export function apply(ctx, config) {
         // success, not a supersession, and must not drop the first-sentence/latency observation.
         const ownedAtDecision = responseGroups.isCurrentAnswer(voiceGroup, voiceGroupVersion);
         await emitSpokenVersion(plan, plan.source, plan.chars, plan.ms, plan.fallback ?? '');
+        if (plan.source === 'condensed') {
+          emitSpokenLint({ turn: plan.turn, text: plan.text, bodyChars: speechCharCount(full) });
+        }
         spokenPlan = plan;
         responseGroups.noteAnswerPlan({
           group: voiceGroup,

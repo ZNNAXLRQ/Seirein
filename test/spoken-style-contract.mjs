@@ -3,11 +3,11 @@
  * normalization that backs them.
  *
  * Two independent layers are asserted here:
- *   1. `SPOKEN_VERSION_GUIDE` carries a short-sentence / no-formatting / few-written-connective
- *      section whose priority is explicitly above style and structure;
- *   2. `normalizeSpokenVersion` cleans presentation marks without deleting content, and accepts a
- *      candidate whose length equals the body (turn 11: 166 chars -> 166 chars) while still
- *      refusing anything longer.
+ *   1. `SPOKEN_VERSION_GUIDE` carries a soft short-sentence / natural-phrasing contract whose
+ *      priority is explicitly below facts, semantics and persona, plus two real few-shot pairs;
+ *   2. `normalizeSpokenVersion` cleans presentation marks without deleting content (negation,
+ *      causality, numbers/units, names, conditions, persona particles), and accepts a candidate
+ *      whose length equals the body while refusing anything longer.
  *
  * The explicit full-read path is unchanged: "详细讲 / 全部读出来" still speaks the body at its
  * own completeness, and the guide still says so.
@@ -30,51 +30,65 @@ assert.notEqual(guideEnd, -1, 'SPOKEN_VERSION_GUIDE is a template literal');
 const guide = indexSource.slice(guideStart, guideEnd);
 
 // ---------------------------------------------------------------------------
-// 1. The hard constraint block exists and outranks style/structure
+// 1. The hard constraint block exists, stays soft on length, and never outranks semantics/persona
 // ---------------------------------------------------------------------------
-test('1. guide 含口语硬约束，且优先级高于文采与结构', (t) => {
+test('1. guide 含软性短句约束、两组 few-shot 与语义/人设优先', (t) => {
   for (const marker of [
     '口语硬约束',
     '优先级高于文采与结构',
+    '但低于事实、语义与人设',
     '冲突时，以本节为准',
   ]) {
     assert.ok(guide.includes(marker), `missing priority marker "${marker}"`);
   }
 
-  // One meaning per sentence, short sentences, long attributives split out.
-  for (const marker of ['一句一个意思', '尽量短句', '约 25 字', '长定语拆成短句']) {
-    assert.ok(guide.includes(marker), `missing short-sentence rule "${marker}"`);
+  // One main idea per sentence; long attributives split out; short sentences stay a soft rule.
+  for (const marker of ['一句一个主要意思', '句子长短跟着口气走', '不为了短而硬拆', '定语太长', '再拆成短句']) {
+    assert.ok(guide.includes(marker), `missing soft short-sentence rule "${marker}"`);
   }
+  assert.ok(!guide.includes('约 25 字'), 'no hard 25-character ceiling');
+  assert.ok(!/每句超过约\s*25\s*字|超过\s*25\s*字就拆/u.test(guide), 'no split-if-over-25 rule');
 
-  // No Markdown / headings / numbering / brackets / quotes / dashes / emoji.
+  // Formatting is phrased as "say it naturally", not a blanket ban on quotes/brackets/dashes.
   for (const marker of [
-    '不输出 Markdown', '标题', '编号', '括号', '引号', '破折号', '表情符号',
-    '停顿只用逗号和句号',
+    '不朗读 Markdown', '标题', '编号', '列表符号',
+    '括号补充', '引号里的原话', '破折号停顿',
+    '生成时尽量改成自然口语', '间接引语', '不要为了躲符号而删掉内容',
   ]) {
     assert.ok(guide.includes(marker), `missing no-formatting rule "${marker}"`);
   }
 
-  // Written connectives are limited, not banned outright.
-  assert.match(
-    guide,
-    /少用书面连接词堆叠[^。]*其实、所以、正是、这种、并且、而/u,
-    'the guide names the written connectives to avoid stacking',
-  );
-  assert.match(guide, /需要时用自然口语，但不要过量/u, 'natural spoken connectives are allowed, not excessive');
+  // Connectives are not banned: 其实/所以 may carry correction or causality.
+  assert.ok(guide.includes('不禁用“其实”“所以”'), 'the guide explicitly allows 其实/所以');
+  assert.ok(!guide.includes('少用书面连接词堆叠'), 'the old blanket connective warning is gone');
 
   // No structural signposting or closing summary.
-  for (const marker of ['结构词', '第一、第二、总之', '结尾总结']) {
+  for (const marker of ['结构词', '第一、第二、总之', '文章式结尾', '总结']) {
     assert.ok(guide.includes(marker), `missing no-structure-word rule "${marker}"`);
   }
 
-  // Persona voice survives, without piling up particles or coy padding.
-  for (const marker of ['保留人设语气', '不堆语气词', '不靠撒娇或铺垫']) {
+  // Persona expression survives; it is never deleted for "cleanliness".
+  for (const marker of ['人设与已有表达优先', '语气词', '轻笑', '不为了“干净”删掉']) {
     assert.ok(guide.includes(marker), `missing persona-tone rule "${marker}"`);
   }
 
-  // Exactly one short contrast example, not a long tutorial.
-  assert.equal((guide.match(/示例/gu) ?? []).length, 1, 'exactly one contrast example');
-  assert.ok(guide.includes('书面') && guide.includes('口语'), 'the example contrasts written and spoken');
+  // Written metaphors are only a preference, not a blanket rewrite rule.
+  assert.ok(guide.includes('书面比喻、成语、评论腔优先考虑直说'), 'written metaphors prefer plain speech');
+  assert.ok(guide.includes('人设正需要这种说法时保留'), 'a persona-required metaphor is kept');
+  assert.ok(guide.includes('只学句式') && guide.includes('不是逐字套用的模板'),
+    'the samples are examples, not absolute templates');
+
+  // The two real written→spoken pairs are both present, word for word.
+  assert.equal((guide.match(/书面：/gu) ?? []).length, 2, 'two written samples');
+  assert.equal((guide.match(/口语：/gu) ?? []).length, 2, 'two spoken samples');
+  for (const sample of [
+    '片子好不好是外面那把尺子的事',
+    '他其实在说，别人只看片子好不好',
+    '这种「一开始不对付」的铺垫其实是最好的调味料',
+    '一开始两个人互相看不顺眼，这个安排挺有意思',
+  ]) {
+    assert.ok(guide.includes(sample), `missing few-shot sample "${sample}"`);
+  }
 
   // The earlier five-step need-oriented structure is intact.
   for (const marker of [
@@ -86,7 +100,7 @@ test('1. guide 含口语硬约束，且优先级高于文采与结构', (t) => {
   ]) {
     assert.ok(guide.includes(marker), `the five-step guide survives: "${marker}"`);
   }
-  t.diagnostic(`guideChars=${guide.length} hardConstraints=yes fiveStepsIntact=yes examples=1`);
+  t.diagnostic(`guideChars=${guide.length} hardConstraints=yes fiveStepsIntact=yes samples=2`);
 });
 
 // ---------------------------------------------------------------------------
@@ -152,4 +166,43 @@ test('3. 空串/过短/前言仍按原 reason 拒绝；用户要求详细时仍�
   );
   assert.ok(guide.includes('不要为了简短而省略'), 'the guide never trades completeness for brevity');
   t.diagnostic(`empty/too-short/preamble refused; fullRead=unchanged`);
+});
+
+// ---------------------------------------------------------------------------
+// 4. Semantic fidelity: cleanup keeps negation/causality/units/names/conditions/persona
+// ---------------------------------------------------------------------------
+test('4. 语义保真：否定、因果、数字单位、名称、补充条件、人设语气词都不被清理删掉', (t) => {
+  const source = '这是一段足够长的正文，用来做语义保真的长度基准。';
+  const cases = [
+    ['negation', '不是取消，是改到明天。', ['不是', '取消', '改到明天']],
+    ['causality', '因为临时有变，所以改到明天。', ['因为', '所以', '改到明天']],
+    ['range+unit', '明天 10—20℃，记得带伞。', ['10—20℃', '带伞']],
+    ['minus+unit', '最低会到 -5℃，风很大。', ['-5℃', '风很大']],
+    ['name reference', '《三体》里的叶文洁很关键。', ['三体', '叶文洁']],
+    ['supplementary condition', '活动到周日（周末除外）。', ['活动到周日', '周末除外']],
+    ['persona particles', '好呀，别担心啦。', ['好呀', '别担心啦']],
+  ];
+  for (const [label, candidate, fragments] of cases) {
+    const result = normalizeSpokenVersion(source, candidate);
+    assert.equal(result.ok, true, `${label}: the candidate is adopted`);
+    for (const fragment of fragments) {
+      assert.ok(result.text.includes(fragment), `${label}: kept "${fragment}" in "${result.text}"`);
+    }
+  }
+
+  // Title marks are presentation only; the referenced work stays.
+  const named = normalizeSpokenVersion(source, '《三体》里的叶文洁很关键。');
+  assert.ok(!named.text.includes('《') && !named.text.includes('》'), 'title marks are dropped');
+  assert.ok(named.text.includes('三体') && named.text.includes('叶文洁'), 'the reference object is kept');
+
+  // Equal length is adopted conservatively: equality is fine, one character over is not.
+  const equalBody = '等长正文'.repeat(8);
+  const equal = normalizeSpokenVersion(equalBody, equalBody);
+  assert.equal(equal.ok, true, 'an equal-length spoken version is accepted');
+  assert.equal(equal.chars, [...equalBody].length);
+  const longer = normalizeSpokenVersion(equalBody, `${equalBody}多一句。`);
+  assert.equal(longer.ok, false, 'a longer candidate is still refused');
+  assert.equal(longer.reason, 'not-shorter');
+  assert.match(textSource, /if \(chars > sourceChars\) return \{ ok: false, text, chars, reason: 'not-shorter' \}/u);
+  t.diagnostic(`semanticCases=${cases.length} equal=${equal.chars} longer=${longer.reason}`);
 });

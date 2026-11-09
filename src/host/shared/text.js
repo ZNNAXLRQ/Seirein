@@ -172,8 +172,10 @@ export function requestsFullRead(utterance) {
 /**
  * Read-aloud cleanup for a model-produced spoken version. Every rule only removes presentation
  * (Markdown emphasis/backticks) or punctuation that is not spoken (paired quotation/book-title
- * wrappers keep their content, em dashes become a comma pause, emoji/decorative symbols and
- * redundant whitespace disappear). No content word is ever deleted.
+ * wrappers keep their content, a prose em dash becomes a comma pause, emoji and decorative
+ * symbols and redundant whitespace disappear). Content is never deleted: negation, causality,
+ * numbers, units, names, supplementary conditions and persona particles all survive. A dash
+ * inside a numeric/alphanumeric range (10—20) is a range sign, not a pause, so it stays.
  * @param {string} value
  * @returns {string}
  */
@@ -197,14 +199,21 @@ function cleanSpokenText(value) {
   text = text.replace(/"([^"\n]*)"/gu, '$1');
   // A lone wrapper at either end is the same shape; strip it rather than speaking it.
   text = text.replace(/^["「『“'"‘《〈]+/u, '').replace(/["」』”'"’》〉]+$/u, '');
-  // An em dash is a pause, not a word.
-  text = text.replace(/——/gu, '，').replace(/—/gu, '，');
-  // Emoji, variation selectors, joiners and decorative symbol characters are never spoken.
+  // A prose em dash is a pause, not a word; a dash joining digits or Latin letters is a range
+  // (10—20, v1—v2) and must survive. En dashes / minus signs were never rewritten here.
+  text = text.replace(/—+/gu, (run, offset, whole) => {
+    const before = whole[offset - 1] ?? '';
+    const after = whole[offset + run.length] ?? '';
+    return /[0-9A-Za-z]/u.test(before) && /[0-9A-Za-z]/u.test(after) ? run : '，';
+  });
+  // Emoji, variation selectors and joiners are never spoken.
   text = text.replace(
     /[\p{Extended_Pictographic}\uFE0F\u200D\u20E3\u{1F1E6}-\u{1F3FF}]/gu,
     '',
   );
-  text = text.replace(/\p{So}/gu, '');
+  // A few purely decorative dingbats are presentation. Do NOT strip the whole Unicode `So`
+  // category: it also contains spoken units (°, ℃, ㎡) and would silently delete real content.
+  text = text.replace(/[★☆✦✧✩✪✫✬✭✮✯✰♪♫♬]/gu, '');
   // Only presentation whitespace is removed; words, numbers and sentence punctuation stay.
   text = text.replace(/\s*\n+\s*/gu, ' ').replace(/[ \t]+/gu, ' ').trim();
   return text;
@@ -215,8 +224,10 @@ function cleanSpokenText(value) {
  * `cleanSpokenText`); similarity is never used to delete anything. Only the shape is checked
  * (non-empty, not longer than the source, no model preamble/quoting), and every failure is
  * reported with a reason so the caller can fall back to the full body. Length equality is
- * allowed: turn 11 produced a 166-character spoken version for a 166-character body and the old
- * `>=` check rejected a usable answer.
+ * allowed and is a deliberate, conservative choice: an equal-length rewrite is accepted when it
+ * is content-faithful and actually sounds spoken, because rejecting it merely for not getting
+ * shorter would fall back to prose that is MORE written. "Equal" is not a way around the length
+ * ceiling: a longer candidate is still refused.
  * @returns {{ok: boolean, text: string, chars: number, reason: string}}
  */
 export function normalizeSpokenVersion(source, candidate) {
@@ -233,6 +244,77 @@ export function normalizeSpokenVersion(source, candidate) {
     return { ok: false, text, chars, reason: 'preamble' };
   }
   return { ok: true, text, chars, reason: '' };
+}
+
+/**
+ * Written-style words the lint only HINTS at: they are common in the source prose and easy to
+ * copy into a spoken version. Listing one never blocks, rewrites or judges the candidate.
+ */
+const WRITTEN_STYLE_HINTS = Object.freeze([
+  '言外之意', '尺子', '铺垫', '调味料', 'CP感', '扎心',
+]);
+/** Quotation / title marks the lint counts (never strips): 「」“”‘’《》. */
+const LINT_QUOTE_MARKS = '「」“”‘’《》';
+/** `longestSentence` is truncated to this many code points in the returned observation. */
+const LINT_LONGEST_MAX = 80;
+
+/**
+ * Read-only spoken-style lint. It never edits `text`, never blocks or retries, and costs no model
+ * call: callers use it only for observation. Counts are deliberately neutral — quotation marks,
+ * em dashes and emoji may be legitimate persona expression, so a non-zero count is not an error.
+ *
+ * - `sentences`: number of completed sentences (unterminated tail counted as one).
+ * - `maxSentenceChars`: code-point length of the longest sentence, terminator included.
+ * - `longestSentence`: that sentence truncated to 80 code points.
+ * - `quoteMarks`: total count of 「」“”‘’《》 characters.
+ * - `emDashes`: number of em-dash runs (a Chinese `——` is one run).
+ * - `emoji`: number of emoji code points.
+ * - `writtenStyleHints`: written-style words that actually occur, in a fixed order.
+ * - `copyRisk`: true when the spoken/body length ratio is ≥ 0.95; needs `bodyChars`, otherwise
+ *   false (not measured, never a judgement).
+ *
+ * @param {string} text
+ * @param {{bodyChars?: number}} [options]
+ * @returns {{sentences: number, maxSentenceChars: number, longestSentence: string,
+ *            quoteMarks: number, emDashes: number, emoji: number,
+ *            writtenStyleHints: string[], copyRisk: boolean}}
+ */
+export function spokenLint(text, { bodyChars = 0 } = {}) {
+  const value = String(text ?? '');
+  const sentences = splitSentences(value);
+  let maxSentenceChars = 0;
+  let longestSentence = '';
+  for (const sentence of sentences) {
+    const chars = speechCharCount(sentence);
+    if (chars > maxSentenceChars) {
+      maxSentenceChars = chars;
+      longestSentence = sentence;
+    }
+  }
+  const longestPoints = [...longestSentence];
+  if (longestPoints.length > LINT_LONGEST_MAX) {
+    longestSentence = longestPoints.slice(0, LINT_LONGEST_MAX).join('');
+  }
+  let quoteMarks = 0;
+  for (const char of value) {
+    if (LINT_QUOTE_MARKS.includes(char)) quoteMarks += 1;
+  }
+  const emDashes = (value.match(/—+/gu) ?? []).length;
+  const emoji = (value.match(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}]/gu) ?? []).length;
+  const writtenStyleHints = WRITTEN_STYLE_HINTS.filter((word) => value.includes(word));
+  const spokenChars = speechCharCount(value);
+  const body = Number(bodyChars);
+  const copyRisk = Number.isFinite(body) && body > 0 ? spokenChars / body >= 0.95 : false;
+  return {
+    sentences: sentences.length,
+    maxSentenceChars,
+    longestSentence,
+    quoteMarks,
+    emDashes,
+    emoji,
+    writtenStyleHints,
+    copyRisk,
+  };
 }
 
 /**
