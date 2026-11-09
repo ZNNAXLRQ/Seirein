@@ -19,15 +19,15 @@ export const OPERATIONS = Object.freeze({
 // id | label | family | states | events | semantic condition | styles | ordered operations
 // semantic=neutral is safe for an idle draw. Other rows require an explicit matching intent.
 const rows = [
-  ['idle-side', '侧看后停留', 'attention', 'idle,waiting', 'idle', 'neutral', 'reserved,composed,cool', 'head-turn'],
-  ['idle-tilt', '偏头安静停留', 'posture', 'idle,waiting', 'idle', 'neutral', 'gentle,dreamy,shy', 'head-tilt'],
-  ['idle-down', '低头短暂停留', 'posture', 'idle,waiting', 'idle', 'neutral', 'reserved,earnest', 'head-lower'],
+  ['idle-side', '侧看后停留', 'attention', 'idle,waiting,tired', 'idle', 'neutral', 'reserved,composed,cool', 'head-turn'],
+  ['idle-tilt', '偏头安静停留', 'posture', 'idle,waiting,tired', 'idle', 'neutral', 'gentle,dreamy,shy', 'head-tilt'],
+  ['idle-down', '低头短暂停留', 'posture', 'idle,waiting,tired', 'idle', 'neutral', 'reserved,earnest', 'head-lower'],
   ['idle-lift', '抬头舒展注意', 'posture', 'idle', 'idle', 'neutral', 'confident,cheerful', 'head-lift'],
   ['idle-center', '缓慢整理头部姿态', 'settle', 'idle,waiting,tired', 'idle,answer-end', 'neutral', 'composed,elegant', 'head-center'],
   ['idle-side-tilt', '转头后轻偏', 'posture', 'idle', 'idle', 'neutral', 'playful,curious', 'head-turn,head-tilt'],
   ['idle-tilt-side', '偏头后看向一侧', 'posture', 'idle', 'idle', 'neutral', 'dreamy,gentle', 'head-tilt,head-turn'],
-  ['idle-eye-side', '仅眼神短暂移开', 'attention', 'idle,waiting', 'idle', 'neutral', 'reserved,cool,shy', 'gaze-side'],
-  ['idle-eye-down', '仅眼神下移', 'attention', 'idle,waiting', 'idle', 'neutral', 'dreamy,composed', 'gaze-down'],
+  ['idle-eye-side', '仅眼神短暂移开', 'attention', 'idle,waiting,tired', 'idle', 'neutral', 'reserved,cool,shy', 'gaze-side'],
+  ['idle-eye-down', '仅眼神下移', 'attention', 'idle,waiting,tired', 'idle', 'neutral', 'dreamy,composed', 'gaze-down'],
   ['idle-eye-up', '仅眼神上移', 'attention', 'idle', 'idle', 'neutral', 'curious,playful', 'gaze-up'],
   ['idle-eye-head', '先眼后头移开注意', 'attention', 'idle', 'idle', 'neutral', 'lively,curious', 'gaze-side,head-turn'],
   ['idle-head-eye', '先头后眼移开注意', 'attention', 'idle', 'idle', 'neutral', 'elegant,composed', 'head-turn,gaze-side'],
@@ -104,13 +104,28 @@ const rows = [
 ];
 
 const split = text => text.split(',');
+/**
+ * A recipe whose every step is a centre/recenter operation is a "settle" action: it only makes
+ * sense when the observed pose is actually away from the natural baseline. The flag (and the
+ * threshold) is recipe metadata, so the selector never needs to hard-code recipe ids such as
+ * `idle-center`; the operation names are the semantic source of truth.
+ */
+const SETTLE_OPERATIONS = new Set(['head-center', 'head-center-lite', 'gaze-center']);
+const SETTLE_OFFSET_THRESHOLD = 0.06;
 export const RECIPES = Object.freeze(rows.map(([id, label, family, states, events, semantic, styles, operations]) => {
   const steps = split(operations);
+  const settle = steps.length > 0 && steps.every(op => SETTLE_OPERATIONS.has(op));
+  const settleChannels = settle
+    ? Object.freeze([...new Set(steps.flatMap(op => OPERATIONS[op] ?? []))])
+    : null;
   return Object.freeze({
     id, label, family, states: Object.freeze(split(states)), events: Object.freeze(split(events)),
     semantic, styles: Object.freeze(split(styles)), operations: Object.freeze(steps),
     requires: Object.freeze([...new Set(steps.flatMap(op => OPERATIONS[op]))]),
     requiresTarget: steps.includes('gaze-target'),
     requiresDirection: steps.includes('head-turn') && states === 'listening',
+    /** Settle/recenter metadata consumed by the selector's idle hard filter. */
+    settle,
+    ...(settle ? { offsetThreshold: SETTLE_OFFSET_THRESHOLD, settleChannels } : {}),
   });
 }));

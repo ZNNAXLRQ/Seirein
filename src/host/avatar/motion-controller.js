@@ -602,6 +602,14 @@ const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
  */
 const PRESET_DEBUG_THROTTLE_MS = 1000;
 const PRESET_COMMIT_THROTTLE_MS = 1000;
+/**
+ * D: after a real semantic action starts, the autonomous idle boundary stays quiet for this long.
+ * This is a separate clock: it never moves `nextDecisionAt`, and it only gates the idle draw —
+ * semantic events themselves keep their normal selection/arbitration path.
+ */
+const PRESET_SEMANTIC_QUIET_MS = 2000;
+/** B: the offset channels exposed to the selector (actual − natural), one value per axis. */
+const PRESET_POSTURE_OFFSET_CHANNELS = Object.freeze(['headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'bodyX']);
 /** Closed vocabulary of "why no preset ran" (`status.live2d.runtime.motion.presets.skips`). */
 const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
 
@@ -981,6 +989,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       selected: 0,
       dropped: 0,
       nextDecisionAt: null,
+      /**
+       * D: timestamp of the last REAL semantic start (`context.event !== 'idle'`). The idle
+       * boundary reads it as a separate quiet-window clock; it never shares `nextDecisionAt`.
+       */
+      lastSemanticAt: null,
       lastSelection: null,
       lastTrace: null,
       /**
@@ -1004,6 +1017,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       history: [],
       recentFamilies: [],
       recentActions: [],
+      /** Recipe ids of the same recent starts (bounded); recipe-level anti-repeat memory. */
+      recentRecipes: [],
+      /** Observability only: preset actions that contain a blink operation (never a second layer). */
+      blinkStarts: 0,
       lastSign: Object.create(null),
       random: createSeededRandom(`preset:${cfg.seed === undefined ? 'default' : String(cfg.seed)}`),
       /**
@@ -1821,6 +1838,34 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
   }
 
+  /**
+   * B: per-axis actual − natural posture offset, in the same normalised pose units the executor
+   * uses. Missing pose/baseline data yields `null` (UNKNOWN) — never a fabricated 0 that would look
+   * like "near baseline". Only axes that exist on both sides are included.
+   */
+  function presetPostureOffset() {
+    const actual = state.lastPose;
+    const natural = state.idle;
+    if (actual === null || actual === undefined || natural === null || natural === undefined) return null;
+    const offset = {};
+    let count = 0;
+    for (const channel of PRESET_POSTURE_OFFSET_CHANNELS) {
+      if (!Number.isFinite(actual[channel]) || !Number.isFinite(natural[channel])) continue;
+      offset[channel] = clampSigned(actual[channel] - natural[channel]);
+      count += 1;
+    }
+    return count > 0 ? offset : null;
+  }
+
+  /**
+   * "Legal posture hold" for the selector: an explicit choose-not-to-move decision. An ordinary
+   * hold window is not enough to block a settle request; a caller can always override with
+   * `postureHeld` / `recenterRequested` in its own select context.
+   */
+  function presetPostureHeld() {
+    return state.motion?.posture?.lastDecision === 'still';
+  }
+
   /** Normalise one selection request into the selector's context shape. */
   function presetContext(raw = {}) {
     const source = raw !== null && typeof raw === 'object' ? raw : {};
@@ -1855,9 +1900,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       style: source.style,
       recipe: source.recipe,
       persona: source.persona ?? presetPersona(),
+      /** B: per-axis actual − natural pose; `null` when no valid pose/baseline exists yet. */
+      postureOffset: presetPostureOffset(),
+      postureHeld: source.postureHeld !== undefined ? source.postureHeld === true : presetPostureHeld(),
+      /** Explicit "return to baseline" request bypasses the idle settle gate. */
+      recenterRequested: source.recenterRequested === true,
       recent: {
         families: state.presets.recentFamilies,
         actions: state.presets.recentActions,
+        recipes: state.presets.recentRecipes,
       },
       history: state.presets.history,
       now: Number.isFinite(source.now) ? source.now : (state.lastAt ?? clockNow()),
@@ -2759,12 +2810,37 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     state.presets.starts += 1;
     state.presets.lastSign = state.presets.lastSign ?? Object.create(null);
-    state.presets.history.push({ id: selection.presetId, at });
+    // Selection memory is written ONLY here, after a trajectory really started. A hold draw, a
+    // refused capability check, a takeover refusal and a later cancellation never enter it.
+    const historyEntry = {
+      id: selection.presetId,
+      recipe: typeof selection.recipe === 'string' ? selection.recipe : null,
+      family: typeof selection.family === 'string' ? selection.family : null,
+      at,
+    };
+    state.presets.history.push(historyEntry);
     while (state.presets.history.length > 32) state.presets.history.shift();
-    state.presets.recentFamilies.push(selection.family);
-    while (state.presets.recentFamilies.length > 8) state.presets.recentFamilies.shift();
+    if (typeof selection.family === 'string' && selection.family.length > 0) {
+      state.presets.recentFamilies.push(selection.family);
+      while (state.presets.recentFamilies.length > 8) state.presets.recentFamilies.shift();
+    }
+    // Push BOTH ids: the selector counts recipe repetition (same recipe, any variant) and exact
+    // preset repetition separately. Old preset-only entries are completed through the catalog.
+    if (typeof selection.recipe === 'string' && selection.recipe.length > 0) {
+      state.presets.recentRecipes.push(selection.recipe);
+      while (state.presets.recentRecipes.length > 8) state.presets.recentRecipes.shift();
+      state.presets.recentActions.push(selection.recipe);
+    }
     state.presets.recentActions.push(selection.presetId);
     while (state.presets.recentActions.length > 8) state.presets.recentActions.shift();
+    // D: a semantic action (answer-start / confused / …) starts the idle quiet window. Only a real
+    // start reaches this point; an idle action never moves the semantic clock.
+    if (typeof context.event === 'string' && context.event.length > 0 && context.event !== 'idle') {
+      state.presets.lastSemanticAt = at;
+    }
+    if ((selection.operations ?? []).some((operation) => operation === 'blink' || operation === 'double-blink')) {
+      state.presets.blinkStarts += 1;
+    }
     // Observability only: the executor already resolved these amounts; the event publishes them so
     // "it started" can be judged together with "how large / how long" (and reaches the host log).
     const plannedStages = presetPlannedStages(built.stages);
@@ -3144,6 +3220,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       notePresetGateSkip('busy', `busy:intent:${state.intentSeq}`, event, now);
       return null;
     }
+    // D: semantic actions and the autonomous idle draw have separate clocks. A real semantic
+    // start keeps the idle boundary quiet for a short window WITHOUT moving `nextDecisionAt`; the
+    // semantic action itself already went through the normal selection/arbitration path.
+    if (Number.isFinite(state.presets.lastSemanticAt)
+      && now - state.presets.lastSemanticAt < PRESET_SEMANTIC_QUIET_MS) {
+      notePresetGateSkip('busy', `semantic-recent:${state.presets.lastSemanticAt}`, event, now);
+      return null;
+    }
     if (state.presets.nextDecisionAt === null) {
       state.presets.nextDecisionAt = now + PRESET_EXECUTION.DECISION_MIN_MS
         + (PRESET_EXECUTION.DECISION_MAX_MS - PRESET_EXECUTION.DECISION_MIN_MS) * state.presets.random();
@@ -3303,6 +3387,36 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         },
       },
       recent: state.presets.recent.map((trace) => clonePresetTrace(trace)),
+      /** D: timestamp of the last real semantic start (read-only; the idle quiet window uses it). */
+      lastSemanticAt: state.presets.lastSemanticAt,
+      /**
+       * Selection memory is bounded and read-only here. Only a started trajectory appends; hold,
+       * refusal and cancellation never do. `history` completes legacy entries through the catalog
+       * inside the selector (unknown ids stay unknown).
+       */
+      selectionMemory: {
+        history: state.presets.history.map((entry) => ({ ...entry })),
+        recentFamilies: [...state.presets.recentFamilies],
+        recentActions: [...state.presets.recentActions],
+        recentRecipes: [...state.presets.recentRecipes],
+      },
+      /**
+       * Blink ownership is reported, not changed: the continuous base blink layer keeps running
+       * and a preset blink is a second writer on the same eye channels. This evidence is NOT part
+       * of the idle-diversity count.
+       */
+      blinkLayers: {
+        baseline: { active: true, note: 'continuous base blink layer' },
+        preset: {
+          starts: state.presets.blinkStarts,
+          active: state.presets.active.some((item) => (
+            (item.operations ?? []).some((operation) => operation === 'blink' || operation === 'double-blink')
+          )),
+        },
+        dualDrive: state.presets.active.some((item) => (
+          (item.operations ?? []).some((operation) => operation === 'blink' || operation === 'double-blink')
+        )),
+      },
     };
   }
 

@@ -32,9 +32,22 @@
  *   persona            { styles?: string[] | Record<styleId, 0..1>, dimensions?: {
  *                        liveliness, softness, restraint } } — soft affinity, never a ban
  *   recent             { families?: string[] | Record<string,number>,
- *                        actions?:  string[] | Record<string,number> } — newest last
+ *                        actions?: string[] | Record<string,number>,
+ *                        recipes?: string[] | Record<string,number> } — newest last.
+ *                      `actions` may contain preset ids or recipe ids; an old preset-only entry is
+ *                      completed through the catalog, never guessed.
  *   recentWindow       how many newest recent entries to count (default 4)
- *   history            [{ id, at }] recent plays for the frequency constraint
+ *   history            [{ id, recipe?, family?, at }] recent plays for the frequency constraint.
+ *                      A legacy `{ id, at }` entry is completed through the catalog when possible;
+ *                      an unknown id stays unknown and is only counted at preset level.
+ *   postureOffset      { headX?, headY?, headZ?, gazeX?, gazeY?, bodyX? } — actual − natural pose,
+ *                      per axis, already normalised to the controller's pose units. Missing axes
+ *                      are absent (never 0); `null` means "no valid pose/baseline, do not infer".
+ *   postureHeld        true when the current posture is an explicitly held one. A settle candidate
+ *                      is skipped then (reason `posture-held`), unless `recenterRequested` is true.
+ *   recenterRequested  explicit "return to baseline" request: bypasses the idle settle gate.
+ *   settleOffsetThreshold  per-draw enter threshold override (default 0.06); the exit threshold is
+ *                      wider (hysteresis), so an observed offset near the boundary cannot flicker.
  *   now                ms timestamp used to window `history` (absent = count all)
  *   frequencyWindowMs  history window (default 60000)
  *   family, style, recipe  optional hard narrowing (family id / affinity tag / recipe id)
@@ -62,7 +75,7 @@
  * exactly like `queryPresets`.
  */
 
-import { PRESETS, OPERATIONS, STYLES } from './presets/index.js';
+import { PRESETS, OPERATIONS, RECIPES, STYLES } from './presets/index.js';
 
 // ---------------------------------------------------------------------------------------------
 // Constants: scoring, intent vocabulary, optional channels. None of this edits the library.
@@ -87,8 +100,20 @@ const PERSONA_SPAN = 0.8;
 const STATE_SPECIFIC_BONUS = 1.12;
 const EVENT_SPECIFIC_BONUS = 1.12;
 const FAMILY_REPEAT_WEIGHT = 0.55;
-const ACTION_REPEAT_WEIGHT = 1;
-const FREQUENCY_WEIGHT = 0.8;
+/** Same recipe, different timing variant is still a repeat: this coefficient is deliberately < 1. */
+const RECIPE_REPEAT_WEIGHT = 0.45;
+/** Same exact preset is the strongest recent-repeat signal. */
+const PRESET_REPEAT_WEIGHT = 1;
+const RECIPE_FREQUENCY_WEIGHT = 0.35;
+const PRESET_FREQUENCY_WEIGHT = 0.8;
+/** Default settle/recenter enter threshold in pose units (one unit = 30° for head axes). */
+const DEFAULT_SETTLE_OFFSET_THRESHOLD = 0.06;
+/** Exit threshold = enter × this ratio: the band is wider than the entry, preventing flicker. */
+const SETTLE_OFFSET_EXIT_RATIO = 1.6;
+/** Operations that make a recipe a settle/recenter action (metadata is the source of truth). */
+const SETTLE_OPERATIONS = new Set(['head-center', 'head-center-lite', 'gaze-center']);
+/** Per-axis offset inputs shared by every pose-consuming gate (missing axes are simply absent). */
+const POSTURE_OFFSET_CHANNELS = Object.freeze(['headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'bodyX']);
 
 /** Event names that carry an explicit communicative intent (README, "筛选、概率与保持不动"). */
 const INTENT_EVENT_SEMANTIC = Object.freeze({
@@ -143,6 +168,12 @@ const STYLE_DIMENSION_PROFILES = Object.freeze({
 });
 const STYLE_DIMENSION_NAMES = Object.freeze(['liveliness', 'softness', 'restraint']);
 const KNOWN_STYLE_IDS = new Set(STYLES.map(style => style.id));
+/**
+ * Recipe metadata (`settle`, `offsetThreshold`, `settleChannels`) is authored in `presets/recipes.js`.
+ * `catalog.js` deliberately mirrors only the presentation fields onto each preset variant, so the
+ * selector reads the metadata by recipe id here — never by hard-coded recipe ids.
+ */
+const RECIPE_META = new Map(RECIPES.map(recipe => [recipe.id, recipe]));
 
 // ---------------------------------------------------------------------------------------------
 // Small numeric / random helpers
@@ -380,6 +411,21 @@ function recentCounts(input, window) {
   return counts;
 }
 
+/** Per-axis actual − natural offset. A missing axis is ABSENT (never silently 0). */
+function normalizePostureOffset(input) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  const offset = {};
+  let count = 0;
+  for (const channel of POSTURE_OFFSET_CHANNELS) {
+    if (!Object.prototype.hasOwnProperty.call(input, channel)) continue;
+    const value = Number(input[channel]);
+    if (!Number.isFinite(value)) continue;
+    offset[channel] = Math.max(-1, Math.min(1, value));
+    count += 1;
+  }
+  return count > 0 ? offset : null;
+}
+
 function normalizeContext(context) {
   if (context === null || typeof context !== 'object' || Array.isArray(context)) {
     return { ok: false, reason: 'invalid-context' };
@@ -403,6 +449,7 @@ function normalizeContext(context) {
   const window = Number.isInteger(context.recentWindow) && context.recentWindow > 0
     ? context.recentWindow
     : DEFAULT_RECENT_WINDOW;
+  const settleThreshold = Number(context.settleOffsetThreshold);
   return {
     ok: true,
     context: {
@@ -418,7 +465,12 @@ function normalizeContext(context) {
       personaAffinity: normalizePersona(context.persona),
       recentFamilies: recentCounts(context.recent?.families, window),
       recentActions: recentCounts(context.recent?.actions, window),
+      recentRecipes: recentCounts(context.recent?.recipes, window),
       history: Array.isArray(context.history) ? context.history : [],
+      postureOffset: normalizePostureOffset(context.postureOffset),
+      postureHeld: context.postureHeld === true,
+      recenterRequested: context.recenterRequested === true,
+      settleOffsetThreshold: Number.isFinite(settleThreshold) && settleThreshold > 0 ? settleThreshold : null,
       now: Number.isFinite(context.now) ? context.now : null,
       frequencyWindowMs: Number.isFinite(context.frequencyWindowMs) && context.frequencyWindowMs > 0
         ? context.frequencyWindowMs
@@ -467,16 +519,93 @@ function channelCheck(preset, verified) {
   return { ok: true, droppedChannels };
 }
 
+/**
+ * Resolve the settle/recenter metadata for a candidate. Authored metadata wins; a custom catalog
+ * that mirrors the library's semantics but not the extra fields is still recognised when EVERY
+ * operation is a centre operation. Recipe ids are never compared here.
+ */
+function settleProfileFor(preset) {
+  const meta = RECIPE_META.get(preset.recipeId);
+  if (meta !== undefined && meta.settle === true) {
+    const channels = Array.isArray(meta.settleChannels) && meta.settleChannels.length > 0
+      ? meta.settleChannels
+      : (Array.isArray(meta.operations) ? meta.operations : []).flatMap(operation => OPERATIONS[operation] ?? []);
+    return {
+      channels: [...new Set(channels)],
+      threshold: finite(meta.offsetThreshold, DEFAULT_SETTLE_OFFSET_THRESHOLD),
+    };
+  }
+  const operations = Array.isArray(preset.operations) ? preset.operations : [];
+  if (operations.length === 0 || !operations.every(operation => SETTLE_OPERATIONS.has(operation))) {
+    return null;
+  }
+  return {
+    channels: [...new Set(operations.flatMap(operation => OPERATIONS[operation] ?? []))],
+    threshold: DEFAULT_SETTLE_OFFSET_THRESHOLD,
+  };
+}
+
+/**
+ * Per-axis hysteresis: entering the near-baseline band needs `enter`, leaving it needs the wider
+ * `exit`. The state lives on the selector instance (attached to the normalised context), so a
+ * value hovering at the boundary cannot flip a settle candidate in and out on neighbouring draws.
+ */
+function settleBandNear(bands, channel, magnitude, enter, exit) {
+  const key = `${channel}@${enter}`;
+  if (bands.get(key) === true) {
+    if (magnitude > exit) {
+      bands.set(key, false);
+      return false;
+    }
+    return true;
+  }
+  if (magnitude < enter) {
+    bands.set(key, true);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * The idle settle gate. It is deliberately narrow: only an autonomous `idle` draw is affected,
+ * explicit boundaries (answer-end / user-speaking / recenterRequested) keep their semantics.
+ * Missing pose data is UNKNOWN and never treated as zero; posture-held only applies when known.
+ */
+function settleExclusion(preset, context) {
+  if (context.event !== 'idle' || context.recenterRequested === true) return null;
+  const profile = settleProfileFor(preset);
+  if (profile === null) return null;
+  if (context.postureOffset !== null) {
+    const enter = context.settleOffsetThreshold ?? profile.threshold;
+    const exit = enter * SETTLE_OFFSET_EXIT_RATIO;
+    const bands = context.settleBands ?? new Map();
+    let known = 0;
+    let near = true;
+    for (const channel of profile.channels) {
+      const value = context.postureOffset[channel];
+      if (!Number.isFinite(value)) continue;
+      known += 1;
+      if (!settleBandNear(bands, channel, Math.abs(value), enter, exit)) near = false;
+    }
+    // Near-baseline is only claimed when EVERY axis the settle action would correct is known.
+    // A missing axis means "unknown", never zero, so partial data cannot trigger the gate.
+    if (profile.channels.length > 0 && known === profile.channels.length && near) return 'near-baseline';
+  }
+  if (context.postureHeld === true) return 'posture-held';
+  return null;
+}
+
 /** Hard filter. Returns `{ stateIds }` etc. inside one pass; no software penalty is applied. */
 function collectCandidates(context, overrides, index) {
-  if (context.privacy === true || context.disposed === true) return [];
+  if (context.privacy === true || context.disposed === true) return { entries: [], excluded: [] };
   const stateIds = index.byState.get(context.state);
   const eventIds = index.byEvent.get(context.event);
-  if (stateIds === undefined || eventIds === undefined) return [];
+  if (stateIds === undefined || eventIds === undefined) return { entries: [], excluded: [] };
   const [small, large] = stateIds.size <= eventIds.size ? [stateIds, eventIds] : [eventIds, stateIds];
   const verified = new Set(context.verifiedChannels);
   const intent = effectiveIntent(context);
   const candidates = [];
+  const excluded = [];
   for (const id of small) {
     if (!large.has(id)) continue;
     const preset = index.byId.get(id);
@@ -490,9 +619,14 @@ function collectCandidates(context, overrides, index) {
     if (preset.requiresDirection && context.directionVerified !== true) continue;
     const channels = channelCheck(preset, verified);
     if (!channels.ok) continue;
+    const settleReason = settleExclusion(preset, context);
+    if (settleReason !== null) {
+      excluded.push({ preset, reason: settleReason });
+      continue;
+    }
     candidates.push({ preset, droppedChannels: channels.droppedChannels });
   }
-  return candidates;
+  return { entries: candidates, excluded };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -515,26 +649,63 @@ function personaFit(preset, affinity) {
 const stateFit = preset => (preset.states.length === 1 ? STATE_SPECIFIC_BONUS : 1);
 const eventFit = preset => (preset.events.length === 1 ? EVENT_SPECIFIC_BONUS : 1);
 
+/**
+ * Count how many recent entries name this recipe. Explicit `recent.recipes` entries win; a
+ * preset-only `recent.actions` entry is completed through the catalog. An unknown id stays
+ * unknown (it can still count as its own preset below, never as a guessed recipe).
+ */
+function recentRecipeCount(preset, context) {
+  let count = context.recentRecipes.get(preset.recipeId) ?? 0;
+  for (const [key, value] of context.recentActions) {
+    if (key === preset.recipeId) {
+      count = Math.max(count, value);
+      continue;
+    }
+    const known = context.presetById?.get(key);
+    if (known !== undefined && known.recipeId === preset.recipeId) count = Math.max(count, value);
+  }
+  return count;
+}
+
 function repeatPenalty(preset, context) {
+  // Repeat/frequency describe IDLE variety. An explicit semantic boundary (answer-start,
+  // confused, …) must keep its full weight; its arbitration still happens in the executor.
+  if (context.event !== 'idle') return 1;
   const familyCount = context.recentFamilies.get(preset.family) ?? 0;
-  const actionCount = Math.max(
-    context.recentActions.get(preset.id) ?? 0,
-    context.recentActions.get(preset.recipeId) ?? 0,
-  );
-  return 1 / (1 + FAMILY_REPEAT_WEIGHT * familyCount + ACTION_REPEAT_WEIGHT * actionCount);
+  const recipeCount = recentRecipeCount(preset, context);
+  const presetCount = context.recentActions.get(preset.id) ?? 0;
+  return 1 / (1
+    + FAMILY_REPEAT_WEIGHT * familyCount
+    + RECIPE_REPEAT_WEIGHT * recipeCount
+    + PRESET_REPEAT_WEIGHT * presetCount);
 }
 
 function frequencyPenalty(preset, context) {
-  if (context.history.length === 0) return 1;
-  let count = 0;
+  if (context.event !== 'idle' || context.history.length === 0) return 1;
+  let presetCount = 0;
+  let recipeCount = 0;
   for (const entry of context.history) {
-    const id = typeof entry === 'string' ? entry : entry?.id ?? entry?.presetId;
-    if (id !== preset.id) continue;
-    const at = typeof entry === 'object' && entry !== null ? Number(entry.at) : NaN;
+    if (typeof entry === 'string') {
+      if (entry === preset.id) presetCount += 1;
+      if (entry === preset.recipeId) recipeCount += 1;
+      continue;
+    }
+    if (entry === null || typeof entry !== 'object') continue;
+    const id = typeof entry.id === 'string'
+      ? entry.id
+      : (typeof entry.presetId === 'string' ? entry.presetId : null);
+    const at = Number(entry.at);
     if (context.now !== null && Number.isFinite(at) && context.now - at > context.frequencyWindowMs) continue;
-    count += 1;
+    let recipe = typeof entry.recipe === 'string' && entry.recipe.length > 0
+      ? entry.recipe
+      : (typeof entry.recipeId === 'string' && entry.recipeId.length > 0 ? entry.recipeId : null);
+    // Legacy history is preset-only: complete it from the catalog when possible. If the id is
+    // unknown, recipe stays null and only the preset-level count applies.
+    if (recipe === null && id !== null) recipe = context.presetById?.get(id)?.recipeId ?? null;
+    if (id !== null && id === preset.id) presetCount += 1;
+    if (recipe !== null && recipe === preset.recipeId) recipeCount += 1;
   }
-  return 1 / (1 + FREQUENCY_WEIGHT * count);
+  return 1 / (1 + PRESET_FREQUENCY_WEIGHT * presetCount + RECIPE_FREQUENCY_WEIGHT * recipeCount);
 }
 
 function scoreCandidate(entry, context, overrides, relaxed) {
@@ -625,15 +796,24 @@ const holdResult = (reason, extraReasons = []) => ({
 });
 
 function evaluate(context, overrides, index, relaxed) {
-  const entries = collectCandidates(context, overrides, index);
-  if (entries.length === 0) return { entries, families: [] };
-  const scored = entries.map(entry => scoreCandidate(entry, context, overrides, relaxed));
-  return { entries, families: groupWeights(scored) };
+  const collected = collectCandidates(context, overrides, index);
+  if (collected.entries.length === 0) {
+    return { entries: collected.entries, excluded: collected.excluded, families: [] };
+  }
+  const scored = collected.entries.map(entry => scoreCandidate(entry, context, overrides, relaxed));
+  return { entries: collected.entries, excluded: collected.excluded, families: groupWeights(scored) };
 }
+
+const excludedReasons = excluded => {
+  const counts = {};
+  for (const entry of excluded) counts[entry.reason] = (counts[entry.reason] ?? 0) + 1;
+  return counts;
+};
 
 /**
  * @param {{presets?: Array, catalog?: ReturnType<typeof createPresetIndex>,
  *          minFamilies?: number,
+ *          settleOffsetThreshold?: number,
  *          overrides?: {disabled?: string[], disabledFamilies?: string[],
  *                      familyPriority?: Record<string, number>,
  *                      actionPriority?: Record<string, number>}}} [options]
@@ -643,6 +823,7 @@ export function createPresetSelector({
   catalog = null,
   overrides = {},
   minFamilies = MIN_FAMILIES,
+  settleOffsetThreshold = DEFAULT_SETTLE_OFFSET_THRESHOLD,
 } = {}) {
   const index = catalog ?? createPresetIndex(presets);
   if (index === null || typeof index !== 'object' || !Array.isArray(index.presets)) {
@@ -651,7 +832,12 @@ export function createPresetSelector({
   if (!Number.isInteger(minFamilies) || minFamilies < 1) {
     throw new TypeError('preset-selector: minFamilies must be a positive integer');
   }
+  const defaultSettleThreshold = Number.isFinite(settleOffsetThreshold) && settleOffsetThreshold > 0
+    ? settleOffsetThreshold
+    : DEFAULT_SETTLE_OFFSET_THRESHOLD;
   const baseOverrides = normalizeOverrides(overrides);
+  /** Hysteresis memory is per selector instance, never global module state. */
+  const settleBands = new Map();
 
   const resolve = (context) => {
     const normalized = normalizeContext(context);
@@ -659,25 +845,33 @@ export function createPresetSelector({
     const callOverrides = context.overrides === undefined
       ? baseOverrides
       : normalizeOverrides(context.overrides);
+    // Catalog lookups complete legacy preset-only memory; the un-normalised axis stays unknown.
+    normalized.context.presetById = index.byId;
+    normalized.context.settleBands = settleBands;
+    normalized.context.settleOffsetThreshold = normalized.context.settleOffsetThreshold
+      ?? defaultSettleThreshold;
     return { ok: true, context: normalized.context, overrides: callOverrides };
   };
 
   const query = (context = {}) => {
     const resolved = resolve(context);
     if (!resolved.ok) return [];
-    return collectCandidates(resolved.context, resolved.overrides, index).map(entry => entry.preset);
+    return collectCandidates(resolved.context, resolved.overrides, index).entries.map(entry => entry.preset);
   };
 
   const candidates = (context = {}) => {
     const resolved = resolve(context);
     if (!resolved.ok) return [];
-    return collectCandidates(resolved.context, resolved.overrides, index);
+    return collectCandidates(resolved.context, resolved.overrides, index).entries;
   };
 
   const explain = (context = {}) => {
     const resolved = resolve(context);
     if (!resolved.ok) {
-      return { ok: false, reason: resolved.reason, candidates: [], families: [], hold: { weight: HOLD_WEIGHT } };
+      return {
+        ok: false, reason: resolved.reason, candidates: [], families: [], excluded: [],
+        excludedReasons: {}, reasons: [], hold: { weight: HOLD_WEIGHT },
+      };
     }
     let relaxed = false;
     let evaluation = evaluate(resolved.context, resolved.overrides, index, false);
@@ -686,6 +880,7 @@ export function createPresetSelector({
       evaluation = evaluate(resolved.context, resolved.overrides, index, true);
     }
     const total = evaluation.families.reduce((sum, family) => sum + family.weight, 0) + HOLD_WEIGHT;
+    const blocked = excludedReasons(evaluation.excluded);
     return {
       ok: true,
       candidates: evaluation.entries,
@@ -711,6 +906,19 @@ export function createPresetSelector({
           }),
         };
       }),
+      /** Per-candidate hard-filter evidence (`near-baseline` / `posture-held`), never relaxed. */
+      excluded: evaluation.excluded.map(entry => ({
+        presetId: entry.preset.id,
+        family: entry.preset.family,
+        recipe: entry.preset.recipeId,
+        reason: entry.reason,
+      })),
+      excludedReasons: blocked,
+      /** Family coverage + exclusion evidence in one human-readable list. */
+      reasons: [
+        ...evaluation.families.map(family => `family:${family.family}`),
+        ...Object.entries(blocked).map(([reason, count]) => `excluded:${reason}:${count}`),
+      ],
       hold: { weight: HOLD_WEIGHT, probability: HOLD_WEIGHT / total },
       relaxed,
     };
@@ -722,7 +930,10 @@ export function createPresetSelector({
     const { context: ctx, overrides: callOverrides } = resolved;
     let relaxed = false;
     let evaluation = evaluate(ctx, callOverrides, index, false);
-    if (evaluation.families.length === 0) return holdResult('no-candidates');
+    const blocked = excludedReasons(evaluation.excluded);
+    if (evaluation.families.length === 0) {
+      return holdResult('no-candidates', Object.keys(blocked));
+    }
     let relaxReasons = [];
     if (evaluation.families.length < minFamilies) {
       relaxed = true;
@@ -730,7 +941,7 @@ export function createPresetSelector({
       relaxReasons = ['candidate-shortage', 'relaxed-soft-penalties'];
     }
     if (evaluation.families.length === 0) {
-      return holdResult('no-candidates', relaxReasons);
+      return holdResult('no-candidates', [...new Set([...relaxReasons, ...Object.keys(blocked)])]);
     }
     const total = evaluation.families.reduce((sum, family) => sum + family.weight, 0) + HOLD_WEIGHT;
     const rand = createRandom({
@@ -746,14 +957,14 @@ export function createPresetSelector({
     if (picked === null || picked.kind === 'hold') {
       return holdResult(
         evaluation.families.length < minFamilies ? 'candidate-shortage' : 'hold-draw',
-        relaxReasons,
+        [...relaxReasons, ...Object.keys(blocked)],
       );
     }
     const family = picked.family;
     const recipe = pickWeighted(family.recipes, item => item.weight, rand);
-    if (recipe === null) return holdResult('hold-draw', relaxReasons);
+    if (recipe === null) return holdResult('hold-draw', [...relaxReasons, ...Object.keys(blocked)]);
     const variant = pickWeighted(recipe.variants, item => item.weight, rand);
-    if (variant === null) return holdResult('hold-draw', relaxReasons);
+    if (variant === null) return holdResult('hold-draw', [...relaxReasons, ...Object.keys(blocked)]);
     const chosen = variant.candidate;
     // Probability actually used by the three roulette stages above (hold shares the first stage).
     const recipeSum = family.recipes.reduce((sum, item) => sum + item.weight, 0);
@@ -772,6 +983,7 @@ export function createPresetSelector({
       `probability:${round(probability, 4)}`,
       ...relaxReasons,
     ];
+    for (const [reason, count] of Object.entries(blocked)) reasons.push(`excluded:${reason}:${count}`);
     if (chosen.droppedChannels.length > 0) {
       reasons.push(`dropped-channels:${chosen.droppedChannels.join(',')}`);
     }
@@ -804,6 +1016,11 @@ export const PRESET_SELECTOR_CONSTANTS = Object.freeze({
   DEFAULT_PRIORITY,
   DEFAULT_RECENT_WINDOW,
   DEFAULT_FREQUENCY_WINDOW_MS,
+  DEFAULT_SETTLE_OFFSET_THRESHOLD,
+  RECIPE_REPEAT_WEIGHT,
+  PRESET_REPEAT_WEIGHT,
+  RECIPE_FREQUENCY_WEIGHT,
+  PRESET_FREQUENCY_WEIGHT,
   INTENT_EVENT_SEMANTIC,
   OPTIONAL_OPERATION_CHANNELS,
 });
