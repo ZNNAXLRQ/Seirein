@@ -115,14 +115,51 @@ const styleChannelAmplitude = (style, channel) => {
 // P-139 stage 3 — persona-derived style dimensions (expression only, never intent selection)
 // ---------------------------------------------------------------------------------------------
 //
-// The three dimensions are a *view* of the already-cached style, NOT another model call and NOT
+// The dimensions are a *view* of the already-cached style, NOT another model call and NOT
 // another random draw. Same persona text → same `styleVersion` → same style → same dimensions,
 // and the numeric seed is the persona hash (falling back to the canonical style when no version
-// was supplied). A dimension only scales amplitude / duration / variant choice later; it never
-// enters the event → intent table in `motionEvents.js`.
+// was supplied). A dimension only scales amplitude / duration / hold / variant choice / attention
+// later; it never enters the event → intent table in `motionEvents.js`.
+//
+// The first three names are the original stage-3 contract and stay frozen for compatibility
+// (`avatar-style` asserts their exact shape on the snapshot). The four added names complete the
+// PLAN vocabulary:
+//
+//   liveliness     活力      bigger and quicker motion
+//   softness       柔和      (legacy) longer, gentler motion
+//   restraint      克制      caps gesture size
+//   expressiveness 表达强度  larger/clearer emphasis, deeper variants
+//   attention      注意方式  how readily attention/head direction reorients (0 = steady, 1 = scanning)
+//   composure      从容      slower tempo, longer holds and smoother transitions
+//   texture        质感      how much consecutive gestures vary (variant spread / micro-variation)
+//
+// None of them selects an intent: `motionEvents.js` still owns event → intent, and the selector
+// maps them onto soft weights only.
 
 /** Dimension names; every value is a unit interval (0..1). */
-export const AVATAR_STYLE_DIMENSIONS = Object.freeze(['liveliness', 'softness', 'restraint']);
+export const AVATAR_STYLE_DIMENSIONS = Object.freeze([
+  'liveliness',
+  'softness',
+  'restraint',
+  'expressiveness',
+  'attention',
+  'composure',
+  'texture',
+]);
+
+/** The original three dimensions, kept as an exact compatibility subset for existing snapshots. */
+export const AVATAR_STYLE_LEGACY_DIMENSIONS = Object.freeze(['liveliness', 'softness', 'restraint']);
+
+/** Human-readable labels (documentation / diagnostics only; never a selector key). */
+export const AVATAR_STYLE_DIMENSION_LABELS = Object.freeze({
+  liveliness: '活力',
+  softness: '柔和',
+  restraint: '克制',
+  expressiveness: '表达强度',
+  attention: '注意方式',
+  composure: '从容',
+  texture: '质感',
+});
 
 
 /** Map one style value onto its configured range (0..1). */
@@ -165,20 +202,32 @@ export function avatarStyleSeed(style, { styleVersion = '' } = {}) {
 }
 
 
+/** How readily each gaze habit reorients attention (0 = steady, 1 = scanning). */
+const GAZE_ATTENTION = Object.freeze({ steady: 0.25, direct: 0.65, wandering: 0.95 });
+
+
 /**
- * Derive the three style dimensions from the persona style.
+ * Derive every style dimension from the persona style. The first three values are byte-for-byte
+ * the original stage-3 formulas (existing tests pin their ordering and event shape); the four
+ * additional dimensions reuse the same normalised inputs so one style produces one deterministic
+ * set.
  *
- *   liveliness  larger amplitude / faster rhythm / bigger gestures  → bigger, quicker motion
- *   softness    slow tempo / small amplitude / low expression       → longer, gentler transitions
- *   restraint   small amplitude / low expression / rare tilt        → caps the gesture size
+ *   liveliness     larger amplitude / faster rhythm / bigger gestures → bigger, quicker motion
+ *   softness       slow tempo / small amplitude / low expression     → longer, gentler transitions
+ *   restraint      small amplitude / low expression / rare tilt      → caps the gesture size
+ *   expressiveness strong expression / bigger nods                   → larger emphasis, deeper variants
+ *   attention      outward gaze habit / more tilt                    → more attention reorientation
+ *   composure      slow tempo / small amplitude                      → longer holds, calmer transitions
+ *   texture        expressive, detailed, quicker style               → more variant spread
  *
- * A quiet persona therefore lands high on `restraint` (and low on `liveliness`); a lively persona
- * is the opposite. The values are deterministic in the style and the seed is deterministic in the
- * persona version, which is exactly what the stage-3 tests compare.
+ * A quiet persona therefore lands high on `restraint`/`composure` (and low on `liveliness`); a
+ * lively persona is the opposite. The values are deterministic in the style and the seed is
+ * deterministic in the persona version, which is exactly what the stage-3 tests compare.
  *
  * @param {object} style persona style (partial accepted)
  * @param {{styleVersion?: string}} [options]
- * @returns {{liveliness: number, softness: number, restraint: number, seed: number}}
+ * @returns {{liveliness: number, softness: number, restraint: number, expressiveness: number,
+ *            attention: number, composure: number, texture: number, seed: number}}
  */
 export function deriveAvatarStyleDimensions(style, { styleVersion = '' } = {}) {
   const source = coerceAvatarStyle(style);
@@ -193,12 +242,48 @@ export function deriveAvatarStyleDimensions(style, { styleVersion = '' } = {}) {
     + 0.12 * expression + 0.10 * tilt + 0.10 * speed;
   const restraint = 1 - (0.45 * amplitude + 0.25 * expression + 0.15 * tilt + 0.15 * nod);
   const softness = 0.50 * (1 - tempo) + 0.30 * (1 - amplitude) + 0.20 * (1 - expression);
+
+  // Added dimensions: all derived from the same normalised style values, never from a persona id.
+  const gazeAttention = GAZE_ATTENTION[source.gazeHabit] ?? GAZE_ATTENTION.steady;
+  // A channel override is an explicit request for per-channel detail → part of the motion texture.
+  const channelDetail = Math.min(1, Object.keys(source.channels ?? {}).length / 4);
+  const expressiveness = 0.60 * expression + 0.25 * nod + 0.15 * amplitude;
+  const attention = 0.55 * gazeAttention + 0.30 * tilt + 0.15 * liveliness;
+  const composure = 0.45 * (1 - tempo) + 0.25 * (1 - amplitude)
+    + 0.20 * (1 - liveliness) + 0.10 * (1 - expression);
+  const texture = 0.35 * expression + 0.25 * (1 - softness)
+    + 0.20 * channelDetail + 0.20 * tempo;
+
   return {
     liveliness: roundDimension(liveliness),
     softness: roundDimension(softness),
     restraint: roundDimension(restraint),
+    expressiveness: roundDimension(expressiveness),
+    attention: roundDimension(attention),
+    composure: roundDimension(composure),
+    texture: roundDimension(texture),
     seed: avatarStyleSeed(source, { styleVersion }),
   };
+}
+
+
+/**
+ * Split a derived object into the frozen legacy snapshot shape and the full trait set. Hosts and
+ * older consumers keep `style.dimensions` exactly as it was; the stage-3 behaviours read
+ * `style.traits`, which additionally carries the four new dimensions.
+ *
+ * @param {ReturnType<typeof deriveAvatarStyleDimensions>} derived
+ * @returns {{dimensions: object, traits: object}} fresh plain objects
+ */
+export function splitAvatarStyleDimensions(derived) {
+  const source = derived !== null && typeof derived === 'object' ? derived : {};
+  const dimensions = {};
+  for (const name of AVATAR_STYLE_LEGACY_DIMENSIONS) dimensions[name] = finite(source[name], 0);
+  dimensions.seed = finite(source.seed, 0);
+  const traits = {};
+  for (const name of AVATAR_STYLE_DIMENSIONS) traits[name] = finite(source[name], 0);
+  traits.seed = finite(source.seed, 0);
+  return { dimensions, traits };
 }
 
 

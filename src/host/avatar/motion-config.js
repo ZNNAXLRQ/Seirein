@@ -115,7 +115,76 @@ export const STYLE_DIMENSION_APPLICATION = Object.freeze({
   durationBase: 0.70,
   durationSpan: 0.60,
   livelinessTempo: 0.20,
+  /** Stage-3 additions: all six PLAN dimensions reach the executor through this one table. */
+  expressivenessAmplitude: 0.16,
+  composureDuration: 0.18,
+  composureHold: 0.42,
+  composureTempo: 0.14,
+  textureVariation: 0.85,
+  attentionChanceBase: 0.12,
+  attentionChanceSpan: 0.76,
 });
+
+
+const clampDimension = value => {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.5;
+  return Math.max(0, Math.min(1, number));
+};
+
+const roundEffect = value => Math.round(value * 10_000) / 10_000;
+
+
+/**
+ * P-139 stage 3 — the single dimension → motion mapping.
+ *
+ * Every consumer (intent executor, preset executor, selector weighting, posture hold) reads these
+ * multipliers instead of inventing its own per-dimension formula. A persona's dimensions are the
+ * only input; no recipe id, state or persona name is consulted here.
+ *
+ * The values are calibrated so the neutral trait set (all dimensions 0.5) returns ≈1 for the
+ * size/duration multipliers. That keeps the stage-1/2 trajectories numerically stable while a
+ * persona with a different profile visibly diverges.
+ *
+ * @param {{liveliness?: number, softness?: number, restraint?: number, expressiveness?: number,
+ *          attention?: number, composure?: number, texture?: number}} [traits]
+ * @returns {{amplitude: number, tempo: number, duration: number, hold: number,
+ *            transition: number, attentionChance: number, variantSpread: number}}
+ */
+export function styleTraitEffects(traits = {}) {
+  const source = traits !== null && typeof traits === 'object' ? traits : {};
+  const liveliness = clampDimension(source.liveliness);
+  const softness = clampDimension(source.softness);
+  const restraint = clampDimension(source.restraint);
+  const expressiveness = clampDimension(source.expressiveness);
+  const attention = clampDimension(source.attention);
+  const composure = clampDimension(source.composure);
+  const texture = clampDimension(source.texture);
+  const app = STYLE_DIMENSION_APPLICATION;
+  return Object.freeze({
+    /** Gesture size: lively/expressive grows, restrained shrinks. */
+    amplitude: roundEffect(Math.max(0.55, Math.min(1.35,
+      0.80 + 0.30 * liveliness + app.expressivenessAmplitude * expressiveness
+        - 0.18 * restraint))),
+    /** Gesture rhythm: lively faster, composed slower. */
+    tempo: roundEffect(Math.max(0.65, Math.min(1.30,
+      0.86 + 0.28 * liveliness - app.composureTempo * composure + 0.05 * texture))),
+    /** Active-phase length: soft/composed longer, expressive a little shorter. */
+    duration: roundEffect(Math.max(0.65, Math.min(1.45,
+      0.82 + 0.28 * softness + app.composureDuration * composure - 0.08 * expressiveness))),
+    /** Hold length: composed/soft longer, lively shorter. */
+    hold: roundEffect(Math.max(0.60, Math.min(1.50,
+      0.78 + app.composureHold * composure + 0.18 * softness - 0.10 * liveliness))),
+    /** Planned transition length: composed calmer, lively slightly quicker. */
+    transition: roundEffect(Math.max(0.75, Math.min(1.20,
+      0.90 + 0.22 * composure - 0.08 * liveliness))),
+    /** Probability of reorienting attention / turning the head on an autonomous draw. */
+    attentionChance: roundEffect(Math.max(0.05, Math.min(0.95,
+      app.attentionChanceBase + app.attentionChanceSpan * attention))),
+    /** How far a new-variant draw may move away from the neutral delivery. */
+    variantSpread: roundEffect(Math.max(0, Math.min(1, 0.15 + app.textureVariation * texture))),
+  });
+}
 
 
 /** How long an ended intent keeps its channels flushed while the pose settles back to baseline. */

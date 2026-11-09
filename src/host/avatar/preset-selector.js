@@ -30,7 +30,11 @@
  *   targetVerified     bool proof that gaze-target has a real target (never inferred)
  *   directionVerified  bool proof that a head-turn has a measured direction
  *   persona            { styles?: string[] | Record<styleId, 0..1>, dimensions?: {
- *                        liveliness, softness, restraint } } — soft affinity, never a ban
+ *                        liveliness, softness, restraint, expressiveness, attention,
+ *                        composure, texture } } — soft affinity/weights, never a ban. The first
+ *                        three are the legacy stage-3 set; the selector uses `attention` for
+ *                        attention/head-turn weight, `composure`/`liveliness`/`texture` for timing
+ *                        variants and `expressiveness`/`restraint`/`composure` for action variants.
  *   recent             { families?: string[] | Record<string,number>,
  *                        actions?: string[] | Record<string,number>,
  *                        recipes?: string[] | Record<string,number> } — newest last.
@@ -58,11 +62,17 @@
  *   rand               () => [0,1) injected random source (wins over seed)
  *
  * `select` output:
- *   { kind: 'preset', presetId, family, recipe, variant, score, probability,
- *     reasons: string[], droppedChannels: string[], timing, operations, requires,
- *     effectiveRequires }
+ *   { kind: 'preset', presetId, family, recipe, variant, actionVariant, actionVariantKey,
+ *     actionVariantProfile, score, probability, reasons: string[], droppedChannels: string[],
+ *     timing, operations, requires, effectiveRequires }
  *   { kind: 'hold', presetId: null, family: null, recipe: null, variant: null,
+ *     actionVariant: null, actionVariantKey: null, actionVariantProfile: null,
  *     score: 0, probability: 0, reasons: string[], droppedChannels: [] }
+ *
+ * `variant` is the timing variant (flow/pause/linger/spaced). `actionVariant` is the delivery
+ * variant of the SAME recipe (nod-small/nod-deep/…); it is chosen from the same seeded stream
+ * after the timing variant, so a fixed seed reproduces both. A recipe's variants share one recipe
+ * id: recipe-level anti-repeat is untouched and family probability is not inflated by them.
  *
  * Candidate shortage: when fewer than `minFamilies` (default 3) hard-eligible families
  * remain, the soft repeat/frequency penalties are dropped for that draw and the reasons say
@@ -148,25 +158,33 @@ const OPTIONAL_OPERATION_CHANNELS = Object.freeze({
  * that `deriveAvatarStyleDimensions` already produces. This is selector data, not preset data,
  * and it only ever produces a soft multiplier.
  */
+// Order: liveliness, softness, restraint, expressiveness, attention, composure, texture.
+// The first three columns are the original stage-3 profiles; the extra four let the same tags
+// inform expression, attention, hold and variant spread without any persona id lookup.
 const STYLE_DIMENSION_PROFILES = Object.freeze({
-  common: Object.freeze([0.5, 0.5, 0.5]),
-  gentle: Object.freeze([0.35, 0.85, 0.55]),
-  lively: Object.freeze([0.85, 0.35, 0.2]),
-  reserved: Object.freeze([0.2, 0.5, 0.85]),
-  composed: Object.freeze([0.4, 0.6, 0.7]),
-  playful: Object.freeze([0.8, 0.4, 0.25]),
-  shy: Object.freeze([0.3, 0.7, 0.7]),
-  confident: Object.freeze([0.75, 0.4, 0.25]),
-  elegant: Object.freeze([0.4, 0.75, 0.6]),
-  curious: Object.freeze([0.7, 0.45, 0.3]),
-  rational: Object.freeze([0.45, 0.5, 0.7]),
-  warm: Object.freeze([0.65, 0.65, 0.35]),
-  dreamy: Object.freeze([0.25, 0.85, 0.6]),
-  earnest: Object.freeze([0.55, 0.55, 0.45]),
-  cool: Object.freeze([0.25, 0.4, 0.75]),
-  cheerful: Object.freeze([0.85, 0.55, 0.2]),
+  common: Object.freeze([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]),
+  gentle: Object.freeze([0.35, 0.85, 0.55, 0.4, 0.4, 0.75, 0.35]),
+  lively: Object.freeze([0.85, 0.35, 0.2, 0.85, 0.8, 0.3, 0.8]),
+  reserved: Object.freeze([0.2, 0.5, 0.85, 0.3, 0.25, 0.8, 0.3]),
+  composed: Object.freeze([0.4, 0.6, 0.7, 0.4, 0.35, 0.85, 0.3]),
+  playful: Object.freeze([0.8, 0.4, 0.25, 0.8, 0.75, 0.3, 0.8]),
+  shy: Object.freeze([0.3, 0.7, 0.7, 0.35, 0.45, 0.65, 0.4]),
+  confident: Object.freeze([0.75, 0.4, 0.25, 0.85, 0.65, 0.4, 0.6]),
+  elegant: Object.freeze([0.4, 0.75, 0.6, 0.5, 0.45, 0.75, 0.55]),
+  curious: Object.freeze([0.7, 0.45, 0.3, 0.75, 0.85, 0.35, 0.75]),
+  rational: Object.freeze([0.45, 0.5, 0.7, 0.45, 0.35, 0.8, 0.35]),
+  warm: Object.freeze([0.65, 0.65, 0.35, 0.7, 0.6, 0.55, 0.55]),
+  dreamy: Object.freeze([0.25, 0.85, 0.6, 0.4, 0.55, 0.75, 0.7]),
+  earnest: Object.freeze([0.55, 0.55, 0.45, 0.65, 0.6, 0.5, 0.45]),
+  cool: Object.freeze([0.25, 0.4, 0.75, 0.3, 0.2, 0.8, 0.25]),
+  cheerful: Object.freeze([0.85, 0.55, 0.2, 0.9, 0.7, 0.3, 0.75]),
 });
-const STYLE_DIMENSION_NAMES = Object.freeze(['liveliness', 'softness', 'restraint']);
+const STYLE_DIMENSION_NAMES = Object.freeze([
+  'liveliness', 'softness', 'restraint', 'expressiveness', 'attention', 'composure', 'texture',
+]);
+/** Dimensions the selector uses directly (the other three still project onto style affinity). */
+const ATTENTION_OPERATIONS = new Set(['head-turn', 'shake']);
+const GAZE_SHIFT_OPERATIONS = new Set(['gaze-side', 'gaze-up', 'gaze-down', 'gaze-target']);
 const KNOWN_STYLE_IDS = new Set(STYLES.map(style => style.id));
 /**
  * Recipe metadata (`settle`, `offsetThreshold`, `settleChannels`) is authored in `presets/recipes.js`.
@@ -352,9 +370,18 @@ function priorityFor(preset, overrides) {
 
 const priorityMultiplier = priority => PRIORITY_LOW + PRIORITY_SPAN * (priority / PRIORITY_MAX);
 
-/** Persona affinity map: explicit tags, else a projection of the three style dimensions. */
+/**
+ * Persona input → `{ affinity, traits }`.
+ *
+ * `affinity` is the soft style-tag map (explicit tags, else projected from dimensions).
+ * `traits` is the raw unit-interval dimension set; the new stage-3 behaviours use it directly
+ * (attention/head-turn weight, timing-variant weight, action-variant weight) instead of squeezing
+ * everything through the tag table. Missing dimensions stay `undefined`, never a fabricated 0.5.
+ */
 function normalizePersona(input) {
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { affinity: null, traits: null };
+  }
   const tags = input.styles ?? input.tags;
   const affinity = new Map();
   if (Array.isArray(tags)) {
@@ -368,29 +395,33 @@ function normalizePersona(input) {
       affinity.set(tag, clamp01(Number.isFinite(value) ? value : 0));
     }
   }
-  if (affinity.size > 0) return affinity;
   const dimensions = input.dimensions;
-  if (dimensions === null || typeof dimensions !== 'object' || Array.isArray(dimensions)) return null;
-  const normalized = {};
+  const traits = {};
   let count = 0;
-  for (const name of STYLE_DIMENSION_NAMES) {
-    const value = Number(dimensions[name]);
-    if (!Number.isFinite(value)) continue;
-    normalized[name] = clamp01(value);
-    count += 1;
+  if (dimensions !== null && typeof dimensions === 'object' && !Array.isArray(dimensions)) {
+    for (const name of STYLE_DIMENSION_NAMES) {
+      const value = Number(dimensions[name]);
+      if (!Number.isFinite(value)) continue;
+      traits[name] = clamp01(value);
+      count += 1;
+    }
   }
-  if (count === 0) return null;
-  for (const [style, profile] of Object.entries(STYLE_DIMENSION_PROFILES)) {
-    let distance = 0;
-    let seen = 0;
-    STYLE_DIMENSION_NAMES.forEach((name, index) => {
-      if (normalized[name] === undefined) return;
-      distance += Math.abs(normalized[name] - profile[index]);
-      seen += 1;
-    });
-    if (seen > 0) affinity.set(style, clamp01(1 - 1.5 * (distance / seen)));
+  if (affinity.size === 0 && count > 0) {
+    for (const [style, profile] of Object.entries(STYLE_DIMENSION_PROFILES)) {
+      let distance = 0;
+      let seen = 0;
+      STYLE_DIMENSION_NAMES.forEach((name, index) => {
+        if (traits[name] === undefined) return;
+        distance += Math.abs(traits[name] - profile[index]);
+        seen += 1;
+      });
+      if (seen > 0) affinity.set(style, clamp01(1 - 1.5 * (distance / seen)));
+    }
   }
-  return affinity.size > 0 ? affinity : null;
+  return {
+    affinity: affinity.size > 0 ? affinity : null,
+    traits: count > 0 ? traits : null,
+  };
 }
 
 /** Recent-list input becomes a count map. Arrays are newest-last; maps are counts already. */
@@ -450,6 +481,7 @@ function normalizeContext(context) {
     ? context.recentWindow
     : DEFAULT_RECENT_WINDOW;
   const settleThreshold = Number(context.settleOffsetThreshold);
+  const persona = normalizePersona(context.persona);
   return {
     ok: true,
     context: {
@@ -462,7 +494,8 @@ function normalizeContext(context) {
       recipe: typeof context.recipe === 'string' && context.recipe.length > 0 ? context.recipe : null,
       targetVerified: context.targetVerified === true,
       directionVerified: context.directionVerified === true,
-      personaAffinity: normalizePersona(context.persona),
+      personaAffinity: persona.affinity,
+      personaTraits: persona.traits,
       recentFamilies: recentCounts(context.recent?.families, window),
       recentActions: recentCounts(context.recent?.actions, window),
       recentRecipes: recentCounts(context.recent?.recipes, window),
@@ -644,6 +677,81 @@ function personaFit(preset, affinity) {
   return PERSONA_BASE + PERSONA_SPAN * best;
 }
 
+const traitValue = (traits, name) => (Number.isFinite(traits?.[name]) ? traits[name] : 0.5);
+
+/**
+ * Direct dimension fit for the attention dimension.
+ *
+ * `attention` is the PLAN "注意方式" axis: high means attention reorients readily (head turns,
+ * gaze shifts), low means it stays put and prefers settle/recenter. The check reads the recipe's
+ * own operations and family, never a recipe id or persona name, and it is only a soft multiplier.
+ */
+function dimensionFit(preset, traits) {
+  if (traits === null) return 1;
+  const attention = traitValue(traits, 'attention');
+  const operations = Array.isArray(preset.operations) ? preset.operations : [];
+  const lateral = operations.some(operation => ATTENTION_OPERATIONS.has(operation));
+  const gazeShift = operations.some(operation => GAZE_SHIFT_OPERATIONS.has(operation));
+  let multiplier = 1;
+  if (lateral) multiplier *= 1 + 0.42 * (attention - 0.5) * 2;
+  if (gazeShift) multiplier *= 1 + 0.24 * (attention - 0.5) * 2;
+  if (preset.family === 'settle') multiplier *= 1 + 0.18 * (0.5 - attention) * 2;
+  return Math.max(0.45, Math.min(1.8, multiplier));
+}
+
+/**
+ * Timing-variant fit. Composure prefers lingering/unhurried deliveries, liveliness prefers the
+ * quick flow, texture prefers a separated/spaced articulation. It only reweights the four timing
+ * variants INSIDE one recipe, so the family/recipe probability stays untouched.
+ */
+function timingFit(timing, traits) {
+  if (traits === null || timing === null || typeof timing !== 'object') return 1;
+  const liveliness = traitValue(traits, 'liveliness');
+  const composure = traitValue(traits, 'composure');
+  const texture = traitValue(traits, 'texture');
+  let multiplier = 1;
+  if (timing.hold === 'lingering') multiplier *= 1 + 0.30 * composure;
+  if (timing.release === 'unhurried') multiplier *= 1 + 0.22 * composure;
+  if (timing.onset === 'pause-before') multiplier *= 1 + 0.18 * composure;
+  if (timing.pacing === 'connected') multiplier *= 1 + 0.12 * liveliness;
+  if (timing.pacing === 'separated') multiplier *= 1 + 0.20 * texture;
+  if (timing.hold === 'brief') multiplier *= 1 + 0.10 * liveliness;
+  return Math.max(0.5, Math.min(1.6, multiplier));
+}
+
+/**
+ * Action-variant preference. `texture`/`expressiveness`/`composure`/`liveliness` decide whether a
+ * soft, clear or defined delivery is more likely. Variants still come from the same seeded draw;
+ * only their weights change, so a fixed seed is reproducible and a different persona is an A/B.
+ */
+function actionVariantWeight(profile, traits) {
+  if (traits === null) return 1;
+  const liveliness = traitValue(traits, 'liveliness');
+  const restraint = traitValue(traits, 'restraint');
+  const expressiveness = traitValue(traits, 'expressiveness');
+  const composure = traitValue(traits, 'composure');
+  const texture = traitValue(traits, 'texture');
+  const extent = Number.isFinite(profile.extent) ? profile.extent : 0;
+  const holdBias = Number.isFinite(profile.holdBias) ? profile.holdBias : 0;
+  const speedBias = Number.isFinite(profile.speedBias) ? profile.speedBias : 0;
+  const textureBias = Number.isFinite(profile.textureBias) ? profile.textureBias : 0;
+  const weight = 1
+    + 0.55 * extent * (expressiveness - 0.5) * 2
+    - 0.35 * extent * (restraint - 0.5) * 2
+    + 0.45 * holdBias * (composure - 0.5) * 2
+    + 0.35 * speedBias * (liveliness - 0.5) * 2
+    + 0.30 * textureBias * (texture - 0.5) * 2;
+  return Math.max(0.05, weight);
+}
+
+/** Seeded choice of one of the recipe's delivery variants; `null` for a custom catalog. */
+function pickActionVariant(preset, traits, rand) {
+  const meta = RECIPE_META.get(preset.recipeId);
+  const list = Array.isArray(meta?.actionVariants) ? meta.actionVariants : [];
+  if (list.length === 0) return null;
+  return pickWeighted(list, profile => actionVariantWeight(profile, traits), rand);
+}
+
 // A recipe offered for fewer states/events is the more specific fit for this moment; the bonus
 // is small (1.12×) and soft, so a broadly applicable blink/breath is not buried.
 const stateFit = preset => (preset.states.length === 1 ? STATE_SPECIFIC_BONUS : 1);
@@ -711,11 +819,14 @@ function frequencyPenalty(preset, context) {
 function scoreCandidate(entry, context, overrides, relaxed) {
   const { preset } = entry;
   const persona = personaFit(preset, context.personaAffinity);
+  const dimension = dimensionFit(preset, context.personaTraits);
+  const timing = timingFit(preset.timing, context.personaTraits);
   const repeat = relaxed ? 1 : repeatPenalty(preset, context);
   const frequency = relaxed ? 1 : frequencyPenalty(preset, context);
   const priority = priorityFor(preset, overrides);
   const multiplier = priorityMultiplier(priority);
-  const weight = BASE_SCORE * stateFit(preset) * eventFit(preset) * persona * repeat * frequency * multiplier;
+  const weight = BASE_SCORE * stateFit(preset) * eventFit(preset) * persona
+    * dimension * timing * repeat * frequency * multiplier;
   return {
     preset,
     droppedChannels: entry.droppedChannels,
@@ -724,6 +835,8 @@ function scoreCandidate(entry, context, overrides, relaxed) {
       stateFit: stateFit(preset),
       eventFit: eventFit(preset),
       personaFit: persona,
+      dimensionFit: dimension,
+      timingFit: timing,
       repeat,
       frequency,
       priority,
@@ -789,6 +902,9 @@ const holdResult = (reason, extraReasons = []) => ({
   family: null,
   recipe: null,
   variant: null,
+  actionVariant: null,
+  actionVariantKey: null,
+  actionVariantProfile: null,
   score: 0,
   probability: 0,
   reasons: ['hold', ...new Set([reason, ...extraReasons])],
@@ -966,6 +1082,10 @@ export function createPresetSelector({
     const variant = pickWeighted(recipe.variants, item => item.weight, rand);
     if (variant === null) return holdResult('hold-draw', [...relaxReasons, ...Object.keys(blocked)]);
     const chosen = variant.candidate;
+    // A delivery variant is picked AFTER the timing variant, from the same seeded stream. It is a
+    // second dimension of choice, not another preset candidate: recipe-level anti-repeat is
+    // untouched because the recipe/preset ids do not change.
+    const actionVariant = pickActionVariant(chosen.preset, ctx.personaTraits, rand);
     // Probability actually used by the three roulette stages above (hold shares the first stage).
     const recipeSum = family.recipes.reduce((sum, item) => sum + item.weight, 0);
     const variantSum = recipe.variants.reduce((sum, item) => sum + item.weight, 0);
@@ -975,12 +1095,15 @@ export function createPresetSelector({
       `state-fit:${round(factors.stateFit)}`,
       `event-fit:${round(factors.eventFit)}`,
       `persona-fit:${round(factors.personaFit)}`,
+      `dimension-fit:${round(factors.dimensionFit)}`,
+      `timing-fit:${round(factors.timingFit)}`,
       `repeat:${round(factors.repeat)}`,
       `frequency:${round(factors.frequency)}`,
       `priority:${factors.priority}`,
       `priority-multiplier:${round(factors.priorityMultiplier)}`,
       `family-weight:${round(family.weight)}`,
       `probability:${round(probability, 4)}`,
+      ...(actionVariant === null ? [] : [`action-variant:${actionVariant.id}`]),
       ...relaxReasons,
     ];
     for (const [reason, count] of Object.entries(blocked)) reasons.push(`excluded:${reason}:${count}`);
@@ -993,6 +1116,13 @@ export function createPresetSelector({
       family: chosen.preset.family,
       recipe: chosen.preset.recipeId,
       variant: variant.variant,
+      /**
+       * Replacement delivery of the same recipe. `actionVariantKey` is the stable composite used
+       * by diagnostics/tests; `variant` above remains the timing variant for compatibility.
+       */
+      actionVariant: actionVariant === null ? null : actionVariant.id,
+      actionVariantKey: actionVariant === null ? null : `${chosen.preset.recipeId}:${actionVariant.id}`,
+      actionVariantProfile: actionVariant === null ? null : { ...actionVariant },
       score: chosen.weight,
       probability,
       relaxed,

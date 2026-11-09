@@ -103,6 +103,73 @@ const rows = [
   ['answer-center-lite', '开口时水平回归自然姿态', 'settle', 'speaking', 'answer-start', 'neutral', 'composed,rational', 'head-center-lite'],
 ];
 
+// ---------------------------------------------------------------------------------------------
+// P-139 stage 3 — replaceable action variants
+// ---------------------------------------------------------------------------------------------
+//
+// A recipe keeps ONE identity (and one recipe-level anti-repeat bucket); its variants only change
+// HOW the same symbolic choreography is delivered. They never add operations, channels or
+// semantics, so a variant can never turn a neutral idle into an affirmation.
+//
+// `amount` scales the operation amplitude, `duration` scales its active phase, `hold` scales the
+// post-active hold. The bias fields (-1..1) only let the selector prefer a variant from the
+// persona dimensions; they are not amplitudes themselves.
+const variant = (id, label, amount, duration, hold, biases = {}) => Object.freeze({
+  id,
+  label,
+  amount,
+  duration,
+  hold,
+  extent: Math.max(-1, Math.min(1, Number(biases.extent) || 0)),
+  holdBias: Math.max(-1, Math.min(1, Number(biases.holdBias) || 0)),
+  speedBias: Math.max(-1, Math.min(1, Number(biases.speedBias) || 0)),
+  textureBias: Math.max(-1, Math.min(1, Number(biases.textureBias) || 0)),
+});
+
+/** Delivery variants for nodding choreography. */
+export const NOD_ACTION_VARIANTS = Object.freeze([
+  variant('nod-small', '轻点', 0.88, 1.06, 1.10, { extent: -0.7, holdBias: 0.5, speedBias: -0.4, textureBias: 0.2 }),
+  variant('nod-deep', '深点', 1.14, 0.98, 1.04, { extent: 0.9, holdBias: 0.3, speedBias: -0.2, textureBias: 0.5 }),
+  variant('nod-quick', '快点', 1.00, 0.82, 0.78, { extent: 0.2, holdBias: -0.8, speedBias: 0.9, textureBias: 0.6 }),
+]);
+
+/** Delivery variants for head-roll / tilt choreography. */
+export const TILT_ACTION_VARIANTS = Object.freeze([
+  variant('tilt-narrow', '窄倾', 0.90, 1.05, 1.12, { extent: -0.5, holdBias: 0.5, speedBias: -0.3, textureBias: 0.2 }),
+  variant('tilt-wide', '宽倾', 1.15, 1.10, 1.16, { extent: 0.9, holdBias: 0.7, speedBias: -0.5, textureBias: 0.6 }),
+  variant('tilt-quick', '快倾', 1.00, 0.84, 0.80, { extent: 0.1, holdBias: -0.8, speedBias: 0.9, textureBias: 0.5 }),
+]);
+
+/** Delivery variants for gaze-only attention choreography. */
+export const GAZE_ACTION_VARIANTS = Object.freeze([
+  variant('gaze-short', '短瞥', 0.88, 0.86, 0.76, { extent: -0.4, holdBias: -0.6, speedBias: 0.7, textureBias: 0.3 }),
+  variant('gaze-hold', '久停', 1.05, 1.14, 1.30, { extent: 0.5, holdBias: 0.9, speedBias: -0.6, textureBias: 0.4 }),
+  variant('gaze-soft', '轻移', 1.00, 1.00, 1.10, { extent: 0.0, holdBias: 0.3, speedBias: 0.0, textureBias: 0.1 }),
+]);
+
+/** Delivery variants for head-turn choreography. */
+export const TURN_ACTION_VARIANTS = Object.freeze([
+  variant('turn-small', '小转', 0.86, 1.05, 1.02, { extent: -0.6, holdBias: 0.2, speedBias: -0.2, textureBias: 0.2 }),
+  variant('turn-wide', '大转', 1.15, 1.10, 1.14, { extent: 0.9, holdBias: 0.6, speedBias: -0.4, textureBias: 0.5 }),
+  variant('turn-quick', '快转', 1.00, 0.84, 0.80, { extent: 0.1, holdBias: -0.7, speedBias: 0.9, textureBias: 0.6 }),
+]);
+
+/** Neutral delivery variants for blink / brow / settle / breath choreography. */
+export const NEUTRAL_ACTION_VARIANTS = Object.freeze([
+  variant('soft', '轻缓', 0.90, 1.10, 1.18, { extent: -0.6, holdBias: 0.8, speedBias: -0.6, textureBias: 0.2 }),
+  variant('clear', '清晰', 1.00, 1.00, 1.00, { extent: 0.0, holdBias: 0.0, speedBias: 0.0, textureBias: 0.0 }),
+  variant('defined', '利落', 1.12, 0.90, 0.84, { extent: 0.9, holdBias: -0.6, speedBias: 0.8, textureBias: 0.8 }),
+]);
+
+/** Pick the variant family from the recipe's own operations (data, never a recipe id). */
+function actionVariantsFor(operations) {
+  if (operations.some(operation => operation === 'nod' || operation === 'double-nod')) return NOD_ACTION_VARIANTS;
+  if (operations.some(operation => operation === 'head-tilt')) return TILT_ACTION_VARIANTS;
+  if (operations.some(operation => operation.startsWith('gaze-'))) return GAZE_ACTION_VARIANTS;
+  if (operations.some(operation => operation === 'head-turn' || operation === 'shake')) return TURN_ACTION_VARIANTS;
+  return NEUTRAL_ACTION_VARIANTS;
+}
+
 const split = text => text.split(',');
 /**
  * A recipe whose every step is a centre/recenter operation is a "settle" action: it only makes
@@ -124,6 +191,12 @@ export const RECIPES = Object.freeze(rows.map(([id, label, family, states, event
     requires: Object.freeze([...new Set(steps.flatMap(op => OPERATIONS[op]))]),
     requiresTarget: steps.includes('gaze-target'),
     requiresDirection: steps.includes('head-turn') && states === 'listening',
+    /**
+     * Replaceable delivery variants of THIS recipe. They share one recipe id (so recipe-level
+     * anti-repeat still holds) but let two draws of the same recipe look different. Frozen data,
+     * never another preset entry, so family probability is not inflated by the variant count.
+     */
+    actionVariants: actionVariantsFor(steps),
     /** Settle/recenter metadata consumed by the selector's idle hard filter. */
     settle,
     ...(settle ? { offsetThreshold: SETTLE_OFFSET_THRESHOLD, settleChannels } : {}),

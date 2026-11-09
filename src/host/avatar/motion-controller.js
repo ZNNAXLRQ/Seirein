@@ -23,6 +23,7 @@ import {
   coerceAvatarStyle,
   deriveAvatarStyleDimensions,
   normalizeAvatarStyle,
+  splitAvatarStyleDimensions,
   styleChannelAmplitude,
 } from './style.js';
 import {
@@ -39,6 +40,7 @@ import {
   STATUS_MODIFIERS,
   STYLE_DIMENSION_APPLICATION,
   intentChannelsFor,
+  styleTraitEffects,
 } from './motion-config.js';
 import { createPresetSelector } from './preset-selector.js';
 import { composeChannels, normalizeGaze } from './mixer.js';
@@ -822,7 +824,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   // still draw the same replacement sequence; the dimension seed follows the persona version.
   const initialStyle = coerceAvatarStyle(cfg.style);
   const initialStyleVersion = String(cfg.styleVersion ?? '');
-  const initialDimensions = deriveAvatarStyleDimensions(initialStyle, { styleVersion: initialStyleVersion });
+  const initialDerived = deriveAvatarStyleDimensions(initialStyle, { styleVersion: initialStyleVersion });
+  const initialSplit = splitAvatarStyleDimensions(initialDerived);
+  const initialDimensions = initialSplit.dimensions;
+  const initialTraits = initialSplit.traits;
   const variantSeed = hash32(
     typeof cfg.seed === 'number' && Number.isFinite(cfg.seed) ? cfg.seed : 0,
     `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:variant`,
@@ -900,8 +905,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     /** Persona style is the BASELINE; `effective` is the temporary per-state scaling of it. */
     style: initialStyle,
     styleVersion: initialStyleVersion,
-    /** P-139 stage 3: persona-derived expression dimensions (never an intent selector). */
+    /** P-139 stage 3: persona-derived expression dimensions (legacy three-field shape). */
     dimensions: initialDimensions,
+    /**
+     * P-139 stage 3: the full PLAN dimension set. `dimensions` stays a compatibility subset so
+     * older consumers (and the stage-3 snapshot contract) keep their exact shape; every new
+     * behaviour reads `traits` through `styleTraitEffects`.
+     */
+    traits: initialTraits,
     status: MOTION_STATUSES.includes(cfg.status) ? cfg.status : 'idle',
     statusChangedAt: 0,
     effective: null,
@@ -1069,6 +1080,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return Math.max(0.2, finite(effective?.tempo, finite(state.style?.tempo, 1)));
   }
 
+  /** The one dimension → motion projection for this persona (never intent selection). */
+  function traitEffects() {
+    return styleTraitEffects(state.traits);
+  }
+
+  /** Re-derive both views from the current baseline style + version. */
+  function applyDerivedDimensions() {
+    const split = splitAvatarStyleDimensions(
+      deriveAvatarStyleDimensions(state.style, { styleVersion: state.styleVersion }),
+    );
+    state.dimensions = split.dimensions;
+    state.traits = split.traits;
+  }
+
   /**
    * The hold window in force (A). An explicit host config always wins; otherwise the lively persona
    * gets the optional 4–8 s variant and every other persona keeps the 6–12 s base.
@@ -1092,7 +1117,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       ? 'config'
       : bounds.min === POSTURE_HOLD_ALLOCATION.lively.MIN_MS ? 'lively' : 'base';
     const tempo = postureTempo();
-    const stay = Math.max(0.8, Math.min(1.5, 1 / tempo));
+    const effects = traitEffects();
+    // Composure/softness stretch the stay inside the SAME allocation band; the band itself is the
+    // stage-4 A allocation, so this never turns a lively persona into a 20 s statue.
+    const stay = Math.max(0.8, Math.min(1.5, (1 / tempo) * effects.hold));
     const base = bounds.min + (bounds.max - bounds.min) * clamp01(motionRandom());
     motion.holdMs = Math.max(1000, Math.min(bounds.max, Math.max(bounds.min, base * stay)));
     motion.holdUntil = now + motion.holdMs;
@@ -1161,8 +1189,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       return null;
     }
     const window = transitionWindow(kind);
+    // Composure lengthens the planned transition, liveliness shortens it; the window of the
+    // original CAUSE still clamps the result, so the stage-1/2 continuity bounds are unchanged.
+    const transitionScale = traitEffects().transition;
     const planned = durationMs === null
-      ? finite(cfg.postureTransitionMs, POSTURE_TRANSITION.BASE_MS) / postureTempo()
+      ? (finite(cfg.postureTransitionMs, POSTURE_TRANSITION.BASE_MS) * transitionScale) / postureTempo()
       : finite(durationMs, window.min);
     const plannedMs = Math.max(window.min, Math.min(window.max, planned));
     const seconds = plannedMs / 1000;
@@ -1455,8 +1486,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const EVENTS_MAX = 100;
 
   // The initial dimensions are observable before the first tick, so a host (or a test) can show
-  // them without waiting for a style refresh.
+  // them without waiting for a style refresh. The legacy event keeps its exact shape; the new
+  // `traits` event carries the full PLAN dimension set.
   recordEvent('avatar.style.dimensions', { ...state.dimensions });
+  recordEvent('avatar.style.traits', { ...state.traits });
 
   function recordEvent(type, data = {}) {
     state.events.push({ type, at: state.lastAt ?? clockNow(), ...data });
@@ -1656,7 +1689,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     state.style = normalized.style;
     state.effective = null;
     if (typeof styleVersion === 'string' && styleVersion.length > 0) state.styleVersion = styleVersion;
-    state.dimensions = deriveAvatarStyleDimensions(state.style, { styleVersion: state.styleVersion });
+    applyDerivedDimensions();
     recordEvent('avatar.style.set', {
       styleVersion: state.styleVersion,
       changed: normalized.changed,
@@ -1664,8 +1697,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       invalid: normalized.invalid,
     });
     // Dimensions are a pure projection of the new style: re-derive and publish them in the same
-    // transition, so a listener never sees a style newer than its dimensions.
+    // transition, so a listener never sees a style newer than its dimensions. The legacy event
+    // and the full trait event are both current before this call returns.
     recordEvent('avatar.style.dimensions', { ...state.dimensions });
+    recordEvent('avatar.style.traits', { ...state.traits });
     return {
       ok: true,
       style: { ...state.style },
@@ -1807,7 +1842,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       add('confident', 0.7);
       add('composed', 0.6);
     }
-    return { styles, dimensions: state.dimensions, tiltChance: tilt, gazeHabit };
+    return {
+      styles,
+      /** Full PLAN dimension set (the legacy three plus expression/attention/composure/texture). */
+      dimensions: state.traits,
+      tiltChance: tilt,
+      gazeHabit,
+    };
   }
 
   /**
@@ -1820,12 +1861,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const selector = presetSelector();
     const tilt = clamp01(finite((state.effective ?? state.style)?.tiltChance, DEFAULT_AVATAR_STYLE.tiltChance) / 0.5);
     const gazeHabit = (state.effective ?? state.style)?.gazeHabit ?? 'steady';
+    // P-139 stage 3: "注意方式" directly reweights attention/head-turn recipes. `attentionChance`
+    // is 0..1 and already derived from the persona (gaze habit × tilt × liveliness), so this is
+    // not a persona-name lookup. It is a priority (soft) — never a hard enable/disable.
+    const attentionShift = (traitEffects().attentionChance - 0.5) * 2;
     const gazePriority = gazeHabit === 'direct'
-      ? { target: 82, center: 74, away: 24 }
+      ? { target: 82 + 8 * attentionShift, center: 74, away: 24 - 10 * attentionShift }
       : gazeHabit === 'wandering'
-        ? { target: 24, center: 30, away: 82 }
-        : { target: 55, center: 55, away: 55 };
-    const tiltPriority = Math.round(50 + (tilt - 0.5) * 70);
+        ? { target: 24 + 10 * attentionShift, center: 30, away: 82 + 8 * attentionShift }
+        : {
+            target: 55 + 8 * attentionShift,
+            center: 55,
+            away: 55 + 14 * attentionShift,
+          };
+    const tiltPriority = Math.round(50 + (tilt - 0.5) * 70 + attentionShift * 18);
     const untouched = (preset) => {
       for (const key of [preset.id, preset.recipeId]) {
         if (Object.prototype.hasOwnProperty.call(base.actionPriority, key)) return false;
@@ -2164,6 +2213,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       family: normalized.family ?? null,
       recipe: normalized.recipe ?? null,
       variant: normalized.variant ?? null,
+      actionVariant: normalized.actionVariant ?? null,
+      actionVariantKey: normalized.actionVariantKey ?? null,
       reasons: [...normalized.reasons],
       droppedChannels: [...(normalized.droppedChannels ?? [])],
       targetVerified: normalized.targetVerified,
@@ -2210,6 +2261,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         family: selection.family ?? null,
         recipe: selection.recipe ?? null,
         variant: selection.variant ?? null,
+        actionVariant: selection.actionVariant ?? null,
+        actionVariantKey: selection.actionVariantKey ?? null,
         probability: finite(selection.probability, 0),
         reasons: [...(selection.reasons ?? [])],
         operations: [...(selection.operations ?? [])],
@@ -2318,16 +2371,25 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const timing = selection.timing ?? {};
     const style = state.effective ?? state.style;
     const dims = state.dimensions ?? {};
+    const effects = traitEffects();
     const liveliness = clamp01(finite(dims.liveliness, 0));
     const restraint = clamp01(finite(dims.restraint, 0));
     const tilt = clamp01(finite(context?.persona?.tiltChance, finite(style?.tiltChance, 0.15) / 0.5));
     const gazeHabit = context?.persona?.gazeHabit ?? style?.gazeHabit ?? 'steady';
-    const tempo = Math.max(0.2, finite(style?.tempo, 1));
+    // The selector picked the replacement delivery for THIS recipe; the executor only applies its
+    // amount/duration/hold multipliers. A custom catalog without variants defaults to 1.
+    const actionVariant = selection.actionVariantProfile ?? null;
+    const variantAmount = Math.max(0.5, Math.min(1.5, finite(actionVariant?.amount, 1)));
+    const variantDuration = Math.max(0.5, Math.min(1.5, finite(actionVariant?.duration, 1)));
+    const variantHold = Math.max(0.5, Math.min(1.5, finite(actionVariant?.hold, 1)));
+    const tempo = Math.max(0.2, finite(style?.tempo, 1) * effects.tempo);
     const amplitudeScale = (STYLE_DIMENSION_APPLICATION.amplitudeBase
       + STYLE_DIMENSION_APPLICATION.amplitudeSpan * liveliness)
-      * (1 - STYLE_DIMENSION_APPLICATION.restraintCap * restraint);
+      * (1 - STYLE_DIMENSION_APPLICATION.restraintCap * restraint)
+      * effects.amplitude * variantAmount;
     const unstable = timing.release === 'unhurried';
-    const holdScale = timing.hold === 'lingering' ? PRESET_EXECUTION.HOLD_LINGER_MS : PRESET_EXECUTION.HOLD_MIN_MS;
+    const holdScale = (timing.hold === 'lingering' ? PRESET_EXECUTION.HOLD_LINGER_MS : PRESET_EXECUTION.HOLD_MIN_MS)
+      * effects.hold * variantHold;
     const separated = timing.pacing === 'separated';
     const stages = [];
     const droppedOps = [];
@@ -2344,13 +2406,16 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const targetOffsets = {};
       const channel = channels[0];
       const sign = choosePresetSign(op, profile, channel === 'eyeOpenL' ? 'headY' : channel);
-      const jitter = 0.94 + state.presets.random() * 0.12;
-      const durationJitter = 0.94 + state.presets.random() * 0.12;
+      // Texture widens the existing seeded jitter band; it never adds another random source.
+      const jitterBand = 0.12 * (0.5 + effects.variantSpread);
+      const jitter = 0.94 + state.presets.random() * jitterBand;
+      const durationJitter = 0.94 + state.presets.random() * jitterBand;
       const activeMs = Math.max(80, (PRESET_EXECUTION[profile.active] ?? PRESET_EXECUTION.BROW_ACTIVE_MS)
-        / tempo * durationJitter);
+        / tempo * durationJitter * variantDuration);
       const prepareMs = Math.max(60, PRESET_EXECUTION.PREPARE_MS / tempo);
       let holdMs = holdScale / tempo;
-      let exitMs = (unstable ? PRESET_EXECUTION.UNHURRIED_EXIT_MS : PRESET_EXECUTION.EXIT_MS) / tempo;
+      let exitMs = (unstable ? PRESET_EXECUTION.UNHURRIED_EXIT_MS : PRESET_EXECUTION.EXIT_MS)
+        / tempo * variantDuration;
       if (profile.tilt === true) {
         holdMs *= 0.8 + 0.6 * tilt;
         if (tilt > 0.4) exitMs *= 1.12;
@@ -2767,6 +2832,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }));
     trace.output.droppedChannels = [...(selection.droppedChannels ?? [])];
     trace.output.reason = 'running';
+    // A started action is observable immediately: `lastTrace` is the newest trace, whether it is
+    // still running (also available as `currentTrace`) or already finished. Cancellation/eviction
+    // later overwrites it with the completed/interrupted trace, exactly as before.
+    state.presets.lastTrace = clonePresetTrace(trace);
     if (built.nativeOps.length > 0) trace.output.nativeOwned = [...built.nativeOps];
     if (built.droppedOps.length > 0) trace.output.skippedOperations = [...built.droppedOps];
     state.presets.seq += 1;
@@ -2783,6 +2852,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       family: selection.family,
       recipe: selection.recipe,
       variant: selection.variant,
+      actionVariant: selection.actionVariant ?? null,
+      actionVariantKey: selection.actionVariantKey ?? null,
       operations: [...(selection.operations ?? [])],
       channels: [...new Set(built.stages.flatMap((stage) => stage.channels))],
       stages: built.stages,
@@ -2860,6 +2931,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       family: selection.family,
       recipe: selection.recipe,
       variant: selection.variant,
+      actionVariant: selection.actionVariant ?? null,
+      actionVariantKey: selection.actionVariantKey ?? null,
       event: context.event ?? '',
       operations: [...(selection.operations ?? [])],
       channels: [...item.channels],
@@ -2892,6 +2965,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       family: selection.family,
       recipe: selection.recipe,
       variant: selection.variant,
+      actionVariant: selection.actionVariant ?? null,
+      actionVariantKey: selection.actionVariantKey ?? null,
       operations: [...item.operations],
       channels: [...item.channels],
       droppedChannels: [...(selection.droppedChannels ?? [])],
@@ -3309,6 +3384,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   function presetsSnapshot() {
+    // One clone shared by lastTrace/currentTrace: a status snapshot must not copy a live trace twice.
+    const livePresetTrace = state.presets.active.length === 0
+      ? null
+      : clonePresetTrace(state.presets.active[state.presets.active.length - 1].trace);
     return {
       enabled: state.presets.enabled,
       starts: state.presets.starts,
@@ -3363,10 +3442,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       },
       lastSelection: state.presets.lastSelection === null
         ? null : JSON.parse(JSON.stringify(state.presets.lastSelection)),
-      lastTrace: clonePresetTrace(state.presets.lastTrace),
+      /**
+       * The newest trace: while an action is still running this is its LIVE trace (the same object
+       * also exposed as `currentTrace`), otherwise the last completed/hold trace. Older tests and
+       * the host read this field after a short window, so a running action must never look empty.
+       */
+      lastTrace: livePresetTrace ?? clonePresetTrace(state.presets.lastTrace),
       /** The live three-layer trace while a preset is still executing (null when idle). */
-      currentTrace: state.presets.active.length === 0
-        ? null : clonePresetTrace(state.presets.active[state.presets.active.length - 1].trace),
+      currentTrace: livePresetTrace,
       /** Channels still being written by the release window after a preset ended/cancelled. */
       releasing: [...state.releases]
         .filter(([, entry]) => String(entry.kind).startsWith('preset:'))
@@ -3430,6 +3513,43 @@ export function createBehaviorRuntime({ config = {} } = {}) {
 
 
   /**
+   * Stage-3 dimension preference for one intent variant. Texture/expressiveness favour the
+   * replacements that differ most from the neutral middle; restraint favours the small one;
+   * composure favours the longer delivery. Weights only, never a different intent.
+   */
+  function intentVariantWeight(item, traits) {
+    if (traits === null || traits === undefined) return 1;
+    const texture = clamp01(finite(traits.texture, 0.5));
+    const expression = clamp01(finite(traits.expressiveness, 0.5));
+    const restraint = clamp01(finite(traits.restraint, 0.5));
+    const liveliness = clamp01(finite(traits.liveliness, 0.5));
+    const composure = clamp01(finite(traits.composure, 0.5));
+    const size = Math.abs(finite(item.amplitude, 1) - 1) / 0.15;
+    const speed = Math.abs(finite(item.duration, 1) - 1) / 0.2;
+    const amplitudeBias = (finite(item.amplitude, 1) - 1) * 8;
+    const durationBias = (finite(item.duration, 1) - 1) * 4;
+    const weight = 1
+      + 0.32 * texture * Math.min(1, size + speed)
+      + 0.24 * expression * amplitudeBias
+      - 0.20 * restraint * amplitudeBias
+      + 0.18 * liveliness * speed
+      + 0.14 * composure * durationBias;
+    return Math.max(0.05, weight);
+  }
+
+  function pickWeightedVariant(list, weightOf, randomValue) {
+    const weights = list.map(item => Math.max(0, weightOf(item)));
+    const total = weights.reduce((sum, value) => sum + value, 0);
+    if (!(total > 0)) return list[list.length - 1];
+    let threshold = clamp01(finite(randomValue, 0)) * total;
+    for (let index = 0; index < list.length; index += 1) {
+      threshold -= weights[index];
+      if (threshold < 0) return list[index];
+    }
+    return list[list.length - 1];
+  }
+
+  /**
    * Draw one variant for `kind` from that intent's own seeded stream. The previous variant of the
    * SAME intent is skipped, so a run of identical gestures never draws the same replacement twice
    * in a row. The stream is stable for one runtime seed, which keeps the sequence reproducible.
@@ -3452,11 +3572,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       stream = createSeededRandom(`${state.variant.seed}:${kind}`);
       state.variant.streams.set(kind, stream);
     }
-    let index = Math.min(list.length - 1, Math.floor(clamp01(finite(stream(), 0)) * list.length));
-    if (list.length > 1 && list[index].id === state.variant.last[kind]) {
-      index = (index + 1) % list.length;
-    }
-    const variant = list[index];
+    const traits = state.traits ?? null;
+    const previous = state.variant.last[kind];
+    // A repeat is impossible back-to-back: the previous variant's weight is zeroed, so the seeded
+    // draw is still reproducible but can never return the same replacement twice in a row.
+    const variant = pickWeightedVariant(
+      list,
+      item => (list.length > 1 && item.id === previous ? 0 : intentVariantWeight(item, traits)),
+      clamp01(finite(stream(), 0)),
+    );
     state.variant.last[kind] = variant.id;
     state.variant.lastInfo = { intent: kind, variant: variant.id, seed: state.variant.seed };
     return variant;
@@ -3494,14 +3618,18 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const now = Number.isFinite(at) ? at : clockNow();
     const scaled = effectiveStyle();
     const dims = state.dimensions;
+    const effects = traitEffects();
     const occasional = gestureProfile !== null;
     const variant = pickIntentVariant(action, { deep: occasional });
     const application = STYLE_DIMENSION_APPLICATION;
     const baseDurationMs = action === 'surprise'
       ? Math.round(520 / scaled.tempo)
       : Math.round(scaled.nodDurationMs / scaled.tempo);
+    // All six PLAN dimensions reach the gesture through `effects`: expression/composure lengthen
+    // or shorten the active phase, and the seeded variant adds its own delivery difference.
     const durationScale = (application.durationBase + application.durationSpan * dims.softness)
       * (1 + application.livelinessTempo - 2 * application.livelinessTempo * dims.liveliness)
+      * effects.duration
       * variant.duration
       * (occasional ? OCCASIONAL_ACTION.DURATION : 1);
     // `durationMs` is the planned gesture length; a conclusion keeps a floor so its affirmation
@@ -3519,6 +3647,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           : 0.16 * scaled.amplitude;
     const amplitudeScale = (application.amplitudeBase + application.amplitudeSpan * dims.liveliness)
       * (1 - application.restraintCap * dims.restraint)
+      * effects.amplitude
       * variant.amplitude
       * (occasional ? OCCASIONAL_ACTION.AMPLITUDE : 1);
     // C: only an occasional action is capped at the 12–14° band, and the cap is applied AFTER the
@@ -4814,8 +4943,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         baseline: { ...state.style },
         effective: { ...(state.effective ?? effectiveStyle()) },
         version: state.styleVersion,
-        /** P-139 stage 3: expression dimensions derived from the baseline persona style. */
+        /** P-139 stage 3: legacy expression dimensions (exact shape kept for older consumers). */
         dimensions: { ...state.dimensions },
+        /**
+         * P-139 stage 3: the full PLAN dimension set (liveliness / softness / restraint /
+         * expressiveness / attention / composure / texture) and the derived effect multipliers.
+         * Read-only projection; it never feeds back into the style itself.
+         */
+        traits: { ...state.traits },
+        effects: { ...traitEffects() },
       },
       status: state.status,
       intents: {
