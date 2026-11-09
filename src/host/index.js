@@ -11631,6 +11631,7 @@ export function apply(ctx, config) {
           hint: { type: 'string' },
           reason: { type: 'string' },
           error: { type: 'string' },
+          evidenceType: { type: 'string', enum: ['current'] },
         },
         required: ['ok', 'running', 'engine', 'frames', 'sheets', 'ready', 'file', 'bytes'],
       },
