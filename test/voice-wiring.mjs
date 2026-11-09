@@ -819,3 +819,34 @@ test('13. turn/start never pauses the typed reply; a typed message does', async 
   assert.equal(cancelled.reason, 'user-input');
   t.diagnostic(`turn2 start: cancelled=0 keep=${keep?.payload?.reason}; typed input: ${cancelled.reason}`);
 });
+
+// ---------------------------------------------------------------------------
+// 14. P-139 lane gate: a whole-line tool `assistant_say` end is not an answer end
+// ---------------------------------------------------------------------------
+
+test('14. 工具 assistant_say 整行结束不报 answer-end、不收势', async (t) => {
+  const app = await mount(t);
+  await app.connectAvatar();
+  // Keep the tool clip sounding long enough to observe its own end.
+  state.playerMs = 1200;
+  app.emit(turnStart(1));
+  app.emit(userMessage(1, '说一句'));
+  // The progress line is a tool lane; it must not claim the answer's voice or its end.
+  const said = await app.say({ text: '我先去查一下，稍等。', purpose: 'explicit' });
+  assert.equal(said.accepted, true, `the tool line was accepted (${said.reason ?? ''})`);
+  await waitUntil(() => app.players().length === 1, 'the tool line reached the player');
+  const before = await app.runtime();
+  assert.equal(before.speech.clip.active, true, 'the tool line owns its own clip');
+  assert.equal(before.intentEvents.calls['answer-end'], 0, 'no answer end before the line sounds');
+  const settledBefore = before.intentEvents.settled;
+
+  app.players()[0].resolve();
+  await app.waitForEvent('voice.playback.end');
+  await tick(120);
+  const after = await app.runtime();
+  assert.equal(after.intentEvents.calls['answer-end'], 0, 'the tool line end is not an answer end');
+  assert.equal(after.intentEvents.settled, settledBefore, 'the tool line end never settles the pose');
+  assert.equal(after.speech.clip.session, true, 'the tool line closed its clip without closing the answer');
+  t.diagnostic(`answerEnd=${after.intentEvents.calls['answer-end']} settled=${settledBefore}->`
+    + `${after.intentEvents.settled} toolSession=${after.speech.clip.session}`);
+});

@@ -624,3 +624,57 @@ test('5. 边界空闲时第一段正文起播恰好触发一次 opening gesture�
     + `dropped=${(await app.events()).filter((entry) => entry.type === 'avatar.intent.dropped'
       && entry.payload?.event === 'answer-start').length}`);
 });
+
+// =============================================================================================
+// 6. Lane gate (P-139 stage 2 P0 B): only the ANSWER BODY's natural end reports the answer end.
+//    The waiting line (ack) closes its own clip; the reply body reports `answer-end` exactly once.
+// =============================================================================================
+test('6. 候音（ack）结束不触发 answer-end；reply 正文自然结束恰好触发一次', async (t) => {
+  const app = await mountHost(t, { settings: { voice: { ackDelayMs: 200 } } });
+  // Hold the body's synthesis: the waiting line plays and ends while no answer body is ready.
+  let releaseBody;
+  hostState.bodyGates.push(new Promise((resolve) => { releaseBody = resolve; }));
+
+  app.emit(turnStart(1));
+  app.emit(userMessage(1, '帮我查一下明天的天气'));
+  await waitUntil(() => app.players().length >= 1, 'the waiting line reached the player');
+  const beforeAck = await app.runtime();
+  assert.equal(beforeAck.intentEvents.calls['answer-end'], 0, 'nothing is an answer end before it starts');
+  const settledBeforeAck = beforeAck.intentEvents.settled;
+
+  // The waiting line (lane ack) really ends: its own clip closes, the answer does not.
+  app.players()[0].resolve();
+  await tick(250);
+  let view = await app.runtime();
+  assert.equal(view.intentEvents.calls['answer-end'], 0, 'an ack end is never an answer end');
+  assert.equal(view.intentEvents.settled, settledBeforeAck, 'an ack end never settles the pose');
+  assert.equal(view.speech.clip.session, true, 'the ack did not close the whole speech session');
+  assert.equal(view.speech.clip.active, false, 'the ack closed its own clip');
+  const ackSession = view.speech.clip.session;
+
+  // The answer body arrives and its first block starts once the held synthesis is released.
+  app.emit(assistantBody(1, '明天上海多云。'));
+  app.emit(turnEnd(1));
+  releaseBody();
+  await waitUntil(() => app.players().length >= 2, 'the reply body reached the player');
+  const answerStartBeforeEnd = (await app.runtime()).intentEvents.calls['answer-start'];
+  assert.equal(answerStartBeforeEnd, 1, 'the body start still reports answer-start once');
+
+  // End every body block (a sentence may have been split): the reply's natural end reports once.
+  for (let index = 0; index < 60; index += 1) {
+    if ((await app.runtime()).intentEvents.calls['answer-end'] > 0) break;
+    for (const player of app.players().slice(1)) player.resolve();
+    await tick(40);
+  }
+  await waitUntil(async () => (await app.runtime()).intentEvents.calls['answer-end'] === 1,
+    'the reply body end reported answer-end exactly once');
+  await tick(200);
+  view = await app.runtime();
+  assert.equal(view.intentEvents.calls['answer-end'], 1, 'the reply body reports its end once, never twice');
+  assert.equal(view.speech.clip.session, false, 'the reply natural end closed the speech session');
+  const stagedAnswerStart = (await app.events()).filter((entry) => entry.type === 'avatar.intent.staged'
+    && entry.payload?.event === 'answer-start');
+  assert.equal(stagedAnswerStart.length, 1, 'the ack still never staged an opening intent');
+  console.log(`[lane] ack: answerEnd=0 settled=${settledBeforeAck} session=${ackSession} `
+    + `reply: answerEnd=${view.intentEvents.calls['answer-end']} players=${app.players().length}`);
+});

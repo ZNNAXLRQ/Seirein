@@ -3922,6 +3922,15 @@ export function apply(ctx, config) {
       return null;
     }
   };
+  /**
+   * P-139: a verified user barge-in is a real interruption of the motion runtime, not only of the
+   * audio. One stable reason vocabulary (`barge-in`) lets the runtime take the same smooth fade as
+   * `interrupt`; a turn/model switch never comes through here and keeps its immediate hard stop.
+   */
+  const avatarInterrupt = (reason = 'barge-in') => avatarCall(
+    'interrupt',
+    (current) => current.interrupt({ reason }),
+  );
   /** One sentence-level clip boundary (P-54): `start` opens the sentence, `end` closes it. */
   const avatarClip = (phase, session) => avatarCall(`speechClip.${phase}`, (current) => current.speechClip(
     phase === 'end' ? 'end' : 'start',
@@ -4792,6 +4801,26 @@ export function apply(ctx, config) {
   };
 
   /**
+   * P-139: the speech lane of one clip. ONLY the answer body may report the answer's end
+   * (`answer-end` / `speechEnd`): voice, typed and fast-path replies are `reply`; the waiting line
+   * is `ack`, a whole-line notice is `say` and an `assistant_say` line is `tool`. A clip that names
+   * no lane is incidental (`say`), so it can never close the answer by accident.
+   */
+  const ANSWER_SPEECH_LANE = 'reply';
+  const SPEECH_LANES = Object.freeze(['reply', 'ack', 'say', 'tool']);
+  const speechLaneFor = (lane, owner = null) => {
+    if (SPEECH_LANES.includes(lane)) return lane;
+    const ownerLane = typeof owner?.lane === 'string' ? owner.lane : '';
+    // The seat owner's `typed` lane is the typed reply's answer body; `say` is the tool line.
+    if (ownerLane === 'reply' || ownerLane === 'typed') return ANSWER_SPEECH_LANE;
+    if (ownerLane === 'say') return 'tool';
+    if (ownerLane === 'ack') return 'ack';
+    return 'say';
+  };
+  /** True only for the answer body: the one lane allowed to close the speech session. */
+  const isAnswerBodyClip = (session) => session?.speechLane === ANSWER_SPEECH_LANE;
+
+  /**
    * Playback session: the single owner of the clock and of cancellation.
    * `startedAt` is a host/player clock anchor, not a measured sound-card first-audio instant.
    * Streaming sessions wait for a transport start notification before setting this anchor.
@@ -4803,6 +4832,8 @@ export function apply(ctx, config) {
       file,
       durationMs: Math.max(0, Number(durationMs) || 0),
       subtitle,
+      /** Speech lane (`reply`/`ack`/`say`/`tool`): only `reply` may close the answer. */
+      speechLane: 'say',
       /**
        * The text really sent to TTS for this clip (speech language). It is the echo filter's
        * reference; `subtitle` above is display-only and may be a different language. `''` means
@@ -4938,12 +4969,15 @@ export function apply(ctx, config) {
       // clip is queued behind it (the next clip start reopens a fresh sentence identity).
       if (session.startedAt > 0 && (session.chunkIndex ?? 0) >= (session.chunkCount ?? 1) - 1) {
         avatarClip('end', session);
-        if (!playbackQueued()) {
+        // P-139: ONLY the answer body's natural end closes the speech session and reports the
+        // answer end. A waiting line (ack), a tool line, a whole-line say and a cancelled or
+        // interrupted clip close their own playback only: they never make the companion settle as
+        // if the answer had finished. A cancel/interruption is not an answer end.
+        const answerBody = isAnswerBodyClip(session);
+        const answerEnded = session.endReason === 'end' || session.endReason === 'watchdog';
+        if (answerBody && answerEnded && !playbackQueued()) {
           avatarSpeechEnd(session.endedAt);
-          // P-139: the answer is over. A cancel/interruption is not an answer end.
-          if (session.endReason === 'end' || session.endReason === 'watchdog') {
-            avatarIntent('answer-end', { at: session.endedAt });
-          }
+          avatarIntent('answer-end', { at: session.endedAt });
         }
       }
     }
@@ -5127,6 +5161,9 @@ export function apply(ctx, config) {
     // P-54: the sentence this clip belongs to and its position inside that sentence. A lane that
     // does not know them (a whole line) leaves `sentenceId` null and plays as a one-block clip.
     sentenceId = null, chunkIndex = 0, chunkCount = 1,
+    // P-139: the speech lane at the playback entrance. Only `reply` (the answer body) may report
+    // the answer's end; `ack` / `say` / `tool` are incidental lines. Omitted = derive from `owner`.
+    lane = null,
   }) => {
     signal?.throwIfAborted();
     // Wait for the single playback seat (FIFO). A playing sentence is never cut here; only an
@@ -5144,6 +5181,7 @@ export function apply(ctx, config) {
       session = createPlayback({ file, durationMs, subtitle: subtitleText, speechText });
       session.seat = seat;
       session.owner = owner;
+      session.speechLane = speechLaneFor(lane, owner);
       session.sentenceId = Number.isInteger(sentenceId) ? sentenceId : null;
       session.chunkIndex = Number.isInteger(chunkIndex) && chunkIndex >= 0 ? chunkIndex : 0;
       session.chunkCount = Number.isInteger(chunkCount) && chunkCount > 0 ? chunkCount : 1;
@@ -5257,6 +5295,8 @@ export function apply(ctx, config) {
     turn = null, deliveryMessageId = null, sessionId = null,
     // P2: the text the stream is synthesized from — `text` itself unless a lane says otherwise.
     speechText = text,
+    // P-139: speech lane at the playback entrance (see `playAudio`); only `reply` may end an answer.
+    lane = null,
   }) => {
     signal?.throwIfAborted();
     // FIFO: a queued sentence starts only after the sounding one finished; no mid-sentence cut.
@@ -5273,6 +5313,7 @@ export function apply(ctx, config) {
       session = createPlayback({ subtitle: subtitleText, speechText });
       session.seat = seat;
       session.owner = owner;
+      session.speechLane = speechLaneFor(lane, owner);
       session.subtitleFinal = subtitleFinal !== false;
       // The player has been granted the seat but has not produced its first chunk: the clip is not
       // audible yet, so `ttsIsSpeaking()` must stay false until `onStart` below.
@@ -7599,6 +7640,8 @@ export function apply(ctx, config) {
             signal: lane,
             onPlaybackSession: (session) => adopt(session, index),
             owner: speechOwner,
+            // A tool line closes its own playback, never the answer.
+            lane: 'tool',
             subtitleFinal: finalBlock,
             // P-54: every block of one say line is the same "sentence" here; block 0 opens the
             // reported clip boundary and the last block closes it.
@@ -7694,6 +7737,8 @@ export function apply(ctx, config) {
                 signal: combined,
                 onPlaybackSession: adopt,
                 owner: speechOwner,
+                // A tool line closes its own playback, never the answer.
+                lane: 'tool',
                 // Observation only: the streamed answer transport.
                 purpose: 'answer',
                 // P-46 stage 2: the streamed line's turn attribution.
@@ -11685,6 +11730,8 @@ export function apply(ctx, config) {
         sentenceId: Number.isInteger(sentenceId) ? sentenceId : 0,
         chunkIndex: index,
         chunkCount: Number.isInteger(count) && count > 0 ? count : 1,
+        // The fast path's spoken answer is the answer body: its natural end may settle the pose.
+        lane: 'reply',
       });
       return { audioStartedAt: session.startedAt > 0 ? session.startedAt : Date.now(), done: session.done };
     };
@@ -12865,7 +12912,11 @@ export function apply(ctx, config) {
    * failure notices). `subtitle` is optional: when the subtitle language differs from the speech
    * language, the caller passes both texts.
    */
-  const speakLine = async (text, subtitle = '', { turn = null, sessionId = null } = {}) => {
+  const speakLine = async (
+    text,
+    subtitle = '',
+    { turn = null, sessionId = null, lane = 'say' } = {},
+  ) => {
     if (!features.enabled('voice')) return null;
     try {
       const signal = speechSignal();
@@ -12904,6 +12955,9 @@ export function apply(ctx, config) {
         subtitleText: caption,
         speechText: prepared.speechText,
         signal,
+        // A whole-line notice/fallback closes its own playback; with `lane:'say'` (the default)
+        // it never reports the answer's end, so it cannot settle the pose.
+        lane,
       });
       // Legacy metric: a synchronous host clock anchor, NOT measured speaker first audio (A1).
       return {
@@ -12969,6 +13023,8 @@ export function apply(ctx, config) {
       // The waiting line's audio was synthesized from this text, not from its caption.
       speechText: typeof audio?.speechText === 'string' ? audio.speechText : '',
       signal,
+      // The waiting line is a cue, not the answer: its end never settles the pose.
+      lane: 'ack',
     });
     // A superseded record aborts this signal: that stops its own clip instead of leaving the
     // stale line sounding until the next play happens to supersede it.
@@ -13547,6 +13603,8 @@ export function apply(ctx, config) {
         captionStream: showing ? (audio?.captionStream ?? null) : null,
         signal: combined,
         owner: { sessionId, turn: Number.isInteger(turnId) ? turnId : null, lane: 'typed' },
+        // The typed reply's body is the answer body; its natural end may close/settle the answer.
+        lane: 'reply',
         // One caption for the sentence: a block gap must not hide it; the last block holds it.
         subtitleFinal: chunkIndex >= chunkCount - 1,
         // P-54: the reply speaker's `sentenceId` names the sentence this block belongs to.
@@ -13573,8 +13631,11 @@ export function apply(ctx, config) {
     },
     speakWhole: async (value, scope = {}) => {
       await answerAfterAck(scope?.sessionId, scope?.turnId);
-      // P-46 stage 2: the typed whole-line fallback names the same typed round.
-      const result = await speakLine(value, '', { sessionId: scope?.sessionId, turn: scope?.turnId });
+      // P-46 stage 2: the typed whole-line fallback names the same typed round. It is still the
+      // answer body, so its natural end may report `answer-end`/`speechEnd`.
+      const result = await speakLine(value, '', {
+        sessionId: scope?.sessionId, turn: scope?.turnId, lane: 'reply',
+      });
       const at = Number(result?.audioStartedAt) || 0;
       if (at > 0) ackLane?.bodyStarted({ sessionId: scope?.sessionId, turn: scope?.turnId, at });
       if (at > 0) noteReplySpoke(scope?.sessionId, scope?.turnId);
@@ -14056,6 +14117,8 @@ export function apply(ctx, config) {
                     captionStream: showing ? (audio?.captionStream ?? null) : null,
                     signal: laneSignal,
                     owner: { speechId, sessionId, turn: turnId, lane: 'reply' },
+                    // The reply's body is the only lane allowed to report the answer's end.
+                    lane: 'reply',
                     onPlaybackSession: (playing) => {
                       playingSession = playing;
                       onPlaying(playing);
@@ -14161,8 +14224,9 @@ export function apply(ctx, config) {
               if (claim.ok !== true) return null;
               let result;
               try {
-                // P-46 stage 2: the whole-reply fallback belongs to this answer's turn.
-                result = await speakLine(value, '', { sessionId, turn: turnId });
+                // P-46 stage 2: the whole-reply fallback belongs to this answer's turn. It speaks
+                // the answer body, so its natural end may still close the answer.
+                result = await speakLine(value, '', { sessionId, turn: turnId, lane: 'reply' });
               } catch (error) {
                 speechLedger.releaseText({ sessionId, turn: turnId, text: value });
                 throw error;
@@ -15687,6 +15751,9 @@ export function apply(ctx, config) {
     }
     void log.emit('hearing.bargein', { source: 'partial', frames, rmsDb: Math.round(level) }).catch(() => {});
     cancelFastReply('voice');
+    // The audio/ledger are already stopped; the motion runtime must leave the interrupted action
+    // through its smooth barge-in fade, not keep playing it to its natural end.
+    avatarInterrupt('barge-in');
     return true;
   };
   /** Comparable form for the echo check: punctuation and spacing do not make an echo new words. */
@@ -15744,6 +15811,9 @@ export function apply(ctx, config) {
     }
     void log.emit('hearing.bargein', { source: 'final', deduped: false }).catch(() => {});
     cancelFastReply('voice');
+    // One real user interruption: the sounding clip is gone, and the running gesture takes the
+    // runtime's smooth `barge-in` exit (never the 0 ms turn-switch hard clear, never revived).
+    avatarInterrupt('barge-in');
     return { interrupted: true, reason: '' };
   };
 

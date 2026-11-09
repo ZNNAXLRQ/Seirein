@@ -613,6 +613,14 @@ const PRESET_POSTURE_OFFSET_CHANNELS = Object.freeze(['headX', 'headY', 'headZ',
 /** Closed vocabulary of "why no preset ran" (`status.live2d.runtime.motion.presets.skips`). */
 const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unverified', 'throttled', 'busy']);
 
+/**
+ * Reasons that mean "the user interrupted us", not "a new generation owns the pose". They take the
+ * smooth 240 ms preset fade; every other invalidation (turn/model/channel switch, lock, teardown)
+ * keeps the 0 ms hard stop, so no old action can survive into the next generation.
+ */
+const SMOOTH_INTERRUPT_REASON = /interrupt|barge[-_ ]?in/i;
+const SMOOTH_INTERRUPT_FADE_MS = 240;
+
 const presetClamp = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
 
 /**
@@ -3645,8 +3653,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // survive onto the pose of the next turn.
     clearExpressions(`intents:${String(reason ?? 'invalidate')}`);
     // A barge-in is a smooth exit; a model/lock/generation switch is a hard stop. Neither may ever
-    // let a late trajectory contribute to the next turn (the preset list is the only owner).
-    const presetFade = /interrupt/i.test(String(reason)) ? 240 : 0;
+    // let a late trajectory contribute to the next turn (the preset list is the only owner). The
+    // host names a user interruption both `interrupt` and `barge-in`, and both must fade: a bare
+    // `barge-in` used to be removed in one frame because only the word "interrupt" matched.
+    const presetFade = SMOOTH_INTERRUPT_REASON.test(String(reason)) ? SMOOTH_INTERRUPT_FADE_MS : 0;
     clearPresets(reason, { fadeMs: presetFade, at: now });
     const removed = [];
     for (let index = state.intents.length - 1; index >= 0; index -= 1) {
