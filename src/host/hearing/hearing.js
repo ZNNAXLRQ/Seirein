@@ -978,6 +978,12 @@ export function startHearing({
   let utterance = [];
   let utteranceSamples = 0;
   let utteranceSeenSamples = 0;
+  /**
+   * 当前这一段第一帧的真实到达时刻（采集时钟）。终稿的 `audioStartAt` 只能是它，
+   * 不能用 `endpointAt - durationMs` 反推：识别完成时间与采集时间不是同一件事。
+   * `null` 表示下一帧将开启新的一段。
+   */
+  let utteranceStartAt = null;
   /** Peak of the current utterance (reset at every endpoint; the shadow row reports it). */
   let utterancePeak = 0;
   let truncated = false;
@@ -1977,6 +1983,9 @@ export function startHearing({
         durationMs: snapshot.durationMs,
         bufferedSamples: snapshot.bufferedSamples,
         endpointAt: snapshot.endpointAt,
+        // 真实采集区间，供媒体台词时间线对齐视觉证据；缺失时为 null，绝不按时长编造。
+        audioStartAt: snapshot.audioStartAt ?? null,
+        audioEndAt: snapshot.audioEndAt ?? null,
         // SenseVoice side-channel tag and the input it came from: observation only, the host may
         // use a `Laughter` tag as a timed nonverbal cue; none of it changes the delivered text.
         event: outcome.event ?? null,
@@ -2399,6 +2408,9 @@ export function startHearing({
       snapshot: {
         ...base,
         endpointAt: last.endpointAt,
+        // 合并段覆盖整段真实采集窗口：开头取最早段，结尾取最后段（与 endpointAt 同源）。
+        audioStartAt: base.audioStartAt ?? null,
+        audioEndAt: last.audioEndAt ?? null,
         onlineText: snapshots.map((item) => item.onlineText).join(''),
         audible: snapshots.some((item) => item.audible === true),
         loudEnough: snapshots.some((item) => item.loudEnough === true),
@@ -2546,6 +2558,8 @@ export function startHearing({
     if (chunkPeak > utterancePeak) utterancePeak = chunkPeak;
 
     // Keep the raw samples of this utterance for the accurate pass, up to the hard cap.
+    // 本段第一帧到达时记下采集起点；endpoint 冻结快照时直接取它，不做事后反推。
+    if (utteranceSeenSamples === 0) utteranceStartAt = captureNow();
     utteranceSeenSamples += samples.length;
     const room = MAX_UTTERANCE - utteranceSamples;
     if (room > 0) {
@@ -2635,6 +2649,9 @@ export function startHearing({
         /** Stable id of this ASR fragment, carried by the group and endpoint observations. */
         segmentId: `seg-${utteranceSeq}`,
         endpointAt,
+        // 真实采集区间：开始是首帧到达时刻，结束就是端点时刻；两者都不是识别完成时间。
+        audioStartAt: utteranceStartAt,
+        audioEndAt: endpointAt,
         onlineText,
         audible,
         loudEnough,
@@ -2753,6 +2770,7 @@ export function startHearing({
       utterance = [];
       utteranceSamples = 0;
       utteranceSeenSamples = 0;
+      utteranceStartAt = null;
       utterancePeak = 0;
       truncated = false;
       recognizer.reset(stream);
