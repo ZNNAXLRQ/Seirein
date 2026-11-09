@@ -7,7 +7,7 @@
  * Public re-exports preserve the plugin's original entry API. No Harness package is imported.
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { cpSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -296,6 +296,9 @@ import { assessFrame } from './vision/black-frame.js';
 import { ambientSourceEvent, ambientSourceOf } from './hearing/ambient.js';
 import { VISION_MODES, VisionMode } from './vision/vision.js';
 import { createPreRequestVision } from './vision/pre-request.js';
+// P-186/P-187 阶段 1：持续视听证据。画面窗口只收元数据，媒体台词是独立证据流（都不是用户发言）。
+import { createEvidenceWindow } from './vision/evidence-window.js';
+import { createMediaTimeline } from './hearing/media-timeline.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -8487,6 +8490,100 @@ export function apply(ctx, config) {
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
   /**
+   * P-186/P-187 阶段 1：滚动画面证据窗口。只登记“什么时候、哪个来源、哪一代”的元数据；每个被
+   * 收进来的画面都先复制到独立的 `cache/evidence/`，所以交付/预览清理删原图不会把证据一起删掉。
+   * `sourceEpoch` 用 `visionGeneration`：切源、隐私、采集重启后旧帧自动配不上新代次。
+   */
+  const evidenceDir = () => join(root, 'cache', 'evidence');
+  /**
+   * 只在目录真的空了才删：淘汰/清空是异步的，迟到的复制可能刚把目录重新建出来；直接递归删会
+   * 误删同一目录里已经登记的有效证据。
+   */
+  const removeEvidenceDirIfEmpty = async () => {
+    try {
+      await rmdir(evidenceDir());
+    } catch {
+      /* 目录仍有证据、已不存在，或正被并发写入：下一次收尾再删 */
+    }
+  };
+  const evidenceWindow = createEvidenceWindow({
+    onEvict: (entry) => {
+      // 淘汰只删副本文件；最后一个文件删掉后目录也收走，卸载/淘汰都不留缓存残渣。
+      void rm(entry.file, { force: true }).then(removeEvidenceDirIfEmpty).catch(() => {});
+    },
+    onClear: () => {
+      // clear 是代次边界：整个目录都属于旧代次，直接递归删除；迟到复制核完代次后会自删。
+      void rm(evidenceDir(), { recursive: true, force: true }).catch(() => {});
+    },
+    emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+  });
+  /** 在途复制：卸载时可能还有 copyFile 没返回，要等它们自删完再收目录。 */
+  const evidenceCopies = new Set();
+  const drainEvidenceCopies = () => Promise.allSettled([...evidenceCopies]);
+  /**
+   * 把一帧已经采集的画面复制进证据窗口。复制期间可能发生隐私切换、切源或卸载：落地后再核对一次
+   * 代次/来源，过期副本直接删掉，绝不让旧代次画面混进新窗口。失败只记事件，不影响交付。
+   */
+  const rememberEvidenceNow = async (shot, { kind = 'frame', token = null } = {}) => {
+    if (shot === null || shot === undefined || typeof shot.file !== 'string') return null;
+    // 进门先挡住已卸载/切换中的调用：复制没有意义，也不给正在收尾的目录添新文件。
+    if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return null;
+    const generation = visionGeneration;
+    const mode = vision.mode;
+    const scene = vision.scene;
+    // 调用方采集时核验过的令牌必须仍是“这一代、这个来源”，否则说明它拿到的是旧帧。
+    if (token !== null
+      && (token.generation !== generation || token.mode !== mode || token.scene !== scene)) {
+      return null;
+    }
+    let file = '';
+    try {
+      await mkdir(evidenceDir(), { recursive: true });
+      file = join(evidenceDir(), `${randomUUID()}.png`);
+      await copyFile(shot.file, file);
+      const info = await stat(file);
+      // 复制期间可能发生隐私/切源/卸载：落地后再核一次，旧代次副本直接删掉。
+      if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy'
+        || generation !== visionGeneration || mode !== vision.mode || scene !== vision.scene) {
+        await rm(file, { force: true });
+        await removeEvidenceDirIfEmpty();
+        return null;
+      }
+      const capturedAt = Number(shot.capturedAt ?? shot.at) || Date.now();
+      const added = evidenceWindow.add({
+        file,
+        bytes: info.size,
+        capturedAt,
+        source: mode === 'scene' ? 'obs' : 'desktop',
+        sourceEpoch: generation,
+        kind,
+        width: shot.width,
+        height: shot.height,
+      });
+      // 被窗口拒绝（例如空文件）时不能把无人引用的副本留在磁盘上。
+      if (added === null) {
+        await rm(file, { force: true });
+        await removeEvidenceDirIfEmpty();
+      }
+      return added;
+    } catch (error) {
+      if (file.length > 0) await rm(file, { force: true }).catch(() => {});
+      await removeEvidenceDirIfEmpty();
+      // 证据复制失败只是一条观测，绝不影响已经成功的截图交付与工具结果。
+      void log.emit('vision.evidence.copy-failed', {
+        reason: error?.message ?? String(error),
+      }).catch(() => {});
+      return null;
+    }
+  };
+  /** 复制任务都登记下来：调用方仍然 `void`，但卸载能等待在途副本自删干净。 */
+  const rememberEvidence = (shot, options = {}) => {
+    const copy = rememberEvidenceNow(shot, options);
+    evidenceCopies.add(copy);
+    void copy.finally(() => evidenceCopies.delete(copy)).catch(() => {});
+    return copy;
+  };
+  /**
    * Session -> the turn the pre-step opened. A tool call does not carry the pre-step payload, so
    * this is the one source of `{sessionId, turn}` for `assistant_see` / `assistant_watch`; it is
    * written exactly where `beginTurn` is, so both always name the same turn.
@@ -8587,6 +8684,8 @@ export function apply(ctx, config) {
   const invalidateVision = () => {
     // A snapshot from the previous source/scene/privacy era is never a reusable frame.
     preRequestVision.clear();
+    // 证据窗口同理：旧代次的画面不能跨切源/隐私边界继续被当作“最近看到的内容”。
+    evidenceWindow.clear('vision-invalidated');
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
     visionController = new AbortController();
@@ -9232,6 +9331,8 @@ export function apply(ctx, config) {
         // verified gaze channel and this real position exist; otherwise it stays untouched.
         refreshAvatarAttention();
         visionFiles.set(shot.file, baseToken.generation);
+        // 真实的这一眼也是连续证据的一部分：复制后登记，交付用的原图之后被清理也不影响回看。
+        void rememberEvidence(shot, { kind: 'shot', token: captureToken });
         return { ...shot, source: captureToken.mode };
       } catch (error) {
         await discardUndelivered(shot?.file, 'capture');
@@ -9827,6 +9928,7 @@ export function apply(ctx, config) {
         assertVisionToken(token);
         if (watcher !== session) throw new Error('视觉采集已停止');
         visionFiles.set(sheet.file, token.generation);
+        void rememberEvidence(sheet, { kind: 'storyboard', token });
         if (!reusedSheet) {
           // The freshly taken sheet becomes this turn's reusable view.
           preRequestVision.remember(sheet, {
@@ -14615,6 +14717,16 @@ export function apply(ctx, config) {
   // A second, independent ASR session: its text is context only and never triggers a reply.
   let ambient = null;
   const ambientState = { partial: '', recent: [] };
+  /**
+   * P-187 阶段 1：媒体台词时间线。回环转写是**独立证据流**，不是用户发言：这里只按真实音频
+   * 区间保存“媒体在什么时候说了什么”，不创建用户轮次、不写偏好。每次回环采集换代次，切源/
+   * 重启后的旧台词不允许与新台词拼接。
+   */
+  const mediaTimeline = createMediaTimeline({
+    emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+  });
+  let ambientEpoch = 0;
+  let ambientSeq = 0;
   // Endpoint classification of the running session: `loopback` means system playback, `mic` means
   // real surroundings. Kept beside the session so /assistant/status and the tool agree.
   let ambientSource = { source: 'mic', device: '' };
@@ -14656,7 +14768,14 @@ export function apply(ctx, config) {
           if (ambient !== null) await stopAmbient();
           return { device };
         },
-        spawn: ({ device }) => (device ? startHearing({
+        spawn: ({ device }) => {
+          if (!device) return null;
+          // 新的一次回环采集 = 新代次：在 spawn 前同步落定，上一代台词立即作废；旧会话迟到的
+          // 终稿带着自己的 sessionEpoch，天然配不上新代次，不参与跨重启拼接。
+          ambientEpoch += 1;
+          const sessionEpoch = ambientEpoch;
+          mediaTimeline.setEpoch(sessionEpoch);
+          return startHearing({
           ffmpegPath,
           modelDir: paths.stream,
           finalModelDir: finalModelReady(paths.final) ? paths.final : '',
@@ -14720,6 +14839,32 @@ export function apply(ctx, config) {
               };
               ambientState.recent.push(entry);
               if (ambientState.recent.length > 20) ambientState.recent.shift();
+              // 阶段 1：媒体台词时间线。音频区间优先用听觉层给的真实采集时间；旧事件缺这两个
+              // 字段时用「终稿时刻 − 时长」作近似（只进证据层，不影响投递与识别）。
+              const declaredEnd = Number(event.audioEndAt);
+              const audioEndAt = Number.isFinite(declaredEnd) && declaredEnd > 0
+                ? declaredEnd
+                : entry.at;
+              const declaredStart = Number(event.audioStartAt);
+              const audioStartAt = Number.isFinite(declaredStart) && declaredStart > 0
+                && declaredStart <= audioEndAt
+                ? declaredStart
+                : Math.max(0, audioEndAt - (Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0));
+              // 只有本会话仍是当前代次才记账：上一次回环的迟到终稿不能被 upsert 进新代次，
+              // 也不能把时间线的 epoch 回滚到旧会话。
+              if (sessionEpoch === ambientEpoch) {
+                const utteranceId = typeof event.utteranceId === 'string' && event.utteranceId.length > 0
+                  ? event.utteranceId
+                  : `loopback-${++ambientSeq}`;
+                mediaTimeline.upsert({
+                  id: utteranceId,
+                  audioStartAt,
+                  audioEndAt,
+                  text: entry.text,
+                  status: 'final',
+                  sourceEpoch: sessionEpoch,
+                });
+              }
               void log.emit('ambient.utterance', {
                 text: entry.text,
                 durationMs,
@@ -14744,7 +14889,8 @@ export function apply(ctx, config) {
             }
             return { accepted: true };
           },
-        }) : null),
+          });
+        },
         release: (session) => stopHearingSession(session),
         // Adopted inside the gate, so no microtask can slip between the open check and the slot.
         commit: (session) => {
@@ -14790,6 +14936,8 @@ export function apply(ctx, config) {
       dialogueSummary.acquire('loopback');
       await log.emit(source.event.type, source.event.payload);
       await log.emit('ambient.start', { device, source: source.source });
+      // 代次在 spawn 前已同步落定（见上面的 spawn）；这里不再延迟换代，避免新会话开头的
+      // 终稿先按旧代次记账再被清掉。
       // Default (unset) writes no row; an explicit OFF is reported once so the missing diagnostic
       // shadow is explainable instead of silently absent.
       if (speakerShadowLoopbackExplicitOff() && !speakerLoopbackDisabledReported) {
@@ -15119,6 +15267,11 @@ export function apply(ctx, config) {
     // already reads connected/authenticated) and the dedicated `vtsAuth` block (the re-authorize
     // button's contract). Reading it never dials VTS.
     const vtsAuth = vtsAuthStatus();
+    const hearingStatus = projectHearingStatus(status?.hearing, {
+      session: hearing,
+      restart: hearingThresholdRestart,
+      fallbackMinRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
+    });
     return {
       ...status,
       live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
@@ -15132,11 +15285,10 @@ export function apply(ctx, config) {
       // The 听觉 card's 音频保留 switch follows the persisted setting (default off), not a local
       // toggle; the clips themselves are read through `audio.retention.list`.
       retention: { enabled: audioRetention.isEnabled(), limits: { ...audioRetention.limits } },
-      hearing: projectHearingStatus(status?.hearing, {
-        session: hearing,
-        restart: hearingThresholdRestart,
-        fallbackMinRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
-      }),
+      // P-186/P-187 阶段 1 的只读证据状态：只给数量、时间、代次和计数，绝不暴露副本文件路径。
+      // 放在各自既有块里，不改原有字段语义，设置页/诊断脚本一次 status 就能看出窗口是否在工作。
+      vision: { ...(status?.vision ?? {}), evidence: evidenceWindow.state() },
+      hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };
   };
 
@@ -15852,6 +16004,14 @@ export function apply(ctx, config) {
         stop: async () => {
           visionDisposed = true;
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));
+          // 卸载时可能仍有 copyFile 没返回：等它们核到“已卸载”后自删，再把可能被重新建出的
+          // 空目录一并收掉。不等待就会在进程退出前留下没人引用的副本。
+          await drainEvidenceCopies();
+          await rm(evidenceDir(), { recursive: true, force: true }).catch((error) => {
+            void log.emit('vision.cleanup.failed', {
+              stage: 'evidence', error: error?.message ?? String(error),
+            }).catch(() => {});
+          });
           await stopVirtualCam('dispose');
           const cleaned = virtualCamOn !== true && watcher === null;
           return { confirmed: cleaned, ...(cleaned ? {} : { error: '视觉采集未完全停止' }) };
