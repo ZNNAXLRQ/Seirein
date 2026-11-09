@@ -70,6 +70,10 @@ test('attach 后 render：评论关联窗口/当前最新画面/把握齐全，�
   assert.ok(text.includes(`${hhmmss(T0 + 9_000)} 采集`));
   assert.ok(text.includes('晚于开口'), '最新画面晚于开口时必须明确不能倒过来解释评论');
   assert.ok(text.includes('关联把握：高（原因：window）'));
+  assert.ok(
+    text.includes('- 可回看帧：ev-1, ev-2（最多 3 个，调用 assistant_see 的 evidenceFrameIds）'),
+    '有关联帧时块内直接给出可回看的帧 id',
+  );
   assert.ok(text.includes('不要声称已经看见画面内容'), '图片内容尚未交付的边界必须写清楚');
   assert.ok(
     text.includes('如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）'),
@@ -86,6 +90,65 @@ test('attach 后 render：评论关联窗口/当前最新画面/把握齐全，�
   assert.equal(state.latestAt, T0 + 6_000);
   assert.ok(state.attached >= 1);
   assert.equal(JSON.stringify(state).includes('【视听证据'), false, 'state 不含正文');
+});
+
+test('可回看帧只取 relatedFrameIds 前 3 个去重 id，路径类值不进块', () => {
+  const evidence = createCommentEvidence({ now: () => T0 + 1_000 });
+  evidence.attach(attachInput({
+    sessionId: 'review-ids',
+    alignment: alignment({
+      relatedFrameIds: [
+        'ev-1', 'ev-1', 'ev-2', 'ev-3', 'ev-4',
+        'C:\\cache\\evidence\\frame.png', '../escape.png',
+      ],
+    }),
+  }));
+
+  const text = evidence.render('review-ids');
+  assert.ok(
+    text.includes('- 可回看帧：ev-1, ev-2, ev-3（最多 3 个，调用 assistant_see 的 evidenceFrameIds）'),
+    '去重后按顺序只列前 3 个 id',
+  );
+  assert.equal(text.includes('ev-4'), false, '第 4 个及之后的关联帧 id 不输出');
+  assert.equal(text.includes('C:\\'), false, '渲染不含 Windows 路径');
+  assert.equal(text.includes('frame.png'), false, '渲染不含证据文件名');
+  assert.equal(text.includes('escape.png'), false, '渲染不含相对路径');
+  assert.equal(text.includes('..'), false);
+});
+
+test('没有关联帧时明确写“本次没有可回看的关联帧”', () => {
+  const evidence = createCommentEvidence({ now: () => T0 + 1_000 });
+  evidence.attach(attachInput({
+    sessionId: 'no-review-ids',
+    alignment: alignment({ relatedFrameIds: [], afterSpeechFrameIds: [] }),
+  }));
+
+  const text = evidence.render('no-review-ids');
+  assert.ok(text.includes('- 可回看帧：本次没有可回看的关联帧'));
+  assert.equal(text.includes('ev-'), false, '没有关联帧时不得编造 id');
+});
+
+test('可回看帧行同样受 maxChars 截断', () => {
+  const input = attachInput({
+    alignment: alignment({ relatedFrameIds: ['ev-10', 'ev-11', 'ev-12'] }),
+  });
+  const full = createCommentEvidence({ now: () => T0, maxChars: 2_000 });
+  full.attach(input);
+  const whole = full.render('voice-session-a');
+  const reviewAt = whole.indexOf('- 可回看帧：');
+  assert.ok(reviewAt > 0, '完整块里必须出现可回看帧行');
+
+  const limit = reviewAt + 10;
+  const tight = createCommentEvidence({ now: () => T0, maxChars: limit });
+  tight.attach(input);
+  const clipped = tight.render('voice-session-a');
+  assert.equal(clipped.length, limit, '含可回看帧行时仍截到 maxChars');
+  assert.equal(clipped, whole.slice(0, limit), '截断只裁尾部，不重排内容');
+  assert.equal(
+    clipped.includes('（最多 3 个，调用 assistant_see 的 evidenceFrameIds）'),
+    false,
+    '可回看帧行本身也会被截断',
+  );
 });
 
 test('attach 复制入参：调用方事后改对象/数组/嵌套窗口，已存记录不变', () => {

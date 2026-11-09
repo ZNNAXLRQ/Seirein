@@ -6,7 +6,7 @@
  * 按会话短暂保留，并渲染成主请求可读的中文块：
  *
  *   - 用户开口 / 语音结束（端点） / 评论关联窗口 / 当前最新画面必须分开写；
- *   - 只写采集时间与帧数，绝不写文件路径，也不写任何台词或画面正文；
+ *   - 只写采集时间、帧数与可回看帧 id，绝不写文件路径，也不写任何台词或画面正文；
  *   - 这里没有图片，也没有经过后台理解：渲染文案必须明确告诉模型“不要声称已经看见画面内容”；
  *   - 记录有 TTL 与会话数上限，读时清理；`attach` 复制入参，绝不持有调用方的可变引用。
  *
@@ -26,6 +26,8 @@ export const COMMENT_EVIDENCE_DEFAULTS = Object.freeze({
 
 /** 一组帧 id 的复制上限：对齐结果只用于计数/诊断，不该无限占内存。 */
 const MAX_RELATED_IDS = 64;
+/** 主请求里最多回看 3 帧（与 assistant_see 的 evidenceFrameIds 上限一致）。 */
+const MAX_REVIEW_IDS = 3;
 
 function finiteNumber(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -172,6 +174,23 @@ function reasonText(value) {
 }
 
 /**
+ * 可回看帧 id：只取关联帧里前 3 个安全 id，去重。
+ * id 必须是单段机器标识；含路径分隔符/空白/控制字符的值一律丢弃，保证渲染块
+ * 即使拿到畸形 alignment 也不会把文件路径写进主请求。
+ */
+function reviewFrameIds(alignment) {
+  const seen = new Set();
+  const out = [];
+  for (const id of alignment.relatedFrameIds) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= MAX_REVIEW_IDS) break;
+  }
+  return out;
+}
+
+/**
  * @param {object} [options]
  * @param {() => number} [options.now]
  * @param {number} [options.ttlMs]
@@ -265,7 +284,7 @@ export function createCommentEvidence({
   }
 
   /**
-   * 主请求用的中文块：只含时间、帧数、把握与“尚无画面理解”的边界说明。
+   * 主请求用的中文块：只含时间、帧数、把握、可回看帧 id 与“尚无画面理解”的边界说明。
    * 无记录/过期返回 ''，宿主注册的 context 因此不会产生空块。
    */
   function render(sessionId) {
@@ -287,6 +306,11 @@ export function createCommentEvidence({
     // 窗口内全部证据帧 vs 真正参与解释评论的关联帧：两个数分开给，避免把“窗口里有几帧”
     // 误读成“模型能看几帧”。
     const relatedCount = alignment.relatedFrameIds.length;
+    // 模型要回看时必须拿到真实 id；只给前 3 个，且不把路径/超长字符串带进提示词。
+    const reviewIds = reviewFrameIds(alignment);
+    const reviewLine = reviewIds.length > 0
+      ? `- 可回看帧：${reviewIds.join(', ')}（最多 3 个，调用 assistant_see 的 evidenceFrameIds）`
+      : '- 可回看帧：本次没有可回看的关联帧';
 
     let latestLine;
     if (record.latestAt !== null) {
@@ -310,6 +334,7 @@ export function createCommentEvidence({
       `- 评论关联窗口：${clockText(windowFrom)}–${clockText(windowTo)}（窗口内 ${frameCount} 帧，关联 ${relatedCount} 帧）`,
       latestLine,
       `- 关联把握：${confidence}（原因：${reason}）`,
+      reviewLine,
       '- 说明：画面内容尚未经过后台理解；这里只有采集时间与帧数，不要声称已经看见画面内容。如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）。',
     ];
     return lines.join('\n').slice(0, charLimit());
