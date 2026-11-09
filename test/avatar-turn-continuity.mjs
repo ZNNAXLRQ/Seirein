@@ -16,7 +16,11 @@
  *      hard — the interruption is never softened or revived;
  *   4. a model-switch/privacy lock still stops the old action immediately;
  *   5. host: the voice final's claim is recognized by the later Harness `turn/start` in the same
- *      session (`avatar.intent.turn mode:continued`), while an unclaimed typed turn stays hard.
+ *      session (`avatar.intent.turn mode:continued`), while an unclaimed typed turn stays hard;
+ *   6. a same-reply continuation keeps the live trajectory/parameters (ordinary nod and preset nod)
+ *      instead of hard-clearing them; the controller reports `removed:0/faded:0` for that path;
+ *   7. a real interrupt/disconnect AFTER a continuation still stops the trajectory immediately —
+ *      keep-active never weakens the hard cancellation paths.
  *
  * Run: node --test test/avatar-turn-continuity.mjs
  */
@@ -86,6 +90,26 @@ const startPreTurnGesture = (rig, at = 0) => {
     at, sessionId: 1, turnId: 1, replyId: 1,
   });
 };
+
+/** One tick per step, awaiting the async frame send so the next write is not dropped as in-flight. */
+const run = async (rig, from, to, stepMs = 16) => {
+  for (let at = from; at <= to; at += stepMs) {
+    rig.tick(at);
+    await flushMicrotasks();
+  }
+};
+
+const channelFrames = (writes, channel) => writes
+  .filter((frame) => frame.entries.some((entry) => entry.channel === channel))
+  .map((frame) => ({
+    at: frame.at,
+    entry: frame.entries.find((entry) => entry.channel === channel),
+  }));
+
+const presetSnapshot = (runtime) => runtime.snapshot().motion.presets;
+
+/** HEAD_ROWS has no min/max, so the bidirectional head write is `0.5 + semantic / 2`. */
+const HEAD_WRITE_NEUTRAL = 0.5;
 
 // =============================================================================================
 // 1. Same session + same reply: generation advances, identity updates, action keeps running.
@@ -239,6 +263,212 @@ test('4. 模型切换/隐私锁仍立即停：动作结束、epoch 前移、运�
   console.log(`[model-switch] action=${actionId} ended=true epoch=${before.motion.epoch}`
     + `->${after.motion.epoch} locked=true`);
   rig.runtime.dispose();
+});
+
+// =============================================================================================
+// 5. Same-reply continuation keeps the ORDINARY nod trajectory and its actual parameter output.
+// =============================================================================================
+test('5. 同回复续接保留普通点头：actionId 不变，headY 参数输出走完原始剩余时长', async () => {
+  const rig = createRig();
+  await connect(rig);
+  const first = startPreTurnGesture(rig, 0);
+  assert.equal(first.released, true, 'the pre-turn nod started');
+  const before = rig.runtime.snapshot();
+  const action = before.actions.current;
+  assert.ok(action !== null, 'the pre-turn nod owns the action slot');
+  const actionId = action.actionId;
+  const durationMs = action.durationMs;
+  assert.ok(durationMs > 300, `the nod is long enough to observe (${durationMs} ms)`);
+  rig.runtime.takeEvents();
+
+  // Let the first frame happen, then claim the real turn id while the nod is still running.
+  await run(rig, 0, 192);
+  rig.setClock(200);
+  const switched = rig.runtime.intentEvent('thinking', {
+    at: 200, sessionId: 1, turnId: 2, replyId: 1, continuation: true,
+  });
+  assert.equal(switched.staged, true, 'the next phase is staged');
+  const after = rig.runtime.snapshot();
+  const keptNod = after.intents.active.find((item) => item.kind === 'nod');
+  assert.ok(keptNod !== undefined, 'the running nod trajectory survives the continuation');
+  assert.ok(keptNod.remainingMs > 100,
+    `the nod kept its remaining time (${Math.round(keptNod.remainingMs)} ms)`);
+  assert.equal(after.actions.current?.actionId, actionId, 'the running actionId is preserved');
+  assert.equal(after.actions.interrupted, before.actions.interrupted, 'the continuation is not an interruption');
+  assert.equal(after.motion.epoch, before.motion.epoch, 'the output epoch is not bumped');
+
+  const events = rig.runtime.takeEvents();
+  assert.deepEqual(
+    events.filter((event) => event.type === 'avatar.intent.trajectory.cleared'
+      && event.reason === 'turn-continued'),
+    [],
+    'the continuation does not hard-clear the trajectory',
+  );
+  const kept = events.find((event) => event.type === 'avatar.intent.trajectory.kept');
+  assert.ok(kept !== undefined, 'the keep-active path is reported');
+  assert.equal(kept.reason, 'turn-continued');
+  assert.ok(kept.keptIntents >= 1, 'at least the nod trajectory was kept');
+  assert.deepEqual(kept.presetClear, { removed: 0, faded: 0 }, 'nothing was hard-cleared');
+
+  // Actual parameter output, not only bookkeeping: the first write due after the continuation must
+  // still carry the nod. The write frame is taken from the transport, exactly what VTS receives.
+  await run(rig, 216, 400);
+  const inWindow = channelFrames(rig.writes, 'headY')
+    .find((frame) => frame.at > 200 && frame.at < durationMs);
+  assert.ok(inWindow !== undefined,
+    `a headY frame was still written in the original remaining window (${JSON.stringify(
+      channelFrames(rig.writes, 'headY').map((frame) => frame.at))})`);
+  const deflection = Math.abs(inWindow.entry.value - HEAD_WRITE_NEUTRAL);
+  assert.ok(deflection > 0.02,
+    `headY still deflected after the continuation (${inWindow.entry.value}, Δ=${deflection.toFixed(4)})`);
+  assert.ok(rig.runtime.snapshot().intents.active.some((item) => item.kind === 'nod'),
+    'the nod is still active right before its original end');
+
+  // Natural end: the nod leaves the active list because its own clock expired, not because the
+  // continuation cut it, and the action ends without `interrupted`.
+  await run(rig, 432, 432);
+  assert.equal(rig.runtime.snapshot().intents.active.some((item) => item.kind === 'nod'), false,
+    'the nod ended at its original duration');
+  const tail = rig.runtime.takeEvents();
+  const ended = tail.find((event) => event.type === 'avatar.action.end'
+    && event.actionId === actionId);
+  assert.ok(ended !== undefined, 'the original action ended by itself');
+  assert.equal(ended.interrupted, false, 'the natural end is not an interruption');
+  console.log(`[continuity-param] action=${actionId} duration=${Math.round(durationMs)}ms`
+    + ` keptRemaining=${Math.round(keptNod.remainingMs)}ms write@${inWindow.at}=${inWindow.entry.value}`
+    + ` angleDelta=${deflection.toFixed(3)} presetRemoved=0 presetFaded=0`);
+  rig.runtime.dispose();
+});
+
+// =============================================================================================
+// 6. Same-reply continuation keeps the PRESET nod trajectory: removed=0, faded=0, still writing.
+// =============================================================================================
+test('6. 同回复续接保留预设点头：removed=0/faded=0，参数输出继续', async () => {
+  const rig = createRig({ presetExecution: true });
+  await connect(rig);
+  rig.runtime.setStatus('speaking', 'preset-continuity-test');
+  // Prefer the single `agree-nod` recipe; the selector still owns the choice, and any agreement
+  // variant contains a real nod operation on headY.
+  rig.runtime.setPresetOverrides({
+    actionPriority: { 'agree-nod': 100, 'agree-double': 0, 'agree-eye-nod': 0 },
+  });
+  rig.setClock(0);
+  const marked = rig.runtime.markConclusion('预设点头', { at: 0, sessionId: 1, turnId: 1 });
+  assert.equal(marked.released, true, 'the conclusion preset started');
+  const before = rig.runtime.snapshot();
+  const action = before.actions.current;
+  const preset = presetSnapshot(rig.runtime).active[0];
+  assert.ok(action !== null, 'the preset owns the action slot');
+  assert.ok(preset !== undefined, 'the preset trajectory is active');
+  assert.ok(preset.operations.some((operation) => operation.includes('nod')),
+    `a nod preset was drawn (${preset.operations.join(',')})`);
+  const durationMs = action.durationMs;
+  assert.ok(durationMs > 800, `the preset nod is long enough to observe (${durationMs} ms)`);
+  rig.runtime.takeEvents();
+
+  await run(rig, 0, 192);
+  rig.setClock(200);
+  const switched = rig.runtime.intentEvent('thinking', {
+    at: 200, sessionId: 1, turnId: 2, replyId: 1, continuation: true,
+  });
+  assert.equal(switched.staged, true, 'the next phase is staged');
+  const after = rig.runtime.snapshot();
+  assert.equal(after.actions.current?.actionId, action.actionId, 'the preset actionId is preserved');
+  assert.equal(after.actions.current?.presetActionId, action.presetActionId,
+    'the controller-side preset ownership is preserved');
+  const keptPreset = presetSnapshot(rig.runtime).active;
+  assert.equal(keptPreset.length, 1, 'the preset trajectory is not removed in one frame');
+  assert.equal(keptPreset[0].presetId, preset.presetId, 'the same preset still owns the pose');
+  assert.equal(keptPreset[0].cancelled, false, 'it was not faded or cancelled');
+
+  const events = rig.runtime.takeEvents();
+  assert.deepEqual(events.filter((event) => event.type === 'avatar.preset.cleared'), [],
+    'no preset clearance row for a same-reply continuation');
+  assert.deepEqual(events.filter((event) => event.type === 'avatar.action.interrupted'), [],
+    'the continuation is not an interruption');
+  const kept = events.find((event) => event.type === 'avatar.intent.trajectory.kept');
+  assert.ok(kept !== undefined, 'the keep-active path is reported');
+  assert.equal(kept.reason, 'turn-continued');
+  assert.equal(kept.keptPresets, 1, 'the running preset is reported as kept');
+  assert.deepEqual(kept.presetClear, { removed: 0, faded: 0 }, 'removed=0 and faded=0');
+
+  // The preset's headY trajectory must keep reaching the transport in the remaining window. A
+  // pause-before timing variant only starts its nod after ~330 ms, so sample up to 800 ms.
+  await run(rig, 216, 800);
+  const inWindowCandidates = channelFrames(rig.writes, 'headY')
+    .filter((frame) => frame.at > 200 && frame.at < durationMs);
+  const inWindow = inWindowCandidates
+    .find((frame) => Math.abs(frame.entry.value - HEAD_WRITE_NEUTRAL) > 0.01);
+  assert.ok(inWindow !== undefined,
+    `a preset headY frame was still written after the continuation (${JSON.stringify(
+      inWindowCandidates.map((frame) => [frame.at, frame.entry.value]))})`);
+  const deflection = Math.abs(inWindow.entry.value - HEAD_WRITE_NEUTRAL);
+  assert.ok(deflection > 0.01,
+    `preset headY still deflected after the continuation (${inWindow.entry.value}, Δ=${deflection.toFixed(4)})`);
+  assert.equal(presetSnapshot(rig.runtime).active.length, 1, 'the preset is still running at 800 ms');
+  const tail = rig.runtime.takeEvents();
+  assert.deepEqual(tail.filter((event) => event.type === 'avatar.preset.cleared'), [],
+    'still no clearance row while the preset runs its own duration');
+  console.log(`[continuity-preset] action=${action.actionId} preset=${preset.presetId}`
+    + ` operations=${preset.operations.join(',')} duration=${Math.round(durationMs)}ms`
+    + ` write@${inWindow.at}=${inWindow.entry.value} angleDelta=${deflection.toFixed(3)}`
+    + ' removed=0 faded=0');
+  rig.runtime.dispose();
+});
+
+// =============================================================================================
+// 7. A REAL interrupt/disconnect after a continuation still stops immediately.
+// =============================================================================================
+test('7. 续接之后的真实 interrupt / disconnect 仍立即硬停：keep-active 不削弱取消路径', async () => {
+  const outcomes = [];
+  for (const [name, stop, reasonWord] of [
+    ['barge-in', (runtime) => runtime.interrupt({ reason: 'barge-in' }), 'barge-in'],
+    ['disconnect', async (runtime) => { await runtime.disconnect(); }, 'disconnect'],
+  ]) {
+    const rig = createRig();
+    await connect(rig);
+    startPreTurnGesture(rig, 0);
+    await run(rig, 0, 192);
+    rig.setClock(200);
+    rig.runtime.intentEvent('thinking', {
+      at: 200, sessionId: 1, turnId: 2, replyId: 1, continuation: true,
+    });
+    const keptState = rig.runtime.snapshot();
+    assert.ok(keptState.intents.active.some((item) => item.kind === 'nod'),
+      `${name}: the continuation kept the nod first`);
+    assert.equal(typeof keptState.actions.current?.actionId, 'number',
+      `${name}: one action owns the pose before the real stop`);
+    rig.runtime.takeEvents();
+
+    rig.setClock(300);
+    await stop(rig.runtime);
+    const after = rig.runtime.snapshot();
+    assert.equal(after.intents.active.some((item) => item.kind === 'nod'), false,
+      `${name}: the real stop clears the kept trajectory immediately`);
+    assert.equal(after.actions.current, null, `${name}: the action is ended by the real stop`);
+    const events = rig.runtime.takeEvents();
+    const cleared = events.find((event) => event.type === 'avatar.intent.trajectory.cleared');
+    assert.ok(cleared !== undefined, `${name}: a real clearance row is recorded`);
+    assert.ok(String(cleared.reason).includes(reasonWord),
+      `${name}: the clearance keeps its real reason (${cleared.reason})`);
+    assert.deepEqual(events.filter((event) => event.type === 'avatar.intent.trajectory.kept'), [],
+      `${name}: keep-active never applies to a real stop`);
+    const interrupted = events.filter((event) => event.type === 'avatar.action.interrupted');
+    if (name === 'barge-in') {
+      assert.equal(interrupted.length, 1, 'a barge-in is still one interruption');
+    } else {
+      assert.deepEqual(interrupted, [], 'a disconnect is a stop, not a user interruption');
+    }
+
+    // One more tick: the cleared nod contributes nothing to the axis target.
+    await run(rig, 310, 310);
+    const target = rig.runtime.snapshot().intents.target;
+    assert.ok(target !== null, `${name}: the target was recomputed`);
+    assert.equal(target.headY, 0, `${name}: no residual nod contribution (${target.headY})`);
+    outcomes.push(`${name}=remaining:${cleared.remainingMs}/reason:${cleared.reason}/targetHeadY:0`);
+    rig.runtime.dispose();
+  }
+  console.log(`[hard-after-continuation] ${outcomes.join(' ')}`);
 });
 
 // =============================================================================================
@@ -524,9 +754,9 @@ async function mountHost(t) {
 }
 
 // =============================================================================================
-// 5. Host wiring: voice final claim + same-session turn/start = continued; unclaimed = hard.
+// 8. Host wiring: voice final claim + same-session turn/start = continued; unclaimed = hard.
 // =============================================================================================
-test('5. 宿主：语音终稿的 claim 被同一 session 的 turn/start 认领为 continued，未认领的 typed turn 仍 hard', async (t) => {
+test('8. 宿主：语音终稿的 claim 被同一 session 的 turn/start 认领为 continued，未认领的 typed turn 仍 hard', async (t) => {
   const app = await mountHost(t);
   // Seed the previous Harness turn, so the voice final's pre-turn phase carries turn 1.
   app.emit(turnStart(1));

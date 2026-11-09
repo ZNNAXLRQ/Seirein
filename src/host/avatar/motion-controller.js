@@ -3775,9 +3775,49 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    * that generation (or an untagged/core-created one) are stopped; a newer generation is untouched.
    * `remainingMs` is the largest duration those trajectories had left when they were cleared, so a
    * caller can prove the actual motion was cancelled rather than only some bookkeeping.
+   *
+   * `keepActive` is the ONE non-destructive mode: a same-reply turn continuation has already
+   * retired the staged/expired intent at the host layer (generation + pending slot), and the
+   * trajectories still running belong to that reply's own gesture. They, and the expression layer
+   * driving the same pose, are kept and finish naturally; no clearance event is emitted. Every
+   * real stop (interrupt/barge-in, lock, model switch, disconnect, teardown) keeps the default.
    */
-  function clearIntents({ reason = 'invalidate', throughGeneration = null, at = undefined } = {}) {
+  function clearIntents({
+    reason = 'invalidate', throughGeneration = null, at = undefined, keepActive = false,
+  } = {}) {
     const now = Number.isFinite(at) ? at : clockNow();
+    if (keepActive === true) {
+      const keptIntents = state.intents.filter((item) => item.done !== true).length;
+      const keptPresets = state.presets.active.filter((item) => item.done !== true).length;
+      const axes = [];
+      for (const item of state.intents) {
+        if (item.done === true) continue;
+        for (const channel of item.channels) if (!axes.includes(channel)) axes.push(channel);
+      }
+      for (const item of state.presets.active) {
+        if (item.done === true) continue;
+        for (const channel of item.channels) if (!axes.includes(channel)) axes.push(channel);
+      }
+      axes.sort((left, right) => CHANNELS.indexOf(left) - CHANNELS.indexOf(right));
+      recordEvent('avatar.intent.trajectory.kept', {
+        reason: String(reason ?? 'invalidate'),
+        keptIntents,
+        keptPresets,
+        presetClear: { removed: 0, faded: 0 },
+        axes,
+        at: now,
+      });
+      return {
+        ok: true,
+        cleared: 0,
+        kept: keptIntents,
+        presetActive: keptPresets,
+        presets: { removed: 0, faded: 0 },
+        axes,
+        remainingMs: 0,
+        at: now,
+      };
+    }
     // A generation switch also drops the autonomous expression layer: no old gaze/brow offset may
     // survive onto the pose of the next turn.
     clearExpressions(`intents:${String(reason ?? 'invalidate')}`);

@@ -3316,8 +3316,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * turn's sentence boundaries; a soft barge-in keeps them (the host may still report the next one).
    * The core's one-shot trajectories are stopped HERE, not left running out their remaining time:
    * an old tilt must not keep adding to the same axis target as a new gesture of the next one.
+   *
+   * The ONE exception is a same-reply turn continuation (`keepActive`): the host has already
+   * retired the staged/expired intent by advancing the generation, while the trajectories still
+   * running belong to this reply's own gesture. They are handed to the controller's keep-active
+   * mode and finish naturally (the action and its ownership are kept too); a real interrupt/lock/
+   * model switch/disconnect never sets `keepActive` and keeps the historical hard stop.
    */
-  function invalidateIntents(reason, { at = clockNow(), interrupted = false, clearClip = false, hard = false, endRunning = true } = {}) {
+  function invalidateIntents(reason, { at = clockNow(), interrupted = false, clearClip = false, hard = false, endRunning = true, keepActive = false } = {}) {
     const staleGeneration = intentState.generation;
     // A turn/session switch expires the answer's opening intent (its boundary belongs to the old
     // answer); every other staged phase keeps the historical `stale-generation` reason.
@@ -3331,8 +3337,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // A generation switch breaks any run of conclusions: the next turn may mark its own.
     intentState.lastIntentProfile = null;
     // Only the generation that is being replaced is cleared; anything started after this call is
-    // tagged with the new generation and is never touched by this invalidation.
-    inner.clearIntents({ reason, throughGeneration: staleGeneration, at });
+    // tagged with the new generation and is never touched by this invalidation. A same-reply
+    // continuation keeps the reply's own running trajectories instead of hard-clearing them.
+    inner.clearIntents({ reason, throughGeneration: staleGeneration, at, keepActive });
     // A same-reply turn continuation keeps the running gesture (it is this reply's gesture) and
     // only advances the generation, so the old staged intent can never start later. Every real
     // switch still ends it here.
@@ -3616,9 +3623,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (sameReply === true) {
         // Same reply: advance the generation and drop the old staged intent (late writes and a
         // deferred ticket can never start), but let the reply's own running gesture finish and
-        // keep the clip identity the next sentence still belongs to.
+        // keep the clip identity the next sentence still belongs to. `keepActive` is the ONLY
+        // path that does not hard-clear the controller's live trajectory/preset: the host already
+        // retired the pending/expired intent above, so the nod/preset runs out its real duration.
         invalidateIntents('turn-continued', {
           at: time, interrupted: false, clearClip: false, hard: false, endRunning: false,
+          keepActive: true,
         });
       } else {
         // A real turn/session switch: the old generation stops NOW (hard epoch, interrupted end).
