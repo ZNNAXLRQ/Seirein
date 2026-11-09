@@ -371,6 +371,21 @@ const hooks = registerHooks({
       async moveModel() {}
       setChannelInputs() {}
       close() { this.ready = false; this.connected = false; }
+      // /assistant/status 的授权块经由该方法投影；保持与真实客户端一致的返回，不特判生产代码。
+      authStatus() {
+        return {
+          state: this.ready ? 'ready' : 'disconnected',
+          authenticated: this.ready === true,
+          needsAuth: false,
+          authError: '',
+          lastAuthAt: 0,
+          lastAuthSuccessAt: 0,
+          retryable: this.ready !== true,
+          authorizePending: false,
+          authorizeRequests: 0,
+          freshTokenRejected: false,
+        };
+      }
     }`,
       };
     }

@@ -227,6 +227,9 @@ async function fixture(t, { preRequestTtlMs = 30_000 } = {}) {
     obsPort: server.address().port,
     privacyScene: 'Privacy',
     dependencyBootDelayMs: 8000,
+    // 本测试只验证 pre-request preparation；关闭持续证据采集，避免首轮 pre-step 后的
+    // 后台故事板把 `state.starts` 计成“preparation 自己开故事板”。
+    evidenceCaptureEnabled: false,
     vision: { preRequestTtlMs },
   });
   t.after(() => cleanupRoot(root, disposers));

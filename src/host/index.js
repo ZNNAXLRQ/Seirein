@@ -8801,6 +8801,8 @@ export function apply(ctx, config) {
     evidenceRetryTimer = null;
   };
   const evidenceCaptureAllowed = () => {
+    // 测试/诊断逃生阀：显式关闭时绝不启动持续采集；默认 undefined 视作开启，生产行为不变。
+    if (config?.evidenceCaptureEnabled === false) return false;
     if (companionSessionSeen !== true) return false;
     if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return false;
     try { return features.enabled('vision') === true; } catch { return false; }
