@@ -31,6 +31,14 @@ const MIN_FRAME_GAP_MS = 33;
 const FRAME_REPLY_TIMEOUT_MS = 400;
 /** How many timed-out frame IDs are remembered so a late APIError is still attributable. */
 const FRAME_LATE_SLOTS = 64;
+/** Mapping probe: how long VTS gets to apply one injected value before the parameters are re-read. */
+const PROBE_INJECT_WAIT_MS = 80;
+/** A parameter must move more than this to count as evidence (Live2D values are normalised). */
+const PROBE_CHANGE_EPSILON = 0.01;
+/** Restoring a probed input to 0 is best-effort and must never hold the diagnostic open for long. */
+const PROBE_RESTORE_TIMEOUT_MS = 2_000;
+/** While a probe owns the transport the frame loop idles in steps of this size. */
+const PROBE_FRAME_PAUSE_POLL_MS = 10;
 /** Ring size for computedHz: ~2 s of frames at 30 Hz. */
 const FRAME_RATE_WINDOW = 64;
 /**
@@ -302,6 +310,11 @@ export class VtsClient {
     // Real-time frame transport (single slot + single-flight loop).
     this.pendingFrame = null;
     this.frameLoop = null;
+    /**
+     * True only while probeInputMapping() is measuring. The frame loop holds instead of sending, so
+     * a probe cannot race the 30 Hz writer; it is always cleared in a finally block.
+     */
+    this.probeActive = false;
     this.frameAwait = new Map();
     this.frameLate = new Map();
     this.frameSentAt = [];
@@ -1814,6 +1827,12 @@ export class VtsClient {
 
   async runFrameLoop() {
     while (this.pendingFrame !== null) {
+      if (this.probeActive === true) {
+        // A mapping probe is reading the model. Hold the newest value in the slot instead of
+        // racing it; the slot already drops older values, so nothing backs up.
+        await sleep(PROBE_FRAME_PAUSE_POLL_MS);
+        continue;
+      }
       const frame = this.pendingFrame;
       this.pendingFrame = null;
       if (frame.epoch !== this.frameEpoch) {
@@ -1846,6 +1865,17 @@ export class VtsClient {
       if (!this.connected) {
         this.noteFrameDrop('disconnected');
         this.settleFrame(frame, { ok: false, error: 'VTube Studio is not connected', sent: false });
+        continue;
+      }
+      if (this.probeActive === true) {
+        // A probe started during the 33 ms pacing wait: give the value back to the slot (or keep
+        // the newer one) and wait, so the probe's before/after read is not disturbed.
+        if (this.pendingFrame === null) {
+          this.pendingFrame = frame;
+        } else {
+          this.noteFrameDrop('superseded');
+          this.settleFrame(frame, { ok: true, superseded: true, sent: false });
+        }
         continue;
       }
       try {
@@ -2174,6 +2204,126 @@ export class VtsClient {
         error: firstError || (error?.message ?? String(error)),
       };
     }
+  }
+
+  // ---- runtime mapping evidence -----------------------------------------
+  /**
+   * Read the current values of model parameters, keyed by the requested name. A parameter VTS did
+   * not answer with is `null`; transport/API failures reject (the probe below catches them).
+   */
+  async readParameterValues(parameterNames) {
+    const names = (Array.isArray(parameterNames) ? parameterNames : [parameterNames])
+      .map((name) => String(name ?? '').trim())
+      .filter((name) => name.length > 0);
+    const values = Object.fromEntries(names.map((name) => [name, null]));
+    if (names.length === 0) return values;
+    const data = unwrap(
+      await this.request('GetParameterValues', { parameterNames: names }),
+      'GetParameterValues',
+    );
+    const list = collectModelParameters(
+      data.parameterValues ?? data.parameters ?? data.live2DModelParameters,
+    );
+    const byName = new Map(list.map((entry) => [normalizeName(entry.name), entry.value]));
+    for (const name of names) {
+      const value = byName.get(normalizeName(name));
+      if (Number.isFinite(value)) values[name] = value;
+    }
+    return values;
+  }
+
+  /**
+   * Runtime evidence that an injectable *input* really drives a model parameter.
+   *
+   * InputParameterListRequest only proves that a value can be sent; the user's VTS parameter
+   * mapping decides whether the model reacts, and the API cannot read that mapping. This probe
+   * reads the target parameters, injects one value through InjectParameterDataRequest, waits
+   * briefly, reads again, and restores the input to 0. `changed` is evidence, not name matching.
+   *
+   * It never throws: timeouts and VTS errors become `ok:false` with `error`. While it runs the
+   * 30 Hz frame slot is held, so a probe cannot race the motion writer. Restoring to 0 is
+   * best-effort: a failed restore is reported in `error` but does not discard a valid measurement.
+   *
+   * @param {{inputName: string, parameterNames: string[], value?: number}} options
+   * @returns {Promise<{ok: boolean, inputName: string, parameterNames: string[], before: object,
+   *   after: object, delta: object, changed: boolean, error: string}>}
+   */
+  async probeInputMapping({ inputName, parameterNames, value = 0.5 } = {}) {
+    const name = String(inputName ?? '').trim();
+    const names = (Array.isArray(parameterNames) ? parameterNames : [parameterNames])
+      .map((entry) => String(entry ?? '').trim())
+      .filter((entry) => entry.length > 0);
+    const result = {
+      ok: false,
+      inputName: name,
+      parameterNames: names,
+      before: {},
+      after: {},
+      delta: {},
+      changed: false,
+      error: '',
+    };
+    if (name.length === 0) {
+      result.error = 'inputName is required';
+      return result;
+    }
+    if (names.length === 0) {
+      result.error = 'parameterNames is required';
+      return result;
+    }
+    if (!this.connected) {
+      result.error = 'VTube Studio is not connected';
+      return result;
+    }
+
+    const probeValue = Number.isFinite(Number(value)) ? Number(value) : 0.5;
+    let injectAttempted = false;
+    this.probeActive = true;
+    try {
+      result.before = await this.readParameterValues(names);
+      injectAttempted = true;
+      await this.request('InjectParameterDataRequest', {
+        parameterValues: [{ id: name, value: probeValue }],
+        mode: 'set',
+      });
+      await sleep(PROBE_INJECT_WAIT_MS);
+      result.after = await this.readParameterValues(names);
+      let changed = false;
+      for (const parameter of names) {
+        const before = result.before[parameter];
+        const after = result.after[parameter];
+        if (!Number.isFinite(before) || !Number.isFinite(after)) {
+          result.delta[parameter] = null;
+          continue;
+        }
+        const delta = after - before;
+        result.delta[parameter] = delta;
+        if (Math.abs(delta) > PROBE_CHANGE_EPSILON) changed = true;
+      }
+      result.changed = changed;
+      result.ok = true;
+    } catch (error) {
+      result.error = error?.message ?? String(error);
+      result.ok = false;
+    } finally {
+      // Only restore when the input may have been sent: injecting 0 without an injection would
+      // overwrite a live tracking value for no reason.
+      if (injectAttempted === true) {
+        try {
+          await this.request('InjectParameterDataRequest', {
+            parameterValues: [{ id: name, value: 0 }],
+            mode: 'set',
+          }, PROBE_RESTORE_TIMEOUT_MS);
+        } catch (error) {
+          if (result.error.length === 0) {
+            result.error = `restore failed: ${error?.message ?? String(error)}`;
+          }
+        }
+      }
+      this.probeActive = false;
+      if (this.pendingFrame !== null) void this.pumpFrames();
+    }
+    return result;
   }
 
   async moveModel({ x, y, rotation, size }) {

@@ -15,6 +15,12 @@
  *
  * Automatic name matching alone only ever produces a *candidate* (injectable, not verified).
  * Nothing here injects values — sending belongs to the motion stage (VtsClient.injectInputs).
+ *
+ * A third, runtime-only proof is optional: with `probeMappings:true` the caller supplies
+ * `probeInputMapping` (normally `VtsClient.probeInputMapping`). For gazeX/gazeY the probe injects an
+ * input and compares the model parameters before/after. Only `changed:true` keeps `verified`; a
+ * failed or unchanged probe marks the channel `mappingUnverified` and sets `verified:false`, but
+ * never removes the injectable channel — a diagnostics failure must not take the eye channel away.
  */
 
 /** Every channel the motion stage wants to drive, in a stable order. */
@@ -32,6 +38,15 @@ export const CHANNEL_ORDER = [
   'bodyX',
   'breath',
 ];
+
+/**
+ * Channels a runtime probe can check honestly: both have model parameters whose value can be read
+ * before and after one injection. Other channels stay name-rule candidates; probing them is not
+ * part of this stage.
+ */
+export const PROBE_CHANNEL_ORDER = Object.freeze(['gazeX', 'gazeY']);
+/** Diagnostic injection value; gaze tracking inputs are normalised to -1..1. */
+export const PROBE_VALUE = 0.5;
 
 /**
  * Candidate *input* names per channel, most specific first. Matching is an exact, case-insensitive
@@ -102,11 +117,13 @@ const emptyCapabilities = () => ({
   channels: [],
   mapped: [],
   verified: [],
+  mappingUnverified: [],
   unmapped: [...CHANNEL_ORDER],
   model: { ok: false, source: '', count: 0, error: '' },
   parameterCount: { default: 0, custom: 0 },
   declared: [],
   discoveredAt: '',
+  probeError: '',
   error: '',
 });
 
@@ -143,9 +160,19 @@ export function sameDiscoveryIdentity(left, right) {
 
 /** Deep-enough copy so callers cannot mutate the committed snapshot or the cache. */
 function copyCapabilities(base) {
-  const copyEntry = (entry) => (entry === null || entry === undefined
-    ? null
-    : { ...entry, modelParams: [...(entry.modelParams ?? [])] });
+  const copyEntry = (entry) => {
+    if (entry === null || entry === undefined) return null;
+    const copy = { ...entry, modelParams: [...(entry.modelParams ?? [])] };
+    if (entry.probe !== null && typeof entry.probe === 'object') {
+      copy.probe = {
+        ...entry.probe,
+        ...(entry.probe.delta !== null && typeof entry.probe.delta === 'object'
+          ? { delta: { ...entry.probe.delta } }
+          : {}),
+      };
+    }
+    return copy;
+  };
   return {
     ...base,
     inputs: Object.fromEntries(
@@ -154,10 +181,12 @@ function copyCapabilities(base) {
     channels: (base.channels ?? []).map((entry) => copyEntry(entry)),
     mapped: [...base.mapped],
     verified: [...base.verified],
+    mappingUnverified: [...(base.mappingUnverified ?? [])],
     unmapped: [...base.unmapped],
     declared: [...(base.declared ?? [])],
     model: { ...base.model },
     parameterCount: { ...base.parameterCount },
+    probeError: String(base.probeError ?? ''),
   };
 }
 
@@ -225,7 +254,13 @@ function declaredInputName(channelMap, channel) {
  * @param {() => (object|null)} [options.currentIdentity]
  *   Reads the identity that is current *now*. Returning null means "no usable connection".
  * @param {boolean} [options.force] Bypass a cached result, but never a request already in flight.
- * @returns {Promise<object>} `{ ok, inputs, channels, mapped, verified, unmapped, model, … }`
+ * @param {boolean} [options.probeMappings=false]
+ *   Explicit opt-in: after name matching, probe gazeX/gazeY at runtime. Off by default so ordinary
+ *   discovery stays read-only and does not inject values into the user's model.
+ * @param {(input: {inputName: string, parameterNames: string[], value: number}) => Promise<object>}
+ *   [options.probeInputMapping] The evidence source, normally `VtsClient.probeInputMapping`.
+ * @param {number} [options.probeValue=0.5] Value injected by the diagnostic probe.
+ * @returns {Promise<object>} `{ ok, inputs, channels, mapped, verified, mappingUnverified, … }`
  */
 export function discoverCapabilities({
   listInputParameters,
@@ -235,6 +270,9 @@ export function discoverCapabilities({
   identity = undefined,
   currentIdentity = undefined,
   force = false,
+  probeMappings = false,
+  probeInputMapping = undefined,
+  probeValue = PROBE_VALUE,
 } = {}) {
   const scoped = identity !== undefined && identity !== null;
   const key = scoped ? discoveryIdentityKey(identity) : '';
@@ -291,6 +329,7 @@ export function discoverCapabilities({
 
   const run = probeCapabilities({
     listInputParameters, listModelParameters, channelMap, note, fail, commit, scoped, modelId,
+    probeMappings, probeInputMapping, probeValue,
   });
   if (scoped) {
     inFlight.set(key, run);
@@ -302,8 +341,72 @@ export function discoverCapabilities({
   return run;
 }
 
+/**
+ * Optional runtime evidence for gaze channels. A probe outcome is allowed to *downgrade* a
+ * name-rule verification (or confirm it), never to remove the injectable channel or its input:
+ * a failed diagnostic means "not proven", not "the eye cannot be driven at all".
+ *
+ * Only `changed:true` from a successful probe keeps `verified`; a timeout, an error or an unchanged
+ * parameter value sets `mappingUnverified:true` and `verified:false`. Returns a non-empty
+ * `probeError` only when probing was requested but could not be configured.
+ */
+async function probeChannelMappings({ channels, probeMappings, probeInputMapping, probeValue, note }) {
+  if (probeMappings !== true) return '';
+  if (typeof probeInputMapping !== 'function') {
+    return 'probeMappings 已开启，但没有提供 probeInputMapping';
+  }
+  const value = Number.isFinite(Number(probeValue)) ? Number(probeValue) : PROBE_VALUE;
+  for (const channel of channels) {
+    if (!PROBE_CHANNEL_ORDER.includes(channel.channel)) continue;
+    if (channel.injectable !== true || channel.inputName.length === 0) continue;
+    if (!Array.isArray(channel.modelParams) || channel.modelParams.length === 0) continue;
+
+    let outcome;
+    try {
+      outcome = await probeInputMapping({
+        inputName: channel.inputName,
+        parameterNames: [...channel.modelParams],
+        value,
+      });
+    } catch (error) {
+      outcome = { ok: false, changed: false, error: error?.message ?? String(error) };
+    }
+    // `changed` is the decisive evidence. An explicit ok:false still wins (a contradictory
+    // "changed" from a failed probe is not proof); a probe that omits ok is accepted by `changed`.
+    const changed = outcome?.ok !== false && outcome?.changed === true;
+    channel.verified = changed;
+    channel.mappingUnverified = changed !== true;
+    channel.probe = {
+      ok: outcome?.ok === true,
+      changed,
+      value,
+      error: String(outcome?.error ?? ''),
+    };
+    if (outcome?.delta !== null && typeof outcome?.delta === 'object') {
+      channel.probe.delta = { ...outcome.delta };
+    }
+    if (changed) {
+      channel.notes = `运行期探测确认 ${channel.inputName} 改变 ${channel.modelParams.join('、')}（阈值 0.01）`;
+    } else {
+      const reason = channel.probe.error.length > 0 ? `：${channel.probe.error}` : '：参数值未达到变化阈值';
+      channel.notes = `运行期探测未确认 ${channel.inputName} 驱动 ${channel.modelParams.join('、')}${reason}；保留通道并标记 mappingUnverified`;
+    }
+    await note('avatar.mapping.probe', {
+      channel: channel.channel,
+      input: channel.inputName,
+      changed,
+      ok: channel.probe.ok,
+      error: channel.probe.error,
+    });
+  }
+  return '';
+}
+
 /** Probe one capability map; caching, identity verification and lifecycle events belong to the caller. */
-async function probeCapabilities({ listInputParameters, listModelParameters, channelMap, note, fail, commit, scoped, modelId }) {
+async function probeCapabilities({
+  listInputParameters, listModelParameters, channelMap, note, fail, commit, scoped, modelId,
+  probeMappings, probeInputMapping, probeValue,
+}) {
   if (scoped) await note('avatar.discovery.start', { modelId });
 
   if (typeof listInputParameters !== 'function') {
@@ -405,10 +508,12 @@ async function probeCapabilities({ listInputParameters, listModelParameters, cha
         inputSource: '',
         injectable: false,
         verified: false,
+        mappingUnverified: false,
         modelParams: presentTargets,
         min: 0,
         max: 1,
         defaultValue: 0,
+        probe: null,
         notes: declaredName.length > 0
           ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里`
           : '没有可注入输入匹配该通道',
@@ -429,20 +534,28 @@ async function probeCapabilities({ listInputParameters, listModelParameters, cha
       inputSource,
       injectable: true,
       verified,
+      mappingUnverified: false,
       modelParams: presentTargets,
       min: hit.min,
       max: hit.max,
       defaultValue: hit.defaultValue,
+      probe: null,
       notes,
     };
   };
 
   const channels = CHANNEL_ORDER.map(buildChannel);
+  const probeError = await probeChannelMappings({
+    channels, probeMappings, probeInputMapping, probeValue, note,
+  });
   const inputs = Object.fromEntries(
     channels.map((entry) => [entry.channel, entry.injectable ? entry : null]),
   );
   const mapped = channels.filter((entry) => entry.injectable).map((entry) => entry.channel);
   const verified = channels.filter((entry) => entry.verified).map((entry) => entry.channel);
+  const mappingUnverified = channels
+    .filter((entry) => entry.mappingUnverified === true)
+    .map((entry) => entry.channel);
   const unmapped = channels.filter((entry) => !entry.injectable).map((entry) => entry.channel);
 
   return commit({
@@ -452,11 +565,13 @@ async function probeCapabilities({ listInputParameters, listModelParameters, cha
     channels,
     mapped,
     verified,
+    mappingUnverified,
     unmapped,
     model,
     parameterCount: { default: defaults.length, custom: customs.length },
     declared: CHANNEL_ORDER.filter((channel) => declaredInputName(channelMap, channel).length > 0),
     discoveredAt: new Date().toISOString(),
+    probeError,
     error: '',
   });
 }
