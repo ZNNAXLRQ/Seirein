@@ -13,6 +13,11 @@
  *
  * The automatic evidence lane is the opposite: its wording stays exactly as spoken (§6.4).
  *
+ * P2 regression: the manual tools must NOT pre-convert a relative word with the calendar date.
+ * Both hand the raw wording to the store, whose 04:00 day anchor then writes
+ * `2026-11-10（明天）` at 02:30 (not the calendar `2026-11-11`) and returns the same
+ * `timeResolved` for the same input/now/zone.
+ *
  * Run: node --test test/memory-time-wiring.mjs
  */
 import assert from 'node:assert/strict';
@@ -23,10 +28,18 @@ import test from 'node:test';
 
 import { apply } from '../src/host/index.js';
 import { createAutoMemoryRecorder } from '../src/host/memory/auto-recorder.js';
+import { normalizeForManualMemory } from '../src/host/memory/memory-normalize.js';
 import { MemoryStore } from '../src/host/memory/store.js';
 
 /** Monday 2026-11-09, 16:00 Asia/Shanghai (the P-67 acceptance anchor). */
 const BASE = new Date('2026-11-09T16:00:00+08:00');
+/** P2 probe instants: the 04:00 boundary, its last minute, and a Sunday around it. */
+const LATE_0230 = Date.parse('2026-11-10T02:30:00+08:00');
+const BEFORE_0400 = Date.parse('2026-11-10T03:59:00+08:00');
+const AT_0400 = Date.parse('2026-11-10T04:00:00+08:00');
+const SUNDAY_0230 = Date.parse('2026-11-08T02:30:00+08:00');
+/** Monday 02:30 still belongs to Sunday at the 04:00 boundary: the week anchor really moves. */
+const MONDAY_0230 = Date.parse('2026-11-09T02:30:00+08:00');
 
 async function tempRoot() {
   return mkdtemp(join(tmpdir(), 'dsh-mem-time-wiring-'));
@@ -307,4 +320,202 @@ test('5) both real registered output schemas declare a strict timeResolved field
     assert.ok(key in itemSchema.properties, `schema declares the returned key ${key}`);
   }
   console.log('[5] registered schemas declare strict timeResolved; no runtime schema mutation');
+});
+
+/**
+ * P2: both manual tools must see the SAME 04:00 anchor. This mounts the real tools at `now`
+ * and returns the store row of a remembered expression plus the correction result.
+ */
+async function manualPairAt(t, now) {
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const root = await tempRoot();
+  const app = mount(root);
+  t.after(async () => {
+    app.close();
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+  });
+  return {
+    app,
+    root,
+    async remember(text) {
+      return app.call('assistant_remember', { text });
+    },
+    async correct(term) {
+      const target = await app.call('assistant_remember', { text: '原定时间开会' });
+      const value = await app.call('assistant_memory_correct', {
+        targetId: target.id,
+        expectedVersion: 1,
+        expectedText: '时间',
+        replacement: term,
+      });
+      return { target, value };
+    },
+  };
+}
+
+test('6) 02:30 Beijing: remember and correct both use the 04:00 anchor → 2026-11-10（明天）', async (t) => {
+  const pair = await manualPairAt(t, LATE_0230);
+  const remembered = await pair.remember('明天去公园');
+  assert.deepEqual(remembered.timeResolved, [
+    { term: '明天', date: '2026-11-10', ok: true },
+  ], '02:30 is still the previous day at the 04:00 boundary');
+
+  const { target, value: corrected } = await pair.correct('明天');
+  assert.equal(corrected.ok, true, corrected.error);
+  assert.equal(corrected.to, '2026-11-10（明天）', 'the correction keeps the original word');
+  assert.deepEqual(
+    corrected.timeResolved,
+    remembered.timeResolved,
+    'same input + same now/zone → the same report',
+  );
+
+  pair.app.close();
+  await withStore(pair.root, (store) => {
+    assert.equal(rowOf(store, remembered.id).text, '2026-11-10（明天）去公园');
+    assert.equal(rowOf(store, remembered.id).raw_text, '明天去公园');
+    assert.equal(rowOf(store, target.id).text, '原定2026-11-10（明天）开会');
+  });
+  console.log(`[6] 02:30 remember/correct → ${corrected.to}; timeResolved=${JSON.stringify(corrected.timeResolved)}`);
+});
+
+test('7) 03:59 boundary: 明天 still resolves to 2026-11-10 for both tools', async (t) => {
+  const pair = await manualPairAt(t, BEFORE_0400);
+  const remembered = await pair.remember('明天去公园');
+  assert.deepEqual(remembered.timeResolved, [
+    { term: '明天', date: '2026-11-10', ok: true },
+  ]);
+
+  const { target, value: corrected } = await pair.correct('明天');
+  assert.equal(corrected.ok, true, corrected.error);
+  assert.equal(corrected.to, '2026-11-10（明天）');
+  assert.deepEqual(corrected.timeResolved, remembered.timeResolved);
+
+  pair.app.close();
+  await withStore(pair.root, (store) => {
+    assert.equal(rowOf(store, remembered.id).text, '2026-11-10（明天）去公园');
+    assert.equal(rowOf(store, target.id).text, '原定2026-11-10（明天）开会');
+  });
+  console.log(`[7] 03:59 → ${corrected.to}`);
+});
+
+test('8) 04:00 boundary: 明天 rolls over to 2026-11-11 for both tools', async (t) => {
+  const pair = await manualPairAt(t, AT_0400);
+  const remembered = await pair.remember('明天去公园');
+  assert.deepEqual(remembered.timeResolved, [
+    { term: '明天', date: '2026-11-11', ok: true },
+  ], 'at 04:00 the anchor is 11-10, so 明天 is 11-11');
+
+  const { target, value: corrected } = await pair.correct('明天');
+  assert.equal(corrected.ok, true, corrected.error);
+  assert.equal(corrected.to, '2026-11-11（明天）');
+  assert.deepEqual(corrected.timeResolved, remembered.timeResolved);
+
+  pair.app.close();
+  await withStore(pair.root, (store) => {
+    assert.equal(rowOf(store, remembered.id).text, '2026-11-11（明天）去公园');
+    assert.equal(rowOf(store, target.id).text, '原定2026-11-11（明天）开会');
+  });
+  console.log(`[8] 04:00 → ${corrected.to}`);
+});
+
+test('9) Sunday/Monday 02:30 cross-week 下周三 / 周三 agree between remember and correct', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: SUNDAY_0230 });
+  const instants = [
+    ['Sunday 02:30', SUNDAY_0230],
+    ['Monday 02:30 (still Sunday)', MONDAY_0230],
+  ];
+  for (const [label, instant] of instants) {
+    t.mock.timers.setTime(instant);
+    for (const term of ['下周三', '周三']) {
+      const root = await tempRoot();
+      const app = mount(root);
+      try {
+        const remembered = await app.call('assistant_remember', { text: `${term}去公园` });
+        const expected = term === '周三'
+          ? [{ term, date: '2026-11-11', ok: true, note: 'next-occurrence' }]
+          : [{ term, date: '2026-11-11', ok: true }];
+        assert.deepEqual(
+          remembered.timeResolved,
+          expected,
+          `${label} ${term}: the 04:00 anchor owns the week`,
+        );
+        const target = await app.call('assistant_remember', { text: '原定时间开会' });
+        const corrected = await app.call('assistant_memory_correct', {
+          targetId: target.id,
+          expectedVersion: 1,
+          expectedText: '时间',
+          replacement: term,
+        });
+        assert.equal(corrected.ok, true, corrected.error);
+        assert.equal(corrected.to, `2026-11-11（${term}）`);
+        assert.deepEqual(corrected.timeResolved, remembered.timeResolved, `${label} ${term}: same report`);
+
+        app.close();
+        await withStore(root, (store) => {
+          assert.equal(rowOf(store, remembered.id).text, `2026-11-11（${term}）去公园`);
+          assert.equal(rowOf(store, target.id).text, `原定2026-11-11（${term}）开会`);
+        });
+      } finally {
+        app.close();
+        await rm(root, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  }
+  console.log('[9] Sunday/Monday 02:30: 下周三/周三 → 2026-11-11 for both tools');
+});
+
+test('10) absolute dates and recurring terms are never rewritten by either tool', async (t) => {
+  const pair = await manualPairAt(t, LATE_0230);
+
+  const absolute = await pair.remember('2026-11-11 开会');
+  assert.deepEqual(absolute.timeResolved, [], 'an absolute date needs no resolution');
+  const chinese = await pair.remember('11月11日开会');
+  assert.deepEqual(chinese.timeResolved, [], 'a Chinese absolute date needs no resolution');
+  const recurring = await pair.remember('每周三开例会');
+  assert.deepEqual(recurring.timeResolved, [
+    { term: '每周三', date: null, ok: false, reason: 'recurring' },
+  ], 'a recurring term is reported, never turned into one date');
+
+  const absoluteCorrect = await pair.correct('2026-11-11');
+  assert.equal(absoluteCorrect.value.ok, true, absoluteCorrect.value.error);
+  assert.equal(absoluteCorrect.value.to, '2026-11-11', 'the absolute replacement is verbatim');
+  assert.deepEqual(absoluteCorrect.value.timeResolved, []);
+
+  const recurringCorrect = await pair.correct('每周三');
+  assert.equal(recurringCorrect.value.ok, true, recurringCorrect.value.error);
+  assert.equal(recurringCorrect.value.to, '每周三', 'the recurring replacement is verbatim');
+  assert.deepEqual(recurringCorrect.value.timeResolved, [
+    { term: '每周三', date: null, ok: false, reason: 'recurring' },
+  ]);
+  assert.deepEqual(recurringCorrect.value.timeResolved, recurring.timeResolved);
+
+  pair.app.close();
+  await withStore(pair.root, (store) => {
+    assert.equal(rowOf(store, absolute.id).text, '2026-11-11 开会');
+    assert.equal(rowOf(store, absolute.id).raw_text, null, 'nothing was rewritten, so no raw copy');
+    assert.equal(rowOf(store, chinese.id).text, '11月11日开会');
+    assert.equal(rowOf(store, recurring.id).text, '每周三开例会');
+    assert.equal(rowOf(store, absoluteCorrect.target.id).text, '原定2026-11-11开会');
+    assert.equal(rowOf(store, recurringCorrect.target.id).text, '原定每周三开会');
+  });
+  console.log('[10] absolute 2026-11-11 / 11月11日 and 每周三 stay unchanged');
+});
+
+test('11) the manual normalizer expands anaphora only, never relative or absolute time', () => {
+  const expanded = normalizeForManualMemory('她明天去', {
+    now: LATE_0230,
+    context: { previous: ['我养了一只猫，叫团子'] },
+  });
+  assert.equal(expanded.text, '团子明天去', 'pronoun expansion still runs on the manual lane');
+  assert.deepEqual(expanded.changes, ['pronoun'], 'relative time is not a stage-2 change any more');
+  assert.equal(expanded.rawText, '她明天去');
+
+  const absolute = normalizeForManualMemory('2026-11-11 开会', { now: LATE_0230 });
+  assert.equal(absolute.text, '2026-11-11 开会');
+  assert.deepEqual(absolute.changes, []);
+
+  const recurring = normalizeForManualMemory('每周三开例会', { now: LATE_0230 });
+  assert.equal(recurring.text, '每周三开例会');
+  assert.deepEqual(recurring.changes, []);
+  console.log('[11] manual normalizer: pronoun only; time stays raw for the store');
 });

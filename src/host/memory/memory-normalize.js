@@ -18,7 +18,8 @@
  *      reported speech the date is resolved against the speaker's own speech instant
  *      (`昨天小王说「我明天去」` → 小王's tomorrow), and when that instant cannot be established
  *      the words stay and `unresolved = 1`. Vague expressions (改天/找个时间/下周 without a
- *      weekday) stay as written and set `unresolved = 1`.
+ *      weekday) stay as written and set `unresolved = 1`. This is the library/comparison
+ *      behaviour; the two MANUAL write tools opt out (see `normalizeForManualMemory`).
  *
  *      The automatic evidence lane is the exception (§6.4): its body is what the user actually
  *      said, so relative wording stays verbatim. The recorder is the only caller that supplies a
@@ -26,8 +27,9 @@
  *      states `expand` (or `resolveTime`), so this inference is stable. A caller can always state
  *      `resolveTime` to override it.
  *
- * Pure and store-free: the auto recorder, `assistant_remember` and the correction replacement
- * all call this one function. Idempotent — normalizing an already-normalized body changes
+ * Pure and store-free: the auto recorder, the dedup projection, `assistant_remember` and the
+ * correction replacement all call this one function (the two manual tools through
+ * `normalizeForManualMemory`). Idempotent — normalizing an already-normalized body changes
  * nothing and reports no change.
  */
 
@@ -704,4 +706,23 @@ export function normalizeForMemory(text, options = {}) {
   if (VAGUE_TIME_RE.test(body) || BARE_WEEK_RE.test(body)) unresolved = 1;
 
   return { text: body, rawText, changes, unresolved, tz, referentId };
+}
+
+/**
+ * The MANUAL write lane's stage-2 call (`assistant_remember`, `assistant_memory_correct`).
+ *
+ * The manual lane states the ONE time base explicitly: it never absolutizes a relative word
+ * itself (`resolveTime:false`), so `明天` reaches the store verbatim and the store's
+ * `resolveRelativeTime` (04:00 local day anchor) writes `2026-11-10（明天）` and returns
+ * `timeResolved`. Both tools therefore share the store's anchor and the same report for the
+ * same input; only anaphora/quoted-speaker expansion (or nothing, for a correction) happens
+ * here. The store is the single owner of the 04:00 boundary.
+ *
+ * @param {string} text the model's submitted wording / correction fragment
+ * @param {{now?: Date|number|string, timeZone?: string, context?: object, expand?: boolean}} [options]
+ * @returns {{text: string, rawText: string, changes: string[], unresolved: 0|1, tz: string,
+ *            referentId: string}}
+ */
+export function normalizeForManualMemory(text, options = {}) {
+  return normalizeForMemory(text, { ...options, resolveTime: false });
 }

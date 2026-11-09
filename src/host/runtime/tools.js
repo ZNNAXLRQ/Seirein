@@ -16,7 +16,7 @@
 import { AVATAR_ERROR_CODES } from '../avatar/avatarRuntime.js';
 import { truncationNotice } from '../hearing/hearing.js';
 import { deliveredRecallRows, memoryReferentRecord } from '../memory/memory-injection.js';
-import { resolveMemoryTimeZone } from '../memory/memory-normalize.js';
+import { resolveMemoryTimeZone, normalizeForManualMemory } from '../memory/memory-normalize.js';
 import { DEFAULT_HOTKEYS, HOTKEY_ACTIONS, hotkeyActionsForCombo, parseBinding } from '../platform/hotkeys.js';
 import { displayMessageSnippet, normalizeDomain, scoreImportance, tokenizeQuery } from '../memory/store.js';
 
@@ -92,6 +92,36 @@ function queryWindowReport(from, to, relaxed) {
 }
 
 export function createHostTools(deps) {
+  /**
+   * Stage-2 normalization for the two MANUAL write tools. Both use the SAME lane: only
+   * anaphora/quoted-speaker expansion runs here. Relative time is never pre-converted, because
+   * the store owns the 04:00 day anchor and must still see the original word to write
+   * `YYYY-MM-DD（原词）` and report `timeResolved`. `config.memoryNormalize` is the test-injected
+   * wrapper (it receives the same `resolveTime:false`); without it the lane is
+   * `normalizeForManualMemory`, i.e. `normalizeForMemory` with `resolveTime:false`. The host's
+   * `memoryNormalizeSafe` wrapper does not forward a lane switch, so these tools call the
+   * configured normalizer directly with the same try/catch fallback.
+   */
+  const normalizeManualBody = (text, { sessionId = '', now, expand = true, context = null } = {}) => {
+    const { config, memoryContextOf } = deps;
+    const timeZone = resolveMemoryTimeZone(config?.memory?.timeZone);
+    try {
+      const normalize = typeof config?.memoryNormalize === 'function'
+        ? config.memoryNormalize
+        : normalizeForManualMemory;
+      return normalize(text, {
+        now: now ?? new Date(),
+        timeZone,
+        context: context ?? memoryContextOf(sessionId),
+        expand,
+        resolveTime: false,
+      });
+    } catch {
+      const body = typeof text === 'string' ? text : '';
+      return { text: body, rawText: body, changes: [], unresolved: 0, tz: timeZone, referentId: '' };
+    }
+  };
+
   return {
     async executeSee(args, exec, owner = null) {
       const {
@@ -158,8 +188,8 @@ export function createHostTools(deps) {
     },
     async executeRemember(args, exec) {
       const {
-        SCOPE_ERROR, config, emitMemoryNormalize, features, log, memory, memoryContextOf,
-        memoryNormalizeSafe, memoryTurnScope, scopeBlocksTool,
+        SCOPE_ERROR, config, emitMemoryNormalize, features, log, memory, memoryTurnScope,
+        scopeBlocksTool,
       } = deps;
       if (scopeBlocksTool(exec)) {
         return { id: '', domain: '', ts: '', ok: false, error: SCOPE_ERROR };
@@ -171,22 +201,21 @@ export function createHostTools(deps) {
       // Manual lane: the model supplies the distilled text and (optionally) the importance,
       // clamped to >= 50 so the user's explicit confirmation outranks an auto original. Without
       // an explicit value the deterministic heuristic is used (still clamped to the manual band).
-      // It runs through the SAME normalizer as the automatic lane, so a manual fact also carries
-      // an absolute date and no dangling pronoun. The context is captured once so the `referent`
-      // link (stage 3) points at the row the pronoun was resolved from.
+      // Stage 2 only expands anaphora/quotes here; the raw relative word is deliberately NOT
+      // pre-converted, so the store's `resolveRelativeTime` still sees `明天` and the 04:00 day
+      // anchor is the ONE base this tool shares with `assistant_memory_correct`.
       const { sessionId } = memoryTurnScope(exec);
-      const context = memoryContextOf(sessionId);
-      const normalized = memoryNormalizeSafe(args.text, { sessionId, context });
+      const now = new Date();
+      const normalized = normalizeManualBody(args.text, { sessionId, now });
       const kind = args.kind ?? 'fact';
       const modelImportance = Number(args.importance);
       const importance = Number.isFinite(modelImportance)
         ? Math.min(100, Math.max(50, Math.round(modelImportance)))
         : Math.min(100, Math.max(50, scoreImportance(normalized.text, kind)));
       // Raw vs normalized stay separate: `normalized.text` is what gets indexed (pronouns
-      // resolved, relative dates absolute on this manual lane), while `rawText` is the model's
-      // submitted wording. `add()` re-runs `resolveRelativeTime` on the raw wording to restore the
-      // `2026-11-18（下周三）` bracket and to report `timeResolved`; the store never receives only
-      // an already-absolute body, which would lose the original term.
+      // resolved, relative wording still intact), while `rawText` is the model's submitted
+      // wording. `add()` turns every relative word into `2026-11-10（明天）` and returns
+      // `timeResolved`; both tools pass the same `now`/zone so their reports agree.
       const timeZone = resolveMemoryTimeZone(config?.memory?.timeZone);
       // P-127: `inference`/`evidence` are passed through to the store gate. A marker without an
       // evidence string/ID is stored as an unverified hypothesis; the automatic recorder is not
@@ -196,6 +225,7 @@ export function createHostTools(deps) {
       const record = memory.add(domain, normalized.text, kind, {
         source: 'manual',
         importance,
+        now,
         rawText: normalized.text === normalized.rawText ? null : normalized.rawText,
         unresolved: normalized.unresolved,
         tzUsed: normalized.tz,
@@ -244,7 +274,7 @@ export function createHostTools(deps) {
     async executeMemoryCorrect(args, exec) {
       const {
         SCOPE_ERROR, config, currentUserMessageId, emitMemoryNormalize, features, log, memory,
-        memoryNormalizeSafe, memoryTurnLedger, memoryTurnScope, scopeBlocksTool,
+        memoryTurnLedger, memoryTurnScope, scopeBlocksTool,
       } = deps;
       const shape = {
         ok: false,
@@ -272,12 +302,13 @@ export function createHostTools(deps) {
       // injected so the already-recorded correction statement is merged (hidden + refunded).
       const providedSource = typeof args.sourceMessageId === 'string' ? args.sourceMessageId.trim() : '';
       const sourceMessageId = providedSource.length > 0 ? providedSource : currentUserMessageId(exec);
-      // A correction only rewrites an existing fragment, so it gets the time normalization but
-      // NEVER pronoun expansion: resolving a pronoun here would change more than the user asked.
-      // The normalized copy is for the audit event; the RAW replacement is what the store gets,
-      // so its own `resolveRelativeTime` can still see `明天` and write `2026-11-10（明天）`.
+      // A correction only rewrites an existing fragment, so stage 2 keeps the replacement
+      // verbatim (no pronoun expansion, no time rewrite). The RAW replacement is what the store
+      // gets, so its `resolveRelativeTime` sees `明天` and applies the SAME 04:00 anchor as
+      // `assistant_remember`; `now` pins that single base for both tools.
       const rawReplacement = String(args.replacement ?? '');
-      const replacement = memoryNormalizeSafe(rawReplacement, { expand: false });
+      const now = new Date();
+      const replacement = normalizeManualBody(rawReplacement, { now, expand: false });
       const result = memory.correct({
         targetId: args.targetId,
         expectedVersion: args.expectedVersion,
@@ -285,6 +316,7 @@ export function createHostTools(deps) {
         replacement: rawReplacement,
         sourceMessageId,
         extraText: args.extraText,
+        now,
         timeZone: resolveMemoryTimeZone(config?.memory?.timeZone),
         // P-127: the store gates a speculative replacement/extraText into an unverified
         // `hypothesis` + `unresolved` row; a normal correction is byte-for-byte unchanged.
