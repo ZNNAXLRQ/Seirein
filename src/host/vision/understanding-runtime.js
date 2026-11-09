@@ -11,10 +11,14 @@
  *     → advanceUnderstanding（并入有界连续状态）
  *     → render（被动注入块）
  *
+ * 成功并入状态后可选回调 `onAdvance({ parsed, state })`，供阶段 5 主动候选消费；回调拿到的是
+ * 副本，抛错只产生一条 emit 事件，不改变本次运行结果。
+ *
  * 四条硬约束：
  *
  *   1. 单在途：调度器触发的 run 与手动 runNow 共用同一个在途标记，任何时刻最多一次 analyze；
- *   2. 代次检查：clear()/stop() 会让旧代次在途结果失效，分析即使晚到也不得写回状态；
+ *   2. 代次检查：clear()/stop() 会让旧代次在途结果失效，分析即使晚到也不得写回状态，也不得
+ *      触发 onAdvance；
  *   3. 有界与无路径：render() 只输出场景摘要、最近事件、unresolved、覆盖缺口提示，不渲染
  *      文件路径、帧 id、证据数组或任何内部对象；总长严格不超过 maxChars；
  *   4. 任何异常都不抛给调用方：宿主回调、analyze、解析、状态推进各自兜底，返回机器可读
@@ -150,7 +154,7 @@ function uncertaintyText(value) {
 }
 
 function cloneEvent(event) {
-  return {
+  const copy = {
     from: event.from,
     to: event.to,
     description: event.description,
@@ -158,10 +162,38 @@ function cloneEvent(event) {
     evidenceAudioIds: Array.isArray(event.evidenceAudioIds) ? event.evidenceAudioIds.slice() : [],
     uncertainty: event.uncertainty,
   };
+  // reaction 是可选字段；保留它，但绝不把空串补成字段。
+  if (typeof event.reaction === 'string' && event.reaction.length > 0) copy.reaction = event.reaction;
+  return copy;
 }
 
 function cloneSpan(span) {
   return { from: span.from, to: span.to };
+}
+
+/** 给 onAdvance 的 parsed 副本：调用方改不到本次运行的返回值和内部状态。 */
+function cloneParsed(parsed) {
+  if (!isObject(parsed)) return parsed;
+  return {
+    ...parsed,
+    interval: isObject(parsed.interval) ? { ...parsed.interval } : parsed.interval,
+    events: Array.isArray(parsed.events) ? parsed.events.map((event) => cloneEvent(event)) : [],
+    unknownEvidenceIds: Array.isArray(parsed.unknownEvidenceIds)
+      ? parsed.unknownEvidenceIds.slice()
+      : [],
+  };
+}
+
+/** 给 onAdvance 的 state 副本：与 current() 一样不暴露内部对象引用。 */
+function cloneState(state) {
+  const copy = {
+    sceneSummary: state.sceneSummary,
+    events: Array.isArray(state.events) ? state.events.map((event) => cloneEvent(event)) : [],
+    unresolved: state.unresolved,
+    coverage: Array.isArray(state.coverage) ? state.coverage.map(cloneSpan) : [],
+  };
+  if (state.updatedAt !== undefined) copy.updatedAt = state.updatedAt;
+  return copy;
 }
 
 function stateHasContent(state) {
@@ -193,6 +225,9 @@ function stateHasContent(state) {
  * @param {number} [options.maxChars]
  * @param {number} [options.maxEventsShown]
  * @param {number} [options.maxAgeMs]
+ * @param {(payload: {parsed: object, state: object}) => void|Promise<void>} [options.onAdvance]
+ *   成功并入状态后调用一次；`parsed`/`state` 是副本。回调抛错只 emit 一条
+ *   `understanding-advance-callback-error`，不影响本次运行结果。
  * @param {(event: {type:string,ok:boolean,reason:string,eventCount:number,droppedEvents:number,at:number|null}) => void} [options.emit]
  */
 export function createUnderstandingRuntime(options = {}) {
@@ -205,6 +240,7 @@ export function createUnderstandingRuntime(options = {}) {
   const setTimer = typeof source.setTimer === 'function' ? source.setTimer : setTimeout;
   const clearTimer = typeof source.clearTimer === 'function' ? source.clearTimer : clearTimeout;
   const emit = typeof source.emit === 'function' ? source.emit : null;
+  const onAdvance = typeof source.onAdvance === 'function' ? source.onAdvance : null;
 
   const minIntervalMs = toDuration(source.minIntervalMs, DEFAULT_MIN_INTERVAL_MS);
   const maxFrames = toLimit(source.maxFrames, UNDERSTANDING_RUNTIME_DEFAULTS.maxFrames);
@@ -240,17 +276,10 @@ export function createUnderstandingRuntime(options = {}) {
     return Date.now();
   };
 
-  function emitOutcome(outcome) {
+  function emitEvent(payload) {
     if (emit === null) return;
     try {
-      const result = emit({
-        type: 'understanding-run',
-        ok: outcome.ok === true,
-        reason: outcome.reason,
-        eventCount: outcome.eventCount ?? 0,
-        droppedEvents: outcome.droppedEvents ?? 0,
-        at: lastAt,
-      });
+      const result = emit(payload);
       // 异步订阅方失败同样不能变成未处理拒绝；这里只吞掉，不影响 orchestration。
       if (result !== null && typeof result === 'object' && typeof result.catch === 'function') {
         result.catch(() => {});
@@ -258,6 +287,29 @@ export function createUnderstandingRuntime(options = {}) {
     } catch {
       /* 订阅方失败不能影响状态推进 */
     }
+  }
+
+  function emitOutcome(outcome) {
+    emitEvent({
+      type: 'understanding-run',
+      ok: outcome.ok === true,
+      reason: outcome.reason,
+      eventCount: outcome.eventCount ?? 0,
+      droppedEvents: outcome.droppedEvents ?? 0,
+      at: lastAt,
+    });
+  }
+
+  /** onAdvance 失败只留下一条诊断事件；不改计数、不改变本次运行结果。 */
+  function emitAdvanceCallbackError() {
+    emitEvent({
+      type: 'understanding-advance-callback-error',
+      ok: false,
+      reason: 'callback-error',
+      eventCount: 0,
+      droppedEvents: 0,
+      at: clock(),
+    });
   }
 
   function recordSkip(reason) {
@@ -437,6 +489,27 @@ export function createUnderstandingRuntime(options = {}) {
       eventCount: lastEventCount,
       droppedEvents: parsed.droppedEvents,
     });
+
+    // 到这里状态已经写回且本次运行仍属当前代次（同步执行，没有 await 可插入 clear/stop）。
+    // 回调只看副本，失败也只 emit 诊断，绝不影响 runNow 的成功结果。
+    if (onAdvance !== null) {
+      try {
+        const callbackResult = onAdvance({
+          parsed: cloneParsed(parsed),
+          state: cloneState(nextState),
+        });
+        if (
+          callbackResult !== null
+          && typeof callbackResult === 'object'
+          && typeof callbackResult.catch === 'function'
+        ) {
+          callbackResult.catch(() => emitAdvanceCallbackError());
+        }
+      } catch {
+        emitAdvanceCallbackError();
+      }
+    }
+
     return { ok: true, parsed };
   }
 

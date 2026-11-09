@@ -289,6 +289,42 @@ test('文本上限：空/纯空白描述丢弃，描述、scene、unresolved 截
   assert.equal(defaultBudget.events.length, UNDERSTANDING_DEFAULTS.maxEvents);
 });
 
+test('reaction：可选反应角度保留并截到 80 字，空白/非字符串/缺失不写字段，advance 原样保留', () => {
+  const parsed = parseUnderstanding({
+    raw: {
+      sceneSummary: '剧情出现反转',
+      events: [
+        event({ description: '反转', evidenceFrameIds: ['f0'], reaction: '  原来他早就知道  ' }),
+        event({ description: '超长反应', evidenceFrameIds: ['f0'], reaction: '反'.repeat(120) }),
+        event({ description: 'emoji 反应', evidenceFrameIds: ['f0'], reaction: '😀'.repeat(100) }),
+        event({ description: '空白反应', evidenceFrameIds: ['f0'], reaction: '   ' }),
+        event({ description: '非字符串反应', evidenceFrameIds: ['f0'], reaction: 42 }),
+        event({ description: '没有反应', evidenceFrameIds: ['f0'] }),
+      ],
+    },
+    interval: interval(),
+    frameIds: ['f0'],
+    audioIds: [],
+  });
+
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.droppedEvents, 0, 'reaction 畸形只丢字段，不丢事件');
+  assert.equal(parsed.events[0].reaction, '原来他早就知道', '先 trim');
+  assert.equal(parsed.events[1].reaction.length, 80);
+  assert.equal(Array.from(parsed.events[1].reaction).length, 80);
+  assert.equal(Array.from(parsed.events[2].reaction).length, 80, '按 Unicode 码点截断，不劈开 emoji');
+  for (const index of [3, 4, 5]) {
+    assert.equal('reaction' in parsed.events[index], false, '空白/畸形/缺失都不写空串字段');
+  }
+
+  const state = advanceUnderstanding({}, { events: parsed.events });
+  assert.equal(state.events[0].reaction, '原来他早就知道', '状态推进原样保留 reaction');
+  assert.equal('reaction' in state.events[5], false);
+  // 推进不修改传入的事件。
+  state.events[0].reaction = '被测试改掉';
+  assert.equal(parsed.events[0].reaction, '原来他早就知道');
+});
+
 test('畸形输入一律 ok:false + 机器可读 reason，且不抛错', () => {
   assert.deepEqual(
     [buildUnderstandingInput().ok, buildUnderstandingInput().reason],

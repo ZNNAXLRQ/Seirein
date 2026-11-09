@@ -64,6 +64,18 @@ test('正常渲染：帧 id/时刻、台词区间/文本、上一段场景、关
   assert.match(prompt.system, /evidenceFrameIds/);
   assert.match(prompt.system, /evidenceAudioIds/);
   assert.match(prompt.system, /uncertainty/);
+  // 可选 reaction：只在值得主动说一句时提出观察角度，没有就省略。
+  assert.match(prompt.system, /reaction/);
+  assert.match(prompt.system, /反转/);
+  assert.match(prompt.system, /意外行为/);
+  assert.match(prompt.system, /铺垫兑现/);
+  assert.match(prompt.system, /重要变化/);
+  assert.match(prompt.system, /演出与内容的明显反差/);
+  assert.match(prompt.system, /不超过 60 字/);
+  assert.match(prompt.system, /不剧透/);
+  assert.match(prompt.system, /省略该字段/);
+  assert.match(prompt.system, /绝不为了有话说而编造/);
+  assert.match(prompt.system, /"reaction"/, 'JSON 结构示例包含可选 reaction');
   assert.match(prompt.system, /不要 Markdown/);
   assert.match(prompt.system, /不知道/);
   assert.match(prompt.system, /推断/);

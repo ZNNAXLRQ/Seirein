@@ -29,6 +29,8 @@ export const UNDERSTANDING_DEFAULTS = Object.freeze({
   maxEvents: 8,
   /** 单个事件描述上限（按 Unicode 码点计）。 */
   maxEventChars: 240,
+  /** 单个事件可选反应角度上限（按 Unicode 码点计；提示词要求 ≤60，这里兜底到 80）。 */
+  maxReactionChars: 80,
   /** sceneSummary 上限。 */
   maxSceneChars: 600,
   /** unresolved 上限。 */
@@ -292,7 +294,9 @@ function parseFailure(reason, interval) {
  *   - 两个证据数组都为空：事件必须指向原始帧/台词，纯推断只能写进 `sceneSummary` /
  *     `unresolved`，不能当事件进入共享状态。
  *
- * `uncertainty` 只是线索，字符串按 80 字符截断、数字原样保留。
+ * `uncertainty` 只是线索，字符串按 80 字符截断、数字原样保留。`reaction` 是可选的反应角度：
+ * 非空字符串 trim 后截到 80 字符并保留；空白、非字符串或缺失时不写该字段（不写空串占位），
+ * 也不因此丢弃事件。
  *
  * @param {object} [input]
  * @returns {object}
@@ -387,14 +391,18 @@ export function parseUnderstanding(input = {}) {
       droppedEvents += 1;
       continue;
     }
-    events.push({
+    const reaction = clipText(trimmed(rawEvent.reaction), UNDERSTANDING_DEFAULTS.maxReactionChars);
+    const parsedEvent = {
       from,
       to,
       description,
       evidenceFrameIds: frameEvidence.ids,
       evidenceAudioIds: audioEvidence.ids,
       uncertainty: normalizeUncertainty(rawEvent.uncertainty),
-    });
+    };
+    // reaction 只是可选的角度；空白/畸形当作“没有”，绝不写空串占位。
+    if (reaction.length > 0) parsedEvent.reaction = reaction;
+    events.push(parsedEvent);
   }
 
   const eventBudget = toLimit(input.maxEvents, UNDERSTANDING_DEFAULTS.maxEvents);
@@ -520,7 +528,8 @@ function resolveUpdatedAt(options) {
  * 把新结果并入连续状态。返回对象只包含状态字段，不修改 `previous` / `update`：
  *
  *   - `sceneSummary`：新结果非空则替换，否则沿用上一段（摘要负责连续性）；
- *   - `events`：按到达顺序追加，默认最多保留最近 32 条（环形淘汰最旧）；
+ *   - `events`：按到达顺序追加，默认最多保留最近 32 条（环形淘汰最旧）；事件对象整体浅拷贝，
+ *     所以 `reaction` 等可选字段原样保留（证据 id 数组仍会复制）；
  *   - `unresolved`：新结果非空则替换，否则沿用上一段；始终截断到上限；
  *   - `coverage`：把本次覆盖片段与历史合并（重叠/相接的区间合并），默认最多 32 段。
  *     `update.gaps` 会从 `update.interval` 中扣除，所以缺口不会被虚报成覆盖；

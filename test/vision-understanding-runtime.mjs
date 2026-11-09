@@ -160,6 +160,108 @@ test('正常：帧与台词进入提示词，analyze 收到带 file 的帧，解
   assert.equal(runtime.status().lastEventCount, 1);
 });
 
+test('onAdvance：成功并入状态后调用一次，参数含 events/sceneSummary 且是副本', async () => {
+  const clock = createFakeClock();
+  const calls = [];
+  const observed = [];
+  const runtime = makeRuntime(clock, {
+    onAdvance: (payload) => {
+      calls.push(payload);
+      // 先记录回调收到的内容，再故意改副本。
+      observed.push({
+        parsedScene: payload.parsed.sceneSummary,
+        parsedEvent: payload.parsed.events[0].description,
+        stateScene: payload.state.sceneSummary,
+        stateEvent: payload.state.events[0].description,
+        stateEventCount: payload.state.events.length,
+        coverage: payload.state.coverage.map((span) => ({ ...span })),
+        updatedAt: payload.state.updatedAt,
+      });
+      payload.parsed.sceneSummary = '被回调改掉';
+      payload.parsed.events[0].description = '被回调改掉';
+      payload.parsed.events[0].evidenceFrameIds.push('ghost');
+      payload.state.sceneSummary = '被回调改掉';
+      payload.state.events[0].description = '被回调改掉';
+      payload.state.coverage[0].from = 0;
+    },
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'advance' });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1, '成功并入后只回调一次');
+  assert.equal(observed[0].parsedScene, '桌面上有一个打开的窗口');
+  assert.equal(observed[0].parsedEvent, '窗口出现');
+  assert.equal(observed[0].stateScene, '桌面上有一个打开的窗口');
+  assert.equal(observed[0].stateEvent, '窗口出现');
+  assert.equal(observed[0].stateEventCount, 1);
+  assert.deepEqual(observed[0].coverage, [{ from: 1_010_000, to: 1_020_000 }], '帧间缺口不虚报为覆盖');
+  assert.equal(observed[0].updatedAt, 1_000_000);
+
+  assert.equal(runtime.current().sceneSummary, '桌面上有一个打开的窗口');
+  assert.equal(runtime.current().events[0].description, '窗口出现');
+  assert.deepEqual(runtime.current().events[0].evidenceFrameIds, ['frame-a']);
+  assert.deepEqual(runtime.current().coverage, [{ from: 1_010_000, to: 1_020_000 }]);
+  assert.equal(result.parsed.sceneSummary, '桌面上有一个打开的窗口');
+});
+
+test('onAdvance 抛错：只记一条 emit 诊断，runNow 仍成功且状态已写回', async () => {
+  const clock = createFakeClock();
+  const emitted = [];
+  const runtime = makeRuntime(clock, {
+    emit: (event) => emitted.push(event),
+    onAdvance: () => {
+      throw new Error('boom C:\\secret\\frame-a.png');
+    },
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'callback-fail' });
+
+  assert.equal(result.ok, true, '回调抛错不能改变运行结果');
+  assert.equal(result.parsed.events.length, 1);
+  assert.equal(runtime.current().sceneSummary, '桌面上有一个打开的窗口');
+  assert.equal(runtime.status().failures, 0, '回调失败不计入运行时失败');
+  assert.equal(runtime.status().lastReason, 'ok');
+
+  const callbackEvent = emitted.find((event) => event.reason === 'callback-error');
+  assert.ok(callbackEvent, '回调失败必须留下 emit 诊断');
+  assert.equal(callbackEvent.type, 'understanding-advance-callback-error');
+  assert.equal(callbackEvent.ok, false);
+  const emittedText = JSON.stringify(emitted);
+  assert.equal(emittedText.includes('boom'), false);
+  assert.equal(emittedText.includes('C:\\'), false);
+  assert.equal(emittedText.includes('frame-a'), false);
+});
+
+test('clear 后到达的结果：不写回状态，也不回调 onAdvance', async () => {
+  const clock = createFakeClock();
+  let started = false;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const calls = [];
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => {
+      started = true;
+      await gate;
+      return defaultReply(input.interval);
+    },
+    onAdvance: (payload) => calls.push(payload),
+  });
+
+  const first = runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'stale' });
+  await waitFor(() => started);
+  runtime.clear('privacy');
+  release();
+
+  const outcome = await first;
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'stale');
+  assert.equal(calls.length, 0, '代次失效的在途结果不得回调');
+  assert.equal(runtime.current(), null);
+});
+
 test('分析器返回坏 JSON：ok:false、failures 计数、状态保持为空', async () => {
   const clock = createFakeClock();
   const runtime = makeRuntime(clock, {
