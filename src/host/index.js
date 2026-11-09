@@ -3953,18 +3953,36 @@ export function apply(ctx, config) {
     return result;
   };
 
-  // Auto-connect: VTube Studio may start (or restart) after us, so retry quietly every minute.
-  const vtsAutoTimer = setInterval(() => {
+  // Auto-connect: VTube Studio may start (or restart) after us, and the plugin also launches it at
+  // boot itself — its API port only opens tens of seconds later. A fixed 60 s retry was therefore
+  // always far too late: the window was up while the avatar stayed dead until the next minute tick.
+  // The tick is short, but it dials only once the API port answers, so a starting VTS costs neither
+  // an auth attempt nor a `vts.auth.failed` line. A failed attempt backs off so a broken grant or a
+  // closing socket cannot be hammered every few seconds.
+  let vtsAutoNextAt = 0;
+  let vtsAutoTickRunning = false;
+  const vtsAutoTick = async () => {
     if (!features.enabled('avatar')) return;
     const client = vtsClient();
     if (client.ready || client.connectPromise !== null) return;
-    void vtsConnect();
-  }, 60_000);
+    if (vtsAutoNextAt > Date.now()) return;
+    if (!(await probePort('127.0.0.1', Number(config?.vtsPort ?? 8001), 400))) return;
+    // The probe awaited: another caller may have started a connection in the meantime.
+    if (client.ready || client.connectPromise !== null) return;
+    const result = await vtsConnect();
+    vtsAutoNextAt = result?.ok === true ? 0 : Date.now() + 20_000;
+  };
+  const runVtsAutoTick = () => {
+    if (vtsAutoTickRunning) return;
+    vtsAutoTickRunning = true;
+    void vtsAutoTick().catch(() => {}).finally(() => { vtsAutoTickRunning = false; });
+  };
+  const vtsAutoTimer = setInterval(runVtsAutoTick, 4_000);
   vtsAutoTimer.unref?.();
   ctx.effect(() => () => clearInterval(vtsAutoTimer));
-  const vtsBootTimer = setTimeout(() => {
-    if (features.enabled('avatar')) void vtsConnect();
-  }, 8_000);
+  // The boot one-shot is the same tick: if VTS is already listening (app restart, not a machine
+  // boot) it connects immediately instead of waiting for the first 4 s tick.
+  const vtsBootTimer = setTimeout(runVtsAutoTick, 8_000);
   vtsBootTimer.unref?.();
   // Neither the boot one-shot nor the socket it may already have opened belongs to a request:
   // closing over both ties them to this mount, so an unload cannot leave a live VTS WebSocket
