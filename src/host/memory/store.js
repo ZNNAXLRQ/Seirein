@@ -205,9 +205,14 @@ export function classifyInference(text, { inference = undefined, evidence = unde
 //                   in the source (keyword overlap alone is NOT support), or the claim adds a
 //                   cause/evaluation the source does not state
 //   - contradiction the source states the same predicate with the opposite negation polarity
-// Support is DIRECT TEXT only: after normalization the source (or the sentence holding the quote)
-// must literally contain the claim's core assertion. No model-based entailment is attempted, so
-// ambiguity fails closed to `unsupported`.
+//   - question-source    the only supporting sentence is a question (?, ending 吗/呢/吧,
+//                        or a cue such as 是否/有没有/你觉得/你认为)
+//   - conditional-source the only supporting sentence is a conditional/hypothetical
+//                        (如果/假如/要是/若/假设/万一 + 就/那么/便, or 如果…的话)
+// Support is DIRECT TEXT only: after normalization the source sentence holding the quote (or,
+// without a quote, the sentence that contains the claim) must literally contain the claim's core
+// assertion AND be a declarative statement. No model-based entailment is attempted, so ambiguity
+// fails closed to `unsupported`.
 const EVIDENCE_REF_RE = /^(mem|msg):(.+)$/u;
 const EVIDENCE_REF_SPLIT_RE = /,(?=\s*(?:mem|msg):)/u;
 
@@ -253,6 +258,21 @@ const EVIDENCE_NEGATION_TEST_RE = /(?:并不|并没有|没有|从未|从不|未�
 const EVIDENCE_NON_NEGATION_RE = /(?:不得不|不过|不同|不断|不少|不久|不管|不论|不仅|不但|不如|差不多)/gu;
 const EVIDENCE_SENTENCE_BREAKS = new Set(['。', '！', '？', '!', '?', '；', ';', '\n']);
 
+// P2: a sentence's MOOD decides whether literal containment can support a claim. A question
+// asks about a proposition and a conditional supposes one; neither asserts it. Detection is
+// deterministic and conservative: only the sentence that holds the quote (or that contains the
+// claim) is inspected, and an unrecognized mood is treated as a statement but must still pass the
+// literal-containment check below. A nearby declarative sentence never rescues a question.
+const EVIDENCE_TRAILING_CLOSERS_RE = /[”"』」）)\]】》\s]+$/u;
+const EVIDENCE_QUESTION_END_RE = /[?？][。！!…\s]*$/u;
+const EVIDENCE_QUESTION_PARTICLE_RE = /(?:吗|呢|吧)[。！!…\s]*$/u;
+const EVIDENCE_QUESTION_CUES = Object.freeze([
+  '是否', '有没有', '你觉得', '你认为', '你觉不觉得', '你认不认为', '难道', '谁说',
+]);
+const EVIDENCE_CONDITIONAL_HEAD_RE = /(?:如果|假如|要是|假设|万一|若(?!干))/u;
+const EVIDENCE_CONDITIONAL_TAIL_RE = /的话/u;
+const EVIDENCE_CONDITIONAL_CONSEQUENT_RE = /(?:就|那么|便)/u;
+
 /** Normalize for literal comparison: NFKC, lower-case, no whitespace/punctuation/symbols. */
 function normalizeSupportText(value) {
   return (typeof value === 'string' ? value : '')
@@ -291,23 +311,41 @@ function claimParts(claimNorm) {
     : { core: claimNorm.slice(0, first), extras: claimNorm.slice(first) };
 }
 
-/** The sentence around one character index (split on CJK/ASCII sentence punctuation). */
-function sentenceAround(text, index) {
+/** Split raw text into sentence spans; each span keeps its terminating punctuation. */
+function splitEvidenceSentences(text) {
+  const sentences = [];
   let start = 0;
-  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-    if (EVIDENCE_SENTENCE_BREAKS.has(text[cursor])) {
-      start = cursor + 1;
-      break;
-    }
+  for (let cursor = 0; cursor < text.length; cursor += 1) {
+    if (!EVIDENCE_SENTENCE_BREAKS.has(text[cursor])) continue;
+    sentences.push({ start, end: cursor + 1, text: text.slice(start, cursor + 1) });
+    start = cursor + 1;
   }
-  let end = text.length;
-  for (let cursor = index; cursor < text.length; cursor += 1) {
-    if (EVIDENCE_SENTENCE_BREAKS.has(text[cursor])) {
-      end = cursor + 1;
-      break;
-    }
-  }
-  return text.slice(start, end);
+  if (start < text.length) sentences.push({ start, end: text.length, text: text.slice(start) });
+  return sentences;
+}
+
+/**
+ * Modality of one raw source sentence: a reason code when the sentence cannot ASSERT the claim,
+ * or null for a declarative sentence. Question detection wins over conditional detection, because
+ * a sentence such as "如果…你会觉得奇怪吗？" is still a question.
+ *
+ * @param {string} sentence raw sentence text (may carry trailing quotes/brackets)
+ * @returns {'question-source'|'conditional-source'|null}
+ */
+function sourceSentenceModality(sentence) {
+  const text = (typeof sentence === 'string' ? sentence : '')
+    .trim()
+    .replace(EVIDENCE_TRAILING_CLOSERS_RE, '')
+    .trim();
+  if (text.length === 0) return null;
+  if (EVIDENCE_QUESTION_END_RE.test(text)) return 'question-source';
+  if (EVIDENCE_QUESTION_PARTICLE_RE.test(text)) return 'question-source';
+  if (EVIDENCE_QUESTION_CUES.some((cue) => text.includes(cue))) return 'question-source';
+  const head = EVIDENCE_CONDITIONAL_HEAD_RE.exec(text);
+  if (head === null) return null;
+  if (EVIDENCE_CONDITIONAL_TAIL_RE.test(text)) return 'conditional-source';
+  const afterHead = text.slice(head.index + head[0].length);
+  return EVIDENCE_CONDITIONAL_CONSEQUENT_RE.test(afterHead) ? 'conditional-source' : null;
 }
 
 /**
@@ -357,14 +395,17 @@ function contradictsSource(haystack, core) {
 /**
  * Conservative direct-support verdict for one source/claim/quote triple.
  *
- * A quote (when supplied) must occur verbatim. Then the normalized source, or the sentence that
- * contains the quote, must literally contain the claim (or its core assertion before a causal /
- * evaluative tail). Keyword overlap, shared entities and general topical similarity are not
- * enough. Returns `'supported' | 'contradiction' | 'unsupported'`.
+ * A quote (when supplied) must occur verbatim; the SUPPORTING SENTENCE is then the sentence that
+ * holds the quote. Without a quote it is the sentence that literally contains the claim (or its
+ * core assertion before a causal/evaluative tail). That one sentence must also be a declarative
+ * statement: a question or a conditional/hypothetical is refused with its own reason code, and is
+ * never rescued by a declarative sentence elsewhere in the source. Keyword overlap, shared
+ * entities and general topical similarity are still not enough.
+ *
  * @param {unknown} sourceText
  * @param {unknown} claimText
  * @param {unknown} quote
- * @returns {'supported'|'contradiction'|'unsupported'}
+ * @returns {'supported'|'contradiction'|'unsupported'|'question-source'|'conditional-source'}
  */
 function evidenceSupportVerdict(sourceText, claimText, quote) {
   const source = typeof sourceText === 'string' ? sourceText : '';
@@ -372,21 +413,48 @@ function evidenceSupportVerdict(sourceText, claimText, quote) {
   if (claimNorm.length === 0) return 'unsupported';
   const { core, extras } = claimParts(claimNorm);
   const needle = typeof quote === 'string' ? quote.trim() : '';
-  let candidates = [source];
+  const sentences = splitEvidenceSentences(source);
+  let supporting;
+  let compareAllSentences = false;
   if (needle.length > 0) {
     const at = source.indexOf(needle);
     if (at < 0) return 'unsupported';
-    const sentence = sentenceAround(source, at);
-    if (sentence !== source) candidates = [sentence, source];
+    const end = at + needle.length;
+    // A quote normally lives in one sentence; a quote spanning a break supports from the
+    // sentences it actually overlaps, never from the whole source around it.
+    supporting = sentences.filter((sentence) => sentence.start < end && sentence.end > at);
+    if (supporting.length === 0) return 'unsupported';
+  } else {
+    supporting = sentences.filter((sentence) => {
+      const normalized = normalizeSupportText(sentence.text);
+      if (normalized.length === 0) return false;
+      // Plain containment selects the sentence whose mood decides the verdict; the UNNEGATED
+      // check happens after modality, so "有没有可能我喜欢恐怖片" is refused as a question rather
+      // than mislabelled as a negated (contradicting) statement.
+      if (normalized.includes(claimNorm)) return true;
+      return extras.length === 0 && normalized.includes(core);
+    });
+    compareAllSentences = true;
   }
-  const normalized = candidates
-    .map((candidate) => normalizeSupportText(candidate))
-    .filter((candidate) => candidate.length > 0);
+  // Modality first: literal containment inside a question/conditional is not an assertion.
+  for (const sentence of supporting) {
+    const modality = sourceSentenceModality(sentence.text);
+    if (modality !== null) return modality;
+  }
+  const normalized = supporting
+    .map((sentence) => normalizeSupportText(sentence.text))
+    .filter((sentence) => sentence.length > 0);
   for (const candidate of normalized) {
     if (containsUnnegated(candidate, claimNorm)) return 'supported';
     if (extras.length === 0 && containsUnnegated(candidate, core)) return 'supported';
   }
-  for (const candidate of normalized) {
+  // Without a quote, a contradiction anywhere in the source is still reported as such. With a
+  // quote, only the quoted sentence may speak for the source.
+  const contradictions = compareAllSentences
+    ? [normalizeSupportText(source), ...sentences.map((sentence) => normalizeSupportText(sentence.text))]
+    : normalized;
+  for (const candidate of contradictions) {
+    if (candidate.length === 0) continue;
     if (contradictsSource(candidate, core)) return 'contradiction';
   }
   return 'unsupported';

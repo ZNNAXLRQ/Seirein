@@ -860,3 +860,93 @@ test('14) an added cause/evaluation is unsupported; only the source stating it v
   assert.equal(partial.kind, 'hypothesis');
   assert.deepEqual(partial.evidenceErrors.map((entry) => entry.reason), ['unsupported']);
 });
+
+test('15) question/conditional sentences are not direct support; a declarative statement still is', async (t) => {
+  const root = await tempRoot();
+  const store = openStore(root);
+  t.after(async () => {
+    store.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  });
+
+  // P2 counterexample: literal containment inside a question is not an assertion.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-modality',
+    messageId: 'modality-question',
+    text: '你觉得我喜欢恐怖片吗？',
+    domain: 'chat',
+  });
+  const fromQuestion = store.add('chat', '我喜欢恐怖片', 'preference', {
+    source: 'manual',
+    sessionId: 's-modality',
+    inference: true,
+    evidence: 'msg:modality-question',
+  });
+  assert.equal(fromQuestion.evidenceVerified, false);
+  assert.equal(fromQuestion.inference, true);
+  assert.equal(fromQuestion.kind, 'hypothesis');
+  assert.equal(fromQuestion.unresolved, 1);
+  assert.deepEqual(fromQuestion.evidenceErrors.map((entry) => entry.reason), ['question-source']);
+  assert.equal(readRow(store, fromQuestion.id).evidence, null);
+
+  // P2 counterexample: a conditional states a supposition, not the fact.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-modality',
+    messageId: 'modality-conditional',
+    text: '如果我喜欢恐怖片，就推荐招魂。',
+    domain: 'chat',
+  });
+  const fromConditional = store.add('chat', '我喜欢恐怖片', 'preference', {
+    source: 'manual',
+    sessionId: 's-modality',
+    inference: true,
+    evidence: 'msg:modality-conditional',
+  });
+  assert.equal(fromConditional.evidenceVerified, false);
+  assert.equal(fromConditional.kind, 'hypothesis');
+  assert.equal(fromConditional.unresolved, 1);
+  assert.deepEqual(
+    fromConditional.evidenceErrors.map((entry) => entry.reason),
+    ['conditional-source'],
+  );
+
+  // A nearby declarative sentence must not rescue the question that holds the claim.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-modality',
+    messageId: 'modality-mixed',
+    text: '你觉得我喜欢恐怖片吗？不过我从来不看电影。',
+    domain: 'chat',
+  });
+  const mixed = store.add('chat', '我喜欢恐怖片', 'preference', {
+    source: 'manual',
+    sessionId: 's-modality',
+    inference: true,
+    evidence: 'msg:modality-mixed',
+  });
+  assert.equal(mixed.evidenceVerified, false);
+  assert.deepEqual(mixed.evidenceErrors.map((entry) => entry.reason), ['question-source']);
+
+  // A direct declarative statement keeps the previous behavior: literal containment verifies.
+  store.addMessage({
+    role: 'user',
+    sessionId: 's-modality',
+    messageId: 'modality-statement',
+    text: '我喜欢恐怖片。',
+    domain: 'chat',
+  });
+  const fromStatement = store.add('chat', '我喜欢恐怖片', 'fact', {
+    source: 'manual',
+    sessionId: 's-modality',
+    inference: true,
+    evidence: 'msg:modality-statement',
+  });
+  assert.equal(fromStatement.evidenceVerified, true);
+  assert.equal(fromStatement.inference, false);
+  assert.equal(fromStatement.kind, 'fact');
+  assert.equal(fromStatement.unresolved, 0);
+  assert.deepEqual(fromStatement.evidenceErrors, []);
+  assert.equal(readRow(store, fromStatement.id).evidence, 'msg:modality-statement');
+});
