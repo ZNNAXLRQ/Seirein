@@ -80,6 +80,122 @@ const hooks = registerHooks({
 const { apply } = await import('../src/host/index.js');
 hooks.deregister();
 
+/**
+ * A second host instance with an injected behavior runtime, used only by the same-tick expiry race
+ * case. The real runtime owns a 30 Hz controller and cannot be paused between `setStatus` and
+ * `relax`; this double records those two calls so the synchronous interleaving is deterministic.
+ * The first host instance above keeps the real runtime for all existing acceptance cases.
+ */
+const fakeState = {
+  runtime: null,
+  created: 0,
+  relaxCalls: 0,
+  statusAtRelax: '',
+  raceAfterRecovery: false,
+  raceApplied: false,
+};
+globalThis.__avatarTiredFakeRuntime = fakeState;
+
+const avatarRuntimeUrl = new URL('../src/host/avatar/avatarRuntime.js', import.meta.url).href;
+const fakeRuntimeUrl = `${avatarRuntimeUrl}?avatar-runtime-double`;
+const fakeRuntimeSource = `
+  export const AVATAR_ERROR_CODES = Object.freeze({});
+  export const DEFAULT_AVATAR_STYLE = Object.freeze({});
+  export const buildAvatarStylePrompt = () => '';
+  export const personaStyleVersion = () => 'fake-style';
+  export const createAvatarStyleCache = () => ({
+    snapshot: () => null,
+    refresh: async () => ({ generated: false, cached: false }),
+  });
+  export function createAvatarRuntime() {
+    const g = globalThis.__avatarTiredFakeRuntime;
+    const state = { disposed: false, connected: false, status: 'idle', idleSince: 0, style: null };
+    let mouthInput = '';
+    let relaxCalls = 0;
+    const snapshot = () => ({
+      disposed: state.disposed,
+      connected: state.connected,
+      status: state.status,
+      idleSince: state.idleSince,
+      timerActive: false,
+      owner: 'fake',
+      mouthInput,
+      style: state.style,
+      motion: {
+        locked: false,
+        writes: false,
+        epoch: 1,
+        attention: { mode: 'neutral', target: { x: 0, y: 0 }, verified: false, source: 'fake' },
+        posture: { relaxTransitions: relaxCalls },
+      },
+      channels: { controlled: [], unverified: [], skipped: [] },
+      speech: null,
+      intentEvents: null,
+      idleParams: { mapped: [], writes: 0 },
+      inner: { mouth: {}, idleActions: {}, motion: { posture: { relaxTransitions: relaxCalls } } },
+    });
+    const runtime = {
+      snapshot,
+      async connect() { state.connected = true; return { ok: true }; },
+      setMouthInput(name) { mouthInput = typeof name === 'string' ? name : ''; return { ok: true }; },
+      setIdleSince(at) { state.idleSince = Number.isFinite(at) ? at : 0; return state.idleSince; },
+      setStyle(style) { state.style = style ?? null; return { ok: true }; },
+      setPresetExecution() { return { ok: true }; },
+      setPresetOverrides() { return { ok: true }; },
+      setAttention() { return { ok: true }; },
+      takeActions() { return []; },
+      lock() { return { epoch: 1 }; },
+      unlock() { return { epoch: 1 }; },
+      setStatus(next, options = {}) {
+        const previous = state.status;
+        const changed = next !== previous;
+        if (changed) state.status = next;
+        const reason = typeof options?.reason === 'string' ? options.reason : '';
+        // The injected race: the new listening state arrives synchronously after the host's
+        // tired→waiting transition returned, i.e. before avatarCall('relax') reads the snapshot.
+        if (changed && next === 'waiting' && reason === 'tired-timeout'
+          && g.raceAfterRecovery === true) {
+          g.raceApplied = true;
+          state.status = 'listening';
+        }
+        return { changed, previous, status: state.status };
+      },
+      relax() {
+        relaxCalls += 1;
+        g.relaxCalls = relaxCalls;
+        g.statusAtRelax = state.status;
+        return { ok: true, at: 0, durationMs: 1000, from: {}, to: {}, transitionMs: 0 };
+      },
+      speechClip() { return { ok: true }; },
+      speechEnd() { return { ok: true }; },
+      intentEvent() { return { ok: true }; },
+      dropAnswerStart() { return { ok: true }; },
+      markConclusion() { return { ok: true }; },
+      dispose() {
+        const already = state.disposed;
+        state.disposed = true;
+        return { alreadyDisposed: already };
+      },
+    };
+    g.runtime = runtime;
+    g.created += 1;
+    return runtime;
+  }
+`;
+const runtimeHooks = registerHooks({
+  resolve(specifier, context, next) {
+    const resolved = next(specifier, context);
+    if (resolved?.url === avatarRuntimeUrl) return { ...resolved, url: fakeRuntimeUrl };
+    return resolved;
+  },
+  load(url, context, next) {
+    if (url !== fakeRuntimeUrl) return next(url, context);
+    return { format: 'module', shortCircuit: true, source: fakeRuntimeSource };
+  },
+});
+const { apply: applyWithFakeRuntime } = await import('../src/host/index.js?avatar-runtime-double');
+runtimeHooks.deregister();
+
 const sleep = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
 
 const waitFor = async (check, timeoutMs = 5000, stepMs = 20) => {
@@ -164,7 +280,7 @@ async function createFakeVts() {
  * Mount the real `apply()` with the fake VTS (and the replaced hearing module). Only the services
  * the disabled components need are present; no agent loop is required for a partial ASR event.
  */
-async function mount(t, fake, { config = {}, features = { avatar: true } } = {}) {
+async function mount(t, fake, { config = {}, features = { avatar: true }, applyFn = apply } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'avatar-tired-timeout-'));
   await mkdir(join(root, 'data'), { recursive: true });
   await mkdir(join(root, 'bin'), { recursive: true });
@@ -199,7 +315,7 @@ async function mount(t, fake, { config = {}, features = { avatar: true } } = {})
     }],
   ]);
   const getService = (name) => services.get(name);
-  apply({
+  applyFn({
     effect,
     get: getService,
     tools: {
@@ -526,6 +642,10 @@ test('5. 接线：housekeeping 使用纯判定；任何状态离开/销毁都清
     'recovery uses the recorded deadline');
   assert.ok(/avatarStatusIf\(\['tired'\], 'waiting', 'tired-timeout', \{ at: now \}\)/u.test(source),
     'expiry transitions tired→waiting with the old reason');
+  assert.ok(/avatarStatusIf\(\['tired'\], 'waiting', 'tired-timeout'[\s\S]{0,900}avatarCall\('relax', \(current\) => \{[\s\S]{0,400}current\.snapshot\(\)\.status !== 'waiting'[\s\S]{0,200}current\.relax\(\{ at: now \}\)/u.test(source),
+    'relax is called only after a changed recovery AND re-checks the current state at the call boundary');
+  assert.equal(/avatarCall\('relax', \(current\) => current\.relax\(\{ at: now \}\)/u.test(source), false,
+    'the old unguarded expiry relax call is gone');
   assert.ok(/if \(status === 'tired'\) \{\s*beginAvatarTired\(reason, at, timing\?\.evidenceAt\);/u.test(source),
     'only a changed tired transition records a new deadline');
   assert.ok(/else if \(result\.previous === 'tired'\) \{[\s\S]{0,200}clearAvatarTiredState\(at\);/u.test(source),
@@ -534,4 +654,117 @@ test('5. 接线：housekeeping 使用纯判定；任何状态离开/销毁都清
     'dispose also clears the trial');
   assert.equal((source.match(/avatarStatus\('tired', 'idle-timeout'/gu) ?? []).length, 1,
     'there is exactly one tired entry call site');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 6. Race: listening arrives before the due housekeeping check
+// ---------------------------------------------------------------------------------------------
+
+test('6. 宿主：到期检查与 listening 同拍——新状态优先，relax 不被调用', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const fake = await createFakeVts();
+  const host = await mount(t, fake, {
+    config: {
+      avatarTickMs: 100,
+      avatarTiredTimeoutMs: 20 * 60_000,
+      // Long enough that the +60 s housekeeping tick cannot be mistaken for a silent listening idle.
+      avatarListeningIdleMs: 10 * 60_000,
+    },
+    features: { avatar: true, hearing: true },
+  });
+
+  const realNow = Date.now;
+  let offset = 0;
+  Date.now = () => realNow() + offset;
+  t.after(() => { Date.now = realNow; });
+
+  await connectAvatar(host);
+  await host.waitStatus('waiting');
+  const started = await host.listen({ action: 'start' });
+  assert.equal(started.ok, true, `the fake microphone starts (${started.error ?? ''})`);
+  // One runtime tick establishes the runtime's idleSince before the fake clock jumps.
+  t.mock.timers.tick(1000);
+
+  offset = 11 * 60_000;
+  t.mock.timers.tick(60_000);
+  await host.waitEvent('avatar.state', (p) => p.status === 'tired');
+  const tired = (await host.status()).live2d.runtime;
+  assert.equal(tired.status, 'tired');
+  assert.ok(tired.tired !== null, 'the bounded trial is recorded');
+  const relaxBefore = tired.motion.relaxTransitions;
+
+  // The trial is now due, but a real listening state arrives first (an ASR partial). Its transition
+  // must clear the trial; the next housekeeping tick must not treat the stale snapshot as tired.
+  offset = (tired.tired.expiresAt - realNow()) + 60_000;
+  host.feed({ partial: '嗯' });
+  assert.equal(await waitFor(async () => (await host.status()).live2d.runtime.status === 'listening'), true,
+    'the partial claims listening from tired');
+  const listening = (await host.status()).live2d.runtime;
+  assert.equal(listening.tired, null, 'listening clears the trial immediately');
+  assert.equal(listening.motion.relaxTransitions, relaxBefore, 'the state transition itself does not relax');
+
+  t.mock.timers.tick(60_000);
+  const after = (await host.status()).live2d.runtime;
+  assert.equal(after.status, 'listening', 'the due expiry check leaves the newer listening state alone');
+  assert.equal(after.tired, null, 'no trial is resurrected by the poll');
+  assert.equal(after.motion.relaxTransitions, relaxBefore, 'a stale expiry must not call relax');
+  const events = await host.events();
+  assert.equal(events.some((row) => row.type === 'avatar.motion.relax'), false,
+    'no avatar.motion.relax is recorded for the stale trial');
+  assert.equal(events.filter((row) => row.type === 'avatar.tired.recovered').length, 0,
+    'a trial already left by listening emits no deadline-recovery event');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. Race: the new state arrives synchronously between the transition and relax
+// ---------------------------------------------------------------------------------------------
+
+test('7. 宿主（注入状态/假时钟）：到期回调与新状态同一 tick 的同步竞态 → 不 relax', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const fake = await createFakeVts();
+  fakeState.runtime = null;
+  fakeState.created = 0;
+  fakeState.relaxCalls = 0;
+  fakeState.statusAtRelax = '';
+  fakeState.raceAfterRecovery = false;
+  fakeState.raceApplied = false;
+
+  const host = await mount(t, fake, {
+    applyFn: applyWithFakeRuntime,
+    config: { avatarTickMs: 100, avatar: { tiredTimeoutMs: 60_000 } },
+    features: { avatar: true },
+  });
+
+  const realNow = Date.now;
+  let offset = 0;
+  Date.now = () => realNow() + offset;
+  t.after(() => { Date.now = realNow; });
+
+  await connectAvatar(host);
+  await host.waitStatus('waiting');
+  assert.ok(fakeState.runtime !== null, 'the injected runtime was created');
+  assert.equal(fakeState.created, 1);
+  // A full idle window: the host's first housekeeping tick enters tired.
+  fakeState.runtime.setIdleSince(Date.now() - 11 * 60_000);
+  t.mock.timers.tick(60_000);
+  await host.waitEvent('avatar.state', (p) => p.status === 'tired');
+  assert.equal((await host.status()).live2d.runtime.status, 'tired');
+
+  // The trial expires 60 s later. The injected runtime makes the host's tired→waiting transition
+  // immediately followed by a new listening state before `avatarCall('relax')` reads the snapshot.
+  offset += 60_000;
+  fakeState.raceAfterRecovery = true;
+  t.mock.timers.tick(60_000);
+  const recovered = await host.waitEvent('avatar.tired.recovered');
+  assert.equal(recovered.reason, 'idle-timeout', 'the deadline recovery itself still happens');
+
+  const runtime = (await host.status()).live2d.runtime;
+  assert.equal(fakeState.raceApplied, true, 'the new state arrived in the same tick as the recovery');
+  assert.equal(runtime.status, 'listening', 'the newer state wins');
+  assert.equal(runtime.tired, null, 'the trial is cleared');
+  assert.equal(fakeState.relaxCalls, 0, 'the call-boundary re-check refuses a stale relax');
+  assert.equal(fakeState.statusAtRelax, '', 'relax was never entered');
+  assert.equal(runtime.motion.relaxTransitions, 0, 'status reports no relax transition');
+  assert.equal((await host.events()).some((row) => row.type === 'avatar.motion.relax'), false,
+    'no avatar.motion.relax is recorded');
 });

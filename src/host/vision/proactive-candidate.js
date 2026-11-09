@@ -177,6 +177,50 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
 }
 
 /**
+ * 生成短句返回后、真正开口前的最后一次纯校验。
+ *
+ * evaluate() 发生在模型调用之前，而一次短句生成可能持续数秒：期间用户可能关闭主动回应、
+ * 取消候选（例如先评论了同一画面）、开始说话，或出现待回复任务。生成结束后必须按“同一条候选”
+ * 重新确认全部条件；这里不重新挑选候选，也不消费/修改仲裁器状态。
+ *
+ * @param {object} [input]
+ * @param {string} [input.candidateId] 生成前选中的候选 id。
+ * @param {string[]} [input.pendingIds] `proactive.pendingIds()` 的当前结果。
+ * @param {boolean} [input.enabled] `proactiveEnabled()` 的当前值。
+ * @param {number} [input.generation] 当前的 `proactiveGeneration`。
+ * @param {number} [input.expectedGeneration] 生成开始前记录的代次。
+ * @param {boolean} [input.aborted] 在途生成是否已被取消。
+ * @param {boolean} [input.runtimeActive] 宿主是否仍在运行（`false` = 已卸载/关闭）。
+ * @param {boolean} [input.userSpeaking] 用户是否仍在说话（`speechEvidence !== null`）。
+ * @param {boolean} [input.assistantBusy] TTS 正在播放或有播放会话。
+ * @param {boolean} [input.pendingReply] 是否有已接受/在途的正式回答。
+ * @param {boolean} [input.spoken] 该候选是否已经记账为已说（正常路径不会同时待选）。
+ * @returns {{ok: boolean, reason: string}} 只返回机器原因码，不含候选正文。
+ */
+export function revalidateProactiveCandidate(input = {}) {
+  const state = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const fail = (reason) => ({ ok: false, reason });
+
+  if (state.runtimeActive === false) return fail('disposed');
+  if (state.enabled !== true) return fail('disabled');
+  if (state.generation !== state.expectedGeneration) return fail('generation-changed');
+
+  const id = normalizeId(state.candidateId);
+  const pendingIds = Array.isArray(state.pendingIds) ? state.pendingIds.map(normalizeId) : [];
+  const stillPending = id.length > 0 && pendingIds.includes(id);
+  // 已取消与已说都会让候选离开待选池；spoken 优先给出更精确的原因。
+  if (state.spoken === true) return fail('spoken');
+  if (!stillPending) return fail('candidate-missing');
+  // 取消信号本身不是候选池变化：放在“候选是否仍待选”之后，先让已移除的候选报告真实原因。
+  if (state.aborted === true) return fail('aborted');
+
+  if (state.userSpeaking === true) return fail('user-speaking');
+  if (state.assistantBusy === true) return fail('assistant-busy');
+  if (state.pendingReply === true) return fail('pending-reply');
+  return { ok: true, reason: 'ok' };
+}
+
+/**
  * 创建一个主动回应仲裁器。
  *
  * @param {object} [options]

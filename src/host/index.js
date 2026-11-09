@@ -322,7 +322,10 @@ import { createCommentEvidence } from './vision/comment-evidence.js';
 import { createImageAnalyzer } from './vision/image-analyzer.js';
 import { createUnderstandingRuntime } from './vision/understanding-runtime.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
-import { createProactiveArbiter } from './vision/proactive-candidate.js';
+import {
+  createProactiveArbiter,
+  revalidateProactiveCandidate,
+} from './vision/proactive-candidate.js';
 import { createProactiveLineGenerator } from './vision/proactive-line.js';
 // P-187 阶段 6：把证据/台词/评论/理解/主动状态汇总成可评估的数字（纯投影，无 I/O）。
 import { summarizeAudiovisual } from './vision/audiovisual-metrics.js';
@@ -4049,7 +4052,13 @@ export function apply(ctx, config) {
         // posture over the runtime's 2–4 s plan, so the tired pose does not snap in one frame.
         const result = avatarStatusIf(['tired'], 'waiting', 'tired-timeout', { at: now });
         if (result?.changed === true) {
-          avatarCall('relax', (current) => current.relax({ at: now }));
+          // Second check at the call boundary: a newer listening/speaking/thinking state may have
+          // arrived in the same tick between the transition above and this call. The recovery still
+          // happened, but a stale tired pose must not relax over the new state.
+          avatarCall('relax', (current) => {
+            if (current.snapshot().status !== 'waiting') return null;
+            return current.relax({ at: now });
+          });
           // `reason` is the one label; every measurement in the payload is a number.
           void log.emit('avatar.tired.recovered', {
             reason,
@@ -8939,6 +8948,11 @@ export function apply(ctx, config) {
   let proactiveBusy = false;
   /** 代次：隐私/切源/卸载/重置后，在途的生成或播放结果不再记到新代次上。 */
   let proactiveGeneration = 0;
+  /**
+   * 在途短句生成的取消句柄。关闭开关、重置代次、用户评论取消候选或组件关闭时 abort，
+   * 让 `proactiveLine.generate` 的竞速取消立即返回 `aborted`，而不是等模型/超时。
+   */
+  let proactiveAbort = null;
   let proactiveEvalTimer = null;
   let proactiveIgnoredTimer = null;
 
@@ -8960,9 +8974,21 @@ export function apply(ctx, config) {
     timer?.unref?.();
     proactiveIgnoredTimer = timer;
   };
+  /** 取消当前在途生成；没有在途生成时是 no-op。 */
+  const abortProactive = () => {
+    const controller = proactiveAbort;
+    if (controller === null) return false;
+    try {
+      controller.abort();
+    } catch {
+      /* 取消是旁路：abort 失败也绝不能影响关闭/重置流程 */
+    }
+    return true;
+  };
   /** 清掉这一代的所有时机窗口；累计计数保留，便于诊断。 */
   const resetProactive = (reason) => {
     proactiveGeneration += 1;
+    abortProactive();
     clearProactiveIgnored();
     proactive.reset(reason);
   };
@@ -9010,6 +9036,8 @@ export function apply(ctx, config) {
     proactiveBusy = true;
     const generation = proactiveGeneration;
     const candidate = decision.candidate;
+    const abortController = new AbortController();
+    proactiveAbort = abortController;
     try {
       // `config.proactiveLineGenerator` 是测试缝（对象带 generate，或直接是函数）；生产走本地短句生成器。
       const seam = config?.proactiveLineGenerator;
@@ -9021,8 +9049,41 @@ export function apply(ctx, config) {
       const line = await generate({
         event: candidate,
         state: understanding.current(),
+        // 关闭开关/候选取消/重置/组件关闭时由宿主 abort；生成器与“下一片”竞速后及时返回。
+        signal: abortController.signal,
       });
-      if (generation !== proactiveGeneration || visionDisposed || shutdown.closing) return null;
+
+      // 关键：生成期间世界会变。这里只允许“生成前那条候选”通过全部复核；不重新抽候选。
+      // 任何一项不满足都不进入 speakLine，只记录机器原因。
+      let gate;
+      try {
+        gate = revalidateProactiveCandidate({
+          candidateId: candidate.id,
+          pendingIds: proactive.pendingIds(),
+          enabled: proactiveEnabled(),
+          generation: proactiveGeneration,
+          expectedGeneration: generation,
+          aborted: abortController.signal.aborted,
+          runtimeActive: visionDisposed !== true && shutdown.closing !== true,
+          userSpeaking: speechEvidence !== null,
+          assistantBusy: ttsIsSpeaking() === true || playback !== null,
+          pendingReply: proactivePendingReply(),
+        });
+      } catch {
+        gate = { ok: false, reason: 'revalidate-error' };
+      }
+      if (gate.ok !== true) {
+        // reset/cancelAll/abort 已经让候选离开或由调用方负责：再写持久取消会把旧 id 带进下一代，
+        // 反而压住新事件。只有宿主主动放弃一条仍在待选池里的候选时才记 cancelFor。
+        if (gate.reason !== 'candidate-missing' && gate.reason !== 'generation-changed'
+          && gate.reason !== 'aborted' && gate.reason !== 'disposed') {
+          proactive.cancelFor([candidate.id]);
+        }
+        // 只记录原因码，不把候选 id/正文写进日志。
+        void log.emit('vision.proactive.rejected', { reason: gate.reason }).catch(() => {});
+        return { speak: false, reason: gate.reason };
+      }
+
       if (line === null || line?.ok !== true || typeof line.text !== 'string'
         || line.text.trim().length === 0) {
         proactive.cancelFor([candidate.id]);
@@ -9047,6 +9108,7 @@ export function apply(ctx, config) {
       proactive.cancelFor([candidate.id]);
       return { speak: false, reason: 'error' };
     } finally {
+      if (proactiveAbort === abortController) proactiveAbort = null;
       proactiveBusy = false;
     }
   };
@@ -9088,6 +9150,12 @@ export function apply(ctx, config) {
 
   // 5 秒兜底评估：只在确实有候选时读一次状态；unref 不拖住宿主退出。
   proactiveEvalTimer = setInterval(() => {
+    // 开关关闭后不再等下一轮 evaluate：先中止在途短句并清空候选，避免关闭后仍开口。
+    if (!proactiveEnabled()) {
+      abortProactive();
+      proactive.cancelAll('disabled');
+      return;
+    }
     void evaluateProactive('interval');
   }, 5_000);
   proactiveEvalTimer?.unref?.();
@@ -9254,6 +9322,8 @@ export function apply(ctx, config) {
       // P-187 阶段 5：用户已经亲口评论这一轮画面。取消待说的主动候选并清掉“未回应”计时，
       // 避免同一事件被用户先评论后助手再主动说一遍。
       clearProactiveIgnored();
+      // 用户已亲自评论：取消候选的同时中止在途短句生成，避免它稍后仍尝试开口。
+      abortProactive();
       proactive.cancelAll('user-comment');
       /**
        * P-187 阶段 4：评论对齐不确定时补一次定向分析。只在窗口里确实有可看的帧、且距上一次
@@ -16886,6 +16956,9 @@ export function apply(ctx, config) {
     if (id === 'vision') void startEvidenceCapture(reason || 'feature-enable');
   };
   const onFeatureDisable = async ({ id, reason }) => {
+    // Any component close is a world change for an in-flight proactive sentence: stop generating
+    // immediately. The vision path additionally resets the candidate generation below.
+    abortProactive();
     await log.emit('feature.disable.begin', { id, reason }).catch(() => {});
     // 1. stop capture/playback/layer resources (the component state is already off)
     await stopComponentResources(id, reason);
