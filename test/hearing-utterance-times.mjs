@@ -10,7 +10,9 @@
  * 覆盖：
  *   1. 单段终稿：audioStartAt = 首帧时刻，audioEndAt = endpointAt
  *   2. 两段合并：开始取最早段，结束取最后段
- *   3. durationMs 与 partial 的原样行为不被这两字段改变
+ *   3. partial 也带同一段的 utteranceId 与真实采集区间：与终稿同 id、同 start，
+ *      partial.end 不晚于 final.end
+ *   4. durationMs 与 partial 文本的原样行为不被这些字段改变
  *
  * Run: node --test test/hearing-utterance-times.mjs
  */
@@ -99,6 +101,25 @@ function scriptedStreaming(script) {
   };
 }
 
+/** 按累计样本数换词的流式替身：同一段里可以产生多个 partial。 */
+function stagedStreaming({ endpointAtSamples, textAt }) {
+  return {
+    createStream: () => ({
+      samples: 0,
+      acceptWaveform({ samples }) {
+        this.samples += samples.length;
+      },
+    }),
+    isReady: () => false,
+    decode: () => {},
+    getResult: (stream) => ({ text: stream.samples > 0 ? textAt(stream.samples) : '' }),
+    isEndpoint: (stream) => stream.samples >= endpointAtSamples,
+    reset(stream) {
+      stream.samples = 0;
+    },
+  };
+}
+
 /** 离线替身：返回脚本化文本，供同步精确解码路径使用。 */
 function fakeFinal(text) {
   return {
@@ -180,7 +201,12 @@ test('单段终稿：audioStartAt 是首帧真实到达时刻，audioEndAt 等�
 
   // 第一块 500 ms：这一段开始，起点必须在这里记下。
   child.stdout.write(tone(500));
-  assert.deepEqual(updates[0], { partial: '今天' }, '首帧后先照常到达 partial');
+  const firstPartial = updates[0];
+  assert.equal(firstPartial.partial, '今天', '首帧后先照常到达 partial');
+  assert.equal(typeof firstPartial.utteranceId, 'string');
+  assert.ok(firstPartial.utteranceId.length > 0, 'partial 带这一段自己的身份');
+  assert.equal(firstPartial.audioStartAt, T, 'partial 的起点也是首帧的采集时刻');
+  assert.equal(firstPartial.audioEndAt, T, 'partial 的终点是它发生时的采集时刻');
 
   // 200 ms 后第二块到达并触发端点：终点是此刻，而不是首帧时刻。
   clock.value = T + 200;
@@ -189,6 +215,9 @@ test('单段终稿：audioStartAt 是首帧真实到达时刻，audioEndAt 等�
   const events = finals();
   assert.equal(events.length, 1, '端点后投递一次终稿');
   const final = events[0];
+  assert.equal(final.utteranceId, firstPartial.utteranceId, 'partial 与终稿是同一段身份');
+  assert.equal(firstPartial.audioStartAt, final.audioStartAt, 'partial 与终稿共用首帧起点');
+  assert.ok(firstPartial.audioEndAt <= final.audioEndAt, 'partial 的终点不晚于终稿终点');
   assert.equal(final.audioStartAt, T, '起点是首帧的采集时刻');
   assert.equal(final.audioEndAt, T + 200, '终点是端点的采集时刻');
   assert.equal(final.audioEndAt, final.endpointAt, 'audioEndAt 与 endpointAt 同源');
@@ -250,7 +279,58 @@ test('两段合并：audioStartAt 取最早段开始，audioEndAt 取最后段�
 });
 
 // ---------------------------------------------------------------------------
-// 3. 原有行为不变：durationMs 照旧，partial 原样到达且不带时间字段
+// 3. partial 的区间与身份：同 id、同 start，partial.end 不晚于 final.end
+// ---------------------------------------------------------------------------
+
+test('partial 与终稿同 id：区间从首帧算起，partial 终点不晚于终稿', async () => {
+  const clock = fakeClock(T);
+  const child = new FakeChild();
+  const updates = [];
+  const hearing = startHearing({
+    ffmpegPath: 'ffmpeg-not-used',
+    modelDir: 'models-not-used',
+    finalModelDir: '',
+    device: 'fake-device',
+    recognizer: stagedStreaming({
+      endpointAtSamples: 600 * 16,
+      textAt: (samples) => (samples >= 400 * 16 ? '今天' : '今'),
+    }),
+    finalRecognizer: fakeFinal('今天啊'),
+    spawnProcess: () => child,
+    now: () => clock.value,
+    onUpdate: (event) => updates.push(event),
+  });
+
+  // 200 ms 首帧：第一个 partial 在 T 到达。
+  child.stdout.write(tone(200));
+  // 150 ms 后同一段出现新词：第二个 partial 的终点必须前进。
+  clock.value = T + 150;
+  child.stdout.write(tone(250));
+  // 再 150 ms 触发端点：终稿的终点在这一刻。
+  clock.value = T + 300;
+  child.stdout.write(tone(200));
+
+  const partials = updates.filter((event) => typeof event.partial === 'string');
+  const finals = updates.filter((event) => typeof event.final === 'string');
+  assert.deepEqual(partials.map((event) => event.partial), ['今', '今天'], 'partial 文本仍按识别顺序原样到达');
+  assert.equal(partials[0].audioStartAt, T, '第一个 partial 的起点是首帧时刻');
+  assert.equal(partials[0].audioEndAt, T, '第一个 partial 的终点是它发生时的采集时刻');
+  assert.equal(partials[1].audioEndAt, T + 150, '后续 partial 的终点随采集时钟前进');
+
+  assert.equal(finals.length, 1);
+  const final = finals[0];
+  assert.equal(final.audioStartAt, T);
+  assert.equal(final.audioEndAt, T + 300);
+  for (const partial of partials) {
+    assert.equal(partial.utteranceId, final.utteranceId, '同一段 partial 与终稿共用 id');
+    assert.equal(partial.audioStartAt, final.audioStartAt, 'partial 与终稿共用首帧起点');
+    assert.ok(partial.audioEndAt <= final.audioEndAt, 'partial 终点不晚于终稿终点');
+  }
+  hearing.stop();
+});
+
+// ---------------------------------------------------------------------------
+// 4. 原有行为不变：durationMs 照旧，partial 文案原样到达
 // ---------------------------------------------------------------------------
 
 test('不改变原有行为：durationMs 仍按音频计算，partial 文案原样到达', async () => {
@@ -268,7 +348,10 @@ test('不改变原有行为：durationMs 仍按音频计算，partial 文案原�
 
   const partials = updates.filter((event) => typeof event.partial === 'string');
   assert.equal(partials.length, 1, 'partial 仍只在文本变化时到达一次');
-  assert.deepEqual(partials[0], { partial: '流式草稿' }, 'partial 文案原样到达，未被追加时间字段');
+  assert.equal(partials[0].partial, '流式草稿', 'partial 文案原样到达');
+  assert.equal(partials[0].audioStartAt, T);
+  assert.equal(partials[0].audioEndAt, T);
+  assert.equal(typeof partials[0].utteranceId, 'string', 'partial 只增加身份/时间字段，不改文本');
 
   const events = finals();
   assert.equal(events.length, 1);

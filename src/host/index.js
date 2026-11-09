@@ -15632,6 +15632,13 @@ export function apply(ctx, config) {
   });
   let ambientEpoch = 0;
   let ambientSeq = 0;
+  /**
+   * 当前 partial 段的本地身份与开口时间：只在事件缺 `utteranceId` / `audioStartAt` 时兜底用的，
+   * 正常路径全部使用听觉层给的字段。`ambientPartialKey` 含代次，重启后自然重算。
+   */
+  let ambientPartialKey = '';
+  let ambientPartialStartAt = 0;
+  let ambientPartialId = '';
   // Endpoint classification of the running session: `loopback` means system playback, `mic` means
   // real surroundings. Kept beside the session so /assistant/status and the tool agree.
   let ambientSource = { source: 'mic', device: '' };
@@ -15723,8 +15730,46 @@ export function apply(ctx, config) {
             void log.emit(type, payload).catch(() => {});
           },
           onUpdate: (event) => {
-            if (typeof event.partial === 'string') ambientState.partial = event.partial;
+            if (typeof event.partial === 'string') {
+              // 阶段 1：partial 也写入媒体台词时间线，但只写证据：不触发播放过滤，也不进入投递。
+              // 同一段的 partial 与终稿共用 `utteranceId`，终稿到达时原地覆盖为 final。
+              if (event.partial.trim().length > 0 && sessionEpoch === ambientEpoch) {
+                const declaredEnd = Number(event.audioEndAt);
+                const audioEndAt = Number.isFinite(declaredEnd) && declaredEnd > 0
+                  ? declaredEnd
+                  : Date.now();
+                const declaredStart = Number(event.audioStartAt);
+                const validStart = Number.isFinite(declaredStart) && declaredStart > 0
+                  && declaredStart <= audioEndAt
+                  ? declaredStart
+                  : null;
+                const eventId = typeof event.utteranceId === 'string' && event.utteranceId.length > 0
+                  ? event.utteranceId
+                  : '';
+                // 「该段开口时间」只在事件没带 audioStartAt 时兜底：本段第一次 partial 的起点。
+                // 合成 id 也只在事件没有 utteranceId 时使用，并且同一段内保持稳定。
+                const partialKey = `${sessionEpoch}:${eventId}`;
+                if (partialKey !== ambientPartialKey || ambientPartialStartAt === 0) {
+                  ambientPartialKey = partialKey;
+                  ambientPartialStartAt = validStart ?? audioEndAt;
+                  ambientPartialId = eventId !== '' ? eventId : `loopback-partial-${++ambientSeq}`;
+                }
+                mediaTimeline.upsert({
+                  id: ambientPartialId,
+                  audioStartAt: validStart ?? Math.min(ambientPartialStartAt, audioEndAt),
+                  audioEndAt,
+                  text: event.partial,
+                  status: 'partial',
+                  sourceEpoch: sessionEpoch,
+                });
+              }
+              ambientState.partial = event.partial;
+            }
             if (typeof event.final === 'string') {
+              // 这一段结束：下一段 partial 重新记录开口时间与兜底 id。
+              ambientPartialKey = '';
+              ambientPartialStartAt = 0;
+              ambientPartialId = '';
               const durationMs = Number(event.durationMs ?? 0);
               // Never let the assistant's own voice become context.
               if (ttsIsSpeaking()) return { accepted: false, reason: 'playback-echo' };

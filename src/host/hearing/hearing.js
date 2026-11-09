@@ -252,6 +252,7 @@ const DELIVERY_SKIP_SUMMARY_MAX = 100;
  *                              durationMs?: number, truncated?: boolean, joinFallback?: boolean,
  *                              offlineLimited?: boolean, note?: string, event?: string|null,
  *                              eventClean?: string|null, utteranceId?: string,
+ *                              audioStartAt?: number|null, audioEndAt?: number|null,
  *                              source?: 'mic'|'loopback'|'unknown'}) =>
  *                               void|boolean|{accepted?: boolean, reason?: string},
  *          onEvent?: (type: string, payload: object) => void,
@@ -2588,7 +2589,17 @@ export function startHearing({
       // first partial of the utterance belongs to the speech that started it.
       const hadPartial = partial.length > 0;
       partial = clean;
-      onUpdate?.({ partial });
+      // P-187 阶段 1：partial 也带这一段自己的身份与真实音频区间（首帧到达 → 此刻的采集
+      // 时刻），宿主据此先把证据写进媒体台词时间线，终稿到后用同一 id 原地覆盖为 final。
+      // 只加字段：partial 文本、触发条件与解码顺序都不变。
+      const partialAt = captureNow();
+      const partialStartAt = utteranceStartAt;
+      onUpdate?.({
+        partial,
+        utteranceId: utteranceIdOf(utteranceSeq + 1),
+        audioStartAt: partialStartAt,
+        audioEndAt: partialStartAt === null ? partialAt : Math.max(partialStartAt, partialAt),
+      });
       // Continuation signal #2, streaming: new words after the endpoint (not the offline final).
       if (clean.length > 0) {
         noteGroupContinuation();
