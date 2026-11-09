@@ -304,6 +304,9 @@ import { createMediaTimeline } from './hearing/media-timeline.js';
 // P-186/P-187 阶段 2：评论对齐（纯计算）与主请求里的“评论证据块”（纯状态/文本）。
 import { ALIGNMENT_DEFAULTS, alignComment } from './vision/comment-alignment.js';
 import { createCommentEvidence } from './vision/comment-evidence.js';
+// P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
+import { createImageAnalyzer } from './vision/image-analyzer.js';
+import { createUnderstandingRuntime } from './vision/understanding-runtime.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -627,6 +630,9 @@ const PLUGIN_VERSION = '0.99.0';
  * 环境事实是 102，这里保持 dialogue 之后的稳定位置即可。
  */
 const AUDIOVISUAL_INJECTION_ORDER = DIALOGUE_INJECTION_ORDER + 1;
+
+/** P-187 阶段 3：画面理解块紧接视听证据，仍是 ephemeral runtime context。 */
+const UNDERSTANDING_INJECTION_ORDER = AUDIOVISUAL_INJECTION_ORDER + 1;
 
 /** Only the tool registry is required; everything else stays optional. */
 export const inject = ['tools'];
@@ -2330,25 +2336,44 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * 当前动态观察：recent 对话 + 本轮视听证据，使用与实际 plan 完全相同的门禁。
-   * 缓存 plan 保存这两个指纹；任一变化都必须重算整份 plan。空值也是真实观察，不是“未知”。
+   * P-187 阶段 3：后台“按变化理解画面”的被动块。门禁与 audiovisual 完全一致：
+   * workspace + 陪伴 agent + voice lane + 视觉组件开启；无状态时 render() 返回 ''。
+   *
+   * `understanding` 与 `commentEvidence` 一样在本函数之后才初始化：这里只能在函数体内引用，
+   * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
+   */
+  const understandingForContext = (context) => {
+    try {
+      if (!inWorkspaceScope(context)) return '';
+      if (!isCompanionAgent(context?.agent)) return '';
+      if (contextLaneOf(context) !== 'voice') return '';
+      if (features.enabled('vision') !== true) return '';
+      return understanding.render();
+    } catch {
+      return '';
+    }
+  };
+  /**
+   * 当前动态观察：recent 对话 + 本轮视听证据 + 后台画面理解，使用与实际 plan 完全相同的门禁。
+   * 缓存 plan 保存这三个指纹；任一变化都必须重算整份 plan。空值也是真实观察，不是“未知”。
    */
   const currentObservations = (context, lane) => {
     try {
-      if (!inWorkspaceScope(context)) return { recent: '', audiovisual: '' };
+      if (!inWorkspaceScope(context)) return { recent: '', audiovisual: '', understanding: '' };
       let companion = false;
       try {
         companion = isCompanionAgent(context?.agent);
       } catch {
         companion = false;
       }
-      if (!companion || lane !== 'voice') return { recent: '', audiovisual: '' };
+      if (!companion || lane !== 'voice') return { recent: '', audiovisual: '', understanding: '' };
       return {
         recent: features.enabled('hearing') ? dialogueSummary.render() : '',
         audiovisual: commentEvidenceForContext(context),
+        understanding: understandingForContext(context),
       };
     } catch {
-      return { recent: '', audiovisual: '' };
+      return { recent: '', audiovisual: '', understanding: '' };
     }
   };
   const planContextLayers = (context, laneOverride = null, observed = undefined) => {
@@ -2391,14 +2416,18 @@ export function apply(ctx, config) {
       ? {
         recent: typeof observed.recent === 'string' ? observed.recent : '',
         audiovisual: typeof observed.audiovisual === 'string' ? observed.audiovisual : '',
+        understanding: typeof observed.understanding === 'string' ? observed.understanding : '',
       }
       : currentObservations(context, lane);
     const recentText = observations.recent;
     const audiovisualText = observations.audiovisual;
+    const understandingText = observations.understanding;
     const ephemeralBlocks = [];
     if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'audiovisual', text: audiovisualText, separator: '\n', keep: 'head' });
+    // P-187 阶段 3：画面理解排在视听证据之后；无内容时块为空，不占可见文本。
+    if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'understanding', text: understandingText, separator: '\n', keep: 'head' });
     const plan = assembleLayerPlan({
       lane,
       budget: resolveContextBudget(
@@ -2414,7 +2443,7 @@ export function apply(ctx, config) {
       },
     });
     // Dynamic-layer provenance, not allocation data: only readContextPlan/measure use it.
-    plan.observation = { recent: recentText, audiovisual: audiovisualText };
+    plan.observation = { recent: recentText, audiovisual: audiovisualText, understanding: understandingText };
     return plan;
   };
   /** Start a new assembly: the persona section is the first one the prompt service renders. */
@@ -2450,7 +2479,8 @@ export function apply(ctx, config) {
       if (cached !== undefined) {
         const current = currentObservations(context, cached.lane ?? contextLaneOf(context));
         if (cached.observation?.recent === current.recent
-          && cached.observation?.audiovisual === current.audiovisual) return cached;
+          && cached.observation?.audiovisual === current.audiovisual
+          && cached.observation?.understanding === current.understanding) return cached;
         try {
           const refreshed = planContextLayers(context, null, current);
           contextPlans.set(key, refreshed);
@@ -8613,6 +8643,125 @@ export function apply(ctx, config) {
    */
   const commentEvidence = config?.commentEvidence ?? createCommentEvidence();
   /**
+   * P-187 阶段 3：后台画面理解。分析器只把“已经落盘的帧”交给模型；运行时负责节奏、单在途、
+   * 有界状态与被动渲染。两者都不采集、不写文件、不注册工具，任何失败都不能改变采集/投递语义。
+   */
+  const understandingAnalyzer = createImageAnalyzer({
+    getService: (name) => getService(name),
+    readFile,
+  });
+  /** 能力探测缓存：`usable` 未知时在首次触发前探测一次；明确不可用后 5 分钟内不再重探。 */
+  const understandingCapability = { usable: null, failedAt: 0 };
+  let understandingCapabilityProbe = null;
+  /**
+   * 图片能力不可用时，不按 20 s 的节奏反复调用付费模型：首次触发前探测一次；明确不可用则记一条
+   * `vision.understanding.unavailable {reason}` 并跳过本次触发，5 分钟后才允许重探。
+   * `config.understandingAnalyzer` 是测试缝：注入即视为可用、不探测（否则测试还得伪造默认模型）。
+   */
+  const understandingCapabilityReady = () => {
+    if (typeof config?.understandingAnalyzer === 'function') return Promise.resolve(true);
+    if (understandingCapability.usable === true) return Promise.resolve(true);
+    if (understandingCapability.usable === false
+      && Date.now() - understandingCapability.failedAt < 5 * 60_000) {
+      return Promise.resolve(false);
+    }
+    if (understandingCapabilityProbe !== null) return understandingCapabilityProbe;
+    understandingCapabilityProbe = (async () => {
+      let capability = null;
+      try {
+        capability = await understandingAnalyzer.capability();
+      } catch {
+        capability = null;
+      }
+      const usable = capability?.usable === true;
+      understandingCapability.usable = usable;
+      if (!usable) {
+        understandingCapability.failedAt = Date.now();
+        const reason = typeof capability?.reason === 'string' && capability.reason.length > 0
+          ? capability.reason
+          : 'unavailable';
+        void log.emit('vision.understanding.unavailable', { reason }).catch(() => {});
+      }
+      return usable;
+    })().finally(() => {
+      understandingCapabilityProbe = null;
+    });
+    return understandingCapabilityProbe;
+  };
+  /**
+   * 所有触发都走这里：先确认能力，再交给运行时排程。探测与排程都不向调用方抛错 ——
+   * 触发方（持续采集的 sheet、麦克风终稿）只是旁路，不能因此改变证据登记或投递。
+   */
+  const noteUnderstandingChange = (request) => {
+    void understandingCapabilityReady()
+      .then((usable) => { if (usable) understanding.noteChange(request); })
+      .catch(() => {});
+  };
+  /**
+   * `understanding` 在函数体后段才初始化：
+   *   - `isBlocked` 读取的 `companionSessionSeen` 在本段之后才 `let`（闭包只在挂载后被调用）；
+   *   - `framesBetween` 读取的 `speechEvidenceSource` / `visionGeneration`（后者已初始化）；
+   *   - `audioBetween` 读取的 `mediaTimeline` / `ambientEpoch` 在环境声采集段才初始化。
+   * 这些闭包只在挂载完成、真实触发/渲染时才执行，因此 TDZ 不会发生；这里的注释是给未来改动的
+   * 警示：不要把它们提到挂载期同步执行。
+   */
+  const understanding = createUnderstandingRuntime({
+    analyze: typeof config?.understandingAnalyzer === 'function'
+      ? (options) => config.understandingAnalyzer(options)
+      : (options) => understandingAnalyzer.analyze(options),
+    framesBetween: (from, to) => evidenceWindow.between(from, to, {
+      source: speechEvidenceSource(),
+      sourceEpoch: visionGeneration,
+    }).filter((entry) => typeof entry.file === 'string'),
+    audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
+    isBlocked: () => companionSessionSeen !== true || visionDisposed || visionChanging
+      || shutdown.closing || vision.mode === 'privacy' || features.enabled('vision') !== true,
+    minIntervalMs: (() => {
+      const configured = Number(config?.understandingMinIntervalMs);
+      return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 20_000;
+    })(),
+    // 运行时以单对象 `{type, ok, reason, ...}` 回调 emit；展开成宿主事件名，避免 type 变成对象。
+    emit: (event, payload) => {
+      if (event !== null && typeof event === 'object') {
+        const { type, ...rest } = event;
+        void log.emit(typeof type === 'string' ? type : 'vision.understanding.run', rest).catch(() => {});
+        return;
+      }
+      void log.emit(event, payload).catch(() => {});
+    },
+  });
+  /**
+   * `/assistant/status` 的只读投影：调度计数 + 有界状态的“有没有内容/多大”。绝不暴露场景正文、
+   * 事件描述、帧 id 或文件路径。无状态（含隐私清空后）固定给三个 0。
+   */
+  const understandingStatusView = () => {
+    const emptyState = { sceneChars: 0, events: 0, unresolvedChars: 0 };
+    try {
+      const current = understanding.current();
+      return {
+        ...understanding.status(),
+        state: current === null ? emptyState : {
+          sceneChars: typeof current.sceneSummary === 'string' ? current.sceneSummary.length : 0,
+          events: Array.isArray(current.events) ? current.events.length : 0,
+          unresolvedChars: typeof current.unresolved === 'string' ? current.unresolved.length : 0,
+        },
+      };
+    } catch {
+      return {
+        running: false,
+        pending: 0,
+        lastAt: null,
+        lastReason: '',
+        runs: 0,
+        failures: 0,
+        droppedEvents: 0,
+        stopped: false,
+        hasState: false,
+        state: emptyState,
+      };
+    }
+  };
+  /**
    * 一段麦克风发言的开口证据锁。第一条非空 partial 时只锁一次，终稿到达后立即释放；
    * 隐私/切源/停听时即使还没等到终稿也必须释放，绝不把旧代次的锁或证据带过去。
    */
@@ -8708,6 +8857,8 @@ export function apply(ctx, config) {
         latestAt,
         frameCount: evidence.length,
       });
+      // P-187 阶段 3：用户评论优先触发一次画面理解（仍受调度器的最短间隔约束）。
+      noteUnderstandingChange({ reason: 'comment', from: pending.from, to: end, priority: true });
     } catch (error) {
       void log.emit('vision.comment.align.failed', {
         error: error?.message ?? String(error),
@@ -8855,7 +9006,11 @@ export function apply(ctx, config) {
     // 复制期间可能隐私/切源：token 在交给 rememberEvidence 的此刻取，落地后再核一次代次。
     onSheet: async (sheet) => {
       const token = { mode: vision.mode, scene: vision.scene, generation: visionGeneration };
-      await rememberEvidence(sheet, { kind: 'storyboard', token });
+      const added = await rememberEvidence(sheet, { kind: 'storyboard', token });
+      // 只有真正登记进本代次窗口的画面才值得理解；窗口可以给同一时刻（非优先）。
+      if (added === null) return;
+      const capturedAt = Number(sheet?.capturedAt ?? added.capturedAt ?? Date.now());
+      noteUnderstandingChange({ reason: 'sheet', from: capturedAt, to: capturedAt });
     },
     isBlocked: () => evidenceCaptureHolding !== true || visionDisposed || visionChanging
       || shutdown.closing || vision.mode === 'privacy',
@@ -9017,6 +9172,8 @@ export function apply(ctx, config) {
     dropSpeechEvidence();
     commentEvidence.clearAll();
     evidenceWindow.clear('vision-invalidated');
+    // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
+    understanding.clear('vision-invalidated');
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
     visionController = new AbortController();
@@ -11098,6 +11255,7 @@ export function apply(ctx, config) {
       const sameBudget = cached !== undefined && cached.lane === lane
         && cached.observation?.recent === current.recent
         && cached.observation?.audiovisual === current.audiovisual
+        && cached.observation?.understanding === current.understanding
         && ['persona', 'fixed', 'memory', 'recent', 'ephemeral', 'totalChars']
           .every((name) => cached.budget?.[name] === resolved?.[name]);
       if (sameBudget) return { plan: cached };
@@ -11128,6 +11286,7 @@ export function apply(ctx, config) {
     const ephemeralText = [
       lane === 'voice' ? nonverbalCue.render() : '',
       lane === 'voice' ? commentEvidenceForContext(context) : '',
+      lane === 'voice' ? understandingForContext(context) : '',
       renderEnvironment(),
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
     return {
@@ -11352,6 +11511,17 @@ export function apply(ctx, config) {
         order: AUDIOVISUAL_INJECTION_ORDER,
         text: (context) => planTemporary(
           context, 'audiovisual', () => commentEvidenceForContext(context),
+        ),
+      }),
+    );
+    // P-187 阶段 3：后台画面理解块（场景摘要/最近事件/未解决/覆盖缺口）。它排在视听证据之后，
+    // 仍走同一份 ephemeral 预算；无状态或预算裁掉时渲染 ''，绝不产生空块或绕过额度。
+    scope.effect(() =>
+      registerContext({
+        name: 'assistant:understanding',
+        order: UNDERSTANDING_INJECTION_ORDER,
+        text: (context) => planTemporary(
+          context, 'understanding', () => understandingForContext(context),
         ),
       }),
     );
@@ -15676,6 +15846,8 @@ export function apply(ctx, config) {
         evidenceCapture: evidenceCapture.status(),
         // P-186/P-187 阶段 2 的只读评论证据计数：sessions/latestAt/attached，绝不含对齐正文。
         comment: commentEvidence.state(),
+        // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
+        understanding: understandingStatusView(),
       },
       hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };
@@ -15928,6 +16100,8 @@ export function apply(ctx, config) {
       cancelPlayback('feature-disabled');
     } else if (id === 'vision') {
       clearEvidenceRetry();
+      // 组件关闭即清空后台理解状态；invalidateVision 还会再清一次（幂等）。
+      understanding.clear('feature-disabled');
       await stopEvidenceCapture('feature-disabled');
       await invalidateVision();
       await stopVirtualCam('feature-disabled');
@@ -16408,6 +16582,8 @@ export function apply(ctx, config) {
           visionDisposed = true;
           // 持续证据采集有界停止后，再作废代次、清窗口与在途副本。
           await stopEvidenceCapture('dispose');
+          // P-187 阶段 3：停止后台理解的定时器/队列，在途结果因代次检查不会写回。
+          understanding.stop();
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));
           // 卸载时可能仍有 copyFile 没返回：等它们核到“已卸载”后自删，再把可能被重新建出的
           // 空目录一并收掉。不等待就会在进程退出前留下没人引用的副本。
