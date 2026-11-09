@@ -2,10 +2,10 @@
  * P-187 阶段 5：主动回应仲裁（纯决策层）。
  *
  * 这些用例逐条盯住契约里的硬规则：
- *   证据约束、有效期与 maxAgeMs、优先级选择、四类时机抑制、too-soon、
- *   ignored 静默与放大、每小时上限的可选覆盖、同身份去重、cancelFor、settings 覆盖、
- *   候选上限淘汰、spoken/ignored 状态、通过率 0/100/中间值、按身份只抽一次、
- *   时机/过期不抽签、未回应 quiet 仍生效、默认配额不再限制，以及畸形输入不抛错。
+ *   证据约束、三时间（occurredAt/understoodAt/expiresAt）与 maxAgeMs、优先级选择、
+ *   四类时机抑制、too-soon、ignored 静默与放大、每小时上限的可选覆盖、同身份去重且不续期、
+ *   cancelFor、settings 覆盖、候选上限淘汰、spoken/ignored 状态、通过率 0/100/中间值、
+ *   按身份只抽一次、时机/过期不抽签、未回应 quiet 仍生效、默认配额不再限制，以及畸形输入不抛错。
  *
  * 所有时间都通过可变的 `now` 注入，不用真实时钟；候选的 from/to 也按该时钟生成，
  * 这样“事件发生 -> 候选过期 -> 恢复可开口”的边界可以一眼核对。
@@ -126,7 +126,7 @@ test('证据约束：画面或音频至少一项，空证据与坏证据都不�
   assert.equal(status.counts.rejected, 3);
 });
 
-test('有效期：expiresAt 到点即失效，事件超过 maxAgeMs 拒绝，边界不误杀', () => {
+test('有效期：expiresAt 到点即失效；未显式给出时按 occurredAt + maxAgeMs，边界不误杀', () => {
   const h = createHarness();
   const { arbiter } = h;
   const base = makeCandidate(h.now);
@@ -138,19 +138,118 @@ test('有效期：expiresAt 到点即失效，事件超过 maxAgeMs 拒绝，边
   assert.equal(
     arbiter.propose({ ...makeCandidate(h.now), id: 'too-old', from: T0 - 1_000, to: T0 }),
     null,
-    'now - to > maxAgeMs 应拒绝',
+    'occurredAt 超过 maxAgeMs 应拒绝',
   );
   const edge = arbiter.propose({
     ...makeCandidate(h.now),
     id: 'edge',
-    from: T0 - 1_000,
-    to: T0 + 1,
+    occurredAt: T0 + 2,
+    from: T0 + 1,
+    to: T0 + 2,
   });
-  assert.ok(edge, 'now - to 恰好等于 maxAgeMs 时仍应有效');
+  assert.ok(edge, 'expiresAt 前 1ms 仍应有效');
+  assert.equal(edge.occurredAt, T0 + 2);
+  assert.equal(edge.expiresAt, T0 + 2 + PROACTIVE_DEFAULTS.maxAgeMs);
+  assert.equal(edge.understoodAt, null, '未提供 understoodAt 时留空，不参与有效期');
 
   const status = arbiter.status();
   assert.equal(status.counts.expired, 3);
   assert.equal(status.counts.proposed, 1);
+});
+
+test('三时间：understoodAt 只做诊断，分析完成得再晚也不重置新鲜度', () => {
+  const h = createHarness({ defaults: { maxAgeMs: 60_000 } });
+  const { arbiter } = h;
+  const occurredAt = h.now - 40_000;
+
+  const candidate = arbiter.propose(makeCandidate(h.now, {
+    id: 'analysis-late',
+    eventId: 'evt-late',
+    from: occurredAt - 1_000,
+    to: occurredAt,
+    occurredAt,
+    understoodAt: h.now,
+  }));
+  assert.ok(candidate, '40 秒前发生的重要事件在 60 秒窗口内仍可登记');
+  assert.equal(candidate.occurredAt, occurredAt);
+  assert.equal(candidate.understoodAt, h.now);
+  assert.equal(candidate.expiresAt, occurredAt + 60_000, '有效期锚定 occurredAt，而非 understoodAt');
+
+  // 距发生 59.9 秒仍可评估；到 60 秒（expiresAt）即失效。
+  h.advance(19_999);
+  assert.equal(arbiter.pendingIds().length, 1);
+  assert.equal(arbiter.evaluate().speak, true);
+  h.advance(1);
+  assert.deepEqual(arbiter.pendingIds(), []);
+  assert.equal(arbiter.evaluate().reason, 'no-candidate');
+});
+
+test('重复分析不续期：同身份保留最早 occurredAt/expiresAt，并计 duplicate', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  const first = arbiter.propose(makeCandidate(h.now, {
+    id: 'understand:first',
+    eventId: 'evt-stable',
+    from: T0 - 1_000,
+    to: T0,
+    occurredAt: T0,
+    understoodAt: T0,
+  }));
+  assert.ok(first);
+  assert.equal(first.expiresAt, T0 + PROACTIVE_DEFAULTS.maxAgeMs);
+
+  // 2 秒后同一事件被再次分析：to/描述都变了，但身份相同，时间不得被推后。
+  h.advance(2_000);
+  const second = arbiter.propose(makeCandidate(h.now, {
+    id: 'understand:second',
+    eventId: 'evt-stable',
+    from: T0 + 1_000,
+    to: T0 + 2_000,
+    occurredAt: T0 + 2_000,
+    understoodAt: h.now,
+    description: '新版本的描述',
+  }));
+  assert.ok(second, '同身份后到版本可以合并');
+  assert.equal(second.id, 'understand:first', '保留最早候选 id，避免在途生成错位');
+  assert.equal(second.occurredAt, T0, '保留更早的 occurredAt');
+  assert.equal(second.expiresAt, first.expiresAt, 'expiresAt 不得被重复分析延长');
+  assert.equal(second.to, T0, '内容时间保留最早版本');
+  assert.equal(second.description, '新版本的描述', '描述可以更新，但不重置新鲜度');
+  const status = arbiter.status();
+  assert.equal(status.pending, 1);
+  assert.equal(status.counts.proposed, 1, '同身份合并不算新登记');
+  assert.equal(status.counts.duplicate, 1, '重复分析计 duplicate');
+
+  // 到最早的 expiresAt 就失效，而不是 second 推导出来的 T0 + 2s + maxAge。
+  h.at(first.expiresAt);
+  assert.deepEqual(arbiter.pendingIds(), []);
+});
+
+test('说过的重要事件在 expiresAt 前不会被重复分析再次登记', () => {
+  const h = createHarness({ defaults: { maxAgeMs: 60_000 } });
+  const { arbiter } = h;
+  const first = arbiter.propose(makeCandidate(h.now, {
+    id: 'understand:spoken',
+    eventId: 'evt-spoken',
+    to: T0,
+    occurredAt: T0,
+    understoodAt: T0,
+  }));
+  assert.ok(first);
+  assert.equal(arbiter.evaluate().speak, true);
+  arbiter.spoken(first);
+
+  // 20 秒后同一事件再次进入理解结果：仍在候选有效期内，说过的记忆必须压住它。
+  h.advance(20_000);
+  assert.equal(arbiter.propose(makeCandidate(h.now, {
+    id: 'understand:spoken-again',
+    eventId: 'evt-spoken',
+    to: T0 + 20_000,
+    occurredAt: T0,
+    understoodAt: h.now,
+  })), null);
+  assert.equal(arbiter.status().counts.duplicate, 1);
+  assert.equal(arbiter.evaluate().reason, 'no-candidate');
 });
 
 test('显式 expiresAt 优先：旧 to 仍可登记/待选/评估，到 expiresAt 才失效', () => {
@@ -456,7 +555,11 @@ test('同身份去重、cancelFor 取消、说过的事件在窗口内不能重�
     null,
     '刚说过的事件在 maxAgeMs 窗口内不能重复登记',
   );
-  assert.equal(arbiter.status().counts.duplicate, 1);
+  assert.equal(
+    arbiter.status().counts.duplicate,
+    2,
+    '第二次同身份登记已计一次 duplicate，说过后的重复登记再计一次',
+  );
 
   arbiter.propose(makeCandidate(h.now, { id: 'e2' }));
   assert.equal(arbiter.cancelFor('e2'), 1);

@@ -9783,17 +9783,37 @@ export function apply(ctx, config) {
   };
 
   /**
-   * 主动候选的显式有效期（毫秒）：`config.proactive.maxAgeMs` 优先，缺失/畸形回退默认值。
-   * 有效期从“登记这一刻”起算——后台理解本身可能耗时 20–40 秒，事件的 `to` 是画面时间，
-   * 不能拿它判断刚拿到的候选是否过期；`from/to` 仍原样保留内容时间供选择/展示。
+   * 稳定事件身份：描述 + 证据 id（排序后）的摘要。
+   * 绝不能把每次分析都会变化的 `to`/`from`/index 放进来，否则同一事件会被当成新候选，
+   * 重复分析就能不断续期。描述或证据变化才视为另一个事件。
    */
-  const proactiveMaxAgeMs = () => {
-    const raw = config?.proactive?.maxAgeMs ?? PROACTIVE_DEFAULTS.maxAgeMs;
+  const proactiveEventId = (description, frameIds, audioIds) => {
+    const fingerprint = createHash('sha1')
+      .update(description)
+      .update('\u0000frame\u0000')
+      .update([...frameIds].sort().join('\u0000'))
+      .update('\u0000audio\u0000')
+      .update([...audioIds].sort().join('\u0000'))
+      .digest('hex')
+      .slice(0, 16);
+    return `understand:${fingerprint}`;
+  };
+
+  /** 重要事件允许稍后评论的默认迟到窗口（毫秒）；不是“登记后再活这么久”。 */
+  const PROACTIVE_IMPORTANT_MAX_AGE_DEFAULT_MS = PROACTIVE_DEFAULTS.importantMaxAgeMs ?? 60_000;
+
+  /**
+   * 重要事件候选的允许迟到窗口：`config.proactive.importantMaxAgeMs` 优先，缺失/畸形回退
+   * 默认 60 秒。有效期锚点是事件内容时间 `occurredAt`，不是登记时刻；分析耗时 20–40 秒
+   * 不会因此获得额外的新鲜度。
+   */
+  const proactiveImportantMaxAgeMs = () => {
+    const raw = config?.proactive?.importantMaxAgeMs ?? PROACTIVE_IMPORTANT_MAX_AGE_DEFAULT_MS;
     // 与仲裁器的 nonNegative 口径一致：空串/空白不算 0，畸形值回退默认窗口。
     const configured = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw);
     return Number.isFinite(configured) && configured >= 0
       ? configured
-      : PROACTIVE_DEFAULTS.maxAgeMs;
+      : PROACTIVE_IMPORTANT_MAX_AGE_DEFAULT_MS;
   };
 
   let proactiveBusy = false;
@@ -9806,6 +9826,12 @@ export function apply(ctx, config) {
   let proactiveAbort = null;
   let proactiveEvalTimer = null;
   let proactiveIgnoredTimer = null;
+  /**
+   * 最近一次用户评论/助手开始回应的时刻。候选的 occurredAt 早于它时，说明这条内容已经被
+   * 回应过，发送前复核必须取消；它们不建定时器，只在事件到达时更新。
+   */
+  let lastUserCommentAt = 0;
+  let lastAssistantReplyAt = 0;
 
   /** 主动句发出后 45 秒没有任何用户终稿 = 未回应；下次开口会进入 quiet/放大间隔。 */
   const clearProactiveIgnored = () => {
@@ -9864,6 +9890,32 @@ export function apply(ctx, config) {
   };
 
   /**
+   * 候选的证据是否仍属于当前这一代窗口。
+   * 帧用 evidenceWindow.byId 精确回看；音频时间线没有 byId，只能从当前保留的条目里取 id 集合。
+   * 窗口被隐私/切源清空或条目自然淘汰后，这条候选失去依据，发送前必须取消。
+   */
+  const proactiveEvidenceStillPresent = (candidate) => {
+    try {
+      const frames = Array.isArray(candidate?.evidenceFrameIds) ? candidate.evidenceFrameIds : [];
+      if (frames.length > 0) {
+        const found = new Set(evidenceWindow.byId(frames).map((entry) => entry.id));
+        if (frames.some((id) => !found.has(id))) return false;
+      }
+      const audio = Array.isArray(candidate?.evidenceAudioIds) ? candidate.evidenceAudioIds : [];
+      if (audio.length > 0) {
+        const found = new Set(
+          mediaTimeline.between(0, Date.now()).map((entry) => entry.id),
+        );
+        if (audio.some((id) => !found.has(id))) return false;
+      }
+      return true;
+    } catch {
+      // 证据查询失败按“已失效”处理：宁可少说一句，也不凭不确定的证据开口。
+      return false;
+    }
+  };
+
+  /**
    * 读一次时机并（仅在允许时）开口。任何失败都只取消这一条候选，不抛错、不影响理解运行时。
    * `keyDialogue` 暂固定 false：关键台词检测尚未接入（设计文档第十节只把它列为发送前检查）。
    */
@@ -9915,6 +9967,12 @@ export function apply(ctx, config) {
           expectedGeneration: generation,
           aborted: abortController.signal.aborted,
           runtimeActive: visionDisposed !== true && shutdown.closing !== true,
+          // 显式 expiresAt 只是调度截止；证据、代次、已评论/已回应任何一项失败仍要取消。
+          expiresAt: candidate.expiresAt,
+          now: Date.now(),
+          evidenceValid: proactiveEvidenceStillPresent(candidate),
+          userCommented: candidate.occurredAt < lastUserCommentAt,
+          assistantReplied: candidate.occurredAt < lastAssistantReplyAt,
           userSpeaking: speechEvidence !== null,
           assistantBusy: ttsIsSpeaking() === true || playback !== null,
           pendingReply: proactivePendingReply(),
@@ -9964,44 +10022,65 @@ export function apply(ctx, config) {
   };
 
   /**
-   * 理解推进后登记候选：只处理带非空 reaction 的事件，每次最多 2 条；登记后立即尝试一次
-   * 评估（不必等 5 秒定时器），其余时机由定时器兜住。
+   * 理解推进后登记候选：只为带非空 reaction 的事件产生候选（没有 reaction 的瞬间吐槽/惊讶
+   * 不进入主动链），每次最多 2 条；登记后立即尝试一次评估，其余时机由定时器兜住。
+   *
+   * 时间语义：occurredAt = 内容实际发生（event.to，to 非法时回退合法 from），
+   * understoodAt = 本次分析完成，expiresAt = occurredAt + importantMaxAgeMs。
+   * 分析耗时不会重置新鲜度；事件身份用描述+证据摘要，重复分析只合并、不续期。
    */
   const proposeProactive = (update) => {
     if (!proactiveEnabled()) return;
     const events = Array.isArray(update?.parsed?.events) ? update.parsed.events : [];
-    // 理解分析耗时不参与候选年龄：有效期从登记此刻重新计时，事件 from/to 保持原始内容时间。
-    const expiresInMs = proactiveMaxAgeMs();
+    const importantMaxAgeMs = proactiveImportantMaxAgeMs();
+    const understoodAt = Date.now();
     let added = 0;
     for (let index = 0; index < events.length && added < 2; index += 1) {
       const event = events[index];
       if (event === null || typeof event !== 'object' || Array.isArray(event)) continue;
+      // 只有“值得主动说一句”的发展才带 reaction；瞬间事件没有 reaction，不产生候选。
       const reaction = typeof event.reaction === 'string' ? event.reaction.trim() : '';
       if (reaction.length === 0) continue;
-      const to = Number(event.to);
-      if (!Number.isFinite(to) || to < 0) continue;
-      const from = Number(event.from);
+
+      const rawTo = Number(event.to);
+      const rawFrom = Number(event.from);
+      // occurredAt 是内容时间：优先事件结束点；to 非法时用合法的 from 兜底。
+      let occurredAt = Number.isFinite(rawTo) && rawTo >= 0 ? rawTo : null;
+      if (occurredAt === null && Number.isFinite(rawFrom) && rawFrom >= 0) occurredAt = rawFrom;
+      if (occurredAt === null) continue;
+      const from = Number.isFinite(rawFrom) && rawFrom >= 0 && rawFrom <= occurredAt
+        ? rawFrom
+        : occurredAt;
+
       const frames = Array.isArray(event.evidenceFrameIds) ? event.evidenceFrameIds : [];
       const audio = Array.isArray(event.evidenceAudioIds) ? event.evidenceAudioIds : [];
       // 证据约束由仲裁器再核一次；这里先跳过必然被拒的事件，避免无意义计数。
       if (frames.length === 0 && audio.length === 0) continue;
+      const description = proactiveClip(event.description, 200);
       const candidate = proactive.propose({
-        id: `understand:${to}:${index}`,
-        from: Number.isFinite(from) && from >= 0 ? from : to,
-        to,
-        description: proactiveClip(event.description, 200),
+        // id 只用于本次登记/取消；重复分析的身份由稳定的 eventId 决定。
+        id: `understand:${occurredAt}:${index}`,
+        eventId: proactiveEventId(description, frames, audio),
+        occurredAt,
+        understoodAt,
+        from,
+        to: occurredAt,
+        description,
         evidenceFrameIds: frames,
         evidenceAudioIds: audio,
         angle: proactiveClip(reaction, 80),
-        // 只按登记后的 expiresAt 判过期，避免 20–40 秒的分析耗时让旧 `to` 一登记就 expired。
-        expiresAt: Date.now() + expiresInMs,
-        priority: true,
+        // 最晚表达时刻锚定 occurredAt，而不是登记时刻；重复分析不能延长它。
+        expiresAt: occurredAt + importantMaxAgeMs,
+        priority: 1,
       });
       if (candidate !== null) added += 1;
     }
     if (added > 0) {
-      // 只读诊断：只报数量与有效期，不写候选正文/事件内容；不新增轮询。
-      void log.emit('vision.proactive.proposed', { count: added, expiresInMs }).catch(() => {});
+      // 只读诊断：只报数量与允许迟到窗口，不写候选正文/事件内容；不新增轮询。
+      void log.emit('vision.proactive.proposed', {
+        count: added,
+        expiresInMs: importantMaxAgeMs,
+      }).catch(() => {});
       void evaluateProactive('advance');
     }
   };
@@ -10203,6 +10282,7 @@ export function apply(ctx, config) {
       // 避免同一事件被用户先评论后助手再主动说一遍。
       clearProactiveIgnored();
       // 用户已亲自评论：取消候选的同时中止在途短句生成，避免它稍后仍尝试开口。
+      lastUserCommentAt = at;
       abortProactive();
       proactive.cancelAll('user-comment');
       /**
@@ -14679,6 +14759,13 @@ export function apply(ctx, config) {
   if (typeof ctx.on === 'function') {
     ctx.effect(() => ctx.on('session/event', (session, event) => {
       typedVoice.observe(session, event);
+      // P-187 阶段 5：助手开始正式回应，说明这一轮内容已经进入对话。待说的画面候选立即取消，
+      // 在途短句也中止——否则它会在回答之后再补一句“刚才看到……”。
+      if (event?.type === 'turn/start') {
+        lastAssistantReplyAt = Date.now();
+        abortProactive();
+        proactive.cancelAll('assistant-reply');
+      }
     }));
   }
   /**

@@ -13,21 +13,26 @@
  *
  * 取舍：
  *   - evaluate() 只读输入、不消费候选；真正开口后必须再调用 spoken() 记账。
- *   - spoken() 会移除同一事件的候选，并在 maxAgeMs 窗口内记住该事件，避免重复说出。
+ *   - spoken() 会移除同一事件的候选，并在候选有效期内（至少 maxAgeMs）记住该事件，
+ *     避免同一事件因重复分析再次说出。
  *   - 候选过期就丢弃，不排队；淘汰/拒绝都只计数，不回报正文。
  *   - 通过率按候选身份只抽一次：抽中/未抽中都持久记录（有界），换措辞不重抽。
  *   - cancelAll() 只清待选池（可再次登记）；cancelFor() 才写取消集；reset() 是隐私/切源的
  *     代次边界，连取消集、抽签记录、最近主题与时机窗口一起清空，但保留累计计数。
+ *   - 三个时间分开：occurredAt（内容实际发生）、understoodAt（分析完成，仅诊断）、
+ *     expiresAt（最晚允许表达）。expiresAt 以 occurredAt 为锚，分析完成再晚也不续期。
  */
 
 /** 默认值：不再有固定配额，只保留有效期、静默期与同时候选数；计时/频率仍可显式覆盖。 */
 export const PROACTIVE_DEFAULTS = Object.freeze({
   /**
-   * 未显式给出 expiresAt 时的候选有效期（事件发生到可开口）。
-   * 显式 expiresAt 优先，且只按该时刻判断：后台理解可能耗时 20–40 秒，登记时事件 `to`
-   * 早已超过本窗口，不能让它把刚登记的候选二次判死。
+   * 没有显式 expiresAt 时的允许迟到窗口：最晚表达时刻 = occurredAt + maxAgeMs。
+   * 显式 expiresAt 仍然优先，但同样只是“最晚表达时刻”，不会因为重新分析而延长。
+   * 后台理解可能耗时 20–40 秒，occurredAt 是内容时间，不是登记时刻，也不是 understoodAt。
    */
   maxAgeMs: 8_000,
+  /** 重要事件（带 reaction）允许稍后评论的默认迟到窗口；宿主可用配置覆盖。 */
+  importantMaxAgeMs: 60_000,
   /** 两次主动之间的最小间隔；0 = 不限制（可选覆盖）。 */
   minGapMs: 0,
   /** 每小时上限；null = 不限制（可选覆盖）。 */
@@ -171,30 +176,47 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
     return { ok: false, reason: 'malformed' };
   }
 
+  // 内容实际发生时间：显式 occurredAt 优先；兼容旧输入时回退到事件结束时间 `to`。
+  // 它才是有效期的锚点，登记/分析完成的时刻不能把旧事件“洗新”。
+  let occurredAt = to;
+  if (input.occurredAt !== undefined && input.occurredAt !== null) {
+    const parsed = timestamp(input.occurredAt);
+    if (parsed === null) return { ok: false, reason: 'malformed' };
+    occurredAt = parsed;
+  }
+
+  // 分析完成时间只做诊断：保留给短句生成/状态查看，绝不参与 expiresAt 的计算。
+  let understoodAt = null;
+  if (input.understoodAt !== undefined && input.understoodAt !== null) {
+    const parsed = timestamp(input.understoodAt);
+    if (parsed === null) return { ok: false, reason: 'malformed' };
+    understoodAt = parsed;
+  }
+
+  // 最晚允许表达时刻：
+  //   - 有显式 expiresAt：原样采用（调度截止），但它不能绕过场景/已回应/证据等复核；
+  //   - 没有显式 expiresAt：occurredAt + maxAgeMs。不是 now + maxAgeMs，也不是
+  //     understoodAt + maxAgeMs——理解耗时再长，也不会把事件重新变新鲜。
   let expiresAt = null;
   if (input.expiresAt !== undefined && input.expiresAt !== null) {
     const parsed = timestamp(input.expiresAt);
     if (parsed === null) return { ok: false, reason: 'malformed' };
     expiresAt = parsed;
+  } else {
+    expiresAt = occurredAt + config.maxAgeMs;
   }
 
-  // 有效期语义（两者互斥）：
-  //   - 有显式 expiresAt：只按该时刻判断（到点即失效，不留半拍），不再用事件 `to` 的年龄
-  //     二次拒绝。理解分析可能耗时 20–40 秒，登记时 `to` 往往早已超过 maxAgeMs，若仍按
-  //     `at - to` 判死，候选会一登记就 expired，主动回应永远进不了评估。
-  //   - 没有显式 expiresAt：保持原规则，按事件 `to` 的年龄丢弃，错过就放弃、不积压成解说队列。
-  if (expiresAt !== null) {
-    if (at >= expiresAt) return { ok: false, reason: 'expired' };
-  } else if (at - to > config.maxAgeMs) {
-    return { ok: false, reason: 'expired' };
-  }
+  // 到点即失效，不留半拍；显式与推导出的 expiresAt 用同一判定。
+  if (at >= expiresAt) return { ok: false, reason: 'expired' };
 
   // 用户先评论了同一事件：取消后即使再次送来也不恢复主动。
   if (canceled.has(id) || canceled.has(identity)) return { ok: false, reason: 'canceled' };
 
-  // 重复抑制：同一事件刚说过的 maxAgeMs 内不再接受，避免后台重复理解带来重复开口。
-  const spokenAtTime = spokenAt.get(identity);
-  if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) {
+  // 重复抑制：同一事件在“说过后的抑制窗口”内不再接受，避免后台重复理解带来重复开口。
+  // 抑制窗口至少 maxAgeMs，并覆盖候选自己的 expiresAt：重要事件允许 60 秒迟到时，
+  // 说过的同一事件也要在整段有效期内被压住，而不是 8 秒后又能重新登记。
+  const spokenUntil = spokenAt.get(identity);
+  if (spokenUntil !== undefined && at <= spokenUntil) {
     return { ok: false, reason: 'duplicate' };
   }
 
@@ -208,6 +230,8 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
       eventId,
       from,
       to,
+      occurredAt,
+      understoodAt,
       description,
       evidenceFrameIds: Object.freeze(evidenceFrameIds),
       evidenceAudioIds: Object.freeze(evidenceAudioIds),
@@ -237,6 +261,12 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
  * @param {boolean} [input.assistantBusy] TTS 正在播放或有播放会话。
  * @param {boolean} [input.pendingReply] 是否有已接受/在途的正式回答。
  * @param {boolean} [input.spoken] 该候选是否已经记账为已说（正常路径不会同时待选）。
+ * @param {boolean} [input.expired] 宿主已判定候选超过 expiresAt。
+ * @param {number} [input.expiresAt] 候选的最晚表达时刻；与 now 一起再做一次纯比较。
+ * @param {number} [input.now] 复核时刻（默认使用调用方传入的 expiresAt 判定）。
+ * @param {boolean} [input.evidenceValid] 证据帧/音频是否仍在本代窗口内（false = 已淘汰）。
+ * @param {boolean} [input.userCommented] 用户是否已在本事件后评论。
+ * @param {boolean} [input.assistantReplied] 助手是否已在本事件后回应。
  * @returns {{ok: boolean, reason: string}} 只返回机器原因码，不含候选正文。
  */
 export function revalidateProactiveCandidate(input = {}) {
@@ -245,6 +275,8 @@ export function revalidateProactiveCandidate(input = {}) {
 
   if (state.runtimeActive === false) return fail('disposed');
   if (state.enabled !== true) return fail('disabled');
+  // 宿主在 vision invalidate/切源时同时递增 visionGeneration 与这个 proactive 代次；
+  // 代次不同即说明候选属于旧画面，不能继续开口。
   if (state.generation !== state.expectedGeneration) return fail('generation-changed');
 
   const id = normalizeId(state.candidateId);
@@ -255,6 +287,16 @@ export function revalidateProactiveCandidate(input = {}) {
   if (!stillPending) return fail('candidate-missing');
   // 取消信号本身不是候选池变化：放在“候选是否仍待选”之后，先让已移除的候选报告真实原因。
   if (state.aborted === true) return fail('aborted');
+
+  // expiresAt 只是调度截止：这里再核一次，但即便未过期，后面的证据/已评论/已回应仍能拒绝。
+  if (state.expired === true) return fail('expired');
+  const expiresAt = timestamp(state.expiresAt);
+  const now = timestamp(state.now);
+  if (expiresAt !== null && now !== null && now >= expiresAt) return fail('expired');
+  // 证据帧/音频被窗口淘汰后，候选已失去画面依据，不能再凭旧描述开口。
+  if (state.evidenceValid === false) return fail('evidence-missing');
+  if (state.userCommented === true) return fail('user-commented');
+  if (state.assistantReplied === true) return fail('assistant-replied');
 
   if (state.userSpeaking === true) return fail('user-speaking');
   if (state.assistantBusy === true) return fail('assistant-busy');
@@ -317,19 +359,21 @@ export function createProactiveArbiter(options = {}) {
     }
   }
 
-  /** 候选本身的有效性：未过期、未被取消、不在“刚说过”的重复窗口里。 */
+  /** 候选本身的有效性：未到最晚表达时刻、未被取消、不在“刚说过”的重复窗口里。 */
   function isUsable(candidate, at) {
-    // 与 normalizeCandidate 同一有效期语义：显式 expiresAt 只按该时刻判断；没有时才看 `to`
-    // 的年龄。evaluate/pendingIds/prune 都经过这里，否则会出现“propose 成功但评估时又被
-    // to 年龄丢掉”的半修复状态。
-    if (candidate.expiresAt !== null) {
-      if (at >= candidate.expiresAt) return false;
-    } else if (at - candidate.to > config.maxAgeMs) {
-      return false;
+    // 有效期只看 expiresAt（归一化时已按 occurredAt + maxAgeMs 推导或采用显式值）。
+    // understoodAt 不参与，重复分析/后到的描述都不能延长候选寿命。
+    const expiresAt = timestamp(candidate.expiresAt);
+    if (expiresAt !== null) {
+      if (at >= expiresAt) return false;
+    } else {
+      // 兼容旧的内部候选对象：没有 expiresAt 时仍以内容时间为锚，绝不回退到登记时刻。
+      const occurredAt = timestamp(candidate.occurredAt) ?? candidate.to;
+      if (at >= occurredAt + config.maxAgeMs) return false;
     }
     if (canceled.has(candidate.id) || canceled.has(candidateIdentity(candidate))) return false;
-    const spokenAtTime = spokenAt.get(candidateIdentity(candidate));
-    if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) return false;
+    const spokenUntil = spokenAt.get(candidateIdentity(candidate));
+    if (spokenUntil !== undefined && at <= spokenUntil) return false;
     return true;
   }
 
@@ -361,8 +405,8 @@ export function createProactiveArbiter(options = {}) {
     for (let i = candidates.length - 1; i >= 0; i -= 1) {
       if (!isUsable(candidates[i], now)) candidates.splice(i, 1);
     }
-    for (const [id, time] of spokenAt) {
-      if (now - time > config.maxAgeMs) spokenAt.delete(id);
+    for (const [id, until] of spokenAt) {
+      if (now > until) spokenAt.delete(id);
     }
   }
 
@@ -467,11 +511,39 @@ export function createProactiveArbiter(options = {}) {
       }
 
       const candidate = result.candidate;
-      // 同身份（eventId 优先，否则 id）去重：后到的版本替换旧版本，并视为最新登记；
-      // 同一事件换措辞不会变成两条候选，也不会多一次抽签。
+      // 同身份（eventId 优先，否则 id）去重：描述/证据可以更新，但时间只保留更早的一份。
+      // 重复分析绝不能把 expiresAt 推到 now + maxAgeMs，否则同一事件会无限续期、反复开口。
       const identity = candidateIdentity(candidate);
       const existing = candidates.findIndex((entry) => candidateIdentity(entry) === identity);
-      if (existing >= 0) candidates.splice(existing, 1);
+      if (existing >= 0) {
+        const previous = candidates[existing];
+        duplicate += 1;
+        // 旧版本已过期/已取消：后到的重复分析也不能把它复活，直接拒绝并清掉旧项。
+        if (!isUsable(previous, at)) {
+          candidates.splice(existing, 1);
+          rejected += 1;
+          if (previous.expiresAt !== null && at >= previous.expiresAt) expired += 1;
+          return null;
+        }
+        const merged = Object.freeze({
+          ...candidate,
+          id: previous.id,
+          eventId: previous.eventId,
+          from: previous.from,
+          to: previous.to,
+          occurredAt: Math.min(previous.occurredAt, candidate.occurredAt),
+          // 仅诊断：可以记录更晚的分析完成时间，但它不改变上面的有效期。
+          understoodAt: candidate.understoodAt === null
+            ? previous.understoodAt
+            : candidate.understoodAt,
+          expiresAt: Math.min(
+            timestamp(previous.expiresAt) ?? (previous.occurredAt + config.maxAgeMs),
+            candidate.expiresAt,
+          ),
+        });
+        candidates[existing] = merged;
+        return merged;
+      }
       candidates.push(candidate);
       proposed += 1;
 
@@ -587,7 +659,9 @@ export function createProactiveArbiter(options = {}) {
         ? candidate.description.trim()
         : '';
       lastTopic = { id, label: summarizeTopic(id, description) };
-      spokenAt.set(identity, at);
+      // 抑制到候选自己的最晚表达时刻，至少覆盖 maxAgeMs；同一事件不能因重复理解再开口。
+      const expiresAt = timestamp(candidate.expiresAt);
+      spokenAt.set(identity, Math.max(at + config.maxAgeMs, expiresAt ?? 0));
       spokenCount += 1;
 
       // 同一事件已经说过：从待选池移除，防止紧接着再次被选中。

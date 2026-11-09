@@ -5,14 +5,18 @@
  * `speakLine`。生成可能持续数秒，期间用户关闭主动回应、评论同一画面取消候选、开始说话或出现
  * 待回复任务时，旧结果仍会播出一次。本套件固定住修复后的三道边界：
  *
- *   1. 纯助手 `revalidateProactiveCandidate`：开关/代次/取消/已说/用户说话/待回复/已 abort/
- *      已卸载任一不满足 → ok:false，全部满足 → ok:true；
+ *   1. 纯助手 `revalidateProactiveCandidate`：开关/代次/待选/过期/证据/用户已评论/助手已回应/
+ *      已说/用户说话/待回复/已 abort/已卸载任一不满足 → ok:false，全部满足 → ok:true；
  *   2. 宿主接线：生成时传 `signal`，`await` 后、`speakLine` 前用原候选重新仲裁；失败只记
- *      `vision.proactive.rejected { reason }`，不重新抽候选；reset / 用户评论 / 组件关闭 /
- *      开关关闭的 5 秒 tick 都会 abort 在途生成；
+ *      `vision.proactive.rejected { reason }`，不重新抽候选；reset / 用户评论 / 助手 turn/start /
+ *      组件关闭 / 开关关闭的 5 秒 tick 都会取消候选并 abort 在途生成；
  *   3. 宿主 double：用可控仲裁器 + `config.proactiveLineGenerator` deferred 真正走
  *      `evaluateProactive` —— 生成期间关闭开关 → speakLine 调用 0；生成期间候选被取消 →
- *      speakLine 调用 0。
+ *      speakLine 调用 0；候选池为空时 5 秒 tick 不 evaluate；助手 turn/start 取消待选候选。
+ *
+ * 记录候选的接线（reaction 过滤、occurredAt/understoodAt、occurrence-anchored expiresAt、
+ * 稳定 eventId）用源码断言固定；生产仲裁器的时间/续期语义由 test/vision-proactive-candidate.mjs
+ * 覆盖。整套测试不启动真实采集、不调用模型、不播放语音。
  *
  * 限制：真实宿主只会在后台理解回调里登记候选（需要真实/桩采集与评论链路）。为了在不起采集、
  * 不调用模型的前提下走到 `evaluateProactive`，本文件的宿主 double 只替换了
@@ -33,7 +37,10 @@ import { setTimeout as realSetTimeout } from 'node:timers';
 
 // Load the real helper under a query URL: the bare module URL must stay unloaded so the injected
 // arbiter below can occupy it for the fresh index.js instance.
-import { revalidateProactiveCandidate } from '../src/host/vision/proactive-candidate.js?pure-helper';
+import {
+  PROACTIVE_DEFAULTS,
+  revalidateProactiveCandidate,
+} from '../src/host/vision/proactive-candidate.js?pure-helper';
 import { disposeAll } from './helpers/cleanup.mjs';
 
 const candidateUrl = new URL('../src/host/vision/proactive-candidate.js', import.meta.url).href;
@@ -179,10 +186,19 @@ async function fixture(t, options = {}) {
   const routes = new Map();
   const tools = new Map();
   const disposers = [];
+  const sessionListeners = [];
   const effect = (fn) => {
     const cleanup = fn();
     if (typeof cleanup === 'function') disposers.push(cleanup);
     return cleanup;
+  };
+  const on = (type, handler) => {
+    if (type !== 'session/event' || typeof handler !== 'function') return () => {};
+    sessionListeners.push(handler);
+    return () => {
+      const index = sessionListeners.indexOf(handler);
+      if (index >= 0) sessionListeners.splice(index, 1);
+    };
   };
   const attachments = {
     async saveImage({ data, mediaType, name }) {
@@ -197,6 +213,7 @@ async function fixture(t, options = {}) {
   };
   apply({
     effect,
+    on,
     get: (service) => (service === 'attachments' ? attachments : service === 'llm' ? llm : undefined),
     tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name); } },
     inject: (_dependencies, register) => register({
@@ -259,12 +276,21 @@ async function fixture(t, options = {}) {
     assert.equal(ok, true, `timed out waiting for ${type}`);
     return found.payload ?? {};
   };
+  const fire = (session, event) => {
+    for (const handler of [...sessionListeners]) {
+      try {
+        handler(session, event);
+      } catch {
+        // Other observers may expect a richer session double; only the proactive hook is asserted.
+      }
+    }
+  };
 
   t.after(async () => {
     await disposeAll(disposers.splice(0));
     await rm(root, { recursive: true, force: true });
   });
-  return { root, action, events, waitEvent };
+  return { root, action, events, waitEvent, fire };
 }
 
 /** A deferred generator shaped like proactive-line: cancellation resolves with `aborted`. */
@@ -324,6 +350,11 @@ test('1. 纯助手：同一条候选必须同时通过开关/代次/待选/说�
     [{ userSpeaking: true }, 'user-speaking'],
     [{ assistantBusy: true }, 'assistant-busy'],
     [{ pendingReply: true }, 'pending-reply'],
+    [{ expired: true }, 'expired'],
+    [{ expiresAt: 1_000, now: 1_000 }, 'expired'],
+    [{ evidenceValid: false }, 'evidence-missing'],
+    [{ userCommented: true }, 'user-commented'],
+    [{ assistantReplied: true }, 'assistant-replied'],
   ];
   for (const [patch, reason] of rejected) {
     const verdict = revalidateProactiveCandidate({ ...base, ...patch });
@@ -371,15 +402,25 @@ test('2. 接线：生成传 signal；await 后只对原候选重新仲裁；关�
   assert.match(between, /userSpeaking: speechEvidence !== null/u);
   assert.match(between, /assistantBusy: ttsIsSpeaking\(\) === true \|\| playback !== null/u);
   assert.match(between, /pendingReply: proactivePendingReply\(\)/u);
+  // Post-generation gate also rechecks the three time/context facts that can change while the
+  // model is writing: expiry, evidence still in the current windows, and whether the event has
+  // already been answered by the user or the assistant.
+  assert.match(between, /expiresAt: candidate\.expiresAt/u);
+  assert.match(between, /now: Date\.now\(\)/u);
+  assert.match(between, /evidenceValid: proactiveEvidenceStillPresent\(candidate\)/u);
+  assert.match(between, /userCommented: candidate\.occurredAt < lastUserCommentAt/u);
+  assert.match(between, /assistantReplied: candidate\.occurredAt < lastAssistantReplyAt/u);
   assert.match(between, /if \(gate\.ok !== true\)/u, 'any failed check must skip speakLine');
   assert.match(source, /log\.emit\('vision\.proactive\.rejected', \{ reason: gate\.reason \}\)/u,
     'the rejection event contains only the machine reason');
 
-  // Abort points: reset/dispose, user comment, component close, disabled 5 s tick.
+  // Abort points: reset/dispose, user comment, component close, disabled 5 s tick, assistant turn.
   assert.match(source, /const resetProactive = \(reason\) => \{\s*proactiveGeneration \+= 1;\s*abortProactive\(\);/u,
     'reset must abort the in-flight generation');
-  assert.match(source, /abortProactive\(\);\s*proactive\.cancelAll\('user-comment'\)/u,
-    'user-comment cancellation must abort the in-flight generation');
+  assert.match(source, /lastUserCommentAt = at;\s*abortProactive\(\);\s*proactive\.cancelAll\('user-comment'\)/u,
+    'user-comment cancellation must be remembered and abort the in-flight generation');
+  assert.match(source, /lastAssistantReplyAt = Date\.now\(\);\s*abortProactive\(\);\s*proactive\.cancelAll\('assistant-reply'\)/u,
+    'an assistant turn/start must cancel pending candidates and abort the in-flight generation');
   assert.match(source, /const onFeatureDisable = async \(\{ id, reason \}\) => \{[\s\S]{0,300}?abortProactive\(\);/u,
     'any component close must abort the in-flight generation');
   assert.match(source, /if \(!proactiveEnabled\(\)\) \{\s*abortProactive\(\);\s*proactive\.cancelAll\('disabled'\);/u,
@@ -443,10 +484,10 @@ test('4. 宿主 double：生成期间候选被取消 → speakLine 0 次', async
 });
 
 // ---------------------------------------------------------------------------------------------
-// 5. Source wiring: understanding callbacks register an explicit registration-anchored expiry
+// 5. Source wiring: reaction-only candidates, occurrence-anchored expiry, stable event identity
 // ---------------------------------------------------------------------------------------------
 
-test('5. 理解回调登记候选时显式带 expiresAt：有效期从登记时刻起算，旧 to 不会一登记就过期', async () => {
+test('5. 理解回调：只为 reaction 非空的事件登记；expiresAt 锚定 occurredAt，身份不含每次变化的 to', async () => {
   const source = await readFile(new URL('../src/host/index.js', import.meta.url), 'utf8');
 
   // PROACTIVE_DEFAULTS must be imported so the fallback expiry cannot silently become NaN.
@@ -455,6 +496,8 @@ test('5. 理解回调登记候选时显式带 expiresAt：有效期从登记时�
     /import \{\s*PROACTIVE_DEFAULTS,\s*createProactiveArbiter,\s*revalidateProactiveCandidate,\s*\} from '\.\/vision\/proactive-candidate\.js';/u,
     'index.js must import PROACTIVE_DEFAULTS',
   );
+  assert.equal(PROACTIVE_DEFAULTS.importantMaxAgeMs, 60_000,
+    'important events default to a 60 s late-comment window');
 
   const start = source.indexOf('const proposeProactive = (update) => {');
   assert.ok(start >= 0, 'proposeProactive must exist');
@@ -462,25 +505,103 @@ test('5. 理解回调登记候选时显式带 expiresAt：有效期从登记时�
   assert.ok(end > start, 'proposeProactive block must be bounded');
   const block = source.slice(start, end);
 
-  // Registration-anchored expiry: Date.now() at propose time + the configured/default window.
-  assert.match(block, /const expiresInMs = proactiveMaxAgeMs\(\);/u,
-    'the expiry window is resolved once per understanding callback');
-  assert.match(block, /expiresAt: Date\.now\(\) \+ expiresInMs/u,
-    'every candidate must carry an explicit expiresAt anchored to registration time');
-  assert.match(source, /config\?\.proactive\?\.maxAgeMs \?\? PROACTIVE_DEFAULTS\.maxAgeMs/u,
-    'config.proactive.maxAgeMs overrides the default window');
+  // C1: an instant event without `reaction` never becomes a candidate.
+  assert.match(block, /const reaction = typeof event\.reaction === 'string' \? event\.reaction\.trim\(\) : '';/u,
+    'reaction is read as the "worth saying" signal');
+  assert.match(block, /if \(reaction\.length === 0\) continue;/u,
+    'events without reaction must not produce a candidate');
+
+  // C2: occurredAt is content time (to, falling back to a legal from); understoodAt is analysis time.
+  assert.match(block, /let occurredAt = Number\.isFinite\(rawTo\) && rawTo >= 0 \? rawTo : null;/u);
+  assert.match(block, /if \(occurredAt === null && Number\.isFinite\(rawFrom\) && rawFrom >= 0\) occurredAt = rawFrom;/u,
+    'occurredAt falls back to from only when to is illegal');
+  assert.match(block, /const understoodAt = Date\.now\(\);/u);
+  assert.match(block, /occurredAt,\s*$/mu, 'occurredAt is passed through to the arbiter');
+  assert.match(block, /understoodAt,\s*$/mu, 'understoodAt is passed for diagnostics only');
+
+  // C2/C3: expiry is occurredAt + the important window, never now/understoodAt + window.
+  assert.match(block, /const importantMaxAgeMs = proactiveImportantMaxAgeMs\(\);/u);
+  assert.match(block, /expiresAt: occurredAt \+ importantMaxAgeMs/u,
+    'expiry must be anchored to the event content time');
+  assert.equal(/expiresAt:\s*Date\.now\(\)/.test(block), false,
+    'registration/analysis time must never anchor expiry');
+  assert.match(source, /config\?\.proactive\?\.importantMaxAgeMs \?\? PROACTIVE_IMPORTANT_MAX_AGE_DEFAULT_MS/u,
+    'config.proactive.importantMaxAgeMs overrides the default late window');
+  assert.match(source, /PROACTIVE_DEFAULTS\.importantMaxAgeMs \?\? 60_000/u,
+    'the default falls back to 60 s');
   assert.match(source, /Number\.isFinite\(configured\) && configured >= 0/u,
     'malformed config values must fall back instead of producing a NaN expiry');
 
-  // Event content timestamps are untouched; only the expiry anchor changes.
-  assert.match(block, /from: Number\.isFinite\(from\) && from >= 0 \? from : to,/u,
-    'from/to keep their original content time');
-  assert.match(block, /^\s*to,\s*$/mu, 'raw `to` is still passed through');
+  // Stable identity: description + sorted evidence ids, never the per-analysis `to`/index.
+  assert.match(block, /eventId: proactiveEventId\(description, frames, audio\)/u);
+  assert.equal(/eventId:\s*`understand:\$\{to\}/.test(block), false,
+    'event identity must not contain the per-analysis `to`');
+  const eventIdAt = source.indexOf('const proactiveEventId =');
+  assert.ok(eventIdAt >= 0, 'stable event-id helper must exist');
+  const eventIdBlock = source.slice(eventIdAt, eventIdAt + 700);
+  assert.match(eventIdBlock, /\.sort\(\)\.join\('\\u0000'\)/u,
+    'evidence ids are sorted so ordering does not change identity');
 
   // Diagnostic event is read-only: count + window only, never candidate text.
   const diagnosticAt = block.indexOf('vision.proactive.proposed');
   assert.ok(diagnosticAt >= 0, 'the diagnostic event should be emitted after registration');
-  assert.match(block, /log\.emit\('vision\.proactive\.proposed', \{ count: added, expiresInMs \}\)/u);
+  assert.match(
+    block,
+    /log\.emit\('vision\.proactive\.proposed', \{\s*count: added,\s*expiresInMs: importantMaxAgeMs,\s*\}\)/u,
+  );
   assert.equal(/vision\.proactive\.proposed[\s\S]{0,160}description/u.test(block), false,
     'the diagnostic event must not include candidate text');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 6. Host double: an empty candidate pool makes the 5 s tick a no-op (no new proposal)
+// ---------------------------------------------------------------------------------------------
+
+test('6. 无候选时 5 秒 tick 不 evaluate、不生成、不说话', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  resetArbiter();
+  arbiter.pendingIds = [];
+  let generated = 0;
+  const app = await fixture(t, {
+    proactiveLineGenerator: async () => {
+      generated += 1;
+      return { ok: true, text: '不应出现的一句', reason: 'ok' };
+    },
+  });
+
+  t.mock.timers.tick(5_000);
+  t.mock.timers.tick(5_000);
+  await sleep(30);
+  assert.equal(arbiter.evaluateCalls, 0, 'no candidate means the tick never evaluates');
+  assert.equal(generated, 0, 'no candidate means no model call');
+  const rows = await app.events();
+  assert.equal(rows.some((row) => row.type === 'vision.proactive.spoken'), false);
+  assert.equal(rows.some((row) => row.type === 'vision.proactive.proposed'), false,
+    'the periodic tick must never propose a candidate');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. Host double: an assistant turn/start cancels pending candidates and aborts generation
+// ---------------------------------------------------------------------------------------------
+
+test('7. 助手回复开始（turn/start）→ 待选候选取消、在途生成中止、speakLine 0 次', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  resetArbiter();
+  const { state, generate } = deferredGenerator();
+  const app = await fixture(t, { proactiveLineGenerator: generate });
+
+  t.mock.timers.tick(5_000);
+  assert.equal(await waitFor(() => state.calls.length === 1), true, 'one generation starts first');
+
+  app.fire(
+    { id: 's-1', agent: { session: { id: 's-1' } } },
+    { type: 'turn/start', data: { turn: 1 } },
+  );
+
+  assert.equal(arbiter.cancelAllReason, 'assistant-reply', 'turn/start cancels the pending pool');
+  assert.equal(state.signal.aborted, true, 'the in-flight generation is aborted');
+  const rejected = await app.waitEvent('vision.proactive.rejected');
+  assert.equal(rejected.reason, 'candidate-missing', 'the stale candidate is never spoken');
+  assert.deepEqual(arbiter.spoken, [], 'nothing is accounted as spoken');
+  assert.equal((await app.events()).some((row) => row.type === 'vision.proactive.spoken'), false);
 });
