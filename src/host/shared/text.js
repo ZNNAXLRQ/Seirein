@@ -170,26 +170,80 @@ export function requestsFullRead(utterance) {
 }
 
 /**
- * Read-aloud cleanup for a model-produced spoken version. Every rule only removes presentation
- * (Markdown emphasis/backticks) or punctuation that is not spoken (paired quotation/book-title
- * wrappers keep their content, a prose em dash becomes a comma pause, emoji and decorative
- * symbols and redundant whitespace disappear). Content is never deleted: negation, causality,
- * numbers, units, names, supplementary conditions and persona particles all survive. A dash
- * inside a numeric/alphanumeric range (10—20) is a range sign, not a pause, so it stays.
+ * Substantive tokens the cleanup must never lose or rewrite: CJK (and other letter) characters,
+ * Latin/digit identifiers (underscores included), signed numbers with units, `--flags`, paths and
+ * versions. Presentation punctuation (Markdown markers, quotes, em dashes, commas) is absent, so
+ * removing it is allowed; removing or changing any token below is not.
+ *
+ * Single CJK characters are tokens on purpose: `**重点**是` -> `重点是` keeps the same two
+ * characters and must pass, while `__debug__` -> `debug` loses underscores and must fail.
+ */
+const SUBSTANTIVE_TOKEN = /[+\-−]?\d+(?:[.,]\d+)*(?:[%‰℃℉°]|[A-Za-z]+)?|[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[./\\]?[+\-]{0,2}(?=[\p{Script=Latin}\p{N}_]*[\p{Script=Latin}\p{N}])[\p{Script=Latin}\p{N}_]+(?:[./\\:+\-][\p{Script=Latin}\p{N}_]+)*[%‰℃℉°]?|[%‰℃℉°㎡¥$€£]|\p{L}/gu;
+
+/** Ordered substantive tokens of a text; the cleanup passes only when they are unchanged. */
+function substantiveTokens(value) {
+  return String(value ?? '').match(SUBSTANTIVE_TOKEN) ?? [];
+}
+
+/** Same token count, same tokens, same order. */
+function sameSubstantiveTokens(before, after) {
+  if (before.length !== after.length) return false;
+  return before.every((token, index) => token === after[index]);
+}
+
+/**
+ * Read-aloud cleanup for a model-produced spoken version.
+ *
+ * Protection comes first: fenced code and inline code are replaced by placeholders and every
+ * character inside them (spaces, `--`, underscores, paths, versions) is restored verbatim after
+ * display cleanup. Underscore identifiers (`__debug__`, `_x`, `foo_bar`, `snake_case`) are not
+ * touched: `__...__` is never treated as emphasis, and a bounded `_..._` pair is cleaned only
+ * when the safety gate proves no identifier changed. Only explicit asterisk emphasis
+ * (`**text**`, `*text*`) has its markers removed and its content kept.
+ *
+ * Afterwards the substantive tokens of the pre-clean text and of the cleaned text are compared.
+ * If any content token was lost or changed (identifier collapsed, code span swallowed, CJK or a
+ * number/unit dropped), the cleanup is refused with `unsafe-cleanup` instead of returning a
+ * damaged string.
+ *
  * @param {string} value
- * @returns {string}
+ * @returns {{ok: boolean, text: string, reason: string}}
  */
 function cleanSpokenText(value) {
-  let text = String(value ?? '');
-  // Fenced code lines and inline-code backticks: keep the code text itself, drop the markers.
-  text = text.replace(/```[^\n]*\n?/gu, '');
-  text = text.replace(/`([^`\n]+)`/gu, '$1').replace(/`/gu, '');
-  // Markdown emphasis pairs. `_` is only treated as emphasis in a pair, so `foo_bar` survives.
-  text = text.replace(/\*\*([^*\n]+)\*\*/gu, '$1');
-  text = text.replace(/__([^_\n]+)__/gu, '$1');
-  text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/gu, '$1$2');
-  text = text.replace(/(^|[^_\w])_([^_\n]+)_(?=[^_\w]|$)/gu, '$1$2');
-  // Paired quotation / book-title wrappers: the marks are not spoken, their content is kept.
+  const original = String(value ?? '');
+  const code = [];
+  // A run of NULs that does not occur in the input: a document cannot forge a placeholder.
+  let mark = '\u0000';
+  while (original.includes(mark)) mark += '\u0000';
+  const placeholderPattern = () => new RegExp(`${mark}C(\\d+)${mark}`, 'gu');
+  const placeholder = (content) => {
+    code.push(content);
+    return `${mark}C${code.length - 1}${mark}`;
+  };
+  const restore = (text) => text.replace(placeholderPattern(), (_whole, index) => code[Number(index)] ?? '');
+  let text = original;
+
+  // 1. Fenced code first: drop only the fence lines (and the info word), keep the code body.
+  text = text.replace(/```[^\n]*\n([\s\S]*?)```/gu, (_whole, body) => placeholder(body));
+  // 2. Then inline code, including a one-line triple-backtick span.
+  text = text.replace(/```([^\n`]*?)```/gu, (_whole, body) => placeholder(body));
+  text = text.replace(/`([^`\n]+)`/gu, (_whole, body) => placeholder(body));
+  // 3. Any remaining backtick is presentation only; its neighbours stay.
+  text = text.replace(/`+/gu, '');
+
+  // The baseline includes every code body, so a cleanup step that swallows a placeholder is
+  // caught below even when the body itself has no letters/digits.
+  const baseline = substantiveTokens(restore(text));
+
+  // 4. Explicit paired Markdown emphasis. `__...__` is never treated as emphasis because it is
+  // also the shape of identifiers such as `__debug__`; underscores are content, so the pair is
+  // kept. A single `_..._` wrapper is cleaned only when clearly bounded; the safety gate below
+  // refuses it when the content is an identifier (for example `_debug_`, which would become a
+  // different word).
+  text = text.replace(/\*\*([^\s*](?:[^*\n]*[^\s*])?)\*\*/gu, '$1');
+  text = text.replace(/(^|[^*\w])\*([^\s*](?:[^*\n]*[^\s*])?)\*(?=[^*\w]|$)/gu, '$1$2');
+  text = text.replace(/(^|[^_\w])_([^\s_](?:[^_\n]*[^\s_])?)_(?=[^_\w]|$)/gu, '$1$2');
+  // 5. Paired quotation / book-title wrappers: the marks are not spoken, their content is kept.
   text = text.replace(/“([^“”]*)”/gu, '$1');
   text = text.replace(/‘([^‘’]*)’/gu, '$1');
   text = text.replace(/「([^「」]*)」/gu, '$1');
@@ -199,14 +253,14 @@ function cleanSpokenText(value) {
   text = text.replace(/"([^"\n]*)"/gu, '$1');
   // A lone wrapper at either end is the same shape; strip it rather than speaking it.
   text = text.replace(/^["「『“'"‘《〈]+/u, '').replace(/["」』”'"’》〉]+$/u, '');
-  // A prose em dash is a pause, not a word; a dash joining digits or Latin letters is a range
+  // 6. A prose em dash is a pause, not a word; a dash joining digits or Latin letters is a range
   // (10—20, v1—v2) and must survive. En dashes / minus signs were never rewritten here.
   text = text.replace(/—+/gu, (run, offset, whole) => {
     const before = whole[offset - 1] ?? '';
     const after = whole[offset + run.length] ?? '';
     return /[0-9A-Za-z]/u.test(before) && /[0-9A-Za-z]/u.test(after) ? run : '，';
   });
-  // Emoji, variation selectors and joiners are never spoken.
+  // 7. Emoji, variation selectors and joiners are never spoken.
   text = text.replace(
     /[\p{Extended_Pictographic}\uFE0F\u200D\u20E3\u{1F1E6}-\u{1F3FF}]/gu,
     '',
@@ -214,17 +268,30 @@ function cleanSpokenText(value) {
   // A few purely decorative dingbats are presentation. Do NOT strip the whole Unicode `So`
   // category: it also contains spoken units (°, ℃, ㎡) and would silently delete real content.
   text = text.replace(/[★☆✦✧✩✪✫✬✭✮✯✰♪♫♬]/gu, '');
-  // Only presentation whitespace is removed; words, numbers and sentence punctuation stay.
+  // 8. Only presentation whitespace is removed; words, numbers and sentence punctuation stay.
   text = text.replace(/\s*\n+\s*/gu, ' ').replace(/[ \t]+/gu, ' ').trim();
-  return text;
+
+  // 9. Safety gate: every code placeholder must still be present, in order, and the restored
+  // text must carry exactly the same substantive tokens as the baseline.
+  const present = [...text.matchAll(placeholderPattern())].map((match) => Number(match[1]));
+  const placeholdersIntact = present.length === code.length
+    && present.every((index, position) => index === position);
+  const cleaned = restore(text);
+  if (!placeholdersIntact || !sameSubstantiveTokens(baseline, substantiveTokens(cleaned))) {
+    // Never hand back a damaged cleanup: the caller falls back to the original full text.
+    return { ok: false, text: original, reason: 'unsafe-cleanup' };
+  }
+  return { ok: true, text: cleaned, reason: '' };
 }
 
 /**
  * Validate a model-produced spoken version. The candidate is first cleaned for reading (see
  * `cleanSpokenText`); similarity is never used to delete anything. Only the shape is checked
  * (non-empty, not longer than the source, no model preamble/quoting), and every failure is
- * reported with a reason so the caller can fall back to the full body. Length equality is
- * allowed and is a deliberate, conservative choice: an equal-length rewrite is accepted when it
+ * reported with a reason so the caller can fall back to the full body. Cleanup that cannot be
+ * proven content-preserving is refused as `unsafe-cleanup` with the un-cleaned candidate text:
+ * a damaged version is never adopted, even when its length would be acceptable. Length equality
+ * is allowed and is a deliberate, conservative choice: an equal-length rewrite is accepted when it
  * is content-faithful and actually sounds spoken, because rejecting it merely for not getting
  * shorter would fall back to prose that is MORE written. "Equal" is not a way around the length
  * ceiling: a longer candidate is still refused.
@@ -234,7 +301,16 @@ export function normalizeSpokenVersion(source, candidate) {
   const original = String(source ?? '').trim();
   let text = String(candidate ?? '').trim();
   text = text.replace(/^(?:口语版|口播版|语音版|spoken\s*version|speech)\s*[:：]\s*/iu, '');
-  text = cleanSpokenText(text);
+  const cleaned = cleanSpokenText(text);
+  if (cleaned.ok !== true) {
+    return {
+      ok: false,
+      text,
+      chars: speechCharCount(text),
+      reason: cleaned.reason || 'unsafe-cleanup',
+    };
+  }
+  text = cleaned.text;
   const chars = speechCharCount(text);
   const sourceChars = speechCharCount(original);
   if (chars === 0) return { ok: false, text: '', chars: 0, reason: 'empty' };

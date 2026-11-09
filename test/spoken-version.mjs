@@ -963,3 +963,36 @@ test('23. 清理后仍不得长于正文；空串/过短/前言仍按原 reason 
   t.diagnostic(`equal=${equal.chars} longer=${longer.reason} preamble=${preamble.reason} empty/too-short=refused`);
 });
 
+// ---------------------------------------------------------------------------
+// 24. P2 regression: protect code/identifiers BEFORE removing presentation
+// ---------------------------------------------------------------------------
+test('24. 清理先保护实质内容：围栏命令与 __debug__ 不被删，无法安全清理时拒绝采用', (t) => {
+  const source = '拿一段足够长的正文，用来做清理安全回归的长度基准。'.repeat(2);
+  const BT = '`';
+
+  // Probe 1: the fenced command and the condition that follows it must both survive.
+  const command = normalizeSpokenVersion(
+    source,
+    `执行前先备份，${BT.repeat(3)}cleanup --dry-run${BT.repeat(3)}只能在测试目录运行。`,
+  );
+  assert.equal(command.ok, true, `the command candidate is safe: ${command.reason}`);
+  assert.ok(command.text.includes('cleanup --dry-run'), 'the fenced command is kept');
+  assert.ok(command.text.includes('只能在测试目录运行'), 'the restriction after the code is kept');
+
+  // Probe 2: the two identifiers must not collapse into the same word.
+  const identifiers = normalizeSpokenVersion(source, '设置 __debug__，不要设置 debug。');
+  assert.equal(identifiers.ok, true, `the identifier candidate is safe: ${identifiers.reason}`);
+  assert.ok(identifiers.text.includes('__debug__'), 'the underscored identifier keeps its underscores');
+  assert.ok(identifiers.text.includes('debug'), 'the plain identifier is still there');
+  assert.notEqual(identifiers.text, '设置 debug，不要设置 debug。', 'the identifiers never collapse');
+
+  // A cleanup that would change an identifier is refused, never adopted as ok:true.
+  const unsafe = normalizeSpokenVersion(source, '设置 _debug_，不要设置 debug。');
+  assert.equal(unsafe.ok, false);
+  assert.equal(unsafe.reason, 'unsafe-cleanup');
+  assert.ok(unsafe.text.includes('_debug_'), 'the unsafe result keeps the un-cleaned text');
+  t.diagnostic(
+    `command="${command.text}" identifiers="${identifiers.text}" unsafe=${unsafe.reason}`,
+  );
+});
+
