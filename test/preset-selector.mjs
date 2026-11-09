@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PRESETS, OPERATIONS, RECIPES, STYLES } from '../src/host/avatar/presets/index.js';
+import { PRESETS, OPERATIONS, RECIPES, STYLES, VARIANTS } from '../src/host/avatar/presets/index.js';
 import { createPresetIndex, createPresetSelector, PRESET_SELECTOR_CONSTANTS } from '../src/host/avatar/preset-selector.js';
 
 /** Every semantic channel the library knows, as if a model had verified all of them. */
@@ -465,3 +465,63 @@ test('construction rejects a malformed catalog and clamps user overrides', () =>
   assert.ok(selector.select(idle({ seed: 3 })).kind === 'preset');
   assert.equal(selector.stats().presets, PRESETS.length);
 });
+
+// ---------------------------------------------------------------------------------------------
+// 16. idle-sway — neutral slow headX sway, selectable in idle / waiting / tired
+// ---------------------------------------------------------------------------------------------
+test('idle-sway is catalogued, unique, and selectable on the headX idle channel', () => {
+  const recipe = RECIPES.find(entry => entry.id === 'idle-sway');
+  assert.ok(recipe !== undefined, 'idle-sway recipe exists');
+  assert.equal(recipe.label, '左右轻摇');
+  assert.equal(recipe.family, 'posture');
+  assert.deepEqual([...recipe.states].sort(), ['idle', 'tired', 'waiting']);
+  assert.deepEqual([...recipe.events], ['idle']);
+  assert.equal(recipe.semantic, 'neutral');
+  assert.deepEqual([...recipe.operations], ['head-sway']);
+  assert.deepEqual([...recipe.requires], ['headX']);
+  for (const style of ['gentle', 'dreamy', 'composed']) {
+    assert.ok(recipe.styles.includes(style), `idle-sway style ${style}`);
+  }
+  assert.deepEqual([...OPERATIONS['head-sway']], ['headX']);
+
+  // It shares the headX oscillator with shake but is a distinct operation, and it never uses the
+  // roll channel that idle-tilt owns.
+  const tilt = RECIPES.find(entry => entry.id === 'idle-tilt');
+  assert.notEqual(recipe.id, tilt.id);
+  assert.deepEqual([...tilt.requires], ['headZ']);
+  assert.notDeepEqual([...recipe.requires], [...tilt.requires]);
+
+  const presetIds = PRESETS.map(preset => preset.id);
+  assert.equal(new Set(presetIds).size, presetIds.length, 'preset ids are unique');
+  const recipeIds = RECIPES.map(entry => entry.id);
+  assert.equal(new Set(recipeIds).size, recipeIds.length, 'recipe ids are unique');
+  const swayPresets = PRESETS.filter(preset => preset.recipeId === 'idle-sway');
+  assert.equal(swayPresets.length, VARIANTS.length);
+  assert.ok(swayPresets.every(preset => preset.states.includes('idle')
+    && preset.operations.includes('head-sway') && preset.requires.includes('headX')));
+
+  const selector = createPresetSelector();
+  for (const state of ['idle', 'waiting', 'tired']) {
+    const candidates = selector.query({ state, event: 'idle', verifiedChannels: FULL_CHANNELS });
+    assert.ok(candidates.some(preset => preset.recipeId === 'idle-sway'),
+      `${state} candidates include idle-sway`);
+  }
+
+  // The autonomous idle pool can really draw it, without recipe narrowing or a priority override.
+  let natural = null;
+  for (let seed = 0; seed < 5000 && natural === null; seed += 1) {
+    const result = selector.select(idle({ seed }));
+    if (result.kind === 'preset' && result.recipe === 'idle-sway') natural = result;
+  }
+  assert.ok(natural !== null, 'idle-sway can be drawn from the idle pool');
+  assert.ok(natural.operations.includes('head-sway'));
+
+  // A waiting draw narrows to the recipe and still executes through the selector's contract.
+  const narrowed = selector.select({
+    state: 'waiting', event: 'idle', verifiedChannels: FULL_CHANNELS, recipe: 'idle-sway', seed: 11,
+  });
+  assert.equal(narrowed.kind, 'preset');
+  assert.equal(narrowed.recipe, 'idle-sway');
+  assert.deepEqual([...narrowed.requires], ['headX']);
+});
+

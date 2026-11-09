@@ -565,6 +565,9 @@ const PRESET_OPERATION_PROFILE = Object.freeze({
   nod: Object.freeze({ kind: 'nod', amount: -0.30, sign: -1, active: 'NOD_ACTIVE_MS' }),
   'double-nod': Object.freeze({ kind: 'double-nod', amount: -0.30, sign: -1, active: 'DOUBLE_NOD_ACTIVE_MS' }),
   shake: Object.freeze({ kind: 'shake', amount: 0.32, sign: 0, active: 'SHAKE_ACTIVE_MS' }),
+  // Same signed headX oscillator as `shake`, but smaller and much slower. A distinct operation
+  // keeps the negation gesture's semantics, amplitude and duration untouched.
+  'head-sway': Object.freeze({ kind: 'shake', amount: 0.22, sign: 0, active: 'SWAY_ACTIVE_MS' }),
   'gaze-side': Object.freeze({ kind: 'move', amount: 0.34, sign: 0, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
   'gaze-up': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
   'gaze-down': Object.freeze({ kind: 'move', amount: -0.30, sign: -1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),

@@ -303,7 +303,7 @@ test('C1. tired gains neutral posture/attention recipes; native-only recipes sta
   const families = familiesOf(candidates);
 
   const previousBatch = ['idle-center', 'idle-blink', 'tired-lower', 'tired-blink'];
-  const added = ['idle-side', 'idle-tilt', 'idle-down', 'idle-eye-side', 'idle-eye-down'];
+  const added = ['idle-side', 'idle-tilt', 'idle-down', 'idle-eye-side', 'idle-eye-down', 'idle-sway'];
 
   for (const recipe of previousBatch) assert.ok(recipes.includes(recipe), `kept ${recipe}`);
   for (const recipe of added) assert.ok(recipes.includes(recipe), `new tired recipe ${recipe}`);
@@ -416,6 +416,69 @@ test('E1. base blink and a preset blink are reported as a dual drive, not as div
   assert.equal(layers.preset.active, true);
   assert.equal(layers.dualDrive, true);
   console.log(`[E1] blinkLayers=${JSON.stringify(layers)}`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// F. idle-sway execution on the headX channel
+// ---------------------------------------------------------------------------------------------
+
+test('F1. idle-sway really oscillates headX left and right, slowly and within bounds', () => {
+  const runtime = makeRuntime();
+  const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-sway' });
+  assert.ok(selection !== null, 'idle-sway must be selectable');
+  assert.deepEqual(selection.operations, ['head-sway']);
+
+  const started = runtime.startPreset(selection, { at: 0, context: { state: 'idle', event: 'idle' } });
+  assert.equal(started.started, true);
+  assert.deepEqual(started.channels, ['headX'], 'the sway writes the yaw channel only');
+
+  const samples = [];
+  for (let at = 0; at <= 3200; at += 33) samples.push({ at, x: runtime.tick(at).headX });
+  const trace = runtime.snapshot().motion.presets.lastTrace;
+  assert.equal(trace.selection.recipe, 'idle-sway');
+  assert.deepEqual(trace.output.stages.map(stage => stage.op), ['head-sway']);
+  assert.deepEqual(trace.output.stages[0].channels, ['headX']);
+  assert.deepEqual(trace.output.channels, ['headX'], 'no roll (headZ) overlap with idle-tilt');
+  assert.ok(trace.output.stages[0].activeMs >= 1200,
+    `slow active phase ${trace.output.stages[0].activeMs} ms (negation shake is 620 ms)`);
+
+  // Judge the ACTUAL composed output, not the planned amplitude, inside this stage's active phase.
+  const stage = trace.output.stages[0];
+  const active = samples.filter(sample => sample.at >= stage.startMs + 150
+    && sample.at <= stage.startMs + 150 + stage.activeMs);
+  assert.ok(active.length >= 20, `active samples ${active.length}`);
+  const values = active.map(sample => sample.x);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const peak = Math.max(Math.abs(min), Math.abs(max));
+  assert.ok(max > 0.02, `rightward yaw ${max.toFixed(4)}`);
+  assert.ok(min < -0.02, `leftward yaw ${min.toFixed(4)}`);
+  assert.ok(max - min > 0.10, `peak-to-peak ${(max - min).toFixed(4)} is perceptible`);
+  assert.ok(peak < 0.30, `peak ${peak.toFixed(4)} stays below 0.30 pose units (9°)`);
+
+  const signs = values.filter(value => Math.abs(value) > 1e-4).map(value => Math.sign(value));
+  const directionChanges = signs.slice(1).filter((sign, index) => sign !== signs[index]).length;
+  assert.ok(directionChanges >= 1, `the head really changes direction (${directionChanges} change(s))`);
+  assert.ok(signs.includes(1) && signs.includes(-1), 'both directions are present');
+
+  console.log(`[F1] recipe=${selection.recipe} op=head-sway headX min=${min.toFixed(4)} `
+    + `max=${max.toFixed(4)} peakToPeak=${(max - min).toFixed(4)} activeMs=${stage.activeMs} `
+    + `directionChanges=${directionChanges}`);
+});
+
+test('F2. idle-sway shares the recipe-level anti-repeat bucket', () => {
+  const selector = createPresetSelector();
+  const base = variantWeight(selector, idle(), 'idle-sway', 'idle-sway.flow');
+  assert.ok(base > 0, `base weight ${base}`);
+  const repeated = variantWeight(
+    selector,
+    idle({ recent: { recipes: ['idle-sway'] } }),
+    'idle-sway',
+    'idle-sway.flow',
+  );
+  assert.ok(repeated < base * 0.8,
+    `same-recipe repeat ${repeated.toFixed(4)} must fall below ${(base * 0.8).toFixed(4)}`);
+  console.log(`[F2] idle-sway.flow base=${base.toFixed(4)} sameRecipe=${repeated.toFixed(4)}`);
 });
 
 // ---------------------------------------------------------------------------------------------

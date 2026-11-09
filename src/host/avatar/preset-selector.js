@@ -183,7 +183,7 @@ const STYLE_DIMENSION_NAMES = Object.freeze([
   'liveliness', 'softness', 'restraint', 'expressiveness', 'attention', 'composure', 'texture',
 ]);
 /** Dimensions the selector uses directly (the other three still project onto style affinity). */
-const ATTENTION_OPERATIONS = new Set(['head-turn', 'shake']);
+const ATTENTION_OPERATIONS = new Set(['head-turn', 'shake', 'head-sway']);
 const GAZE_SHIFT_OPERATIONS = new Set(['gaze-side', 'gaze-up', 'gaze-down', 'gaze-target']);
 const KNOWN_STYLE_IDS = new Set(STYLES.map(style => style.id));
 /**

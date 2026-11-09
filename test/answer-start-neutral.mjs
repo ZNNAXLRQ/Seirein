@@ -11,7 +11,7 @@
  *   3) verified=[headY] selects answer-nod;
  *   4) verified=[headZ] hard-filters the new headX/headY recipes (no silent downgrade) while the
  *      existing answer-tilt still works;
- *   5) the user's 320 presets / 80 recipes / 12 new entries are read with the right requires/state.
+ *   5) the user's 324 presets / 81 recipes / 12 answer-start entries are read with the right requires/state.
  *
  * Run: node --test test/answer-start-neutral.mjs
  */
@@ -306,9 +306,9 @@ test('4. verified=[headZ]：新的中性配方不可选（能力硬过滤），�
 // ---------------------------------------------------------------------------------------------
 // 5. The user's appended library is read completely and correctly
 // ---------------------------------------------------------------------------------------------
-test('5. 预设总数 320；12 条新 recipe 的 requires / 状态 / 变体全部正确读取', () => {
-  assert.equal(PRESETS.length, 320);
-  assert.equal(RECIPES.length, 80);
+test('5. 预设总数 324；12 条 answer-start 新 recipe 的 requires / 状态 / 变体全部正确读取', () => {
+  assert.equal(PRESETS.length, 324);
+  assert.equal(RECIPES.length, 81);
 
   let newPresets = 0;
   for (const [recipeId, expected] of Object.entries(NEW_RECIPES)) {
@@ -340,12 +340,15 @@ test('5. 预设总数 320；12 条新 recipe 的 requires / 状态 / 变体全�
     newPresets += entries.length;
   }
   assert.equal(newPresets, 12);
-  // The 12 new presets are APPENDED: every pre-existing ordinal/id is untouched.
-  assert.ok(PRESETS.slice(-12).every((preset) => NEW_RECIPE_IDS.includes(preset.recipeId)));
+  // The 12 answer-start presets are the append block immediately before the newest idle-sway
+  // append; every pre-existing ordinal/id is still untouched.
+  assert.ok(PRESETS.slice(-16, -4).every((preset) => NEW_RECIPE_IDS.includes(preset.recipeId)));
+  assert.ok(PRESETS.slice(-4).every((preset) => preset.recipeId === 'idle-sway'),
+    'idle-sway is the newest append');
   assert.deepEqual(getPreset('answer-center-lite.flow').operations, ['head-center-lite']);
 
   // The selector validates the whole catalog at construction (a malformed recipe throws).
   const selector = createPresetSelector();
-  assert.equal(selector.stats().presets, 320);
-  assert.equal(selector.stats().recipes, 80);
+  assert.equal(selector.stats().presets, 324);
+  assert.equal(selector.stats().recipes, 81);
 });

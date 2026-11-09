@@ -8,6 +8,9 @@ export const OPERATIONS = Object.freeze({
   'head-tilt': ['headZ'], 'head-center': ['headX', 'headZ'],
   'head-center-lite': ['headX'],
   'nod': ['headY'], 'double-nod': ['headY'], 'shake': ['headX'],
+  // Same headX oscillator as `shake`, but a distinct operation: a slow, small idle sway with no
+  // negation semantics. `shake` keeps its existing amplitude/duration and stays negation-only.
+  'head-sway': ['headX'],
   'gaze-side': ['gazeX'], 'gaze-down': ['gazeY'], 'gaze-up': ['gazeY'],
   'gaze-target': ['gazeX', 'gazeY'], 'gaze-center': ['gazeX', 'gazeY'],
   'blink': ['eyeOpenL', 'eyeOpenR'], 'double-blink': ['eyeOpenL', 'eyeOpenR'],
@@ -101,6 +104,9 @@ const rows = [
   ['answer-nod', '开口节奏点头（不表示赞同）', 'speech-beat', 'speaking', 'answer-start', 'neutral', 'common,earnest', 'nod'],
   ['answer-turn', '开口时自然转头（不指向对象）', 'posture', 'speaking', 'answer-start', 'neutral', 'warm,lively', 'head-turn'],
   ['answer-center-lite', '开口时水平回归自然姿态', 'settle', 'speaking', 'answer-start', 'neutral', 'composed,rational', 'head-center-lite'],
+  // Neutral headX sway: the left/right channel is deliberately distinct from idle-tilt's headZ,
+  // so the two idle postures cannot collapse into the same axis. Appended to keep display ordinals.
+  ['idle-sway', '左右轻摇', 'posture', 'idle,waiting,tired', 'idle', 'neutral', 'gentle,dreamy,composed', 'head-sway'],
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -154,7 +160,7 @@ export const TURN_ACTION_VARIANTS = Object.freeze([
   variant('turn-quick', '快转', 1.00, 0.84, 0.80, { extent: 0.1, holdBias: -0.7, speedBias: 0.9, textureBias: 0.6 }),
 ]);
 
-/** Neutral delivery variants for blink / brow / settle / breath choreography. */
+/** Neutral delivery variants for blink / brow / settle / breath / sway choreography. */
 export const NEUTRAL_ACTION_VARIANTS = Object.freeze([
   variant('soft', '轻缓', 0.90, 1.10, 1.18, { extent: -0.6, holdBias: 0.8, speedBias: -0.6, textureBias: 0.2 }),
   variant('clear', '清晰', 1.00, 1.00, 1.00, { extent: 0.0, holdBias: 0.0, speedBias: 0.0, textureBias: 0.0 }),

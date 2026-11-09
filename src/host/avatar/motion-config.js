@@ -259,6 +259,7 @@ export const PRESET_OPERATION_CHANNELS = Object.freeze({
   nod: Object.freeze(['headY']),
   'double-nod': Object.freeze(['headY']),
   shake: Object.freeze(['headX']),
+  'head-sway': Object.freeze(['headX']),
   'gaze-side': Object.freeze(['gazeX']),
   'gaze-down': Object.freeze(['gazeY']),
   'gaze-up': Object.freeze(['gazeY']),
@@ -316,6 +317,8 @@ export const PRESET_EXECUTION = Object.freeze({
   NOD_ACTIVE_MS: 430,
   DOUBLE_NOD_ACTIVE_MS: 780,
   SHAKE_ACTIVE_MS: 620,
+  /** A deliberate slow sway: one full left-right cycle, much longer than the negation shake. */
+  SWAY_ACTIVE_MS: 1_500,
   GAZE_ACTIVE_MS: 540,
   BLINK_ACTIVE_MS: 170,
   DOUBLE_BLINK_ACTIVE_MS: 380,

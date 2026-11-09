@@ -79,7 +79,7 @@ test('1. 模型缺 body/breath：5 条 idle 配方标“当前模型未映射”
 
   const result = await listOf(env);
   assert.equal(result.ok, true);
-  assert.equal(result.items.length, 320, '预设库仍是 320 条（不删除任何预设）');
+  assert.equal(result.items.length, 324, '预设库仍是 324 条（不删除任何预设）');
   assert.deepEqual(result.unmappedNative, ['bodyX', 'bodyY', 'bodyZ', 'breath']);
 
   const affected = result.items.filter(item => item.requires.some(channel => NATIVE.has(channel)));
@@ -178,14 +178,14 @@ test('4. 判定不受文案影响：available 数量与库硬过滤参考值一�
   const expected = PRESETS.filter(preset => preset.requires.every(channel => INJECTABLE_CHANNELS.includes(channel)));
   const available = result.items.filter(item => item.available);
   assert.equal(available.length, expected.length);
-  assert.equal(available.length, 300, '320 − 5 条原生配方 × 4 变体');
+  assert.equal(available.length, 304, '324 − 5 条原生配方 × 4 变体');
   assert.ok(result.items.every(item => item.available === (item.reason === '')), 'available 仍等价于无原因');
   assert.ok(result.items.every(item => typeof item.reason === 'string'), 'reason 字段保持不变');
   assert.ok(result.items.every(item => !('unmappedNative' in item)), 'unmappedNative 只在顶层只读诊断');
 
   // The library itself was never rewritten: the id set and requirement lists are untouched.
-  assert.equal(PRESETS.length, 320);
-  assert.equal(new Set(PRESETS.map(preset => preset.id)).size, 320);
+  assert.equal(PRESETS.length, 324);
+  assert.equal(new Set(PRESETS.map(preset => preset.id)).size, 324);
   for (const item of result.items) {
     const preset = PRESETS.find(entry => entry.id === item.presetId);
     assert.deepEqual(item.requires, [...preset.requires], `${item.presetId} requires 未被改写`);
@@ -194,10 +194,10 @@ test('4. 判定不受文案影响：available 数量与库硬过滤参考值一�
   const full = makeEnv(FULL_CHANNELS);
   t.after(full.cleanup);
   const fullList = await listOf(full, { targetVerified: true, directionVerified: true });
-  assert.equal(fullList.items.filter(item => item.available).length, 320);
+  assert.equal(fullList.items.filter(item => item.available).length, 324);
   assert.deepEqual(fullList.unmappedNative, []);
 
-  console.log(`[decision] available=${available.length}/320 expected=${expected.length}`
+  console.log(`[decision] available=${available.length}/324 expected=${expected.length}`
     + ` unavailable=${result.items.length - available.length}`
     + ` fullVerifiedAvailable=${fullList.items.filter(item => item.available).length}`);
 });
