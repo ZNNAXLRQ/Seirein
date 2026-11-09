@@ -301,6 +301,9 @@ import { createPreRequestVision } from './vision/pre-request.js';
 import { createEvidenceWindow } from './vision/evidence-window.js';
 import { createEvidenceCapture } from './vision/evidence-capture.js';
 import { createMediaTimeline } from './hearing/media-timeline.js';
+// P-186/P-187 阶段 2：评论对齐（纯计算）与主请求里的“评论证据块”（纯状态/文本）。
+import { ALIGNMENT_DEFAULTS, alignComment } from './vision/comment-alignment.js';
+import { createCommentEvidence } from './vision/comment-evidence.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -618,6 +621,12 @@ export const name = 'dsh-assistant';
 
 /** Single source of truth for the host version shown in the UI. */
 const PLUGIN_VERSION = '0.99.0';
+
+/**
+ * 视听证据块紧接对话观察（110）：两者都是 runtime context，不进历史；
+ * 环境事实是 102，这里保持 dialogue 之后的稳定位置即可。
+ */
+const AUDIOVISUAL_INJECTION_ORDER = DIALOGUE_INJECTION_ORDER + 1;
 
 /** Only the tool registry is required; everything else stays optional. */
 export const inject = ['tools'];
@@ -2299,26 +2308,50 @@ export function apply(ctx, config) {
     return null;
   };
   /**
-   * The current effective `recent` observation, using exactly the gate the plan applies. A cached
-   * plan therefore stores this fingerprint and can prove it still describes the live buffer; an
-   * empty value (expired/cleared/different lane) is a real observation, not "unknown".
+   * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁与 runtime context 完全一致：
+   * workspace + 陪伴 agent + voice lane + 视觉组件开启。
+   *
+   * `commentEvidence` 在本函数之后才初始化（挂载时的证据窗口之后）：这里只能在函数体内引用，
+   * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
    */
-  const currentRecentObservation = (context, lane) => {
+  const commentEvidenceForContext = (context) => {
     try {
       if (!inWorkspaceScope(context)) return '';
+      if (!isCompanionAgent(context?.agent)) return '';
+      if (contextLaneOf(context) !== 'voice') return '';
+      if (features.enabled('vision') !== true) return '';
+      const agent = context?.agent;
+      const id = typeof agent?.id === 'string' && agent.id.length > 0
+        ? agent.id
+        : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
+      return id.length > 0 ? commentEvidence.render(id) : '';
+    } catch {
+      return '';
+    }
+  };
+  /**
+   * 当前动态观察：recent 对话 + 本轮视听证据，使用与实际 plan 完全相同的门禁。
+   * 缓存 plan 保存这两个指纹；任一变化都必须重算整份 plan。空值也是真实观察，不是“未知”。
+   */
+  const currentObservations = (context, lane) => {
+    try {
+      if (!inWorkspaceScope(context)) return { recent: '', audiovisual: '' };
       let companion = false;
       try {
         companion = isCompanionAgent(context?.agent);
       } catch {
         companion = false;
       }
-      if (!companion || lane !== 'voice' || !features.enabled('hearing')) return '';
-      return dialogueSummary.render();
+      if (!companion || lane !== 'voice') return { recent: '', audiovisual: '' };
+      return {
+        recent: features.enabled('hearing') ? dialogueSummary.render() : '',
+        audiovisual: commentEvidenceForContext(context),
+      };
     } catch {
-      return '';
+      return { recent: '', audiovisual: '' };
     }
   };
-  const planContextLayers = (context, laneOverride = null, observedRecent = undefined) => {
+  const planContextLayers = (context, laneOverride = null, observed = undefined) => {
     const lane = laneOverride ?? contextLaneOf(context);
     const inScope = inWorkspaceScope(context);
     let companion = false;
@@ -2351,15 +2384,21 @@ export function apply(ctx, config) {
       ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n')
       : '';
     const fixedText = inScope ? renderResources() : '';
-    // The dialogue observation and the nonverbal cue are companion-only (the same gate the prompt
-    // providers use); a typed session carries the shared environment facts only. The raw recent
-    // text is recorded on the plan so a request-side read can detect that the buffer moved.
-    const recentText = typeof observedRecent === 'string'
-      ? observedRecent
-      : currentRecentObservation(context, lane);
+    // The dialogue / audiovisual observations and the nonverbal cue are companion-only (the same
+    // gate the prompt providers use); a typed session carries the shared environment facts only.
+    // Both raw observations are recorded on the plan so a request-side read can detect a move.
+    const observations = observed !== null && typeof observed === 'object'
+      ? {
+        recent: typeof observed.recent === 'string' ? observed.recent : '',
+        audiovisual: typeof observed.audiovisual === 'string' ? observed.audiovisual : '',
+      }
+      : currentObservations(context, lane);
+    const recentText = observations.recent;
+    const audiovisualText = observations.audiovisual;
     const ephemeralBlocks = [];
     if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
+    if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'audiovisual', text: audiovisualText, separator: '\n', keep: 'head' });
     const plan = assembleLayerPlan({
       lane,
       budget: resolveContextBudget(
@@ -2375,7 +2414,7 @@ export function apply(ctx, config) {
       },
     });
     // Dynamic-layer provenance, not allocation data: only readContextPlan/measure use it.
-    plan.observation = { recent: recentText };
+    plan.observation = { recent: recentText, audiovisual: audiovisualText };
     return plan;
   };
   /** Start a new assembly: the persona section is the first one the prompt service renders. */
@@ -2398,19 +2437,20 @@ export function apply(ctx, config) {
    * observation section directly therefore gets a fresh plan on every render instead of a stale
    * one from the previous turn.
    *
-   * The cache is only valid while the live observation it was allocated around is unchanged. Once
-   * `dialogueSummary.render()` differs (an utterance appended between assembly and request, or the
-   * buffer expired/cleared), the WHOLE plan is recomputed from the current layers — not just the
-   * recent block patched — so every layer stays within the same lane allocation. The new plan
-   * replaces the cache for the rest of this turn.
+   * The cache is only valid while the live observations it was allocated around are unchanged.
+   * Once `dialogueSummary.render()` or the audiovisual evidence differs (an utterance appended,
+   * the comment record attached/expired, the buffer cleared), the WHOLE plan is recomputed from
+   * the current layers — not just one block patched — so every layer stays within the same lane
+   * allocation. The new plan replaces the cache for the rest of this turn.
    */
   const readContextPlan = (context) => {
     const key = planKeyOf(context);
     if (key !== null) {
       const cached = contextPlans.get(key);
       if (cached !== undefined) {
-        const current = currentRecentObservation(context, cached.lane ?? contextLaneOf(context));
-        if (cached.observation?.recent === current) return cached;
+        const current = currentObservations(context, cached.lane ?? contextLaneOf(context));
+        if (cached.observation?.recent === current.recent
+          && cached.observation?.audiovisual === current.audiovisual) return cached;
         try {
           const refreshed = planContextLayers(context, null, current);
           contextPlans.set(key, refreshed);
@@ -8566,6 +8606,116 @@ export function apply(ctx, config) {
     },
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
+  /**
+   * P-186/P-187 阶段 2：本轮评论证据。只保留“一次终稿到达后的对齐结果”，按陪伴会话短暂存放；
+   * 主请求通过 runtime context 读取渲染文本（只有采集时间/帧数，没有图片、路径或台词正文）。
+   * `config.commentEvidence` 是测试注入缝（和 `dialogueContext` 一样）：生产 config 来自 JSON。
+   */
+  const commentEvidence = config?.commentEvidence ?? createCommentEvidence();
+  /**
+   * 一段麦克风发言的开口证据锁。第一条非空 partial 时只锁一次，终稿到达后立即释放；
+   * 隐私/切源/停听时即使还没等到终稿也必须释放，绝不把旧代次的锁或证据带过去。
+   */
+  let speechEvidence = null;
+  const speechEvidenceSource = () => (vision.mode === 'scene' ? 'obs' : 'desktop');
+  /** 释放未完成的开口锁；已完成的上一轮 `commentEvidence` 由会话/TTL 自己管理。 */
+  const dropSpeechEvidence = () => {
+    if (speechEvidence === null) return;
+    const pending = speechEvidence;
+    speechEvidence = null;
+    try { evidenceWindow.releaseLock(pending.lockId); } catch { /* already expired/cleared */ }
+  };
+  /**
+   * 第一条非空 partial：立即锁住开口前后的画面，不等待 ASR 结束，也不每条 partial 都锁。
+   * 只在当前来源/代次上锁，锁的 `source` 与 `sourceEpoch` 和记忆证据时写入的完全一致。
+   */
+  const beginSpeechEvidence = () => {
+    if (speechEvidence !== null) return;
+    if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return;
+    try {
+      if (features.enabled('vision') !== true) return;
+    } catch {
+      return;
+    }
+    try {
+      const at = Date.now();
+      const source = speechEvidenceSource();
+      const lock = evidenceWindow.lock({
+        at,
+        source,
+        sourceEpoch: visionGeneration,
+        reason: 'speech-start',
+      });
+      if (lock === null) return;
+      speechEvidence = {
+        lockId: lock.id,
+        from: lock.from,
+        startedAt: at,
+        source,
+        sourceEpoch: visionGeneration,
+      };
+    } catch {
+      /* 证据锁只是旁路：失败不改变识别、投递或打断逻辑。 */
+    }
+  };
+  /**
+   * 终稿到达：补结束时间，按“同来源 + 同代次”取证据，对齐后挂到当前陪伴会话。
+   * 这里任何异常只记 `vision.comment.align.failed`，绝不能影响识别文本与后续投递。
+   */
+  const finishSpeechEvidence = ({ text, endedAt, utteranceId } = {}) => {
+    if (speechEvidence === null) return;
+    const pending = speechEvidence;
+    speechEvidence = null;
+    try {
+      // 隐私/切源/采集换代：锁已经失效，直接释放，不把旧代次的对齐结果 attach 给新画面。
+      if (pending.sourceEpoch !== visionGeneration || pending.source !== speechEvidenceSource()) return;
+      const at = Date.now();
+      const declaredEnd = Number(endedAt);
+      const end = Number.isFinite(declaredEnd) && declaredEnd > 0
+        ? Math.max(declaredEnd, pending.startedAt)
+        : at;
+      evidenceWindow.extendLock(pending.lockId, { to: end });
+      // “窗口开始-回溯”：锁窗起点再向前扩一个对齐回溯范围，覆盖“刚才那个”的最远窗口；
+      // alignComment 会再按文本线索自行收窄，between 只返回仍然存在的元数据。
+      const from = Math.max(0, pending.from - ALIGNMENT_DEFAULTS.lookbackMs);
+      const evidence = evidenceWindow.between(from, end, {
+        source: pending.source,
+        sourceEpoch: pending.sourceEpoch,
+      });
+      // “当前最新画面”独立于评论窗口取全量证据：它只回答“现在”，不能倒过来解释评论。
+      const latest = evidenceWindow.latest({
+        source: pending.source,
+        sourceEpoch: pending.sourceEpoch,
+      });
+      const latestId = latest === null ? null : latest.id;
+      const latestAt = latest === null ? null : latest.capturedAt;
+      const alignment = alignComment({
+        text: typeof text === 'string' ? text : '',
+        startedAt: pending.startedAt,
+        endedAt: end,
+        evidence,
+        latestId,
+        now: () => at,
+      });
+      const target = voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR });
+      commentEvidence.attach({
+        sessionId: target.sessionId,
+        utteranceId,
+        startedAt: pending.startedAt,
+        endedAt: end,
+        alignment,
+        latestId,
+        latestAt,
+        frameCount: evidence.length,
+      });
+    } catch (error) {
+      void log.emit('vision.comment.align.failed', {
+        error: error?.message ?? String(error),
+      }).catch(() => {});
+    } finally {
+      try { evidenceWindow.releaseLock(pending.lockId); } catch { /* already expired/cleared */ }
+    }
+  };
   /** 在途复制：卸载时可能还有 copyFile 没返回，要等它们自删完再收目录。 */
   const evidenceCopies = new Set();
   const drainEvidenceCopies = () => Promise.allSettled([...evidenceCopies]);
@@ -8861,6 +9011,9 @@ export function apply(ctx, config) {
     // A snapshot from the previous source/scene/privacy era is never a reusable frame.
     preRequestVision.clear();
     // 证据窗口同理：旧代次的画面不能跨切源/隐私边界继续被当作“最近看到的内容”。
+    // 评论证据是这一代画面的对齐结果：锁与记录一起作废，绝不让旧代次混进新来源。
+    dropSpeechEvidence();
+    commentEvidence.clearAll();
     evidenceWindow.clear('vision-invalidated');
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
@@ -10939,9 +11092,10 @@ export function apply(ctx, config) {
     const context = key === null ? undefined : { agent: key };
     if (key !== null) {
       const cached = contextPlans.get(key);
-      const currentRecent = currentRecentObservation(context, lane);
+      const current = currentObservations(context, lane);
       const sameBudget = cached !== undefined && cached.lane === lane
-        && cached.observation?.recent === currentRecent
+        && cached.observation?.recent === current.recent
+        && cached.observation?.audiovisual === current.audiovisual
         && ['persona', 'fixed', 'memory', 'recent', 'ephemeral', 'totalChars']
           .every((name) => cached.budget?.[name] === resolved?.[name]);
       if (sameBudget) return { plan: cached };
@@ -10971,6 +11125,7 @@ export function apply(ctx, config) {
     const recentText = lane === 'voice' && features.enabled('hearing') ? dialogueContext.render() : '';
     const ephemeralText = [
       lane === 'voice' ? nonverbalCue.render() : '',
+      lane === 'voice' ? commentEvidenceForContext(context) : '',
       renderEnvironment(),
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
     return {
@@ -11182,6 +11337,20 @@ export function apply(ctx, config) {
             droppedPendingChars: Number(stats.droppedPendingChars ?? 0),
           };
         },
+      }),
+    );
+    // P-186/P-187 阶段 2：本轮评论证据。只对陪伴 agent、voice lane 且视觉组件开启时读取；
+    // 无记录渲染 ''（不产生空块）。它是随轮次变化的 runtime context，绝不能注册成 section：
+    // 否则每次对齐都会把整份系统提示词重新写进历史。
+    // 文本走 ephemeral 预算（与 environment/nonverbal 共享额度）：预算裁掉时这里得到 '',
+    // 不会绕过额度直接注入；fallback 只服务没有 plan 的 legacy/直接挂载。
+    scope.effect(() =>
+      registerContext({
+        name: 'assistant:audiovisual',
+        order: AUDIOVISUAL_INJECTION_ORDER,
+        text: (context) => planTemporary(
+          context, 'audiovisual', () => commentEvidenceForContext(context),
+        ),
       }),
     );
     // The compiled library replaces the persona text on the next request after a compile; while
@@ -14738,6 +14907,11 @@ export function apply(ctx, config) {
             void log.emit(type, payload).catch(() => {});
           },
           onUpdate: (event) => {
+            // P-186/P-187 阶段 2：第一条非空 partial 就锁画面；不等待 ASR 结束，也不每条都锁。
+            // 这只是证据旁路，失败/无画面都不改变下面的识别、打断与投递。
+            if (typeof event.partial === 'string' && event.partial.length > 0) {
+              beginSpeechEvidence();
+            }
             // Real ASR activity — not an open microphone — is the only thing that may claim
             // `listening`; silence then degrades it back to waiting (see avatar-listening-idle).
             if (typeof event.partial === 'string' && event.partial.length > 0) {
@@ -14770,11 +14944,20 @@ export function apply(ctx, config) {
               if (barge.interrupted !== true
                 && (barge.reason === 'filler' || barge.reason === 'room-tone'
                   || barge.reason === 'echo' || barge.reason === 'unaddressed')) {
+                // 被丢弃的终稿不是用户评论：释放开口锁，但绝不 attach 一条评论证据。
+                dropSpeechEvidence();
                 return {
                   accepted: false,
                   reason: barge.reason === 'unaddressed' ? 'call-unaddressed' : 'playback-echo',
                 };
               }
+              // 终稿已通过投递门禁：补锁窗、对齐并挂到当前陪伴会话。
+              // `finishSpeechEvidence` 内部捕获所有异常，绝不阻断下面的 acceptFinal。
+              finishSpeechEvidence({
+                text: event.final,
+                endedAt: event.audioEndAt,
+                utteranceId: event.utteranceId,
+              });
               acceptFinal(event.final, Number(event.durationMs ?? 0), {
                 truncated: event.truncated === true,
                 offlineLimited: event.offlineLimited === true,
@@ -14830,12 +15013,16 @@ export function apply(ctx, config) {
         onExit: (exit) => {
           hearing = null;
           heard.partial = '';
+          // 采集已退出：还没等到终稿的开口锁必须释放，不能留到 TTL 才回收。
+          dropSpeechEvidence();
           dialogueSummary.release('mic');
           avatarStatusIf(['listening'], 'waiting', 'hearing.exit');
           void log.emit('hearing.exit', exit);
         },
       });
       heard.partial = '';
+      // 新采集会话从不继承上一段的开口锁。
+      dropSpeechEvidence();
       mergeBuffer = '';
       mergeMeta = emptyMergeMeta();
       mergeAppends = 0;
@@ -14878,6 +15065,8 @@ export function apply(ctx, config) {
     hearing?.stop();
     hearing = null;
     heard.partial = '';
+    // 停听时若还停留在某段发言中间，开口锁立即释放；已完成的评论证据按会话/TTL 自行失效。
+    dropSpeechEvidence();
     // Listening is closed: release ONLY the microphone's lease. The loopback session may still be
     // running, and the shared summary must stay alive for it. The buffer itself is kept, so a later
     // session continues the same dialogue and the injected text stays continuous.
@@ -15483,6 +15672,8 @@ export function apply(ctx, config) {
         evidence: evidenceWindow.state(),
         // 持续证据采集的只读状态：计数/时间/来源，不含文件路径；不启动或停止任何东西。
         evidenceCapture: evidenceCapture.status(),
+        // P-186/P-187 阶段 2 的只读评论证据计数：sessions/latestAt/attached，绝不含对齐正文。
+        comment: commentEvidence.state(),
       },
       hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };

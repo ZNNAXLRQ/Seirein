@@ -15,6 +15,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { disposeAll } from './helpers/cleanup.mjs';
+import { DIALOGUE_INJECTION_ORDER } from '../src/host/session/conversation/dialogue-summary.js';
+import { createCommentEvidence } from '../src/host/vision/comment-evidence.js';
 
 const state = {
   /** Filled by the fixture; the stubbed sight module calls it instead of touching the screen. */
@@ -55,13 +57,15 @@ const hooks = registerHooks({
     return next(url, context);
   },
 });
-const { apply } = await import('../src/host/index.js');
+const { apply, voiceSessionTarget } = await import('../src/host/index.js');
 hooks.deregister();
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-evidence-host-'));
   const tools = new Map();
   const routes = new Map();
+  const promptSections = new Map();
+  const promptContexts = new Map();
   const disposers = [];
   const effect = (fn) => {
     const cleanup = fn();
@@ -85,7 +89,16 @@ async function fixture(t, options = {}) {
     tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name); } },
     inject: (_dependencies, register) => register({
       effect,
-      systemPrompt: { section: () => () => {} },
+      systemPrompt: {
+        section(definition) {
+          promptSections.set(definition.name, definition);
+          return () => {};
+        },
+        context(definition) {
+          promptContexts.set(definition.name, definition);
+          return () => {};
+        },
+      },
       webServer: {
         register(route) {
           routes.set(route.path, route.handler);
@@ -159,7 +172,7 @@ async function fixture(t, options = {}) {
     await dispose();
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   });
-  return { root, call, status, action, evidenceDir, listEvidence, waitFor, dispose };
+  return { root, call, status, action, evidenceDir, listEvidence, waitFor, dispose, promptSections, promptContexts };
 }
 
 test('真实截图进入证据窗口，删掉原图后副本仍在；status 只给计数不给路径', async (t) => {
@@ -233,4 +246,97 @@ test('未进入陪伴轮时，boot 定时器不会启动真实证据采集', asy
   assert.equal(snapshot.vision.evidenceCapture.ticks, 0);
   assert.equal(state.storyboardStarts, 0, '门禁必须在调用 startStoryboard 之前就拦住');
   assert.deepEqual(await app.listEvidence(), [], 'cache/evidence 不得出现新文件');
+});
+
+test('裸挂载不产生视听证据块：assistant:audiovisual 为空，status.vision.comment 为 0', async (t) => {
+  // 没有真实陪伴轮、没有 ASR：只有 prompt context 注册和空的评论证据计数，绝不碰屏幕。
+  const app = await fixture(t, { evidenceCaptureBootDelayMs: 10 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  const audiovisual = app.promptContexts.get('assistant:audiovisual');
+  assert.ok(audiovisual !== undefined, 'assistant:audiovisual 以 runtime context 注册，不是 section');
+  assert.equal(app.promptSections.has('assistant:audiovisual'), false, '动态块不得进入历史 section');
+  assert.ok(audiovisual.order > DIALOGUE_INJECTION_ORDER, 'order 保持在 dialogue 之后');
+  assert.equal(typeof audiovisual.text, 'function');
+
+  // 陪伴会话身份 + voice lane 都满足时，唯一让渲染为空的理由就是“还没有评论证据”。
+  const workspace = join(app.root, 'workspace');
+  const companion = {
+    id: voiceSessionTarget({ root: app.root }).sessionId,
+    session: { header: { cwd: workspace } },
+  };
+  assert.equal(audiovisual.text({ agent: companion }), '', '无记录时不产生空块');
+  assert.equal(audiovisual.text({
+    agent: { id: 'typed-session', session: { header: { cwd: workspace } } },
+  }), '', '非陪伴/typed 会话永远读不到评论证据');
+
+  const snapshot = await app.status();
+  assert.deepEqual(snapshot.vision.comment, {
+    sessions: 0,
+    latestAt: null,
+    attached: 0,
+    expired: 0,
+    evicted: 0,
+  }, 'status 只暴露只读计数');
+  assert.equal(JSON.stringify(snapshot.vision.comment).includes('cache'), false, '不含证据路径');
+  assert.equal(state.storyboardStarts, 0, '裸挂载不得触发真实采集');
+});
+
+test('assistant:audiovisual 走 ephemeral 预算：小额度为空，大额度恢复且不超额度', async (t) => {
+  // 裸挂载没有真实 ASR，无法从 onUpdate 制造记录：注入一个已 attach 的 commentEvidence 实例，
+  // 只验证 plan/预算/渲染接线，不碰屏幕、不启动采集。
+  const seeded = createCommentEvidence();
+  const voiceBudget = {
+    persona: 100_000,
+    fixed: 100_000,
+    memory: 0,
+    recent: 0,
+    ephemeral: 12,
+    totalChars: 100_000,
+  };
+  const app = await fixture(t, {
+    commentEvidence: seeded,
+    contextBudgets: { voice: voiceBudget },
+  });
+  const sessionId = voiceSessionTarget({ root: app.root }).sessionId;
+  const now = Date.now();
+  seeded.attach({
+    sessionId,
+    utteranceId: 'budget-u',
+    startedAt: now - 3_000,
+    endedAt: now - 1_000,
+    alignment: {
+      confidence: 'high',
+      reason: 'window',
+      window: { from: now - 8_000, to: now - 1_000 },
+      cues: { retrospective: false, current: false },
+      relatedFrameIds: ['ev-1', 'ev-2'],
+      afterSpeechFrameIds: [],
+      latestFrameId: 'ev-2',
+    },
+    latestId: 'ev-2',
+    latestAt: now,
+    frameCount: 4,
+  });
+
+  const audiovisual = app.promptContexts.get('assistant:audiovisual');
+  assert.ok(audiovisual !== undefined);
+  const workspace = join(app.root, 'workspace');
+  const contextFor = () => ({
+    agent: { id: sessionId, session: { header: { cwd: workspace } } },
+  });
+
+  // 12 字符的 ephemeral 连标题都放不下：环境/非语言/视听块一起被裁掉，绝不能绕过额度。
+  const small = audiovisual.text(contextFor());
+  assert.equal(small, '', '预算裁掉时不注入');
+  assert.ok(small.length <= voiceBudget.ephemeral);
+
+  // 同一实例、同一 session，只放宽 ephemeral；换一个 agent 对象触发全新 plan。
+  voiceBudget.ephemeral = 100_000;
+  const large = audiovisual.text(contextFor());
+  assert.ok(large.length > 0, '额度充足时恢复评论证据块');
+  assert.ok(large.includes('评论关联窗口'), '恢复的是同一份评论证据');
+  assert.ok(large.includes('语音结束（端点）'), '文案使用语音端点，不写识别完成');
+  assert.equal(large.includes('识别完成'), false);
+  assert.ok(large.length <= voiceBudget.ephemeral, '任何情况下都不超 ephemeral 额度');
 });
