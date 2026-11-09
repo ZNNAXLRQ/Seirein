@@ -20,6 +20,8 @@ const state = {
   /** Filled by the fixture; the stubbed sight module calls it instead of touching the screen. */
   makeShot: null,
   captures: 0,
+  /** Boot/pre-step 门禁：任何失败/误启动的 storyboard 尝试都必须能被测试看见。 */
+  storyboardStarts: 0,
 };
 globalThis.__visionEvidenceHostTest = state;
 
@@ -32,13 +34,15 @@ const hooks = registerHooks({
         shortCircuit: true,
         source: `
           const s = globalThis.__visionEvidenceHostTest;
-          const forbidden = () => { throw new Error('real capture forbidden'); };
           export const resolveFfmpeg = () => null;
           export const resolveFfplay = () => null;
           export const capture = (options) => s.makeShot(options.dir);
           export const captureDesktop = capture;
           export const captureDevice = capture;
-          export const startStoryboard = forbidden;
+          export const startStoryboard = () => {
+            s.storyboardStarts = (s.storyboardStarts ?? 0) + 1;
+            throw new Error('real capture forbidden');
+          };
           export const OBSERVATION_TTL_MS = 30000;
           export function readObservation(observation, { now = Date.now(), ttlMs = 30000 } = {}) {
             const value = observation ?? {};
@@ -54,7 +58,7 @@ const hooks = registerHooks({
 const { apply } = await import('../src/host/index.js');
 hooks.deregister();
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-evidence-host-'));
   const tools = new Map();
   const routes = new Map();
@@ -89,10 +93,17 @@ async function fixture(t) {
         },
       },
     }),
-  }, { root, enabled: true, defaultDomain: 'chat', privacyScene: 'Privacy' });
+  }, {
+    root,
+    enabled: true,
+    defaultDomain: 'chat',
+    privacyScene: 'Privacy',
+    ...options,
+  });
 
   // A unique capture per call so no coalescing window can hide a second request.
   state.captures = 0;
+  state.storyboardStarts = 0;
   state.makeShot = async (dir) => {
     await mkdir(dir, { recursive: true });
     const file = join(dir, `evidence-${++state.captures}.png`);
@@ -209,4 +220,17 @@ test('进隐私清掉旧证据代次，目录不残留；卸载同样清理副�
   const failures = await app.dispose();
   assert.deepEqual(failures, []);
   await assert.rejects(readdir(app.evidenceDir()), /ENOENT/);
+});
+
+test('未进入陪伴轮时，boot 定时器不会启动真实证据采集', async (t) => {
+  // 裸宿主 mount + 10ms 的 boot 定时器：到点后没有 companionSessionSeen，必须什么都不做。
+  const app = await fixture(t, { evidenceCaptureBootDelayMs: 10 });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  const snapshot = await app.status();
+  assert.equal(snapshot.vision.evidenceCapture.running, false);
+  assert.equal(snapshot.vision.evidenceCapture.startedAt, null);
+  assert.equal(snapshot.vision.evidenceCapture.ticks, 0);
+  assert.equal(state.storyboardStarts, 0, '门禁必须在调用 startStoryboard 之前就拦住');
+  assert.deepEqual(await app.listEvidence(), [], 'cache/evidence 不得出现新文件');
 });

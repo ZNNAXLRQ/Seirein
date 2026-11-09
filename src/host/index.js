@@ -299,6 +299,7 @@ import { VISION_MODES, VisionMode } from './vision/vision.js';
 import { createPreRequestVision } from './vision/pre-request.js';
 // P-186/P-187 阶段 1：持续视听证据。画面窗口只收元数据，媒体台词是独立证据流（都不是用户发言）。
 import { createEvidenceWindow } from './vision/evidence-window.js';
+import { createEvidenceCapture } from './vision/evidence-capture.js';
 import { createMediaTimeline } from './hearing/media-timeline.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
@@ -8632,6 +8633,133 @@ export function apply(ctx, config) {
     return copy;
   };
   /**
+   * P-186/P-187 阶段 1：持续证据采集。与 `startWatcher` 并列、但会话完全归这里所有：按变化取
+   * 故事板，经 `rememberEvidence` 的复制/代次逻辑进入 `evidenceWindow`。它不改变 `assistant_watch`
+   * 的归属，也不复用那个 watcher 会话。
+   */
+  let evidenceCaptureHolding = false;
+  let evidenceCaptureAbort = null;
+  let evidenceRetryTimer = null;
+  /**
+   * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到非子代理、工作区内的真实 pre-step 时才置位。
+   * 工具挂载、设置页、裸宿主 mount 都不置位，所以后台证据采集不会在测试/开机未使用时碰屏幕。
+   */
+  let companionSessionSeen = false;
+  const clearEvidenceRetry = () => {
+    if (evidenceRetryTimer === null) return;
+    clearTimeout(evidenceRetryTimer);
+    evidenceRetryTimer = null;
+  };
+  const evidenceCaptureAllowed = () => {
+    if (companionSessionSeen !== true) return false;
+    if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return false;
+    try { return features.enabled('vision') === true; } catch { return false; }
+  };
+  /**
+   * 与 `startWatcher` 相同的 ffmpeg/来源解析；`source` 由当前视觉模式决定：
+   * scene → OBS 设备，watch → screen。会话的取消信号只属于本次证据采集，
+   * 所以 `assistant_watch` 的 stop 不会顺带杀掉后台证据流。
+   */
+  const startEvidenceStoryboard = async ({ source: requestedSource = '' } = {}) => {
+    const base = visionToken();
+    const wantedSource = requestedSource === 'obs' ? 'obs' : 'screen';
+    if ((wantedSource === 'obs') !== (base.mode === 'scene')) {
+      throw new Error('证据采集来源与当前视觉模式不一致');
+    }
+    const controller = new AbortController();
+    evidenceCaptureAbort = controller;
+    const token = { ...base, signal: AbortSignal.any([controller.signal, shutdown.signal]) };
+    assertVisionToken(token);
+    if (token.mode === 'scene') await ensureSceneCamera(token);
+    assertVisionToken(token);
+    const ffmpegPath = resolveFfmpeg(root, config);
+    if (ffmpegPath === null) throw new Error('未找到 ffmpeg；持续证据采集需要 ffmpeg');
+    let session = null;
+    try {
+      session = await startStoryboard({
+        ffmpegPath,
+        dir: join(root, 'cache', 'screens'),
+        width: Number(config?.visionWidth ?? 800),
+        height: Number(config?.visionHeight ?? 450),
+        fps: Number(config?.visionFps ?? 12),
+        signal: token.signal,
+        source: wantedSource === 'obs'
+          ? { kind: 'obs', device: virtualCamDevice() }
+          : { kind: 'screen' },
+      });
+      assertVisionToken(token);
+      return session;
+    } catch (error) {
+      // 会话已经建好但代次在启动尾段失效：先收掉它，别把 ffmpeg 留给下一次重试。
+      if (session !== null) {
+        try { session.stop(); } catch { /* session teardown is best effort */ }
+        await Promise.resolve(session.done).catch(() => {});
+      }
+      throw error;
+    }
+  };
+  const evidenceCapture = createEvidenceCapture({
+    start: startEvidenceStoryboard,
+    // 复制期间可能隐私/切源：token 在交给 rememberEvidence 的此刻取，落地后再核一次代次。
+    onSheet: async (sheet) => {
+      const token = { mode: vision.mode, scene: vision.scene, generation: visionGeneration };
+      await rememberEvidence(sheet, { kind: 'storyboard', token });
+    },
+    isBlocked: () => evidenceCaptureHolding !== true || visionDisposed || visionChanging
+      || shutdown.closing || vision.mode === 'privacy',
+    emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+  });
+  /**
+   * 启动持续证据采集。失败（例如没有 ffmpeg、OBS 摄像头未就绪）只记事件；最多每分钟重试一次，
+   * 下一次切源/启停组件也会重新尝试，绝不 tight-loop。
+   */
+  const startEvidenceCapture = async (reason = 'startup') => {
+    clearEvidenceRetry();
+    if (!evidenceCaptureAllowed()) return false;
+    evidenceCaptureHolding = true;
+    try {
+      const result = await evidenceCapture.start({
+        source: vision.mode === 'scene' ? 'obs' : 'screen',
+      });
+      const active = result?.running === true;
+      evidenceCaptureHolding = active;
+      // 证据故事板同样占着虚拟摄像头：场景空闲关摄像头必须让路。
+      if (active) clearSceneIdle();
+      return active;
+    } catch (error) {
+      try { evidenceCaptureAbort?.abort(error); } catch { /* already aborted */ }
+      evidenceCaptureAbort = null;
+      evidenceCaptureHolding = false;
+      await log.emit('vision.evidence.capture.start-failed', {
+        reason, error: error?.message ?? String(error),
+      }).catch(() => {});
+      if (evidenceCaptureAllowed() && !visionDisposed && !shutdown.closing) {
+        evidenceRetryTimer = setTimeout(() => {
+          evidenceRetryTimer = null;
+          void startEvidenceCapture('retry');
+        }, 60_000);
+        evidenceRetryTimer.unref?.();
+      }
+      return false;
+    }
+  };
+  /** 停止持续证据采集；代次一停，旧会话迟到的 sheet/错误由模块丢弃。 */
+  const stopEvidenceCapture = async (reason = 'stop') => {
+    clearEvidenceRetry();
+    evidenceCaptureHolding = false;
+    const stopping = evidenceCapture.stop(reason);
+    try { evidenceCaptureAbort?.abort(new Error(`证据采集已停止：${reason}`)); } catch { /* already aborted */ }
+    evidenceCaptureAbort = null;
+    try {
+      return await stopping;
+    } catch (error) {
+      void log.emit('vision.evidence.capture.stop-failed', {
+        reason, error: error?.message ?? String(error),
+      }).catch(() => {});
+      return evidenceCapture.status();
+    }
+  };
+  /**
    * Session -> the turn the pre-step opened. A tool call does not carry the pre-step payload, so
    * this is the one source of `{sessionId, turn}` for `assistant_see` / `assistant_watch`; it is
    * written exactly where `beginTurn` is, so both always name the same turn.
@@ -8948,8 +9076,8 @@ export function apply(ctx, config) {
   const touchSceneIdle = () => {
     clearSceneIdle();
     // A live storyboard owns the camera: the scene-mode idle shutdown must never stop the
-    // capture that is currently feeding it. It is re-armed when that watch stops.
-    if (watcher !== null) return;
+    // capture that is currently feeding it. 持续证据采集（独立于 assistant_watch）同样占着它。
+    if (watcher !== null || evidenceCaptureHolding) return;
     sceneIdleUntil = Date.now() + sceneIdleMs();
     sceneIdleTimer = setTimeout(() => {
       sceneIdleTimer = null;
@@ -9058,6 +9186,8 @@ export function apply(ctx, config) {
       // Privacy pauses the cursor target now; the motion runtime keeps its own frames running.
       attentionSource.setPrivacy(true);
     }
+    // 持续证据采集属于旧代次：先停掉（有界），再 invalidate/切源，旧会话的迟到 sheet 不会跨边界。
+    await stopEvidenceCapture(`vision-mode:${mode}`);
     const cleanup = invalidateVision();
     // Queueing may wait on an older OBS request; handle cleanup errors immediately while
     // retaining the failure for this operation, instead of leaking an unhandled rejection.
@@ -9109,6 +9239,10 @@ export function apply(ctx, config) {
         }
       }
     }
+    if (settled.ok === true && request === visionModeRequest && !visionDisposed && vision.mode !== 'privacy') {
+      // 持续证据采集跟随提交后的来源恢复；不阻塞模式切换，失败由 startEvidenceCapture 记事件。
+      void startEvidenceCapture('vision-mode');
+    }
     return settled;
   };
 
@@ -9128,6 +9262,8 @@ export function apply(ctx, config) {
       return;
     }
     if (current.length > 0 && current !== token.scene) {
+      // OBS 节目场景已不是证据采集代次所标注的那一个：先停采集，再作废旧代次。
+      await stopEvidenceCapture('scene-changed');
       await invalidateVision();
       throw new Error(`OBS 场景已切换（${token.scene} → ${current}）：旧截图与故事板已作废`);
     }
@@ -9442,6 +9578,10 @@ export function apply(ctx, config) {
     const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : '';
     const turn = Number.isSafeInteger(payload?.turn) ? payload.turn : -1;
     if (sessionId.length === 0 || turn < 0) return;
+    // 只有这一条路径能证明“用户真的进入了陪伴会话”：工具挂载、设置页、裸宿主 mount 都走不到。
+    // 置位后持续证据采集才被允许；首次置位同时尝试启动一次（隐私/组件关闭时由 allowed 拒绝）。
+    const firstCompanionTurn = companionSessionSeen !== true;
+    companionSessionSeen = true;
     const source = vision.mode === 'scene' ? 'obs' : 'desktop';
     const scene = vision.mode === 'scene' ? vision.scene : '';
     // Always open the turn scope: a snapshot from the previous turn must not be reused even
@@ -9456,6 +9596,7 @@ export function apply(ctx, config) {
       enabled = false;
     }
     if (!enabled) return;
+    if (firstCompanionTurn) void startEvidenceCapture('first-turn');
     if (!visionLookRequested(payload?.messages)) return;
     // `prepare` reports its own miss and swallows the failure (fail-open).
     await preRequestVision.prepare({
@@ -15337,7 +15478,12 @@ export function apply(ctx, config) {
       retention: { enabled: audioRetention.isEnabled(), limits: { ...audioRetention.limits } },
       // P-186/P-187 阶段 1 的只读证据状态：只给数量、时间、代次和计数，绝不暴露副本文件路径。
       // 放在各自既有块里，不改原有字段语义，设置页/诊断脚本一次 status 就能看出窗口是否在工作。
-      vision: { ...(status?.vision ?? {}), evidence: evidenceWindow.state() },
+      vision: {
+        ...(status?.vision ?? {}),
+        evidence: evidenceWindow.state(),
+        // 持续证据采集的只读状态：计数/时间/来源，不含文件路径；不启动或停止任何东西。
+        evidenceCapture: evidenceCapture.status(),
+      },
       hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };
   };
@@ -15588,6 +15734,8 @@ export function apply(ctx, config) {
       invalidateSpeech();
       cancelPlayback('feature-disabled');
     } else if (id === 'vision') {
+      clearEvidenceRetry();
+      await stopEvidenceCapture('feature-disabled');
       await invalidateVision();
       await stopVirtualCam('feature-disabled');
     } else if (id === 'subtitle') {
@@ -15627,6 +15775,8 @@ export function apply(ctx, config) {
       reason,
       dependencies: dependencies.map((row) => ({ target: row.target, started: row.started === true, running: row.running === true, owned: row.owned === true, skipped: row.skipped ?? '' })),
     }).catch(() => {});
+    // 重新启用视觉组件：依赖已就绪，持续证据采集可以恢复（幂等，隐私/未启用时自行放弃）。
+    if (id === 'vision') void startEvidenceCapture(reason || 'feature-enable');
   };
   const onFeatureDisable = async ({ id, reason }) => {
     await log.emit('feature.disable.begin', { id, reason }).catch(() => {});
@@ -15937,8 +16087,18 @@ export function apply(ctx, config) {
     Number.isFinite(bootDelay) && bootDelay >= 0 ? bootDelay : 8000,
   );
   autostartBoot.unref?.();
+  // P-186/P-187: 持续证据采集要等“真实陪伴轮”出现后才允许启动（默认 5 s 后检查一次）。
+  // 未置位时到点直接返回，不启动、不安排重试：裸宿主 mount / 测试 / 开机未使用都不得碰屏幕。
+  const evidenceBootDelay = Number(config?.evidenceCaptureBootDelayMs);
+  const evidenceBoot = setTimeout(() => {
+    if (companionSessionSeen !== true) return;
+    void startEvidenceCapture('startup');
+  }, Number.isFinite(evidenceBootDelay) && evidenceBootDelay >= 0 ? evidenceBootDelay : 5000);
+  evidenceBoot.unref?.();
   ctx.effect(() => () => {
     clearTimeout(autostartBoot);
+    clearTimeout(evidenceBoot);
+    clearEvidenceRetry();
     if (gptSovitsReadyTimer !== null) clearInterval(gptSovitsReadyTimer);
     if (gptWarmupTimer !== null) clearTimeout(gptWarmupTimer);
   });
@@ -16053,6 +16213,8 @@ export function apply(ctx, config) {
         kind: 'internal',
         stop: async () => {
           visionDisposed = true;
+          // 持续证据采集有界停止后，再作废代次、清窗口与在途副本。
+          await stopEvidenceCapture('dispose');
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));
           // 卸载时可能仍有 copyFile 没返回：等它们核到“已卸载”后自删，再把可能被重新建出的
           // 空目录一并收掉。不等待就会在进程退出前留下没人引用的副本。
@@ -16093,6 +16255,8 @@ export function apply(ctx, config) {
           hearingAutostart?.cancel();
           ambientAutostart?.cancel();
           clearTimeout(autostartBoot);
+          clearTimeout(evidenceBoot);
+          clearEvidenceRetry();
           if (gptSovitsReadyTimer !== null) clearInterval(gptSovitsReadyTimer);
           if (gptWarmupTimer !== null) clearTimeout(gptWarmupTimer);
           return { confirmed: true };
