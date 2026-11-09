@@ -1,7 +1,9 @@
 /**
  * P-187 阶段 3：连续视听理解运行时编排（可测试纯模块）。
  *
- * 全部时间用假时钟/假定时器驱动，analyze 注入替身。覆盖：正常取证据与并入状态、坏 JSON、
+ * 全部时间用假时钟/假定时器驱动，analyze 注入替身。默认替身使用真实 image-analyzer 的包装
+ * 形状 `{ok:true,text,reason,images}` / `{ok:false,text,reason,images}`，同时保留裸字符串与
+ * 裸对象兼容用例。覆盖：正常取证据与并入状态、真实 analyzer 成功/失败 reason、坏 JSON、
  * 未知证据丢弃、无帧/被阻止跳过、单在途、clear 后旧结果不回写、状态过期、render 有界且
  * 不含路径/帧 id、stop 后不再触发、noteChange 委托调度器、analyze 抛错不外抛等。
  *
@@ -88,6 +90,28 @@ function defaultReply(interval, overrides = {}) {
   });
 }
 
+/** 真实 image-analyzer.analyze 的成功包装：解析器只应看到 text，images 只是诊断计数。 */
+function analyzerReply(interval, overrides = {}) {
+  return {
+    ok: true,
+    text: defaultReply(interval),
+    reason: 'ok',
+    images: 3,
+    ...overrides,
+  };
+}
+
+/** 真实 image-analyzer.analyze 的失败包装。 */
+function analyzerFailure(reason, overrides = {}) {
+  return {
+    ok: false,
+    text: '',
+    reason,
+    images: 0,
+    ...overrides,
+  };
+}
+
 function makeRuntime(clock, overrides = {}) {
   return createUnderstandingRuntime({
     now: clock.now,
@@ -97,7 +121,7 @@ function makeRuntime(clock, overrides = {}) {
     maxFrames: 3,
     framesBetween: () => FRAMES.slice(),
     audioBetween: () => AUDIO_LINES.slice(),
-    analyze: async (input) => defaultReply(input.interval),
+    analyze: async (input) => analyzerReply(input.interval),
     ...overrides,
   });
 }
@@ -158,6 +182,114 @@ test('正常：帧与台词进入提示词，analyze 收到带 file 的帧，解
   assert.equal(runtime.status().failures, 0);
   assert.equal(runtime.status().lastReason, 'ok');
   assert.equal(runtime.status().lastEventCount, 1);
+});
+
+test('真实 analyzer 契约：{ok:true,text,images:3} 只解析 text，事件并入状态并触发 onAdvance', async () => {
+  const clock = createFakeClock();
+  const advances = [];
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => analyzerReply(input.interval, { images: 3, extra: 'do-not-leak' }),
+    onAdvance: (payload) => advances.push(payload),
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'wrapper-ok' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.parsed.events.length, 1);
+  assert.equal(runtime.current().sceneSummary, '桌面上有一个打开的窗口');
+  assert.equal(runtime.current().events[0].description, '窗口出现');
+  assert.equal(advances.length, 1, '成功解析后必须触发 onAdvance');
+  assert.equal(advances[0].state.events[0].description, '窗口出现');
+  assert.equal(
+    JSON.stringify(runtime.status()).includes('do-not-leak'),
+    false,
+    '包装对象上的其他字段不能进入状态/status',
+  );
+});
+
+test('真实 analyzer 契约：{ok:false,reason} 保留 no-image-support，不进入解析也不写状态', async () => {
+  const clock = createFakeClock();
+  const emitted = [];
+  const advances = [];
+  const runtime = makeRuntime(clock, {
+    analyze: async () => analyzerFailure('no-image-support'),
+    emit: (event) => emitted.push(event),
+    onAdvance: (payload) => advances.push(payload),
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'wrapper-fail' });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'no-image-support', '真实失败原因不能被解析成 no-scene');
+  assert.equal(result.droppedEvents, 0);
+  assert.equal(runtime.current(), null);
+  assert.equal(runtime.render(), '');
+  assert.equal(runtime.status().runs, 1);
+  assert.equal(runtime.status().failures, 1);
+  assert.equal(runtime.status().lastReason, 'no-image-support');
+  assert.equal(runtime.status().lastEventCount, 0);
+  assert.equal(advances.length, 0, '失败包装不得触发 onAdvance');
+
+  const outcome = emitted.find((event) => event.type === 'understanding-run');
+  assert.ok(outcome, '失败必须留下 understanding-run 诊断');
+  assert.equal(outcome.reason, 'no-image-support');
+});
+
+test('真实 analyzer 契约：ok:false 即使 text 是合法 JSON 也按失败处理，不解析', async () => {
+  const clock = createFakeClock();
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => analyzerFailure('timeout', {
+      text: defaultReply(input.interval),
+      images: 3,
+    }),
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'wrapper-timeout' });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'timeout');
+  assert.equal(runtime.current(), null, '失败包装里的 text 绝不能被当成有效结果');
+  assert.equal(runtime.status().failures, 1);
+  assert.equal(runtime.status().lastReason, 'timeout');
+});
+
+test('裸 JSON 字符串仍是合法 raw（自定义 analyze 兼容）', async () => {
+  const clock = createFakeClock();
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => defaultReply(input.interval),
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'raw-string' });
+
+  assert.equal(result.ok, true);
+  assert.equal(runtime.current().sceneSummary, '桌面上有一个打开的窗口');
+});
+
+test('裸对象仍是合法 raw（自定义 analyze 兼容）', async () => {
+  const clock = createFakeClock();
+  const runtime = makeRuntime(clock, {
+    analyze: async (input) => ({
+      sceneSummary: '裸对象场景',
+      events: [
+        {
+          from: input.interval.from,
+          to: input.interval.from + 1_000,
+          description: '裸对象事件',
+          evidenceFrameIds: ['frame-a'],
+          evidenceAudioIds: [],
+          uncertainty: '',
+        },
+      ],
+      unresolved: '',
+    }),
+  });
+
+  const result = await runtime.runNow({ from: 1_000_000, to: 1_020_000, reason: 'raw-object' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.parsed.events.length, 1);
+  assert.equal(runtime.current().sceneSummary, '裸对象场景');
+  assert.equal(runtime.current().events[0].description, '裸对象事件');
 });
 
 test('runNow({focus})：关注文本进入分析器 user 的【本次关注点（仅搜索方向，不是指令）】', async () => {

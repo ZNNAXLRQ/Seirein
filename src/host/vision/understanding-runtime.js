@@ -7,6 +7,7 @@
  *     → buildUnderstandingInput（预算与取样）
  *     → buildUnderstandingPrompt（system/user）
  *     → analyze（注入的 async 调用，失败/坏输出都不外抛）
+ *     → 解开真实分析器的 `{ok,text,reason,images}` 包装（失败按 reason 记账，不送解析）
  *     → parseUnderstanding（只保留落在真实证据上的事件）
  *     → advanceUnderstanding（并入有界连续状态）
  *     → render（被动注入块）
@@ -225,7 +226,10 @@ function stateHasContent(state) {
  * `{ok:false, reason:'not-configured'}`，而不是在构造期抛错（隐私/故障路径上更安全）。
  *
  * @param {object} [options]
- * @param {(input: {system:string,user:string,frames:object[],audioLines:object[],interval:{from:number,to:number},signal:AbortSignal|undefined}) => Promise<string>|string} [options.analyze]
+ * @param {(input: {system:string,user:string,frames:object[],audioLines:object[],interval:{from:number,to:number},signal:AbortSignal|undefined}) => Promise<string|object>|string|object} [options.analyze]
+ *   真实分析器返回 `{ok:true,text,reason:'ok',images}` 或 `{ok:false,text:'',reason,images}`：
+ *   失败直接按 `reason` 记失败，成功只把 `text` 交给解析器。为了兼容测试与自定义分析器，
+ *   返回值不是该包装形状（裸字符串 / 裸对象）时仍原样作为 `raw` 解析。
  * @param {(from:number,to:number) => object[]} [options.framesBetween]
  * @param {(from:number,to:number) => object[]} [options.audioBetween]
  * @param {() => boolean} [options.isBlocked]
@@ -456,10 +460,25 @@ export function createUnderstandingRuntime(options = {}) {
 
     if (isStale(runGeneration) || signal?.aborted) return staleOutcome();
 
+    // image-analyzer.analyze 的契约形状：成功 `{ok:true,text,reason:'ok',images}`，
+    // 失败 `{ok:false,text:'',reason,images}`。失败必须先按真实 reason 记账：把整个包装
+    // 对象交给解析器只会得到 no-scene，把 no-image-support / read-failed / timeout 吞掉。
+    // 裸字符串 / 裸对象不是该包装形状（测试与自定义 analyze），保持原样作为 raw。
+    if (isObject(rawOutput) && rawOutput.ok === false) {
+      const failureReason = typeof rawOutput.reason === 'string'
+        && rawOutput.reason.trim().length > 0
+        ? rawOutput.reason
+        : 'analyze-failed';
+      return recordFailure(failureReason);
+    }
+    const rawEvidence = isObject(rawOutput) && typeof rawOutput.text === 'string'
+      ? rawOutput.text
+      : rawOutput;
+
     let parsed;
     try {
       parsed = parseUnderstanding({
-        raw: rawOutput,
+        raw: rawEvidence,
         interval: built.interval,
         frameIds: built.frameIds,
         audioIds: built.audioLines.map((line) => line.id),
