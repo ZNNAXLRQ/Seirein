@@ -16425,6 +16425,90 @@ export function apply(ctx, config) {
   });
 
   /**
+   * P-47 baseline fields: one short, real scalar or null. The status route must never present a
+   * path/URL as a model, protocol or voice, so those shapes are treated as "not observed" here.
+   * The limits match the baseline builder's own caps.
+   */
+  const baselineScalar = (value, max = 160) => {
+    if (typeof value !== 'string') return null;
+    const text = value.trim();
+    if (text.length === 0 || text.length > max) return null;
+    if (/[\u0000-\u001f\u007f]/u.test(text)) return null;
+    if (/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(text)) return null;
+    if (/^[a-z][a-z0-9+.-]*:\/\//iu.test(text)) return null;
+    if (text.includes('\\')) return null;
+    return text;
+  };
+
+  /** The Harness default-model selection, or null when the service is absent/throwing. */
+  const baselineSelection = () => {
+    try {
+      const selection = getService('agentDefaultModel')?.currentSelection?.() ?? null;
+      return selection !== null && typeof selection === 'object' ? selection : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * P-47 top-level projection for the baseline snapshot builder. Everything comes from an
+   * explicitly named field: the model selection (direct fields, then `route`), an explicit
+   * protocol/reasoning value, `config.ttsVoice` or the Edge voice the host resolves now.
+   *
+   * `reasoning.applied` stays null: the selection only reports what was REQUESTED. No host state
+   * records what a provider actually adopted (a downgrade event is diagnostic, not a status
+   * field), so copying `requested` here would fabricate evidence.
+   *
+   * `input.*`: the host has no real token/cache accounting for agent turns, so tokens stay
+   * unknown (null) and cache stats are explicitly unavailable (false), matching the builder.
+   *
+   * `versions`: only versions already held by live state are exposed. VTS has no application
+   * version in its protocol here; OBS is never queried (no probe/start) from the status route.
+   */
+  const baselineStatusFields = (status) => {
+    const selection = baselineSelection();
+    const route = selection?.route !== null && typeof selection?.route === 'object'
+      ? selection.route
+      : null;
+    const requestedReasoning = baselineScalar(selection?.reasoningEffort, 40)
+      ?? baselineScalar(route?.reasoningEffort, 40)
+      ?? baselineScalar(selection?.reasoning, 40)
+      ?? baselineScalar(selection?.reasoning?.requested, 40)
+      ?? baselineScalar(route?.reasoning, 40)
+      ?? baselineScalar(route?.reasoning?.requested, 40)
+      ?? baselineScalar(config?.reasoningEffort, 40);
+    // GPT-SoVITS has no voice name; when it is the active engine the honest voice is null.
+    // Edge's voice is the host's real per-language default (the same resolution TTS uses).
+    const explicitVoice = baselineScalar(config?.ttsVoice, 160);
+    const edgeVoice = explicitVoice === null
+      && gptSovitsSettings().enabled !== true
+      && typeof ttsModule.voiceForLanguage === 'function'
+      ? ttsModule.voiceForLanguage(langSettings().speech)
+      : null;
+    const existingVersions = status?.versions !== null && typeof status?.versions === 'object'
+      ? status.versions
+      : null;
+    const vtsVersion = baselineScalar(vts?.appVersion, 80)
+      ?? baselineScalar(existingVersions?.vts, 80)
+      ?? null;
+    const obsVersion = baselineScalar(existingVersions?.obs, 80)
+      ?? baselineScalar(status?.obsVersion, 80)
+      ?? baselineScalar(status?.vision?.obsVersion, 80)
+      ?? null;
+    return {
+      model: {
+        provider: baselineScalar(selection?.provider, 80) ?? baselineScalar(route?.provider, 80),
+        id: baselineScalar(selection?.model, 160) ?? baselineScalar(route?.model, 160),
+      },
+      protocol: baselineScalar(selection?.protocol, 80) ?? baselineScalar(route?.protocol, 80),
+      reasoning: { requested: requestedReasoning, applied: null },
+      input: { tokensAvailable: null, cacheStatsAvailable: false },
+      tts: { voice: explicitVoice ?? baselineScalar(edgeVoice, 160), weightsCold: null },
+      versions: { vts: vtsVersion, obs: obsVersion },
+    };
+  };
+
+  /**
    * `status.hearing` = the builder's own block plus the live capture evidence: the running
    * instance's id, the floor that instance resolves *now*, and the last threshold-save restart
    * outcome. Projected here because the hearing domain owns these fields (see
@@ -16441,8 +16525,17 @@ export function apply(ctx, config) {
       restart: hearingThresholdRestart,
       fallbackMinRmsDb: Number(runtime?.asrMinRmsDb ?? config?.asrMinRmsDb ?? -50),
     });
+    // P-47 baseline fields stay top-level (the snapshot builder reads them there): the existing
+    // status blocks keep their old shape, and `tts` only gains `voice`/`weightsCold`.
+    const baseline = baselineStatusFields(status);
     return {
       ...status,
+      model: baseline.model,
+      protocol: baseline.protocol,
+      reasoning: baseline.reasoning,
+      input: baseline.input,
+      tts: { ...(status?.tts ?? {}), ...baseline.tts },
+      versions: { ...(status?.versions ?? {}), ...baseline.versions },
       live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
       vtsAuth,
       // P0 portability evidence: where the voice compaction preset came from (registered by the
