@@ -310,6 +310,8 @@ import { createUnderstandingRuntime } from './vision/understanding-runtime.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
 import { createProactiveArbiter } from './vision/proactive-candidate.js';
 import { createProactiveLineGenerator } from './vision/proactive-line.js';
+// P-187 阶段 6：把证据/台词/评论/理解/主动状态汇总成可评估的数字（纯投影，无 I/O）。
+import { summarizeAudiovisual } from './vision/audiovisual-metrics.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -1277,6 +1279,8 @@ export async function publishVoiceInjected({ log, row = {}, turn = null, seen = 
  *   registry source (a no-argument async function returning raw `reg query` text); tests inject it.
  */
 export function apply(ctx, config) {
+  // 阶段 6 的每分钟/每小时调用量以本次宿主挂载为起点；只用于 status 投影，不持久化。
+  const mountedAt = Date.now();
   // First run: no instance.json means the user never chose where data should live.
   const explicitRoot = typeof config?.root === 'string' && config.root.trim().length > 0;
   const instanceChosen = !explicitRoot && (() => {
@@ -16290,6 +16294,15 @@ export function apply(ctx, config) {
         understanding: understandingStatusView(),
         // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
         proactive: { ...proactive.status(), enabled: proactiveEnabled() },
+        // P-187 阶段 6：以上证据/台词/评论/理解/主动状态的数字投影；只读、无路径/正文/帧 id。
+        audiovisual: summarizeAudiovisual({
+          evidence: evidenceWindow.state(),
+          media: mediaTimeline.state(),
+          comment: commentEvidence.state(),
+          understanding: understandingStatusView(),
+          proactive: { ...proactive.status(), enabled: proactiveEnabled() },
+          uptimeMs: Date.now() - mountedAt,
+        }),
       },
       hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };
