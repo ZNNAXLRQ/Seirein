@@ -7,7 +7,8 @@
  * against the source literal. It is a source assertion on purpose: no model, no network, no Host.
  *
  * Proves:
- *  1. external lookup prefers `web_search`, and a specific page is read with `web_fetch`;
+ *  1. external lookup prefers `assistant_web_search`, and a specific page is read with
+ *     `assistant_web_fetch`;
  *  2. `curl` / `Invoke-WebRequest` against search-engine result pages or wiki APIs is forbidden;
  *  3. rate limits / empty / anti-bot responses are reported honestly, without hopping engines,
  *     and a delegated subtask follows the same web-first rule;
@@ -53,13 +54,13 @@ function webRetrievalLines(lines) {
   return lines.slice(headingAt + 1);
 }
 
-test('1. 外部资料优先 web_search，具体页面用 web_fetch', () => {
+test('1. 外部资料优先 assistant_web_search，具体页面用 assistant_web_fetch', () => {
   const lines = toolSelectionLines();
-  const lookup = lineWith(lines, 'web_search');
+  const lookup = lineWith(lines, 'assistant_web_search');
   assert.match(lookup, /外部资料/u, 'the bullet names external lookups');
-  assert.match(lookup, /优先使用\s*`web_search`/u, 'external lookups prefer web_search');
+  assert.match(lookup, /优先使用\s*`assistant_web_search`/u, 'external lookups prefer assistant_web_search');
   assert.match(lookup, /具体页面/u, 'the same bullet distinguishes a specific page');
-  assert.match(lookup, /`web_fetch`/u, 'a specific page is read with web_fetch');
+  assert.match(lookup, /`assistant_web_fetch`/u, 'a specific page is read with assistant_web_fetch');
   console.log(`1) lookup="${lookup}"`);
 });
 
@@ -86,7 +87,7 @@ test('3. 限流/空响应/反爬如实说明、不连续换引擎，子任务同
   assert.match(fallback, /反爬/u, 'anti-bot responses are included');
   assert.match(fallback, /不要连续更换搜索引擎/u, 'engine hopping is refused');
   assert.match(fallback, /派子任务/u, 'delegating the lookup is allowed');
-  assert.match(fallback, /子任务同样优先使用\s*`web_search`\s*\/\s*`web_fetch`/u,
+  assert.match(fallback, /子任务同样优先使用\s*`assistant_web_search`\s*\/\s*`assistant_web_fetch`/u,
     'a subtask follows the same web-first rule');
   console.log(`3) fallback="${fallback}"`);
 });
@@ -95,7 +96,7 @@ test('4. 没有 web 工具时明确说「当前没有联网搜索工具」，不
   const lines = toolSelectionLines();
   const missing = lineWith(lines, '当前没有联网搜索工具');
   assert.match(missing, /工具集中没有/u, 'the bullet is scoped to the session toolset');
-  assert.match(missing, /`web_search`\s*\/\s*`web_fetch`/u, 'both web tools are named');
+  assert.match(missing, /`assistant_web_search`\s*\/\s*`assistant_web_fetch`/u, 'both web tools are named');
   assert.match(missing, /不要改用\s*curl\s*假装在搜索/u, 'curl must not stand in for a search');
   console.log(`4) missing="${missing}"`);
 });
