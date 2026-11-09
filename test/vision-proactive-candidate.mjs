@@ -4,6 +4,7 @@
  * 这些用例逐条盯住契约里的硬规则：
  *   证据约束、三时间（occurredAt/understoodAt/expiresAt）与 maxAgeMs、优先级选择、
  *   四类时机抑制、too-soon、ignored 静默与放大、每小时上限的可选覆盖、同身份去重且不续期、
+ *   事件身份历史（候选被 prune 后仍拒绝已过期身份的迟到重登）、
  *   cancelFor、settings 覆盖、候选上限淘汰、spoken/ignored 状态、通过率 0/100/中间值、
  *   按身份只抽一次、时机/过期不抽签、未回应 quiet 仍生效、默认配额不再限制，以及畸形输入不抛错。
  *
@@ -223,6 +224,216 @@ test('重复分析不续期：同身份保留最早 occurredAt/expiresAt，并�
   // 到最早的 expiresAt 就失效，而不是 second 推导出来的 T0 + 2s + maxAge。
   h.at(first.expiresAt);
   assert.deepEqual(arbiter.pendingIds(), []);
+});
+
+// ---- 事件身份历史（prune 不得抹掉“已过期”的事实）--------------------------
+
+test('身份历史：首次 expiresAt 前同身份合并，仍保留最早 occurredAt/expiresAt', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  const first = arbiter.propose(makeCandidate(h.now, {
+    id: 'hist-before:1',
+    eventId: 'evt-hist-before',
+    occurredAt: T0,
+    from: T0 - 1_000,
+    to: T0,
+    expiresAt: T0 + 9_000,
+  }));
+  assert.ok(first);
+  assert.equal(arbiter.status().identities, 1, '首次登记写入身份历史');
+
+  // 5 秒后（仍在首次 expiresAt 之前）同一事件带着更新后的内容时间再来：可以合并，但不续期。
+  h.at(T0 + 5_000);
+  const second = arbiter.propose(makeCandidate(h.now, {
+    id: 'hist-before:2',
+    eventId: 'evt-hist-before',
+    occurredAt: T0 + 5_000,
+    from: T0 + 4_000,
+    to: T0 + 5_000,
+    expiresAt: T0 + 14_000,
+    description: '更新后的描述',
+  }));
+  assert.ok(second, '首次有效期之前可以合并');
+  assert.equal(second.expiresAt, first.expiresAt, 'expiresAt 保持最早，不得续期');
+  assert.equal(second.occurredAt, T0, 'occurredAt 保持最早');
+  assert.equal(second.to, T0, '内容时间保留最早版本');
+  assert.equal(second.description, '更新后的描述', '描述仍可更新');
+  assert.equal(arbiter.status().pending, 1);
+  assert.equal(arbiter.status().identities, 1, '合并不会新增身份');
+
+  h.at(first.expiresAt);
+  assert.deepEqual(arbiter.pendingIds(), [], '到最早 expiresAt 即失效');
+  assert.equal(arbiter.evaluate().reason, 'no-candidate');
+});
+
+test('身份历史：首次 expiresAt 后迟到重登被拒绝，不能复活/续期/开口', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  const first = arbiter.propose(makeCandidate(h.now, {
+    id: 'late:1',
+    eventId: 'evt-late',
+    occurredAt: T0,
+    from: T0 - 1_000,
+    to: T0,
+    expiresAt: T0 + 9_000,
+  }));
+  assert.ok(first);
+
+  // 反例：候选已过 9 秒截止并被 prune 清掉；10 秒时同一事件带着“更新后的内容时间”
+  // 送来，按输入会推导出 18 秒的新截止。若不查身份历史，它会被重新登记并能开口。
+  h.at(T0 + 10_000);
+  assert.deepEqual(arbiter.pendingIds(), []);
+  const late = arbiter.propose(makeCandidate(h.now, {
+    id: 'late:2',
+    eventId: 'evt-late',
+    occurredAt: T0 + 10_000,
+    from: T0 + 9_000,
+    to: T0 + 10_000,
+    expiresAt: T0 + 18_000,
+    description: '迟到的重复分析',
+  }));
+  assert.equal(late, null, '已过期身份不得重新登记');
+  const status = arbiter.status();
+  assert.equal(status.pending, 0);
+  assert.equal(status.valid, 0);
+  assert.equal(status.identities, 1, '身份历史不随候选 prune 丢失');
+  assert.equal(status.lastRejectReason, 'expired-identity');
+  assert.equal(status.counts.proposed, 1, '迟到重登不得计入新登记');
+  assert.equal(status.counts.rejected, 1);
+  assert.equal(status.counts.expired, 1);
+  assert.equal(status.counts.duplicate, 1);
+
+  const out = arbiter.evaluate();
+  assert.equal(out.speak, false);
+  assert.equal(out.candidate, null);
+  assert.equal(out.reason, 'no-candidate');
+  assert.deepEqual(out.suppressed, ['no-candidate']);
+  assert.equal(arbiter.status().drawn, 0, '拒绝的迟到事件不消耗通过率抽签');
+
+  // 再迟到一次也一样：历史只记首次，后续输入再新也不能洗白。
+  h.at(T0 + 12_000);
+  assert.equal(arbiter.propose(makeCandidate(h.now, {
+    id: 'late:3',
+    eventId: 'evt-late',
+    occurredAt: T0 + 12_000,
+    from: T0 + 11_000,
+    to: T0 + 12_000,
+    expiresAt: T0 + 20_000,
+  })), null);
+  assert.equal(arbiter.status().counts.expired, 2);
+  assert.equal(arbiter.status().pending, 0);
+});
+
+test('身份历史：不同 id/eventId 的新事件不受已过期身份影响', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  assert.ok(arbiter.propose(makeCandidate(h.now, {
+    id: 'stale',
+    eventId: 'evt-stale',
+    occurredAt: T0,
+    from: T0 - 1_000,
+    to: T0,
+    expiresAt: T0 + 9_000,
+  })));
+
+  h.at(T0 + 10_000);
+  assert.equal(arbiter.propose(makeCandidate(h.now, {
+    id: 'stale-late',
+    eventId: 'evt-stale',
+    occurredAt: T0 + 10_000,
+    from: T0 + 9_000,
+    to: T0 + 10_000,
+    expiresAt: T0 + 18_000,
+  })), null, '旧身份仍被拒绝');
+
+  const fresh = arbiter.propose(makeCandidate(h.now, {
+    id: 'fresh',
+    eventId: 'evt-fresh',
+    occurredAt: T0 + 10_000,
+    from: T0 + 9_000,
+    to: T0 + 10_000,
+    expiresAt: T0 + 18_000,
+  }));
+  assert.ok(fresh, '不同事件身份应正常登记');
+  assert.equal(arbiter.status().pending, 1);
+  assert.equal(arbiter.status().identities, 2);
+  const out = arbiter.evaluate();
+  assert.equal(out.speak, true);
+  assert.equal(out.candidate.id, 'fresh');
+});
+
+test('身份历史有界且 reset 代次清空；cancelFor 不写历史', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  // 第一条先过期，随后 300 个新身份把最早的历史挤出有界表。
+  assert.ok(arbiter.propose(makeCandidate(h.now, {
+    id: 'bounded-first',
+    eventId: 'evt-bounded-first',
+    occurredAt: T0,
+    from: T0 - 1_000,
+    to: T0,
+    expiresAt: T0 + 1_000,
+  })));
+  for (let i = 0; i < 300; i += 1) {
+    assert.ok(arbiter.propose(makeCandidate(h.now, {
+      id: `bounded-${i}`,
+      eventId: `evt-bounded-${i}`,
+      occurredAt: T0,
+      from: T0 - 1_000,
+      to: T0,
+      expiresAt: T0 + 20_000,
+    })), `bounded-${i} 应能登记`);
+  }
+  assert.equal(arbiter.status().identities, 256, '身份历史必须保持有界');
+
+  h.at(T0 + 2_000);
+  // 最早的身份已被挤出：这是有界表的明确取舍，按新事件登记而不是永久拒绝。
+  const replayed = arbiter.propose(makeCandidate(h.now, {
+    id: 'bounded-first',
+    eventId: 'evt-bounded-first',
+    occurredAt: T0 + 2_000,
+    from: T0 + 1_000,
+    to: T0 + 2_000,
+    expiresAt: T0 + 11_000,
+  }));
+  assert.ok(replayed, '被挤出历史的身份按新事件登记');
+  assert.equal(arbiter.status().identities, 256, '重新登记后仍保持有界');
+
+  // reset 是代次边界：清空后同一过期身份可在新代次重新登记。
+  const g = createHarness();
+  assert.ok(g.arbiter.propose(makeCandidate(g.now, {
+    id: 'gen:1',
+    eventId: 'evt-gen',
+    occurredAt: T0,
+    from: T0 - 1_000,
+    to: T0,
+    expiresAt: T0 + 1_000,
+  })));
+  g.at(T0 + 2_000);
+  assert.equal(g.arbiter.propose(makeCandidate(g.now, {
+    id: 'gen:2',
+    eventId: 'evt-gen',
+    occurredAt: T0 + 2_000,
+    from: T0 + 1_000,
+    to: T0 + 2_000,
+    expiresAt: T0 + 12_000,
+  })), null, '同一代次内已过期身份仍被拒绝');
+  assert.equal(g.arbiter.status().identities, 1);
+  assert.equal(g.arbiter.reset('vision-invalidated'), 0);
+  assert.equal(g.arbiter.status().identities, 0, 'reset 清空身份历史');
+  assert.ok(g.arbiter.propose(makeCandidate(g.now, {
+    id: 'gen:3',
+    eventId: 'evt-gen',
+    occurredAt: T0 + 2_000,
+    from: T0 + 1_000,
+    to: T0 + 2_000,
+    expiresAt: T0 + 12_000,
+  })), '新代次不再受旧身份历史限制');
+
+  // cancelFor 只写取消集，不写身份历史。
+  const c = createHarness();
+  c.arbiter.cancelFor(['never-proposed', null]);
+  assert.equal(c.arbiter.status().identities, 0);
 });
 
 test('说过的重要事件在 expiresAt 前不会被重复分析再次登记', () => {

@@ -16,6 +16,10 @@
  *   - spoken() 会移除同一事件的候选，并在候选有效期内（至少 maxAgeMs）记住该事件，
  *     避免同一事件因重复分析再次说出。
  *   - 候选过期就丢弃，不排队；淘汰/拒绝都只计数，不回报正文。
+ *   - 事件身份历史与候选队列分开维护（有界 256）：旧候选被 prune 清掉后，“首次 expiresAt
+ *     已过”的事实仍然保留，同一事件迟到重登会被拒绝（expired-identity），不能用新的内容
+ *     时间重新登记/续期；首次 expiresAt 之前只合并、不续期。reset() 清空历史，cancelFor()
+ *     只写取消集、不写历史。
  *   - 通过率按候选身份只抽一次：抽中/未抽中都持久记录（有界），换措辞不重抽。
  *   - cancelAll() 只清待选池（可再次登记）；cancelFor() 才写取消集；reset() 是隐私/切源的
  *     代次边界，连取消集、抽签记录、最近主题与时机窗口一起清空，但保留累计计数。
@@ -56,6 +60,16 @@ const CANCELED_ID_LIMIT = 256;
 
 /** 通过率抽签结果按候选身份持久保存；有界，防止长会话无限增长。 */
 const DRAW_ID_LIMIT = 256;
+
+/**
+ * 事件身份历史的上限（按 eventId 优先、否则 id）。
+ *
+ * 候选队列会被 prune() 清掉过期项，但“这个事件已经过了首次有效期”是独立事实：如果只靠
+ * 候选队列判断，迟到的重复分析可以带一个更新的内容时间重新登记（新的 expiresAt），把旧事件
+ * 洗新后再次开口。这里把首次 occurredAt/expiresAt 单独记在有界表里，不随候选清理而丢失。
+ * reset() 是代次边界，会一起清空；cancelFor() 只写取消集，不写这张表。
+ */
+const IDENTITY_HISTORY_LIMIT = 256;
 
 /** 发言时间只用于滚动一小时计数；硬上限防止异常时钟/重复记账把数组撑大。 */
 const SPEAK_TIMES_LIMIT = 2_048;
@@ -447,6 +461,25 @@ export function createProactiveArbiter(options = {}) {
   }
 
   /**
+   * 记录事件身份的“首次” occurredAt/expiresAt；已存在时绝不覆盖（只做防御性返回）。
+   * 超过上限先丢最旧身份：候选寿命很短，256 足够覆盖任何仍可能被重复分析的窗口。
+   */
+  function rememberIdentity(identity, occurredAt, expiresAt, at) {
+    const existing = identityHistory.get(identity);
+    if (existing !== undefined) return existing;
+    const entry = {
+      occurredAt,
+      expiresAt,
+      expiredAt: at >= expiresAt ? at : null,
+    };
+    identityHistory.set(identity, entry);
+    while (identityHistory.size > IDENTITY_HISTORY_LIMIT) {
+      identityHistory.delete(identityHistory.keys().next().value);
+    }
+    return entry;
+  }
+
+  /**
    * 通过率判定：每个独立候选身份只判定一次，结果持久记录。
    * 0 = 直接不开口；100 = 直接必过；中间值才调用一次注入的随机源。
    * 已记录的身份不重抽——即使同一事件换了措辞、id 或描述。
@@ -475,6 +508,8 @@ export function createProactiveArbiter(options = {}) {
   const canceled = new Map();
   const spokenAt = new Map();
   const draws = new Map();
+  /** 事件身份历史：与候选队列分开，prune() 不碰；reset() 才清空。 */
+  const identityHistory = new Map();
   const speakTimes = [];
   let proposed = 0;
   let rejected = 0;
@@ -492,6 +527,8 @@ export function createProactiveArbiter(options = {}) {
   let lastRate = config.rate;
   let lastTopic = null;
   let lastReason = null;
+  /** 最近一次 propose 被拒的机器原因码（诊断用，不含候选正文）。 */
+  let lastRejectReason = null;
 
   return {
     /**
@@ -507,13 +544,48 @@ export function createProactiveArbiter(options = {}) {
         rejected += 1;
         if (result.reason === 'expired') expired += 1;
         if (result.reason === 'duplicate') duplicate += 1;
+        lastRejectReason = result.reason;
         return null;
       }
 
-      const candidate = result.candidate;
+      let candidate = result.candidate;
+      lastRejectReason = null;
       // 同身份（eventId 优先，否则 id）去重：描述/证据可以更新，但时间只保留更早的一份。
       // 重复分析绝不能把 expiresAt 推到 now + maxAgeMs，否则同一事件会无限续期、反复开口。
       const identity = candidateIdentity(candidate);
+      const history = identityHistory.get(identity);
+
+      // 关键：prune() 可能已经清掉过期候选，所以不能只看候选队列判断“是不是旧事件”。
+      // 身份历史独立保留首次 occurredAt/expiresAt；首次有效期一过，迟到的重复分析直接拒绝，
+      // 不允许它带着更新的内容时间重新登记、续期或再次开口。
+      if (history !== undefined) {
+        if (history.expiredAt !== null || at >= history.expiresAt) {
+          if (history.expiredAt === null) history.expiredAt = at;
+          duplicate += 1;
+          rejected += 1;
+          expired += 1;
+          lastRejectReason = 'expired-identity';
+          // 防御性清理：正常情况下 prune() 已经移除了同身份旧候选。
+          for (let i = candidates.length - 1; i >= 0; i -= 1) {
+            if (candidateIdentity(candidates[i]) === identity) candidates.splice(i, 1);
+          }
+          return null;
+        }
+        // 首次有效期之前：合并但仍保留最早 occurredAt/expiresAt，不续期。
+        const firstOccurredAt = Math.min(history.occurredAt, candidate.occurredAt);
+        const firstExpiresAt = Math.min(
+          history.expiresAt,
+          timestamp(candidate.expiresAt) ?? (candidate.occurredAt + config.maxAgeMs),
+        );
+        if (firstOccurredAt !== candidate.occurredAt || firstExpiresAt !== candidate.expiresAt) {
+          candidate = Object.freeze({
+            ...candidate,
+            occurredAt: firstOccurredAt,
+            expiresAt: firstExpiresAt,
+          });
+        }
+      }
+
       const existing = candidates.findIndex((entry) => candidateIdentity(entry) === identity);
       if (existing >= 0) {
         const previous = candidates[existing];
@@ -522,6 +594,7 @@ export function createProactiveArbiter(options = {}) {
         if (!isUsable(previous, at)) {
           candidates.splice(existing, 1);
           rejected += 1;
+          lastRejectReason = 'duplicate';
           if (previous.expiresAt !== null && at >= previous.expiresAt) expired += 1;
           return null;
         }
@@ -542,7 +615,16 @@ export function createProactiveArbiter(options = {}) {
           ),
         });
         candidates[existing] = merged;
+        // 首次登记的历史必须锚定最早值；正常路径下 history 已存在，这里只覆盖
+        // “历史被有界表挤出、候选仍在池里”的极端配置。
+        if (history === undefined) {
+          rememberIdentity(identity, merged.occurredAt, merged.expiresAt, at);
+        }
         return merged;
+      }
+      // 首次登记：把首次内容时间/截止写进独立身份历史，之后即使候选被 prune 也不会丢。
+      if (history === undefined) {
+        rememberIdentity(identity, candidate.occurredAt, candidate.expiresAt, at);
       }
       candidates.push(candidate);
       proposed += 1;
@@ -745,6 +827,9 @@ export function createProactiveArbiter(options = {}) {
       canceled.clear();
       spokenAt.clear();
       draws.clear();
+      // 身份历史也是代次内的事实：新代次从零开始，旧画面的事件不能继续被当成“见过”。
+      identityHistory.clear();
+      lastRejectReason = null;
       speakTimes.length = 0;
       lastSpokenAt = null;
       consecutiveIgnored = 0;
@@ -796,6 +881,9 @@ export function createProactiveArbiter(options = {}) {
           ignored: ignoredCount,
         },
         canceledEvents: canceled.size,
+        // 有界身份历史只暴露数量；不含 eventId/id 正文。lastRejectReason 是短机器码。
+        identities: identityHistory.size,
+        lastRejectReason,
         spokenLastHour: recentSpeakCount(at),
         consecutiveIgnored,
         quietUntil,
