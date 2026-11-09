@@ -689,11 +689,38 @@ function memoryTimeResolvedLine(value) {
 }
 
 /**
+ * The model-facing line that names the window a memory query actually covered.
+ *
+ * `range` is the store's actual window (after relaxation), never the wording of the query.
+ * A null range is rendered as 未限定, not as "everything was searched and empty": the model
+ * must be able to say "I only looked here" without turning the range into a hit. An invalid
+ * archive window is reported as a fallback, because silently searching everything would make
+ * the empty/non-empty result look like a bounded answer.
+ * @param {{range?: {from?: string|null, to?: string|null}|null, relaxed?: boolean,
+ *          rangeInvalid?: boolean}} value
+ */
+function memoryQueryLine(value) {
+  const range = value?.range ?? null;
+  const span = range === null
+    ? '未限定'
+    : `${typeof range.from === 'string' && range.from.length > 0 ? range.from : '不限'}–`
+      + `${typeof range.to === 'string' && range.to.length > 0 ? range.to : '不限'}`;
+  const fallback = value?.rangeInvalid === true
+    ? '（时间范围无效或无法解析，已回退为全归档）'
+    : '';
+  return `查询范围：${span}${fallback} · 放宽：${value?.relaxed === true ? '是' : '否'}`;
+}
+
+/**
  * The model-facing summary of one delivered frame: metadata only, never anything read out of
  * the picture itself. The image block that follows carries the pixels.
+ *
+ * The evidence label is part of the contract, not decoration: a screenshot (live or cached) can
+ * only testify to the instant it was captured, so the summary says so next to the timestamp. It
+ * must never be read as proof that something happened earlier.
  * @param {{width: number, height: number, bytes: number, createdAt: number, mode: string, scaled: boolean}} value
  */
-function sightSummary(value) {
+export function sightSummary(value) {
   const observedAt = Number(value.observedAt ?? value.capturedAt ?? value.at)
     || Number(value.createdAt) || Date.now();
   const captured = new Date(observedAt).toISOString();
@@ -703,7 +730,8 @@ function sightSummary(value) {
   const currency = value.current === false || value.stale === true ? '非当前画面：' : '当前画面：';
   return `${currency}Screenshot ${value.width}x${value.height}, ${value.bytes} bytes, `
     + `observedAt=${captured}, captured ${captured}, `
-    + `mode=${value.mode || 'unknown'}, privacy=off${scaled}.${freshness}`;
+    + `mode=${value.mode || 'unknown'}, privacy=off${scaled}.${freshness}`
+    + ' 证据类型：current（只证明该时刻的画面，不能证明过去发生过什么）。';
 }
 
 /** One refusal shape, so every failed delivery is a plain text result and never an image. */
@@ -711,6 +739,9 @@ function sightFailure(reason) {
   return {
     ok: false,
     reason,
+    // Even a refusal is a "current view" attempt: the next look only says something about now
+    // and never becomes evidence about the past.
+    evidenceType: 'current',
     file: '',
     bytes: 0,
     width: 0,
@@ -7831,6 +7862,8 @@ export function apply(ctx, config) {
           ok: { type: 'boolean' },
           reason: { type: 'string' },
           error: { type: 'string' },
+          // Screenshots are current-state evidence only; the render repeats the rule.
+          evidenceType: { type: 'string', enum: ['current'] },
           evidence: { type: 'boolean' },
           frameIds: { type: 'array', items: { type: 'string' } },
           frames: { type: 'array', items: { type: 'object' } },
@@ -7852,7 +7885,7 @@ export function apply(ctx, config) {
           hint: { type: 'string' },
         },
         required: [
-          'ok', 'reason', 'file', 'bytes', 'width', 'height',
+          'ok', 'reason', 'evidenceType', 'file', 'bytes', 'width', 'height',
           'mode', 'createdAt', 'scaled', 'attachmentId', 'attachment',
           'at', 'capturedAt', 'observedAt', 'ageMs', 'stale', 'current', 'hint',
         ],
@@ -7874,7 +7907,8 @@ export function apply(ctx, config) {
           }
           const blocks = [{
             type: 'text',
-            text: `Evidence replay (${(value.frameIds ?? []).join(', ') || 'none'}): cached frames, not a new screenshot.`,
+            text: `Evidence replay (${(value.frameIds ?? []).join(', ') || 'none'}): cached frames, not a new screenshot. `
+              + '证据类型：current（每帧只证明各自截取时刻的画面，不能据此断言更早发生过什么）。',
           }];
           for (const frame of frames) {
             if (frame?.attachment === null || frame?.attachment === undefined) continue;
@@ -8125,6 +8159,23 @@ export function apply(ctx, config) {
           mode: { type: 'string', enum: ['keyword', 'time', 'adjacent'] },
           roles: { type: 'array', items: { type: 'string' } },
           window: { type: 'integer' },
+          // The store's actual query window and relaxation flag, never a hit: this is what makes
+          // "I only searched this window" visible instead of an empty result reading as history.
+          range: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  from: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  to: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                },
+                required: ['from', 'to'],
+              },
+              { type: 'null' },
+            ],
+          },
+          relaxed: { type: 'boolean' },
           hits: {
             type: 'array',
             items: {
@@ -8194,7 +8245,7 @@ export function apply(ctx, config) {
           ok: { type: 'boolean' },
           error: { type: 'string' },
         },
-        required: ['scope', 'scanned', 'hits', 'assembly'],
+        required: ['scope', 'scanned', 'hits', 'assembly', 'range', 'relaxed'],
       },
       // DSH shows the model only what `render` returns; the value itself stays in the
       // programmatic layer. A count-only line made the agent answer "Found 1 of 2" without
@@ -8212,7 +8263,7 @@ export function apply(ctx, config) {
         const summary = `命中 ${assembly.hits ?? 0} · 同轮 ${assembly.pairs ?? 0}`
           + ` · 邻轮 ${assembly.neighbors ?? 0} · 链接 ${assembly.links ?? 0}`
           + ` · 约定 ${assembly.upcoming ?? 0} · 跳过 ${assembly.skippedByBudget ?? 0}`
-          + ` · 丢弃 ${assembly.dropped ?? 0}`;
+          + ` · 丢弃 ${assembly.dropped ?? 0} · ${memoryQueryLine(value)}`;
         if (value.hits.length === 0) {
           return [{ type: 'text', text: `No match in ${value.scope} (${value.scanned} records scanned).\n${summary}` }];
         }
@@ -8262,6 +8313,22 @@ export function apply(ctx, config) {
           fixed: { type: 'integer' },
           matched: { type: 'integer' },
           terms: { type: 'array', items: { type: 'string' } },
+          // Same contract as assistant_recall: the actual window and whether it was widened.
+          range: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  from: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  to: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                },
+                required: ['from', 'to'],
+              },
+              { type: 'null' },
+            ],
+          },
+          relaxed: { type: 'boolean' },
           fixedRecords: {
             type: 'array',
             items: {
@@ -8299,7 +8366,7 @@ export function apply(ctx, config) {
           ok: { type: 'boolean' },
           error: { type: 'string' },
         },
-        required: ['text', 'fixed', 'matched'],
+        required: ['text', 'fixed', 'matched', 'range', 'relaxed'],
       },
       // `text` already carries the full memory block; it used to be dropped here, leaving the
       // model with "固定 N 条 + 相关 M 条" and no record bodies.
@@ -8308,15 +8375,16 @@ export function apply(ctx, config) {
           return [{ type: 'text', text: value.error }];
         }
         if (value.fixed + value.matched === 0) {
-          return [{ type: 'text', text: '没有可注入的记忆。' }];
+          return [{ type: 'text', text: `没有可注入的记忆。\n${memoryQueryLine(value)}` }];
         }
         const header = `固定 ${value.fixed} 条 + 相关 ${value.matched} 条（关键词：${(value.terms ?? []).join('、') || '无'}）`;
+        const scope = memoryQueryLine(value);
         // The model sees only this render. Correction needs the record id + version, so carry
         // them here instead of hoping the structured value is visible.
         const refs = [...(value.fixedRecords ?? []), ...(value.matchedRecords ?? [])]
           .filter((record) => typeof record.id === 'string' && record.id.length > 0)
           .map((record) => `${record.id}=v${record.version ?? 1}`);
-        const body = value.text.length > 0 ? `${header}\n${value.text}` : header;
+        const body = value.text.length > 0 ? `${header}\n${scope}\n${value.text}` : `${header}\n${scope}`;
         return [{ type: 'text', text: refs.length > 0 ? `${body}\n（定位：${refs.join('；')}）` : body }];
       },
     },
@@ -8343,6 +8411,24 @@ export function apply(ctx, config) {
         properties: {
           query: { type: 'string' },
           count: { type: 'integer' },
+          // The time filter the store actually applied (after rejecting a malformed window).
+          range: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  from: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  to: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                },
+                required: ['from', 'to'],
+              },
+              { type: 'null' },
+            ],
+          },
+          relaxed: { type: 'boolean' },
+          // True when a detected window could not be used and the query fell back to the whole archive.
+          rangeInvalid: { type: 'boolean' },
           hits: {
             type: 'array',
             items: {
@@ -8370,7 +8456,7 @@ export function apply(ctx, config) {
             },
           },
         },
-        required: ['query', 'count', 'hits'],
+        required: ['query', 'count', 'hits', 'range', 'relaxed', 'rangeInvalid'],
       },
       // The model sees only this render, so the count line alone left every hit invisible. The
       // total stays (for paging judgement), then one `- [domain·role·time] body` line per hit.
@@ -8379,9 +8465,9 @@ export function apply(ctx, config) {
           return [{ type: 'text', text: value.error }];
         }
         if (value.count === 0) {
-          return [{ type: 'text', text: `归档里没有匹配「${value.query}」的记录。` }];
+          return [{ type: 'text', text: `归档里没有匹配「${value.query}」的记录。\n${memoryQueryLine(value)}` }];
         }
-        const lines = [`归档命中 ${value.count} 条（${value.query}）。`];
+        const lines = [`归档命中 ${value.count} 条（${value.query}）。`, memoryQueryLine(value)];
         for (const hit of value.hits) {
           const role = hit.role === 'user' || hit.role === 'assistant' ? hit.role : '提炼';
           lines.push(`- [${hit.domain}·${role}·${shortStamp(hit.ts)}] ${hit.text}${hit.turnUpdated === true ? '（该记录已于本轮更新）' : ''}`);
@@ -8489,15 +8575,18 @@ export function apply(ctx, config) {
           action: { type: 'string' },
           current: { type: 'string' },
           scenes: { type: 'array', items: { type: 'string' } },
+          // The program scene is current machine state, never proof of an earlier scene change.
+          evidenceType: { type: 'string', enum: ['current'] },
           error: { type: 'string' },
         },
-        required: ['ok', 'action', 'current', 'scenes'],
+        required: ['ok', 'action', 'current', 'scenes', 'evidenceType'],
       },
       render: (_args, value) => [
         {
           type: 'text',
           text: value.ok
             ? `OBS ${value.action}: current="${value.current}", ${value.scenes.length} scene(s).`
+              + ' 证据类型：current（只证明当前场景，不能证明历史）。'
             : `OBS ${value.action} failed: ${value.error}`,
         },
       ],
@@ -8531,12 +8620,15 @@ export function apply(ctx, config) {
             recordObsScene(args.scene);
           }
           await log.emit('obs.scene', { from: current, to: args.scene });
-          return { ok: true, action: 'set', current: args.scene, scenes };
+          return { ok: true, action: 'set', current: args.scene, scenes, evidenceType: 'current' };
         }
         await log.emit('obs.scene.read', { current, count: scenes.length });
-        return { ok: true, action: args.action, current, scenes };
+        return { ok: true, action: args.action, current, scenes, evidenceType: 'current' };
       } catch (error) {
-        return { ok: false, action: args.action, current: '', scenes: [], error: error?.message ?? String(error) };
+        return {
+          ok: false, action: args.action, current: '', scenes: [], evidenceType: 'current',
+          error: error?.message ?? String(error),
+        };
       } finally {
         client?.close();
       }
@@ -10709,7 +10801,8 @@ export function apply(ctx, config) {
     const capturedAt = Number(shot.capturedAt ?? shot.at) || createdAt;
     const observation = readObservation({ at: capturedAt, capturedAt }, { now: Date.now() });
     return {
-      ok: true, reason: '', file: shot.file, bytes: data.length, width, height,
+      ok: true, reason: '', evidenceType: 'current',
+      file: shot.file, bytes: data.length, width, height,
       mode: token?.mode ?? vision.mode, createdAt, scaled, attachmentId, attachment: attachment ?? null,
       ...observation,
       observedAt: observation.at,
@@ -11706,6 +11799,7 @@ export function apply(ctx, config) {
     '保存成功后用一句短确认回应，例如「好的，已记入重要记忆」或「我记住了」；不要复述全文。',
     '只对本次对话有效的临时信息不要手动保存（自动原文记录仍然保留）。',
     '- 禁止写入日级或会话级汇总（例如「今天聊了 X」「本会话讨论了 Y」）：记忆按每条交流记录，只写单条交流里值得长期保留的事实、偏好与决定。',
+    '- 截图 / 当前画面 / OBS 当前场景 / 当前配置只能作为「当前状态」证据（evidenceType=current），只能证明此刻；不得据此断言历史发生过什么，历史归因必须来自记忆或会话查询。',
   ].join('\n');
 
   const HEARING_CONVENTION = [
@@ -11813,6 +11907,7 @@ export function apply(ctx, config) {
     '- 查询过去对话时，优先使用 assistant_recall / assistant_archive_search。',
     '- 常规记忆查询不自动调用 session_search；仅在用户明确要求翻查原始会话记录时使用。',
     '- `session_search` 受插件预算保护（默认 8 秒）；结果以 `session_search partial: true` 开头表示超时降级，未扫描的会话未纳入，不能据此判断没有记录。',
+    '- 记忆工具返回的 `range` / `relaxed` 是本次**实际查询范围**（`range: null` 表示未限定，`relaxed: true` 表示放宽过）；它只说明「查了哪里」，不是命中内容，无命中不代表没发生。',
     '- 无命中只表示已查范围没有记录；只有获得记录覆盖信息，才能说明"当时尚未开启记录"。',
     '- 取到的记忆区分来源：`[原文·user]` / `[原文·assistant]` 是当时的原话，`[提炼]` 是整理过的记忆；模糊条目会标注「记忆模糊」，不要当成确定事实。',
   ].join('\n');
@@ -12087,7 +12182,7 @@ export function apply(ctx, config) {
         ? `已连接（设备：${virtualCamDevice()}）`
         : `未连接（设备：${virtualCamDevice()}）`;
       return [
-        '【环境事实｜机器状态，不是对话内容，所有会话共享】',
+        '【环境事实｜机器状态，不是对话内容，所有会话共享｜证据类型：current（只证此刻，不能证明历史）】',
         `- OBS 当前场景：${observed}（来源：OBS WebSocket；观察于：${environmentStamp(lastObsSceneAt)}）`,
         `- 采集来源：${source}${locked ? '（隐私锁定中）' : ''}（来源：视觉模式；观察于：${environmentStamp(visionSourceAt)}）`,
         `- 虚拟摄像头：${camera}（来源：视觉采集；观察于：${environmentStamp(virtualCamAt)}）`,

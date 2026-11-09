@@ -464,6 +464,30 @@ function boundedInteger(value, fallback, min, max) {
 
 
 /**
+ * Normalize one archive time bound to canonical ISO.
+ *
+ * Epoch milliseconds and ISO strings are both accepted (tool callers may hold either). An
+ * absent/empty value means "no bound"; an unparseable value also returns null, so the caller
+ * can tell the two apart by checking the raw input and report a rejected window. The result is
+ * always either null or an ISO string valid for parameter binding — never raw caller text.
+ *
+ * @param {number|string|null|undefined} value
+ * @returns {string|null}
+ */
+export function archiveTimeBound(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  return null;
+}
+
+
+/**
  * Memory store: one SQLite file, domains as a column.
  *
  * FTS5 with the trigram tokenizer gives substring search that works for Chinese; when the
@@ -2658,20 +2682,39 @@ export class MemoryStore {
    * nothing although the archive is not empty (or FTS is unavailable), LIKE runs once and the
    * rows are tagged `fallback: 'like'` so a diagnostic can tell the two paths apart.
    *
+   * `fromIso`/`toIso` are already-normalized bounds on the archived original's `ts`
+   * (half-open `[from, to)`, the same rule `listArchive` uses). They are bound as SQL
+   * parameters in both the FTS and the LIKE path, never spliced into the statement.
+   *
    * @param {string} query user query
    * @param {{columns: string, orderBy?: string, limit: number, offset?: number, rank?: boolean,
-   *          includeHidden?: boolean}} options `includeHidden` is internal (audit only): the
-   *   default hides merged correction rows even after they reach the archive.
+   *          includeHidden?: boolean, fromIso?: string|null, toIso?: string|null}} options
+   *   `includeHidden` is internal (audit only): the default hides merged correction rows even
+   *   after they reach the archive.
    * @returns {{rows: object[], fallback: boolean}}
    */
-  queryArchive(query, { columns, orderBy = 'a.archived_at DESC', limit, offset = 0, rank = false, includeHidden = false }) {
+  queryArchive(query, {
+    columns, orderBy = 'a.archived_at DESC', limit, offset = 0, rank = false, includeHidden = false,
+    fromIso = null, toIso = null,
+  }) {
     const text = typeof query === 'string' ? query : String(query ?? '');
     const visible = includeHidden ? '' : ' AND a.hidden = 0';
+    const bounds = [];
+    const boundArgs = [];
+    if (typeof fromIso === 'string' && fromIso.length > 0) {
+      bounds.push('a.ts >= ?');
+      boundArgs.push(fromIso);
+    }
+    if (typeof toIso === 'string' && toIso.length > 0) {
+      bounds.push('a.ts < ?');
+      boundArgs.push(toIso);
+    }
+    const window = bounds.length > 0 ? ` AND ${bounds.join(' AND ')}` : '';
     const like = (fallback) => {
       const rows = this.db
-        .prepare(`SELECT ${columns} FROM memory_archive a WHERE a.text LIKE ? ESCAPE '\\'${visible}
+        .prepare(`SELECT ${columns} FROM memory_archive a WHERE a.text LIKE ? ESCAPE '\\'${visible}${window}
           ORDER BY ${orderBy} LIMIT ? OFFSET ?`)
-        .all(`%${escapeLike(text)}%`, limit, offset);
+        .all(`%${escapeLike(text)}%`, ...boundArgs, limit, offset);
       return { rows: fallback ? rows.map((row) => ({ ...row, fallback: 'like' })) : rows, fallback };
     };
 
@@ -2680,9 +2723,10 @@ export class MemoryStore {
       const rows = this.db
         .prepare(`SELECT ${columns} FROM memory_archive_fts
           JOIN memory_archive a ON a.rowid = memory_archive_fts.rowid
-          WHERE memory_archive_fts MATCH ?${visible} ORDER BY ${rank ? 'memory_archive_fts.rank' : orderBy}
+          WHERE memory_archive_fts MATCH ?${visible}${window}
+          ORDER BY ${rank ? 'memory_archive_fts.rank' : orderBy}
           LIMIT ? OFFSET ?`)
-        .all(`"${text.replaceAll('"', '""')}"`, limit, offset);
+        .all(`"${text.replaceAll('"', '""')}"`, ...boundArgs, limit, offset);
       if (rows.length > 0 || !this.archiveHasRows()) return { rows, fallback: false };
     } catch {
       /* FTS could not answer: one LIKE fallback below */
@@ -2690,10 +2734,48 @@ export class MemoryStore {
     return like(true);
   }
 
-  /** Keyword recall over the archive (explicit user request only; hidden rows opt-in only). */
-  searchArchive(query, limit = 5, { includeHidden = false } = {}) {
+  /**
+   * Keyword recall over the archive (explicit user request only; hidden rows opt-in only).
+   *
+   * `from`/`to` accept epoch milliseconds or ISO strings and are a half-open `[from, to)`
+   * filter on the archived original's `ts`. Omitting both keeps the old whole-archive search.
+   * This is the compatibility wrapper; a caller that needs the actual window (and whether an
+   * invalid one was rejected) uses `searchArchiveInWindow`.
+   */
+  searchArchive(query, limit = 5, { includeHidden = false, from = null, to = null, fromIso = null, toIso = null } = {}) {
+    return this.searchArchiveInWindow(query, {
+      limit,
+      includeHidden,
+      from: from ?? fromIso,
+      to: to ?? toIso,
+    }).rows;
+  }
+
+  /**
+   * Time-filtered archive retrieval with a reportable window.
+   *
+   * The archive is searched by keyword AND by the archived original's timestamp; a question
+   * whose wording only resolves to a time window ("昨天") must not match a row from another
+   * day just because the word appears in its text. An absent bound is no filter. An
+   * unparseable or inverted window falls back to the whole archive instead of silently
+   * returning an empty set, and `invalid` says so — the caller must report the fallback, not
+   * "no records".
+   *
+   * @param {string} query
+   * @param {{limit?: number, includeHidden?: boolean, from?: number|string|null,
+   *          to?: number|string|null}} [options]
+   * @returns {{rows: object[], range: {from: string|null, to: string|null}|null, invalid: boolean}}
+   */
+  searchArchiveInWindow(query, { limit = 5, includeHidden = false, from = null, to = null } = {}) {
     this.open();
-    return this.queryArchive(query, {
+    const fromRaw = from ?? null;
+    const toRaw = to ?? null;
+    const fromIso = archiveTimeBound(fromRaw);
+    const toIso = archiveTimeBound(toRaw);
+    const invalid = (fromRaw !== null && fromIso === null)
+      || (toRaw !== null && toIso === null)
+      || (fromIso !== null && toIso !== null && Date.parse(fromIso) >= Date.parse(toIso));
+    const rows = this.queryArchive(query, {
       // Message identity travels with the hit: without `role`/`session_id`/`turn_id` the caller
       // cannot show “who said it, when, in which turn”, only a bare text blob.
       columns: `a.id, a.ts, a.domain, a.text, a.role, a.session_id, a.turn_id, a.message_id,
@@ -2701,7 +2783,14 @@ export class MemoryStore {
       limit,
       rank: true,
       includeHidden,
+      fromIso: invalid ? null : fromIso,
+      toIso: invalid ? null : toIso,
     }).rows;
+    return {
+      rows,
+      range: invalid || (fromIso === null && toIso === null) ? null : { from: fromIso, to: toIso },
+      invalid,
+    };
   }
 
   /**

@@ -52,6 +52,45 @@ function timeResolvedReport(value) {
   return report;
 }
 
+/** Normalize one query-window bound (epoch ms or ISO) to canonical ISO; null when absent/bad. */
+function windowBound(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  return null;
+}
+
+/**
+ * Project the STORE's actual query window into the tool contract.
+ *
+ * `recall()`/`brief()` report the window they really used (after a `上次` relaxation the lower
+ * bound is null) and whether they widened it. The tool must never re-derive this from the query
+ * text: "昨天" may have been relaxed or a store may report a legacy shape. A malformed bound or
+ * an inverted window projects to `range: null` so a broken window can never be read as a real
+ * "no records" answer; `invalid` lets the archive lane report the fallback.
+ *
+ * @param {unknown} from raw lower bound from the store (epoch ms or ISO)
+ * @param {unknown} to raw upper bound from the store (epoch ms or ISO)
+ * @param {unknown} relaxed store's relaxation flag
+ * @returns {{range: {from: string|null, to: string|null}|null, relaxed: boolean, invalid: boolean}}
+ */
+function queryWindowReport(from, to, relaxed) {
+  const fromIso = windowBound(from);
+  const toIso = windowBound(to);
+  const fromGiven = from !== null && from !== undefined;
+  const toGiven = to !== null && to !== undefined;
+  const invalid = (fromGiven && fromIso === null)
+    || (toGiven && toIso === null)
+    || (fromIso !== null && toIso !== null && Date.parse(fromIso) >= Date.parse(toIso));
+  const range = invalid || (fromIso === null && toIso === null) ? null : { from: fromIso, to: toIso };
+  return { range, relaxed: relaxed === true, invalid };
+}
+
 export function createHostTools(deps) {
   return {
     async executeSee(args, exec, owner = null) {
@@ -290,10 +329,16 @@ export function createHostTools(deps) {
         };
       };
       if (scopeBlocksTool(exec)) {
-        return { scope: '', scanned: 0, hits: [], assembly: assemblyOf(null), ok: false, error: SCOPE_ERROR };
+        return {
+          scope: '', scanned: 0, hits: [], assembly: assemblyOf(null), range: null, relaxed: false,
+          ok: false, error: SCOPE_ERROR,
+        };
       }
       if (!features.enabled('memory')) {
-        return { scope: '', scanned: 0, hits: [], assembly: assemblyOf(null), error: '记忆组件已关闭' };
+        return {
+          scope: '', scanned: 0, hits: [], assembly: assemblyOf(null), range: null, relaxed: false,
+          error: '记忆组件已关闭',
+        };
       }
       // An explicit domain narrows the search; omitting it means "every domain".
       const scoped = typeof args.domain === 'string' && args.domain.trim().length > 0;
@@ -323,6 +368,8 @@ export function createHostTools(deps) {
       }
       const hits = markCorrectedRows(exec, recalled.hits);
       const { scanned, mode, roles, window } = recalled;
+      // The store's actual window (after relaxation), never a re-derivation from the query text.
+      const lookedAt = queryWindowReport(recalled.from, recalled.to, recalled.relaxed);
       // Recall feedback: only memories whose body was actually delivered get stickier (matters
       // once decay is on). D: an id C2 already reinforced this turn is not reinforced again.
       const delivered = deliveredRecallRows(hits);
@@ -345,6 +392,8 @@ export function createHostTools(deps) {
         mode,
         roles,
         window,
+        range: lookedAt.range,
+        relaxed: lookedAt.relaxed,
         assembly: assemblyOf(recalled.assembly),
         hits: hits.map(({
           id, ts, domain, text, importance, clarity, version, matched, score, role, source,
@@ -383,13 +432,22 @@ export function createHostTools(deps) {
         SCOPE_ERROR, autoMemorySettings, features, log, memory, scopeBlocksTool, strengthenOnce,
       } = deps;
       if (scopeBlocksTool(exec)) {
-        return { text: '', fixed: 0, matched: 0, terms: [], ok: false, error: SCOPE_ERROR };
+        return {
+          text: '', fixed: 0, matched: 0, terms: [], range: null, relaxed: false,
+          ok: false, error: SCOPE_ERROR,
+        };
       }
       if (!features.enabled('memory')) {
-        return { text: '', fixed: 0, matched: 0, terms: [], error: '记忆组件已关闭' };
+        return {
+          text: '', fixed: 0, matched: 0, terms: [], range: null, relaxed: false,
+          error: '记忆组件已关闭',
+        };
       }
       const limit = Number.isInteger(args.limit) ? Math.min(10, Math.max(1, args.limit)) : 5;
       const brief = memory.brief({ query: args.query, limit, displayChars: autoMemorySettings().maxChars });
+      // `brief()` reports the window its internal recall really used, so the projection is the
+      // same fact `assistant_recall` would show for that question.
+      const lookedAt = queryWindowReport(brief.from, brief.to, brief.relaxed);
       // The fixed layer's SELECT does not carry clarity; '' reports "not tracked here" instead
       // of inventing a level.
       const toRecord = (row) => ({
@@ -416,6 +474,8 @@ export function createHostTools(deps) {
         fixed: brief.fixed.length,
         matched: brief.matched.length,
         terms: brief.terms,
+        range: lookedAt.range,
+        relaxed: lookedAt.relaxed,
         fixedRecords: brief.fixed.map(toRecord),
         matchedRecords: brief.matched.map(toRecord),
       };
@@ -426,26 +486,43 @@ export function createHostTools(deps) {
         memoryQueryWindow, memoryTurnLedger, memoryTurnScope, scopeBlocksTool,
       } = deps;
       if (scopeBlocksTool(exec)) {
-        return { query: args.query, count: 0, hits: [], ok: false, error: SCOPE_ERROR };
+        return {
+          query: args.query, count: 0, hits: [], range: null, relaxed: false, rangeInvalid: false,
+          ok: false, error: SCOPE_ERROR,
+        };
       }
       if (!features.enabled('memory')) {
-        return { query: args.query, count: 0, hits: [], error: '记忆组件已关闭' };
+        return {
+          query: args.query, count: 0, hits: [], range: null, relaxed: false, rangeInvalid: false,
+          error: '记忆组件已关闭',
+        };
       }
       const limit = Number.isInteger(args.limit) ? Math.min(10, Math.max(1, args.limit)) : 5;
       const { sessionId, turn } = memoryTurnScope(exec);
-      const { range } = memoryQueryWindow(args.query);
+      const detected = memoryQueryWindow(args.query)?.range ?? null;
       const lookup = {
         sessionId, turn, kind: 'archive', query: args.query,
-        fromIso: range?.fromIso ?? null, toIso: range?.toIso ?? null, limit,
+        fromIso: detected?.fromIso ?? null, toIso: detected?.toIso ?? null, limit,
       };
       // C: reuse the window C2 already fetched this turn; only a new/deeper query hits SQL.
       const cached = memoryTurnLedger.lookup(lookup);
       let hits;
+      let lookedAt;
       if (cached !== null) {
         hits = Array.isArray(cached.rows) ? cached.rows.slice(0, limit) : [];
+        // A cached window never touched SQL here, so report the detected window it was keyed by.
+        lookedAt = queryWindowReport(detected?.fromIso ?? null, detected?.toIso ?? null, false);
         await log.emit('memory.query.reused', { key: memoryTurnLedger.key(lookup), source: 'c2' });
       } else {
-        hits = memory.searchArchive(args.query, limit);
+        // P1: the archive query is keyword AND time. The old `searchArchive(query, limit)` threw
+        // the detected window away, so "昨天" matched the word anywhere in the whole archive.
+        const found = memory.searchArchiveInWindow(args.query, {
+          limit,
+          from: detected?.fromIso ?? null,
+          to: detected?.toIso ?? null,
+        });
+        hits = found.rows;
+        lookedAt = { range: found.range, relaxed: false, invalid: found.invalid === true };
       }
       hits = markCorrectedRows(exec, hits);
       const terms = tokenizeQuery(args.query);
@@ -453,6 +530,9 @@ export function createHostTools(deps) {
       return {
         query: args.query,
         count: hits.length,
+        range: lookedAt.range,
+        relaxed: false,
+        rangeInvalid: lookedAt.invalid,
         hits: hits.map((row) => {
           const shown = displayMessageSnippet(row.text, {
             query: args.query,
