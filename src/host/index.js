@@ -8471,6 +8471,7 @@ export function apply(ctx, config) {
           // Screenshots are current-state evidence only; the render repeats the rule.
           evidenceType: { type: 'string', enum: ['current'] },
           evidence: { type: 'boolean' },
+          frameId: { type: 'string' },
           frameIds: { type: 'array', items: { type: 'string' } },
           frames: { type: 'array', items: { type: 'object' } },
           file: { type: 'string' },
