@@ -14,6 +14,8 @@
  *   - evaluate() 只读输入、不消费候选；真正开口后必须再调用 spoken() 记账。
  *   - spoken() 会移除同 id 候选，并在 maxAgeMs 窗口内记住该 id，避免同一事件被重复说出。
  *   - 候选过期就丢弃，不排队；淘汰/拒绝都只计数，不回报正文。
+ *   - cancelAll() 只清待选池（可再次登记）；cancelFor() 才写取消集；reset() 是隐私/切源的
+ *     代次边界，连取消集、最近主题与时机窗口一起清空，但保留累计计数。
  */
 
 /** 第一版试验参数；不是冻结值，按本机实测再调。 */
@@ -41,6 +43,14 @@ const CANCELED_ID_LIMIT = 256;
 
 /** 发言时间只用于滚动一小时计数；硬上限防止异常时钟/重复记账把数组撑大。 */
 const SPEAK_TIMES_LIMIT = 2_048;
+
+/** 生命周期原因码只保留短机器码，避免外部文本（路径/正文）混进 status。 */
+function reasonLabel(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const text = value.trim();
+  if (text.length === 0) return fallback;
+  return text.length > 64 ? text.slice(0, 64) : text;
+}
 
 /** 只接受有限数字或有限数字字符串；其它值（含 null / '' / 布尔）都算缺失。 */
 function finiteNumber(value) {
@@ -433,6 +443,60 @@ export function createProactiveArbiter(options = {}) {
       });
       canceledCandidates += removed;
       return removed;
+    },
+
+    /**
+     * 整体取消当前候选（隐私/切源/用户先评论/卸载）。
+     *
+     * 与 cancelFor 的区别：不把任何 id 写进取消集，所以下一次事件仍可正常登记；只清空当前
+     * 待选池、累计“取消”计数，并让 status().lastReason 记录原因。频率/静默窗口不因此重置。
+     *
+     * @param {string} [reason] 机器原因码；畸形/空值回退为 'cancel-all'。
+     * @returns {number} 本次清掉的候选数
+     */
+    cancelAll(reason = 'cancel-all') {
+      const removed = candidates.length;
+      candidates.length = 0;
+      canceledCandidates += removed;
+      lastReason = reasonLabel(reason, 'cancel-all');
+      return removed;
+    },
+
+    /**
+     * 代次边界（隐私/切源/卸载）：清空候选、取消集、最近主题与所有时机窗口。
+     *
+     * 取舍：累计计数（proposed/rejected/expired/evicted/duplicate/canceled/spoken/ignored）
+     * **保留**，因为它们描述的是这个仲裁器实例的整个生命周期，清理窗口不应让诊断数字归零；
+     * `ignoredCount` 本身是累计值，也保留，但连续 ignored、quiet 截止和最近发言时间会清空，
+     * 让新代次从“没有历史反压”的状态重新开始。取消集清空意味着旧代次的事件 id 不再被永久
+     * 拒绝——代次已经换了，旧事件本就不该再送进来。
+     *
+     * @param {string} [reason] 机器原因码；畸形/空值回退为 'reset'。
+     * @returns {number} 本次清掉的候选数
+     */
+    reset(reason = 'reset') {
+      const removed = candidates.length;
+      candidates.length = 0;
+      canceled.clear();
+      spokenAt.clear();
+      speakTimes.length = 0;
+      lastSpokenAt = null;
+      consecutiveIgnored = 0;
+      quietUntil = null;
+      lastTopic = null;
+      lastReason = reasonLabel(reason, 'reset');
+      return removed;
+    },
+
+    /**
+     * 当前有效候选 id 的只读副本（新数组；调用方增删/排序不影响内部状态）。
+     * 与 status().valid 同一口径：已过期、已取消、刚说过的候选不在结果里。
+     */
+    pendingIds() {
+      const at = currentTime();
+      return candidates
+        .filter((candidate) => isUsable(candidate, at))
+        .map((candidate) => candidate.id);
     },
 
     /** 用户没有回应上一次主动：降低频率并进入 quiet 期。 */

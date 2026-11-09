@@ -307,6 +307,9 @@ import { createCommentEvidence } from './vision/comment-evidence.js';
 // P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
 import { createImageAnalyzer } from './vision/image-analyzer.js';
 import { createUnderstandingRuntime } from './vision/understanding-runtime.js';
+// P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
+import { createProactiveArbiter } from './vision/proactive-candidate.js';
+import { createProactiveLineGenerator } from './vision/proactive-line.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
 import { PersonaStore } from './profile/persona.js';
 import { createProfileStore } from './profile/profileStore.js';
@@ -8744,6 +8747,195 @@ export function apply(ctx, config) {
    * 这些闭包只在挂载完成、真实触发/渲染时才执行，因此 TDZ 不会发生；这里的注释是给未来改动的
    * 警示：不要把它们提到挂载期同步执行。
    */
+  /**
+   * P-187 阶段 5：主动回应。
+   *
+   * 后台理解成功并入状态后，带 `reaction` 的事件登记为主动候选；是否开口交给纯决策层
+   * （proactive-candidate.js）按时机/频率判断。真正决定开口时**才**调用一次短句模型，再走
+   * 现成的整行语音出口 `speakLine`。这里不建用户轮次、不写记忆/人设、不新增 TTS 链路。
+   *
+   * 成本/频率边界：默认每小时最多 3 句、两句至少间隔 60 秒；候选默认 8 秒过期，错过就放弃；
+   * 每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生一次 ≤120 token 的调用。
+   */
+  const PROACTIVE_IGNORED_MS = 45_000;
+  const proactiveEnabled = () => config?.proactiveEnabled !== false;
+  const proactiveMaxPerHour = () => config?.proactiveMaxPerHour ?? 3;
+  const proactiveMinGapMs = () => config?.proactiveMinGapMs ?? 60_000;
+  const proactive = createProactiveArbiter();
+  const proactiveLine = createProactiveLineGenerator({
+    getService,
+    // 延迟读取：persona 在宿主函数更后段才初始化，真正生成时一定已就绪。
+    personaText: () => persona.render(),
+    setTimer: (fn, delay) => setTimeout(fn, delay),
+    clearTimer: (handle) => clearTimeout(handle),
+  });
+
+  /** 按码点截断：状态里的描述/反应可能很长，候选只保留开口需要的那一点。 */
+  const proactiveClip = (value, max) => {
+    if (typeof value !== 'string') return '';
+    const chars = Array.from(value);
+    return chars.length <= max ? value : chars.slice(0, max).join('');
+  };
+
+  let proactiveBusy = false;
+  /** 代次：隐私/切源/卸载/重置后，在途的生成或播放结果不再记到新代次上。 */
+  let proactiveGeneration = 0;
+  let proactiveEvalTimer = null;
+  let proactiveIgnoredTimer = null;
+
+  /** 主动句发出后 45 秒没有任何用户终稿 = 未回应；下次开口会进入 quiet/放大间隔。 */
+  const clearProactiveIgnored = () => {
+    if (proactiveIgnoredTimer === null) return;
+    clearTimeout(proactiveIgnoredTimer);
+    proactiveIgnoredTimer = null;
+  };
+  const armProactiveIgnored = () => {
+    clearProactiveIgnored();
+    const generation = proactiveGeneration;
+    const timer = setTimeout(() => {
+      if (proactiveIgnoredTimer !== timer) return;
+      proactiveIgnoredTimer = null;
+      if (generation !== proactiveGeneration) return;
+      proactive.ignored();
+    }, PROACTIVE_IGNORED_MS);
+    timer?.unref?.();
+    proactiveIgnoredTimer = timer;
+  };
+  /** 清掉这一代的所有时机窗口；累计计数保留，便于诊断。 */
+  const resetProactive = (reason) => {
+    proactiveGeneration += 1;
+    clearProactiveIgnored();
+    proactive.reset(reason);
+  };
+  /** 卸载：除了代次/窗口，还要停掉 5 秒评估定时器本身。 */
+  const stopProactive = () => {
+    if (proactiveEvalTimer !== null) {
+      clearInterval(proactiveEvalTimer);
+      proactiveEvalTimer = null;
+    }
+    resetProactive('dispose');
+  };
+
+  /** 当前是否有一条正式回答仍在生成/播放（用于 pending-reply 抑制）。 */
+  const proactivePendingReply = () => {
+    if (activeVoiceTurn !== null) return true;
+    if (pendingVoice.length > 0) return true;
+    try {
+      return responseGroups.activeSessions().size > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 读一次时机并（仅在允许时）开口。任何失败都只取消这一条候选，不抛错、不影响理解运行时。
+   * `keyDialogue` 暂固定 false：关键台词检测尚未接入（设计文档第十节只把它列为发送前检查）。
+   */
+  const evaluateProactive = async (source = 'interval') => {
+    if (proactiveBusy || visionDisposed || shutdown.closing) return null;
+    if (proactive.status().pending === 0) return null;
+
+    const decision = proactive.evaluate({
+      userSpeaking: speechEvidence !== null,
+      assistantBusy: ttsIsSpeaking() === true || playback !== null,
+      pendingReply: proactivePendingReply(),
+      keyDialogue: false,
+      settings: {
+        enabled: proactiveEnabled(),
+        maxPerHour: proactiveMaxPerHour(),
+        minGapMs: proactiveMinGapMs(),
+      },
+    });
+    if (decision.speak !== true || decision.candidate === null) return decision;
+
+    proactiveBusy = true;
+    const generation = proactiveGeneration;
+    const candidate = decision.candidate;
+    try {
+      // `config.proactiveLineGenerator` 是测试缝（对象带 generate，或直接是函数）；生产走本地短句生成器。
+      const seam = config?.proactiveLineGenerator;
+      const generate = typeof seam === 'function'
+        ? seam
+        : seam !== null && typeof seam === 'object' && typeof seam.generate === 'function'
+          ? (options) => seam.generate(options)
+          : (options) => proactiveLine.generate(options);
+      const line = await generate({
+        event: candidate,
+        state: understanding.current(),
+      });
+      if (generation !== proactiveGeneration || visionDisposed || shutdown.closing) return null;
+      if (line === null || line?.ok !== true || typeof line.text !== 'string'
+        || line.text.trim().length === 0) {
+        proactive.cancelFor([candidate.id]);
+        return { speak: false, reason: typeof line?.reason === 'string' ? line.reason : 'empty' };
+      }
+
+      // 整行出口：字幕与语音同一句；不创建用户轮次，也不写记忆。
+      const spoken = await speakLine(line.text, line.text, {
+        sessionId: voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId,
+      });
+      if (generation !== proactiveGeneration || visionDisposed || shutdown.closing) return null;
+      if (spoken === null) {
+        proactive.cancelFor([candidate.id]);
+        return { speak: false, reason: 'speech-failed' };
+      }
+      proactive.spoken(candidate);
+      armProactiveIgnored();
+      // 只记 id/来源这类机器信息，不把主动句正文写进日志。
+      void log.emit('vision.proactive.spoken', { id: candidate.id, source }).catch(() => {});
+      return { speak: true, candidateId: candidate.id };
+    } catch {
+      proactive.cancelFor([candidate.id]);
+      return { speak: false, reason: 'error' };
+    } finally {
+      proactiveBusy = false;
+    }
+  };
+
+  /**
+   * 理解推进后登记候选：只处理带非空 reaction 的事件，每次最多 2 条；登记后立即尝试一次
+   * 评估（不必等 5 秒定时器），其余时机由定时器兜住。
+   */
+  const proposeProactive = (update) => {
+    if (!proactiveEnabled()) return;
+    const events = Array.isArray(update?.parsed?.events) ? update.parsed.events : [];
+    let added = 0;
+    for (let index = 0; index < events.length && added < 2; index += 1) {
+      const event = events[index];
+      if (event === null || typeof event !== 'object' || Array.isArray(event)) continue;
+      const reaction = typeof event.reaction === 'string' ? event.reaction.trim() : '';
+      if (reaction.length === 0) continue;
+      const to = Number(event.to);
+      if (!Number.isFinite(to) || to < 0) continue;
+      const from = Number(event.from);
+      const frames = Array.isArray(event.evidenceFrameIds) ? event.evidenceFrameIds : [];
+      const audio = Array.isArray(event.evidenceAudioIds) ? event.evidenceAudioIds : [];
+      // 证据约束由仲裁器再核一次；这里先跳过必然被拒的事件，避免无意义计数。
+      if (frames.length === 0 && audio.length === 0) continue;
+      const candidate = proactive.propose({
+        id: `understand:${to}:${index}`,
+        from: Number.isFinite(from) && from >= 0 ? from : to,
+        to,
+        description: proactiveClip(event.description, 200),
+        evidenceFrameIds: frames,
+        evidenceAudioIds: audio,
+        angle: proactiveClip(reaction, 80),
+        priority: true,
+      });
+      if (candidate !== null) added += 1;
+    }
+    if (added > 0) void evaluateProactive('advance');
+  };
+
+  // 5 秒兜底评估：只在确实有候选时读一次状态；unref 不拖住宿主退出。
+  proactiveEvalTimer = setInterval(() => {
+    void evaluateProactive('interval');
+  }, 5_000);
+  proactiveEvalTimer?.unref?.();
+  ctx.effect(() => () => {
+    stopProactive();
+  });
+
   const understanding = createUnderstandingRuntime({
     analyze: typeof config?.understandingAnalyzer === 'function'
       ? (options) => config.understandingAnalyzer(options)
@@ -8768,6 +8960,8 @@ export function apply(ctx, config) {
       }
       void log.emit(event, payload).catch(() => {});
     },
+    // 阶段 5：成功并入状态后登记带 reaction 的主动候选（回调只看副本，抛错由运行时兜底）。
+    onAdvance: (update) => proposeProactive(update),
   });
   /**
    * `/assistant/status` 的只读投影：调度计数 + 有界状态的“有没有内容/多大”。绝不暴露场景正文、
@@ -8898,6 +9092,10 @@ export function apply(ctx, config) {
       });
       // P-187 阶段 3：用户评论优先触发一次画面理解（仍受调度器的最短间隔约束）。
       noteUnderstandingChange({ reason: 'comment', from: pending.from, to: end, priority: true });
+      // P-187 阶段 5：用户已经亲口评论这一轮画面。取消待说的主动候选并清掉“未回应”计时，
+      // 避免同一事件被用户先评论后助手再主动说一遍。
+      clearProactiveIgnored();
+      proactive.cancelAll('user-comment');
     } catch (error) {
       void log.emit('vision.comment.align.failed', {
         error: error?.message ?? String(error),
@@ -9213,6 +9411,8 @@ export function apply(ctx, config) {
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
+    // P-187 阶段 5：主动候选同样属于旧代次；连未回应计时一起清掉，但保留累计计数。
+    resetProactive('vision-invalidated');
     visionGeneration += 1;
     visionController.abort(new Error('视觉采集已作废：隐私或视觉模式发生变化'));
     visionController = new AbortController();
@@ -16001,6 +16201,8 @@ export function apply(ctx, config) {
         comment: commentEvidence.state(),
         // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
         understanding: understandingStatusView(),
+        // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
+        proactive: { ...proactive.status(), enabled: proactiveEnabled() },
       },
       hearing: { ...hearingStatus, media: mediaTimeline.state() },
     };
@@ -16737,6 +16939,8 @@ export function apply(ctx, config) {
           await stopEvidenceCapture('dispose');
           // P-187 阶段 3：停止后台理解的定时器/队列，在途结果因代次检查不会写回。
           understanding.stop();
+          // P-187 阶段 5：先停主动评估定时器并作废在途结果，再让 invalidateVision 清一次窗口。
+          stopProactive();
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));
           // 卸载时可能仍有 copyFile 没返回：等它们核到“已卸载”后自删，再把可能被重新建出的
           // 空目录一并收掉。不等待就会在进程退出前留下没人引用的副本。

@@ -458,6 +458,89 @@ test('spoken/ignored 状态：记录最近时间、截断主题与计数，statu
   assert.equal(afterIgnored.lastReason, 'ignored');
 });
 
+test('cancelAll：清空待选池并记录原因，但不写取消集，事件可以重新登记', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  assert.ok(arbiter.propose(makeCandidate(h.now, { id: 'a' })));
+  assert.ok(arbiter.propose(makeCandidate(h.now, { id: 'b' })));
+  assert.deepEqual(arbiter.pendingIds().sort(), ['a', 'b']);
+
+  assert.equal(arbiter.cancelAll('user-comment'), 2);
+  const status = arbiter.status();
+  assert.equal(status.pending, 0);
+  assert.equal(status.lastReason, 'user-comment');
+  assert.equal(status.counts.canceled, 2);
+  assert.equal(status.canceledEvents, 0, 'cancelAll 不得扩张取消集');
+
+  // 取消集没变：同 id 可以重新登记，而不是像 cancelFor 那样被永久拒绝。
+  assert.ok(arbiter.propose(makeCandidate(h.now, { id: 'a' })));
+  assert.equal(arbiter.status().pending, 1);
+  // 空/畸形原因回退到默认机器码，仍只清待选池。
+  assert.equal(arbiter.cancelAll(), 1);
+  assert.equal(arbiter.status().lastReason, 'cancel-all');
+  assert.equal(arbiter.cancelAll({ reason: 'x' }), 0, '非字符串原因不应抛错');
+});
+
+test('pendingIds：只返回当前有效候选的只读副本', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  arbiter.propose(makeCandidate(h.now, { id: 'ok' }));
+  arbiter.propose(makeCandidate(h.now, { id: 'expired', expiresAt: h.now + 1_000 }));
+  arbiter.propose(makeCandidate(h.now, { id: 'cancel' }));
+  arbiter.cancelFor('cancel');
+
+  h.advance(1_000);
+  const ids = arbiter.pendingIds();
+  assert.deepEqual(ids, ['ok'], '过期的候选不出现在结果里');
+  assert.equal(arbiter.status().pending, 2, 'pendingIds 不消费/不清理候选');
+  assert.equal(arbiter.status().valid, 1);
+
+  // 副本：调用方怎么改都不影响仲裁器内部状态。
+  ids.push('mutated');
+  ids.reverse();
+  assert.deepEqual(arbiter.pendingIds(), ['ok']);
+});
+
+test('reset：清空候选/取消集/重复窗口/时机窗口，保留累计计数', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+  const first = arbiter.propose(makeCandidate(h.now, { id: 'e1' }));
+  assert.equal(arbiter.evaluate().speak, true);
+  arbiter.spoken(first);
+  arbiter.ignored();
+  arbiter.propose(makeCandidate(h.now, { id: 'e2' }));
+  arbiter.cancelFor('e2');
+  arbiter.propose(makeCandidate(h.now, { id: 'e3' }));
+  const before = arbiter.status();
+  assert.equal(before.counts.spoken, 1);
+  assert.equal(before.counts.ignored, 1);
+  assert.equal(before.counts.canceled, 1);
+
+  h.advance(1_000);
+  assert.equal(arbiter.reset('vision-invalidated'), 1, 'reset 返回清掉的候选数');
+  const after = arbiter.status();
+  assert.equal(after.pending, 0);
+  assert.equal(after.canceledEvents, 0, '取消集应在代次边界清空');
+  assert.equal(after.lastSpokenAt, null);
+  assert.equal(after.consecutiveIgnored, 0);
+  assert.equal(after.quietUntil, null);
+  assert.equal(after.spokenLastHour, 0, '每小时窗口应清空');
+  assert.equal(after.lastTopicId, null);
+  assert.equal(after.lastTopic, null);
+  assert.equal(after.lastReason, 'vision-invalidated');
+  // 累计计数保留：它们描述仲裁器整个生命周期，清窗口不应让诊断数字归零。
+  assert.equal(after.counts.proposed, before.counts.proposed);
+  assert.equal(after.counts.spoken, before.counts.spoken);
+  assert.equal(after.counts.ignored, before.counts.ignored);
+  assert.equal(after.counts.canceled, before.counts.canceled);
+
+  // 取消集与 spokenAt 都已清空：同一事件 id 可以重新登记并重新开口。
+  assert.ok(arbiter.propose(makeCandidate(h.now, { id: 'e1' })));
+  const resumed = arbiter.evaluate({ settings: { minGapMs: 0 } });
+  assert.equal(resumed.speak, true);
+  assert.equal(resumed.candidate.id, 'e1');
+});
+
 test('畸形输入不抛错：工厂参数、propose、evaluate、spoken、cancelFor、ignored 都可安全调用', () => {
   assert.doesNotThrow(() => {
     const arbiter = createProactiveArbiter(null);
@@ -486,6 +569,9 @@ test('畸形输入不抛错：工厂参数、propose、evaluate、spoken、cance
     assert.equal(arbiter.spoken({ id: 'x' }, null), true);
     assert.equal(arbiter.cancelFor(null), 0);
     assert.equal(arbiter.cancelFor([null, undefined, {}]), 0);
+    assert.equal(arbiter.cancelAll('bad'), 0);
+    assert.deepEqual(arbiter.pendingIds(), []);
+    assert.equal(arbiter.reset('bad'), 0);
     arbiter.ignored();
     arbiter.status();
   });
