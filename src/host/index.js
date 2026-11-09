@@ -335,6 +335,7 @@ import {
 } from './vision/understanding-runtime.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
 import {
+  PROACTIVE_DEFAULTS,
   createProactiveArbiter,
   revalidateProactiveCandidate,
 } from './vision/proactive-candidate.js';
@@ -9739,9 +9740,10 @@ export function apply(ctx, config) {
    * 现成的整行语音出口 `speakLine`。这里不建用户轮次、不写记忆/人设、不新增 TTS 链路。
    *
    * 成本/频率边界：不再有默认的「每小时 3 句 / 间隔 60 秒」硬配额；是否开口由设置页保存的
-   * `proactive.rate`（0–100）在每次评估时按候选身份抽签决定，100 = 必过、0 = 不开口。候选默认
-   * 8 秒过期，错过就放弃；每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生
-   * 一次 ≤120 token 的调用。
+   * `proactive.rate`（0–100）在每次评估时按候选身份抽签决定，100 = 必过、0 = 不开口。候选在
+   * 登记后默认 8 秒过期（显式 expiresAt 从登记时刻起算，不把理解分析的 20–40 秒算进年龄），
+   * 错过就放弃；每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生一次
+   * ≤120 token 的调用。
    */
   const PROACTIVE_IGNORED_MS = 45_000;
   /**
@@ -9778,6 +9780,20 @@ export function apply(ctx, config) {
     if (typeof value !== 'string') return '';
     const chars = Array.from(value);
     return chars.length <= max ? value : chars.slice(0, max).join('');
+  };
+
+  /**
+   * 主动候选的显式有效期（毫秒）：`config.proactive.maxAgeMs` 优先，缺失/畸形回退默认值。
+   * 有效期从“登记这一刻”起算——后台理解本身可能耗时 20–40 秒，事件的 `to` 是画面时间，
+   * 不能拿它判断刚拿到的候选是否过期；`from/to` 仍原样保留内容时间供选择/展示。
+   */
+  const proactiveMaxAgeMs = () => {
+    const raw = config?.proactive?.maxAgeMs ?? PROACTIVE_DEFAULTS.maxAgeMs;
+    // 与仲裁器的 nonNegative 口径一致：空串/空白不算 0，畸形值回退默认窗口。
+    const configured = typeof raw === 'string' && raw.trim() === '' ? NaN : Number(raw);
+    return Number.isFinite(configured) && configured >= 0
+      ? configured
+      : PROACTIVE_DEFAULTS.maxAgeMs;
   };
 
   let proactiveBusy = false;
@@ -9954,6 +9970,8 @@ export function apply(ctx, config) {
   const proposeProactive = (update) => {
     if (!proactiveEnabled()) return;
     const events = Array.isArray(update?.parsed?.events) ? update.parsed.events : [];
+    // 理解分析耗时不参与候选年龄：有效期从登记此刻重新计时，事件 from/to 保持原始内容时间。
+    const expiresInMs = proactiveMaxAgeMs();
     let added = 0;
     for (let index = 0; index < events.length && added < 2; index += 1) {
       const event = events[index];
@@ -9975,11 +9993,17 @@ export function apply(ctx, config) {
         evidenceFrameIds: frames,
         evidenceAudioIds: audio,
         angle: proactiveClip(reaction, 80),
+        // 只按登记后的 expiresAt 判过期，避免 20–40 秒的分析耗时让旧 `to` 一登记就 expired。
+        expiresAt: Date.now() + expiresInMs,
         priority: true,
       });
       if (candidate !== null) added += 1;
     }
-    if (added > 0) void evaluateProactive('advance');
+    if (added > 0) {
+      // 只读诊断：只报数量与有效期，不写候选正文/事件内容；不新增轮询。
+      void log.emit('vision.proactive.proposed', { count: added, expiresInMs }).catch(() => {});
+      void evaluateProactive('advance');
+    }
   };
 
   // 5 秒兜底评估：只在确实有候选时读一次状态；unref 不拖住宿主退出。

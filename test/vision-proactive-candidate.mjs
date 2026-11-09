@@ -153,6 +153,64 @@ test('有效期：expiresAt 到点即失效，事件超过 maxAgeMs 拒绝，边
   assert.equal(status.counts.proposed, 1);
 });
 
+test('显式 expiresAt 优先：旧 to 仍可登记/待选/评估，到 expiresAt 才失效', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+
+  // 真实故障：理解耗时约 30 秒，事件 to 是 30 秒前；登记时用“现在 + 8 秒”作为显式有效期。
+  const candidate = arbiter.propose(makeCandidate(h.now, {
+    id: 'understand:old-to',
+    from: h.now - 31_000,
+    to: h.now - 30_000,
+    expiresAt: h.now + 8_000,
+  }));
+  assert.ok(candidate, '显式 expiresAt 未到，旧 to 不应再被 maxAgeMs 二次拒绝');
+  assert.equal(candidate.to, h.now - 30_000, 'from/to 保留原始内容时间');
+  assert.equal(candidate.expiresAt, h.now + 8_000, '显式 expiresAt 原样保留');
+  assert.deepEqual(arbiter.pendingIds(), ['understand:old-to']);
+  const status = arbiter.status();
+  assert.equal(status.valid, 1);
+  assert.equal(status.counts.expired, 0);
+  assert.equal(status.counts.proposed, 1);
+
+  // 即使 to 已经 37 秒前，只要还没到 expiresAt，evaluate 仍能选到（isUsable 同语义）。
+  h.advance(7_000);
+  const picked = arbiter.evaluate();
+  assert.equal(picked.speak, true);
+  assert.equal(picked.candidate.id, 'understand:old-to');
+
+  // 到点即失效：评估侧也必须用新语义，否则会出现 propose 成功、evaluate 选不到的半修复。
+  h.advance(1_000);
+  assert.deepEqual(arbiter.pendingIds(), []);
+  const expired = arbiter.evaluate();
+  assert.equal(expired.speak, false);
+  assert.equal(expired.reason, 'no-candidate');
+  assert.equal(arbiter.status().valid, 0);
+});
+
+test('无显式 expiresAt 时保持原 to 年龄规则；显式 expiresAt 已过仍直接 expired', () => {
+  const h = createHarness();
+  const { arbiter } = h;
+
+  // 没有显式 expiresAt：旧的 to 仍按 maxAgeMs 拒绝（既有语义不变）。
+  assert.equal(arbiter.propose(makeCandidate(h.now, {
+    id: 'no-expiry-old-to',
+    from: h.now - 31_000,
+    to: h.now - 30_000,
+    expiresAt: null,
+  })), null);
+  // 显式 expiresAt 已过：即使 to 很新也失效。
+  assert.equal(arbiter.propose(makeCandidate(h.now, {
+    id: 'expired-explicit',
+    expiresAt: h.now - 1,
+  })), null);
+
+  const status = arbiter.status();
+  assert.equal(status.counts.expired, 2);
+  assert.equal(status.counts.proposed, 0);
+  assert.equal(status.counts.rejected, 2);
+});
+
 test('描述必须是可读文本：空白、非字符串都拒绝且不抛错', () => {
   const h = createHarness();
   const values = ['', '   ', null, 42, {}, undefined];

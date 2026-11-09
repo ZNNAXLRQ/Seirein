@@ -22,7 +22,11 @@
 
 /** 默认值：不再有固定配额，只保留有效期、静默期与同时候选数；计时/频率仍可显式覆盖。 */
 export const PROACTIVE_DEFAULTS = Object.freeze({
-  /** 候选有效期（事件发生到可开口）。 */
+  /**
+   * 未显式给出 expiresAt 时的候选有效期（事件发生到可开口）。
+   * 显式 expiresAt 优先，且只按该时刻判断：后台理解可能耗时 20–40 秒，登记时事件 `to`
+   * 早已超过本窗口，不能让它把刚登记的候选二次判死。
+   */
   maxAgeMs: 8_000,
   /** 两次主动之间的最小间隔；0 = 不限制（可选覆盖）。 */
   minGapMs: 0,
@@ -174,10 +178,16 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
     expiresAt = parsed;
   }
 
-  // “已过”按当前时刻已经到达 expiresAt 计算；到点即失效，不留半拍。
-  if (expiresAt !== null && at >= expiresAt) return { ok: false, reason: 'expired' };
-  // 错过就放弃，不积压成解说队列。
-  if (at - to > config.maxAgeMs) return { ok: false, reason: 'expired' };
+  // 有效期语义（两者互斥）：
+  //   - 有显式 expiresAt：只按该时刻判断（到点即失效，不留半拍），不再用事件 `to` 的年龄
+  //     二次拒绝。理解分析可能耗时 20–40 秒，登记时 `to` 往往早已超过 maxAgeMs，若仍按
+  //     `at - to` 判死，候选会一登记就 expired，主动回应永远进不了评估。
+  //   - 没有显式 expiresAt：保持原规则，按事件 `to` 的年龄丢弃，错过就放弃、不积压成解说队列。
+  if (expiresAt !== null) {
+    if (at >= expiresAt) return { ok: false, reason: 'expired' };
+  } else if (at - to > config.maxAgeMs) {
+    return { ok: false, reason: 'expired' };
+  }
 
   // 用户先评论了同一事件：取消后即使再次送来也不恢复主动。
   if (canceled.has(id) || canceled.has(identity)) return { ok: false, reason: 'canceled' };
@@ -309,8 +319,14 @@ export function createProactiveArbiter(options = {}) {
 
   /** 候选本身的有效性：未过期、未被取消、不在“刚说过”的重复窗口里。 */
   function isUsable(candidate, at) {
-    if (candidate.expiresAt !== null && at >= candidate.expiresAt) return false;
-    if (at - candidate.to > config.maxAgeMs) return false;
+    // 与 normalizeCandidate 同一有效期语义：显式 expiresAt 只按该时刻判断；没有时才看 `to`
+    // 的年龄。evaluate/pendingIds/prune 都经过这里，否则会出现“propose 成功但评估时又被
+    // to 年龄丢掉”的半修复状态。
+    if (candidate.expiresAt !== null) {
+      if (at >= candidate.expiresAt) return false;
+    } else if (at - candidate.to > config.maxAgeMs) {
+      return false;
+    }
     if (canceled.has(candidate.id) || canceled.has(candidateIdentity(candidate))) return false;
     const spokenAtTime = spokenAt.get(candidateIdentity(candidate));
     if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) return false;

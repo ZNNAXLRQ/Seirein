@@ -85,7 +85,7 @@ const hooks = registerHooks({
       source: `
         import { revalidateProactiveCandidate } from ${JSON.stringify(realCandidateUrl)};
         export { revalidateProactiveCandidate };
-        export const PROACTIVE_DEFAULTS = Object.freeze({});
+        export const PROACTIVE_DEFAULTS = Object.freeze({ maxAgeMs: 8_000 });
         export function createProactiveArbiter() {
           const g = globalThis.__proactiveArbiterDouble;
           const s = g.state;
@@ -440,4 +440,47 @@ test('4. 宿主 double：生成期间候选被取消 → speakLine 0 次', async
     'a resolved stale line must not reach speakLine');
   assert.ok(arbiter.canceled.includes(arbiter.candidate.id) === false,
     'an already-removed candidate is not re-canceled into the next generation');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 5. Source wiring: understanding callbacks register an explicit registration-anchored expiry
+// ---------------------------------------------------------------------------------------------
+
+test('5. 理解回调登记候选时显式带 expiresAt：有效期从登记时刻起算，旧 to 不会一登记就过期', async () => {
+  const source = await readFile(new URL('../src/host/index.js', import.meta.url), 'utf8');
+
+  // PROACTIVE_DEFAULTS must be imported so the fallback expiry cannot silently become NaN.
+  assert.match(
+    source,
+    /import \{\s*PROACTIVE_DEFAULTS,\s*createProactiveArbiter,\s*revalidateProactiveCandidate,\s*\} from '\.\/vision\/proactive-candidate\.js';/u,
+    'index.js must import PROACTIVE_DEFAULTS',
+  );
+
+  const start = source.indexOf('const proposeProactive = (update) => {');
+  assert.ok(start >= 0, 'proposeProactive must exist');
+  const end = source.indexOf('// 5 秒兜底评估', start);
+  assert.ok(end > start, 'proposeProactive block must be bounded');
+  const block = source.slice(start, end);
+
+  // Registration-anchored expiry: Date.now() at propose time + the configured/default window.
+  assert.match(block, /const expiresInMs = proactiveMaxAgeMs\(\);/u,
+    'the expiry window is resolved once per understanding callback');
+  assert.match(block, /expiresAt: Date\.now\(\) \+ expiresInMs/u,
+    'every candidate must carry an explicit expiresAt anchored to registration time');
+  assert.match(source, /config\?\.proactive\?\.maxAgeMs \?\? PROACTIVE_DEFAULTS\.maxAgeMs/u,
+    'config.proactive.maxAgeMs overrides the default window');
+  assert.match(source, /Number\.isFinite\(configured\) && configured >= 0/u,
+    'malformed config values must fall back instead of producing a NaN expiry');
+
+  // Event content timestamps are untouched; only the expiry anchor changes.
+  assert.match(block, /from: Number\.isFinite\(from\) && from >= 0 \? from : to,/u,
+    'from/to keep their original content time');
+  assert.match(block, /^\s*to,\s*$/mu, 'raw `to` is still passed through');
+
+  // Diagnostic event is read-only: count + window only, never candidate text.
+  const diagnosticAt = block.indexOf('vision.proactive.proposed');
+  assert.ok(diagnosticAt >= 0, 'the diagnostic event should be emitted after registration');
+  assert.match(block, /log\.emit\('vision\.proactive\.proposed', \{ count: added, expiresInMs \}\)/u);
+  assert.equal(/vision\.proactive\.proposed[\s\S]{0,160}description/u.test(block), false,
+    'the diagnostic event must not include candidate text');
 });
