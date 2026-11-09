@@ -1,7 +1,7 @@
 {
   "schema": "seirein.fixed-sample.scenarios/v1",
   "name": "P-61 固定样本五类场景",
-  "description": "每类 5 次是模板占位，不是预置样本；工具只统计 --input 中的真实轮次，可用 --repeat 覆盖。一次只改一个变量。",
+  "description": "每类 5 次是模板占位，不是预置样本；工具只统计 --input 中的真实轮次，可用 --repeat 覆盖。样本非随机、不承诺性能收益、一次只改一个变量；默认只统计 origin=assistant，lane×phase 分开统计。",
   "repeat": 5,
   "scenarios": [
     {
