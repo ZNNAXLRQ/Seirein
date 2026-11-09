@@ -125,18 +125,22 @@ test('1. synthesize carries turn/deliveryMessageId/sessionId (and the block ids)
   console.log(`1. turn=${event.turn} msg=${event.deliveryMessageId} session=${event.sessionId} sentence=${event.sentenceId} chunk=${event.chunkIndex}`);
 });
 
-test('2. no attribution: the three new fields are null and every old field is unchanged', async (t) => {
+test('2. no attribution: the four attribution fields are null and every old field is unchanged', async (t) => {
   const app = await fixture(t);
   await tts.synthesize({ text: '测试', lang: 'zh', dir: app.dir });
 
   assert.equal(app.events.length, 1);
   const event = app.events[0];
   for (const field of OLD_FIELDS) assert.ok(field in event, `missing old field: ${field}`);
-  assert.deepEqual(Object.keys(event).sort(), [...OLD_FIELDS, 'turn', 'deliveryMessageId', 'sessionId'].sort(),
-    'exactly the old fields plus the three optional attribution fields');
+  assert.deepEqual(
+    Object.keys(event).sort(),
+    [...OLD_FIELDS, 'turn', 'deliveryMessageId', 'sessionId', 'speechId'].sort(),
+    'exactly the old fields plus the four optional attribution fields',
+  );
   assert.equal(event.turn, null);
   assert.equal(event.deliveryMessageId, null);
   assert.equal(event.sessionId, null);
+  assert.equal(event.speechId, null, 'a lane without a ledger id reports null, never a guess');
 
   // Strict old-row assertions: no re-measurement, no reordering, no fabricated time.
   assert.equal(event.level, 'debug');

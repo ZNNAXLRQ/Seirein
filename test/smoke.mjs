@@ -150,7 +150,7 @@ console.log(JSON.stringify({ plugin: name, root, results }, null, 2));
 const assert = (condition, message) => {
   if (!condition) throw new Error(`assertion failed: ${message}`);
 };
-assert(results.tools.length === 24, 'twenty-four tools registered');
+assert(results.tools.length === 26, 'twenty-six tools registered');
 assert(results.rememberPreference.domain === 'chat', 'remember writes to chat');
 assert(results.recall.hits.length === 1, 'recall finds the preference');
 assert(results.recall.scope.includes('chat'), 'scoped recall reports its scope');

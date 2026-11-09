@@ -3,13 +3,14 @@
  * download and the read-only settings row. The capture layer is already tested in
  * `speaker-shadow.mjs`; this file proves the host actually connects it and adds no delivery path.
  *
- *   1. default OFF — hearing receives no `speakerShadow`, no `speaker.*` event exists;
+ *   1. default OFF — hearing receives no `speakerShadow`, but the mount still starts the T1 CAM++
+ *      download (`speaker.status.model = downloading`); no verdict/enable row and no delivery change;
  *   2. ON via config or settings — `speakerShadow:true` + `speakerLibraryRoot:<root>` reach
  *      `startHearing`, settings win over config, and status.model follows the model file;
  *   3. `speaker.shadow` rows are aggregated into status.speaker (matches/unsure/noSpeakers/
  *      lastShadow) and `speaker.status` is throttled;
- *   4. enabling with a missing model starts the T1 download (`downloading`), a failure becomes
- *      `missing` + errors, and starting capture / delivering a final still works;
+ *   4. the mount starts T1 with a missing model (`downloading`), enabling reuses it, a failure
+ *      becomes `missing` + errors, retrying on capture start still works, and delivery is unaffected;
  *   5. the settings row renders OFF / ON / model-missing and files `voice.speakerShadow`;
  *   6. a verdict never changes the delivered text or its order (host path, plus a real-hearing
  *      match run with a fake embedder);
@@ -283,8 +284,10 @@ const speakerEvents = (events) => events.filter((event) => event.type.startsWith
 // 1. Default OFF
 // ---------------------------------------------------------------------------
 
-test('1) 默认关闭：startHearing 未收到 speakerShadow，speaker 事件为零，投递照常', async (t) => {
-  const app = await mount(t, { config: { voice: { speakerShadow: false } } });
+test('1) 默认关闭：仍启动 T1 下载，但 startHearing 未收到 speakerShadow、无判定事件、投递照常', async (t) => {
+  const app = await mount(t, {
+    config: { voice: { speakerShadow: false }, speakerModelStartup: true },
+  });
   const started = await app.start();
   assert.equal(started.ok, true, started.error);
 
@@ -292,9 +295,13 @@ test('1) 默认关闭：startHearing 未收到 speakerShadow，speaker 事件为
   assert.equal('speakerShadow' in options, false, 'the option is not passed while the shadow is off');
   assert.equal('speakerLibraryRoot' in options, false, 'and neither is the library root');
 
+  // Mount-time T1: the model download runs even though the shadow stays OFF, and starting capture
+  // never re-triggers it (the in-flight task is reused).
+  assert.equal(state.downloads.length, 1, 'the mount started exactly one T1 download');
+  assert.equal(state.downloads[0].targetPath, join(app.root, 'models', SPEAKER_FILE));
   const snapshot = await app.status();
   assert.deepEqual(snapshot.speaker, {
-    enabled: false, model: 'missing', lastShadow: null,
+    enabled: false, model: 'downloading', lastShadow: null,
     matches: 0, unsure: 0, noSpeakers: 0, errors: 0,
   });
 
@@ -304,8 +311,14 @@ test('1) 默认关闭：startHearing 未收到 speakerShadow，speaker 事件为
   assert.deepEqual(polled.finals, ['你好'], 'delivery is unchanged');
 
   const rows = await app.events();
-  assert.deepEqual(speakerEvents(rows), [], 'no speaker.* event at all');
-  console.log(`[speaker-host 1] speakerShadowInOptions=${'speakerShadow' in options} speakerEvents=0 finals=${polled.finals.length}`);
+  const speakerRows = speakerEvents(rows);
+  assert.deepEqual(speakerRows.map((event) => event.type), ['speaker.status'],
+    'the mount-time download only reports its own status; no verdict/enable/ready row leaks');
+  assert.equal(speakerRows[0].payload.enabled, false);
+  assert.equal(speakerRows[0].payload.model, 'downloading');
+  assert.equal(speakerRows.some((event) => event.type === 'speaker.shadow'), false);
+  console.log(`[speaker-host 1] speakerShadowInOptions=${'speakerShadow' in options} speakerEvents=status-only `
+    + `downloads=${state.downloads.length} model=downloading finals=${polled.finals.length}`);
 });
 
 // ---------------------------------------------------------------------------
@@ -381,16 +394,21 @@ test('3) speaker.shadow → status 汇总；speaker.status 节流', async (t) =>
 // 4. Missing model: T1 download → failure, capture/delivery unaffected
 // ---------------------------------------------------------------------------
 
-test('4) 模型缺失：开启触发 T1（downloading）→ failed 变 missing，听觉与投递照常', async (t) => {
-  const app = await mount(t, { config: { voice: { speakerShadow: false } } });
+test('4) 挂载即 T1（downloading）；开启复用 → failed 变 missing，听觉与投递照常', async (t) => {
+  const app = await mount(t, {
+    config: { voice: { speakerShadow: false }, speakerModelStartup: true },
+  });
+  // The mount-time T1 start is queued for the next turn; wait for it rather than assuming missing.
+  await until(() => state.downloads.length === 1, 'the mount-time T1 download starts');
   let snapshot = await app.status();
-  assert.equal(snapshot.speaker.model, 'missing');
+  assert.equal(snapshot.speaker.model, 'downloading', 'mount starts the T1 download while shadow is OFF');
+  assert.equal(state.downloads[0].targetPath, join(app.root, 'models', SPEAKER_FILE), 'the pinned target');
 
   const enabled = await app.action({ action: 'voice.speakerShadow', enabled: true });
   assert.equal(enabled.ok, true, enabled.error);
   assert.equal(enabled.enabled, true);
-  assert.equal(enabled.model, 'downloading', 'enabling starts the T1 download');
-  assert.equal(state.downloads.length, 1, 'exactly one download task');
+  assert.equal(enabled.model, 'downloading', 'enabling reuses the in-flight T1 download');
+  assert.equal(state.downloads.length, 1, 'no duplicate download task');
   assert.equal(state.downloads[0].targetPath, join(app.root, 'models', SPEAKER_FILE), 'the pinned target');
 
   snapshot = await app.status();

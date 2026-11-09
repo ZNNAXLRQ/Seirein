@@ -87,6 +87,12 @@ const referenceCache = new Map();
 
 export const TTS_AUDIO_MAX_BYTES = 16 * 1024 * 1024;
 const SLOT_LIMIT = 32;
+/**
+ * Monotonic clock for a PROCESS-LOCAL duration (queue wait, provider round trip, ...). Wall time
+ * (`Date.now()`) is only used to correlate events (`at`), so a clock adjustment cannot turn a
+ * queue wait into provider synthesis time (or the reverse).
+ */
+export const monotonicNow = () => performance.now();
 const abortError = () => new DOMException('Speech cancelled', 'AbortError');
 const checkAbort = (signal) => { if (signal?.aborted) throw signal.reason ?? abortError(); };
 const audioLimit = () => Object.assign(new Error('TTS audio exceeds byte limit'), { code: 'TTS_AUDIO_LIMIT' });
@@ -139,7 +145,7 @@ function createSlots() {
     const entry = waiting.shift();
     active = entry;
     entry.running = true;
-    entry.startedAt = Date.now();
+    entry.startedAt = monotonicNow();
     void (async () => {
       let result;
       let delivered = false;
@@ -175,8 +181,9 @@ function createSlots() {
         const entry = {
           run, resolve, reject, controller, running: false, priority,
           // Slot-queue observations, captured at enqueue: how many jobs (running + waiting) were
-          // ahead of this one and whether the slot was already held.
-          enqueuedAt: Date.now(),
+          // ahead of this one and whether the slot was already held. Monotonic, so `slotWaitMs`
+          // is a real duration and never shares a clock with the provider measurement.
+          enqueuedAt: monotonicNow(),
           startedAt: 0,
           queueDepth: waiting.length + (active === null ? 0 : 1),
           runningWhenQueued: active !== null,
@@ -531,9 +538,11 @@ function ttsErrorCode(error) {
 /**
  * P-46: optional turn attribution, copied from the caller exactly as supplied.
  *
- * Observation only. A request that names no turn keeps `null` on all three fields: the clock is
- * never used to guess one, and no id is derived from the text or from the queue. Adding them
- * changes nothing about slot waiting, synthesis or caching.
+ * Observation only. A request that names no turn keeps `null` on all four fields: the clock is
+ * never used to guess one, and no id is derived from the text or from the queue. `speechId` is the
+ * host ledger id of the accepted line/block; it is null for a lane that synthesizes before a
+ * ledger record exists. Adding these fields changes nothing about slot waiting, synthesis or
+ * caching.
  */
 function turnAttribution(request) {
   const id = (value) => (typeof value === 'string' && value.length > 0 ? value : null);
@@ -541,6 +550,7 @@ function turnAttribution(request) {
     turn: Number.isInteger(request?.turn) ? request.turn : null,
     deliveryMessageId: id(request?.deliveryMessageId),
     sessionId: id(request?.sessionId),
+    speechId: id(request?.speechId),
   };
 }
 
@@ -560,14 +570,17 @@ function takeTtsColdStart() {
  * stay separate measurements; `totalMs` is their sum, never a re-measurement of the wall clock.
  * `requestMs` is the clip's synthesis time, except for a streamed request where the provider
  * round trip ends at the FIRST audio byte (`streamed: true`); the rest of a stream is playback.
- * Turn attribution (`turn`/`deliveryMessageId`/`sessionId`) is copied from the caller or null.
+ * Both `slotWaitMs` and `requestMs` are process-local durations measured with the monotonic clock;
+ * wall time is only used for the correlation `at` kept by the caller.
+ * Turn attribution (`turn`/`deliveryMessageId`/`sessionId`/`speechId`) is copied from the caller
+ * or null.
  */
 function reportTtsRequest(request, { slot = null, slotWaitMs = 0, startedAt = 0, requestMs = null,
   result, error, attempts = [], retryErrorCode = null, streamed = false } = {}) {
   if (ttsRequestHook === null) return;
   const wait = Math.max(0, Math.round(Number(slotWaitMs) || 0));
   const elapsed = requestMs === null
-    ? Math.max(0, Math.round(Date.now() - startedAt))
+    ? (Number(startedAt) > 0 ? Math.max(0, Math.round(monotonicNow() - Number(startedAt))) : 0)
     : Math.max(0, Math.round(Number(requestMs) || 0));
   const seen = Array.isArray(attempts) ? attempts : [];
   const payload = {
@@ -594,6 +607,159 @@ function reportTtsRequest(request, { slot = null, slotWaitMs = 0, startedAt = 0,
     streamed: streamed === true,
   };
   void notifyHook(ttsRequestHook, payload);
+}
+
+/**
+ * Select the observed `voice.tts.request` rows that describe one FIRST BLOCK.
+ *
+ * Only a completed (`ok`) `answer` request with `chunkIndex: 0` counts. Optional identity fields
+ * narrow the match: when the caller names a turn / delivery / session / sentence, a row with a
+ * different value is never used for that observation. Rows are returned oldest-first so a caller
+ * can read either the first row of a round (the first sentence's block 0) or the latest row (the
+ * request that just finished). `from`/`observedAt` are WALL stamps used only to correlate rows with
+ * the call that produced them; the durations inside a row are monotonic.
+ *
+ * @param {{rows?: Array<{at: number, payload: object}>, purpose?: string, turn?: number|null,
+ *   deliveryMessageId?: string|null, sessionId?: string|null, sentenceId?: number|null,
+ *   chunkIndex?: number, from?: number, observedAt?: number}} [options]
+ * @returns {Array<{at: number, payload: object}>}
+ */
+export function firstBlockRequestRows({
+  rows = [], purpose = 'answer', turn = null, deliveryMessageId = null, sessionId = null,
+  sentenceId = null, chunkIndex = 0, from = 0, observedAt = 0,
+} = {}) {
+  const lower = Number(from);
+  const upper = Number(observedAt);
+  const wantedTurn = Number.isSafeInteger(turn) ? turn : null;
+  const wantedDelivery = typeof deliveryMessageId === 'string' && deliveryMessageId.length > 0
+    ? deliveryMessageId : null;
+  const wantedSession = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+  const wantedSentence = Number.isSafeInteger(sentenceId) ? sentenceId : null;
+  const wantedChunk = Number.isSafeInteger(chunkIndex) ? chunkIndex : 0;
+  const matched = [];
+  for (const entry of Array.isArray(rows) ? rows : []) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const at = Number(entry.at);
+    if (!Number.isFinite(at)) continue;
+    if (Number.isFinite(lower) && lower > 0 && at < lower) continue;
+    if (Number.isFinite(upper) && upper > 0 && at > upper) continue;
+    const row = entry.payload;
+    if (row === null || typeof row !== 'object') continue;
+    if (row.purpose !== purpose || row.ok !== true) continue;
+    if (row.chunkIndex !== wantedChunk) continue;
+    if (wantedSentence !== null && row.sentenceId !== wantedSentence) continue;
+    if (wantedTurn !== null && row.turn !== wantedTurn) continue;
+    if (wantedDelivery !== null && row.deliveryMessageId !== wantedDelivery) continue;
+    if (wantedSession !== null && row.sessionId !== wantedSession) continue;
+    matched.push({ at, payload: row });
+  }
+  return matched.sort((a, b) => a.at - b.at);
+}
+
+/**
+ * Resolve ONE unit-sizer sample from the synthesis rows.
+ *
+ * The value fed to the EWMA is the first block's own `requestMs` (slot acquired -> synthesis end).
+ * The host await time is NOT used when a row is present: queued time is queue time, not provider
+ * speed. `fallbackMs` (the caller's monotonic await time) is returned with
+ * `source: 'fallback-total'` only when no matching row exists, so the old behavior is kept and its
+ * lower precision is visible in the event log instead of silently polluting the estimate.
+ *
+ * A `requestMs` of 0 is a cache hit / no measured synthesis: it is reported as `cache-hit` with
+ * `observe: false`, so a free lookup can never claim an infinitely fast provider.
+ *
+ * @param {object} [options] same row filter as `firstBlockRequestRows`, plus:
+ * @param {number} [options.fallbackMs] monotonic host await time, used only when no row matches
+ * @param {number} [options.chars] characters of the block that was synthesized
+ * @returns {{ms: number, chars: number, source: 'request'|'cache-hit'|'fallback-total',
+ *   observe: boolean, slotWaitMs: number|null, requestMs: number|null, cached: boolean|null,
+ *   at: number|null}}
+ */
+export function resolveUnitSizerSample({
+  rows = [], purpose = 'answer', turn = null, deliveryMessageId = null, sessionId = null,
+  sentenceId = null, chunkIndex = 0, from = 0, observedAt = 0, fallbackMs = 0, chars = 0,
+} = {}) {
+  const size = Math.max(0, Math.round(Number(chars) || 0));
+  const fallback = Math.max(0, Math.round(Number(fallbackMs) || 0));
+  const matched = firstBlockRequestRows({
+    rows, purpose, turn, deliveryMessageId, sessionId, sentenceId, chunkIndex, from, observedAt,
+  });
+  for (let index = matched.length - 1; index >= 0; index -= 1) {
+    const hit = matched[index];
+    const requestMs = Number(hit.payload.requestMs);
+    if (!Number.isFinite(requestMs) || requestMs < 0) continue;
+    const ms = Math.round(requestMs);
+    const cached = hit.payload.cached === true || ms === 0;
+    const wait = Number(hit.payload.slotWaitMs);
+    return {
+      ms,
+      chars: size,
+      // A 0 ms round trip measured no synthesis cost; feeding it to the EWMA would claim a
+      // provider that synthesizes any block instantly. Keep it visible, never observed.
+      source: ms === 0 ? 'cache-hit' : 'request',
+      observe: ms > 0,
+      slotWaitMs: Number.isFinite(wait) && wait >= 0 ? Math.round(wait) : null,
+      requestMs: ms,
+      cached,
+      at: hit.at,
+    };
+  }
+  return {
+    ms: fallback,
+    chars: size,
+    source: 'fallback-total',
+    observe: fallback > 0,
+    slotWaitMs: null,
+    requestMs: null,
+    cached: null,
+    at: null,
+  };
+}
+
+/**
+ * The first-chunk breakdown of `voice.pipeline.timeline`.
+ *
+ * Only the reply body's real block 0 counts (`purpose: 'answer'`, `sentenceId: 0`,
+ * `chunkIndex: 0`). An ack/progress/tool row and a later block are never read, and several blocks
+ * of the same turn are never summed. `firstChunkQueueWaitMs`/`firstChunkTtsMs` are kept for
+ * compatibility; `firstChunkSlotWaitMs`/`firstChunkRequestMs` make the same measurements explicit,
+ * and `firstChunkAudioReadyMs` is derived from the already-measured first-chunk stage. A stage
+ * that was not measured is null, never a fabricated 0.
+ *
+ * @param {{rows?: Array<{at: number, payload: object}>, streamed?: object|null, origin?: number,
+ *   audioReadyMs?: number|null}} [options]
+ * @returns {object}
+ */
+export function buildFirstChunkBreakdown({
+  rows = [], streamed = null, origin = 0, audioReadyMs = null,
+} = {}) {
+  const matched = firstBlockRequestRows({
+    rows, purpose: 'answer', sentenceId: 0, chunkIndex: 0, from: origin,
+  });
+  const request = matched.length > 0 ? matched[0].payload : null;
+  const measured = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
+  };
+  const translateMs = Number(streamed?.firstTranslateMs);
+  return {
+    firstChunkQueueWaitMs: request === null ? null : measured(request.slotWaitMs),
+    firstChunkTranslateMs: streamed?.firstTranslated === true
+      ? (Number.isFinite(translateMs) && translateMs >= 0 ? Math.round(translateMs) : null)
+      : (streamed === null ? null : 0),
+    firstChunkKanaMs: request === null ? null : 0,
+    firstChunkTtsMs: request === null ? null : measured(request.requestMs),
+    firstChunkChars: request === null ? null : measured(request.chars),
+    ttsColdStart: request === null
+      ? null
+      : (typeof request.coldStart === 'boolean' ? request.coldStart : null),
+    // Explicit identity of the same first block: queue wait and provider round trip stay apart.
+    firstChunkSlotWaitMs: request === null ? null : measured(request.slotWaitMs),
+    firstChunkRequestMs: request === null ? null : measured(request.requestMs),
+    // Derived from the pipeline's own first-chunk stage; null when that boundary was never hit.
+    firstChunkAudioReadyMs: measured(audioReadyMs),
+  };
 }
 
 /** Read sample rate/byte rate straight from the RIFF header — no ffprobe dependency. */
@@ -645,7 +811,7 @@ async function synthesizeGptSovits({ text, dir, speech = 'zh', textLang = '', se
     ['media_type', 'wav'],
   ].map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
 
-  const startedAt = Date.now();
+  const startedAt = monotonicNow();
   const controller = new AbortController();
   const abort = () => controller.abort(signal.reason ?? abortError());
   signal?.addEventListener('abort', abort, { once: true });
@@ -675,7 +841,7 @@ async function synthesizeGptSovits({ text, dir, speech = 'zh', textLang = '', se
   } catch (error) {
     checkAbort(signal);
     if (error?.name === 'AbortError') {
-      const elapsedMs = Date.now() - startedAt;
+      const elapsedMs = Math.round(monotonicNow() - startedAt);
       // The cold-start load is the real cause: say how long it actually took and what to change.
       const timeout = new Error(
         `GPT-SoVITS 超时（上限 ${timeoutMs} ms，实际耗时 ${elapsedMs} ms；首次调用可能较慢，请重试或调大 gptSovits.timeoutMs）`,
@@ -881,13 +1047,13 @@ async function synthesizeEdge({ text, voice, dir, signal, maxBytes = TTS_AUDIO_M
  * clip is never called blindly: the stock API answers HTTP 400 for a missing clip, a clip outside
  * 3–10 s, or empty prompt text, so those cases skip straight to Edge.
  *
- * P-46: `turn`, `deliveryMessageId` and `sessionId` are optional turn attribution. They are only
- * carried on the `voice.tts.request` row (null when omitted); they never affect which engine runs,
- * how long a slot is held, or whether a clip is cached.
+ * P-46: `turn`, `deliveryMessageId`, `sessionId` and `speechId` are optional turn attribution. They
+ * are only carried on the `voice.tts.request` row (null when omitted); they never affect which
+ * engine runs, how long a slot is held, or whether a clip is cached.
  *
  * @param {{text: string, voice?: string, lang?: string, textLang?: string, dir: string,
  *   purpose?: string, turn?: number|null, deliveryMessageId?: string|null, sessionId?: string|null,
- *   sentenceId?: number, chunkIndex?: number}} options
+ *   speechId?: string|null, sentenceId?: number, chunkIndex?: number}} options
  * @returns {Promise<{file: string, bytes: number, durationMs: number, provider: string}>}
  */
 export function synthesize(options) {
@@ -898,7 +1064,8 @@ export function synthesize(options) {
   const observation = { attempts: [], retryErrorCode: null };
   return synthesisSlots.run(
     async (signal, slot) => {
-      const slotWaitMs = Math.max(0, Number(slot?.slotWaitMs) || 0);
+      // Round first: a sub-millisecond enqueue->start gap is an immediate slot, not a queue wait.
+      const slotWaitMs = Math.max(0, Math.round(Number(slot?.slotWaitMs) || 0));
       // Throttle: a slot that started immediately is not reported; only a real queue wait is.
       if (slotWaitMs > 0) {
         void notifyHook(ttsSlotWaitHook, {
@@ -908,8 +1075,9 @@ export function synthesize(options) {
           running: slot?.running === true,
         });
       }
-      // The clock starts when this request owns the slot, so `requestMs` excludes the queue wait.
-      const startedAt = Date.now();
+      // The monotonic clock starts when this request owns the slot, so `requestMs` excludes the
+      // queue wait and cannot be altered by a wall-clock adjustment.
+      const startedAt = monotonicNow();
       let result;
       try {
         result = await synthesizeNow({ ...request, signal, observation });
@@ -919,7 +1087,7 @@ export function synthesize(options) {
       }
       reportTtsRequest(request, { slot, slotWaitMs, startedAt, result, ...observation });
       // Returned so the caller can put the wait beside the clip: `voice.latency.ttsSlotWaitMs`.
-      return { ...result, slotWaitMs: Math.round(slotWaitMs) };
+      return { ...result, slotWaitMs };
     },
     request.signal,
     { priority: Number(request.priority) || 0 },
@@ -1058,19 +1226,21 @@ function startPlayer(command, args, { signal, piped = false, onStart = null } = 
  * caller must prefer over its own duration estimate.
  *
  * @param {{text: string, voice?: string, lang?: string, dir: string, ffplayPath?: string|null, onStart?: Function|null, onTransport?: Function|null,
- *   turn?: number|null, deliveryMessageId?: string|null, sessionId?: string|null, sentenceId?: number, chunkIndex?: number}} options
+ *   turn?: number|null, deliveryMessageId?: string|null, sessionId?: string|null, speechId?: string|null,
+ *   sentenceId?: number, chunkIndex?: number}} options
  * @returns {Promise<{file: string, bytes: number, durationMs: number, firstChunkMs: number|null, via: string}>}
  */
 export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', dir, ffplayPath = null, onStart = null,
   onTransport = null, purpose = 'speech', turn = null, deliveryMessageId = null, sessionId = null,
-  sentenceId = null, chunkIndex = null, signal, snapshot = captureTtsSnapshot(), maxBytes = TTS_AUDIO_MAX_BYTES }) {
+  speechId = null, sentenceId = null, chunkIndex = null, signal, snapshot = captureTtsSnapshot(),
+  maxBytes = TTS_AUDIO_MAX_BYTES }) {
   checkAbort(signal);
   const resolvedVoice = typeof voice === 'string' && voice.trim().length > 0 ? voice : voiceForLanguage(lang);
   if (snapshot.settings?.enabled === true || !ffplayPath) {
     // P-46: the fallback path reports through `synthesize()`, so the attribution must ride along.
     const result = await synthesize({
       text, voice: resolvedVoice, lang, textLang, dir, purpose, turn, deliveryMessageId, sessionId,
-      sentenceId, chunkIndex, signal, snapshot, maxBytes,
+      speechId, sentenceId, chunkIndex, signal, snapshot, maxBytes,
     });
     try {
       checkAbort(signal);
@@ -1091,7 +1261,8 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
     // row (the file path above already reported one through `synthesize()`). P-46 attribution is
     // copied here too, so a streamed sentence is attributable to its turn without a time window.
     const streamRequest = {
-      text, purpose: String(purpose ?? 'speech'), turn, deliveryMessageId, sessionId, sentenceId, chunkIndex,
+      text, purpose: String(purpose ?? 'speech'), turn, deliveryMessageId, sessionId, speechId,
+      sentenceId, chunkIndex,
     };
     // Always acquire synthesis before playback, like the model-application barrier. The legacy
     // pipe path conservatively retains synthesis ownership until player cleanup; sentence-file
@@ -1101,7 +1272,7 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
       return playbackSlots.run(async (playSignal) => {
         // The provider round trip is timed from the instant both seats are owned, so the playback
         // seat wait never becomes synthesis time (the request row keeps its clocks separate).
-        const requestStartedAt = Date.now();
+        const requestStartedAt = monotonicNow();
         let player;
         /** Process-ready instant from the internal spawn hook; 0 until the child's `spawn` fires. */
         let playerReadyAt = 0;
@@ -1140,12 +1311,15 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
           let firstChunkMs = null;
           /** Transport arrival of the first audio byte: where a streamed provider round trip ends. */
           let firstDataAt = 0;
-          const startedAt = Date.now();
+          /** Monotonic first-byte instant; only the DURATION is taken from it, never a wall anchor. */
+          let firstDataMono = 0;
+          const startedAt = monotonicNow();
           const sink = new Writable({ write(chunk, _encoding, callback) {
             bytes += chunk.length;
             if (bytes > maxBytes) { callback(audioLimit()); return; }
             if (firstChunkMs === null) {
-              firstChunkMs = Date.now() - startedAt;
+              firstDataMono = monotonicNow();
+              firstChunkMs = Math.max(0, Math.round(firstDataMono - startedAt));
               // The first audio DATA handed to the player: transport arrival, not decoded audio and
               // not speaker sound. `firstDataIsAudible` is false without a read-back; the PCM and
               // audible instants are never inferred from it.
@@ -1198,7 +1372,7 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
             slot: synthSlot,
             slotWaitMs,
             startedAt: requestStartedAt,
-            requestMs: firstDataAt > 0 ? firstDataAt - requestStartedAt : null,
+            requestMs: firstDataMono > 0 ? firstDataMono - requestStartedAt : null,
             result: { provider: 'edge-tts' },
             attempts: ['edge'],
             streamed: true,

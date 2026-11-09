@@ -206,11 +206,12 @@ test('a translation fallback sends text_lang=zh although the card pinned ja', as
     },
   }, { root, enabled: true });
 
+  const GPT_BASE = 'http://127.0.0.1:9880';
   const edge = [];
   configureTts({
     gptSovits: () => ({
       enabled: true,
-      apiBase: 'http://127.0.0.1:9880',
+      apiBase: GPT_BASE,
       refAudioPath: 'G:\\voice\\reference.wav',
       promptText: '参考音频里说的话',
       promptLang: 'ja',
@@ -225,6 +226,7 @@ test('a translation fallback sends text_lang=zh although the card pinned ja', as
     },
   });
   const urls = [];
+  const gptOrigin = new URL(GPT_BASE).origin;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     urls.push(String(url));
@@ -241,8 +243,13 @@ test('a translation fallback sends text_lang=zh although the card pinned ja', as
   const finished = await waitSpeech(result.speechId, { timeoutMs: 3000 });
   assert.equal(finished.status, 'finished', 'the accepted fallback speech really finished');
   assert.equal(translations, 1, 'the speech stream attempted one translation');
-  assert.equal(urls.length, 1, 'GPT-SoVITS received exactly one request');
-  const url = new URL(urls[0]);
+  // The mounted host also starts the speaker-model download, which shares the global fetch stub.
+  // Only requests that target the configured GPT-SoVITS base count as TTS traffic.
+  const gptUrls = urls.filter((value) => {
+    try { return new URL(value).origin === gptOrigin; } catch { return false; }
+  });
+  assert.equal(gptUrls.length, 1, 'GPT-SoVITS received exactly one request');
+  const url = new URL(gptUrls[0]);
   assert.equal(url.pathname, '/tts');
   assert.equal(url.searchParams.get('text_lang'), 'zh', 'the fallback Chinese text is labelled zh');
   assert.equal(url.searchParams.get('prompt_lang'), 'ja', 'the reference clip still follows the setting');

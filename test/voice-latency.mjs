@@ -38,6 +38,7 @@ import {
   VoiceLatencyLog,
 } from '../src/host/session/delivery/dispatch.js';
 import { createTranslator, prepareSpeech } from '../src/host/speech/translate.js';
+import { buildFirstChunkBreakdown } from '../src/host/speech/tts.js';
 import { apply, createReplySpeaker, voiceLatencyObservationFields } from '../src/host/index.js';
 import {
   buildTurnTimeline,
@@ -283,6 +284,56 @@ test('the first-sentence stats carry spawn->player-ready, TTS slot and translati
   assert.equal(stats.firstTranslateQueueWaitMs, 450, 'the translation-gate wait reaches voice.latency');
   assert.equal(stats.firstSpawnToPlayerReadyMs, 41, 'the player spawn -> player-ready wait reaches voice.latency');
   assert.equal(stats.firstSpawnToPcmMs, undefined, 'no spawn->PCM stat exists anymore');
+});
+
+test('the first-chunk breakdown keeps slot wait, request and audio-ready apart', () => {
+  const T = 1_760_000_000_000;
+  const row = (payload, offset) => ({ at: T + offset, payload });
+  const answer = row({
+    purpose: 'answer', ok: true, chunkIndex: 0, sentenceId: 0,
+    slotWaitMs: 5000, requestMs: 200, totalMs: 5200, chars: 40, coldStart: true,
+  }, 20);
+  // An ack and a later block are present but must never become the body's first chunk.
+  const rows = [
+    row({ purpose: 'ack', ok: true, chunkIndex: 0, sentenceId: 0, slotWaitMs: 4000, requestMs: 900, chars: 30 }, 10),
+    answer,
+    row({ purpose: 'answer', ok: true, chunkIndex: 1, sentenceId: 0, slotWaitMs: 0, requestMs: 300, chars: 60 }, 30),
+  ];
+  const breakdown = buildFirstChunkBreakdown({
+    rows,
+    streamed: { firstTranslated: false, firstTranslateMs: 0 },
+    origin: T,
+    // Derived from the pipeline's measured first-chunk stage, not re-read from a clock.
+    audioReadyMs: 800,
+  });
+  assert.equal(breakdown.firstChunkSlotWaitMs, 5000, 'the first block queue wait');
+  assert.equal(breakdown.firstChunkQueueWaitMs, 5000, 'the compatibility field is retained');
+  assert.equal(breakdown.firstChunkRequestMs, 200, 'only the synthesis round trip');
+  assert.equal(breakdown.firstChunkTtsMs, 200, 'the compatibility field is retained');
+  assert.notEqual(breakdown.firstChunkRequestMs, 5200, 'queue time is not synthesis time');
+  assert.equal(breakdown.firstChunkAudioReadyMs, 800, 'derived first-chunk stage');
+  assert.equal(breakdown.firstChunkChars, 40, 'block 0 characters, never a later block');
+  assert.equal(breakdown.firstChunkTranslateMs, 0, 'same language is a measured 0');
+  assert.equal(breakdown.firstChunkKanaMs, 0);
+  assert.equal(breakdown.ttsColdStart, true);
+
+  // Missing boundaries stay null: no row and no audio-ready measurement must not become 0.
+  const empty = buildFirstChunkBreakdown({
+    rows: [row({ purpose: 'ack', ok: true, chunkIndex: 0, sentenceId: 0, requestMs: 900 }, 10)],
+    streamed: null,
+    origin: T,
+    audioReadyMs: null,
+  });
+  for (const key of [
+    'firstChunkQueueWaitMs', 'firstChunkSlotWaitMs', 'firstChunkTranslateMs', 'firstChunkKanaMs',
+    'firstChunkTtsMs', 'firstChunkRequestMs', 'firstChunkAudioReadyMs', 'firstChunkChars',
+    'ttsColdStart',
+  ]) {
+    assert.equal(empty[key], null, `${key} is null when never measured`);
+  }
+  // An explicit 0 is a measurement and is kept.
+  const zero = buildFirstChunkBreakdown({ rows: [answer], streamed: null, origin: T, audioReadyMs: 0 });
+  assert.equal(zero.firstChunkAudioReadyMs, 0);
 });
 
 

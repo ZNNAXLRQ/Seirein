@@ -245,6 +245,64 @@ test('residualMs is total - Σphases and a negative residual is preserved', () =
   assert.equal(overlap.residualMs, -700, 'a negative residual is information, not an error');
 });
 
+test('additive first-chunk boundaries never join the phase sum; overlap is still counted once', () => {
+  // The 23.5 s investigation adds process-local first-chunk fields beside the timeline. They are
+  // NOT phases: a new boundary must not be added to Σphases (which would double-count the same
+  // wall interval) and must not change the residual definition.
+  const rows = [
+    event('turn/start', T0, { turn: 12 }),
+    event('step/start', T0 + 10, { turn: 12, step: 1 }),
+    event('assistant/message', T0 + 110, {
+      turn: 12, step: 1, message: { content: [{ type: 'text', text: '并行查。' }] },
+    }),
+    event('tool/call', T0 + 120, { turn: 12, step: 1, callId: 'a', name: 'assistant_see' }),
+    event('tool/call', T0 + 120, { turn: 12, step: 1, callId: 'b', name: 'session_search' }),
+    event('tool/result', T0 + 320, { turn: 12, step: 1, message: { toolCallId: 'a', isError: false } }),
+    event('tool/result', T0 + 420, { turn: 12, step: 1, message: { toolCallId: 'b', isError: false } }),
+    event('turn/end', T0 + 520, { turn: 12, reason: { kind: 'completed' } }),
+  ];
+  const plain = observe(rows);
+  // Same observations, plus the new pipeline fields a future feed may attach. They must be ignored
+  // by this event-time builder instead of becoming extra phases.
+  const additive = plain.map((row) => ({
+    ...row,
+    firstChunkSlotWaitMs: 5_000,
+    firstChunkRequestMs: 200,
+    firstChunkAudioReadyMs: 800,
+  }));
+  const anchors = { replyAt: T0 + 500, audioAt: T0 + 900 };
+  const without = buildTurnTimeline({
+    sessionId: SESSION, turn: 12, origin: { at: T0, source: 'endpoint' },
+    observations: plain, anchors,
+  });
+  const withAdditive = buildTurnTimeline({
+    sessionId: SESSION, turn: 12, origin: { at: T0, source: 'endpoint' },
+    observations: additive, anchors,
+  });
+
+  assert.equal(withAdditive.residualMs, without.residualMs, 'the residual definition is untouched');
+  assert.equal(withAdditive.overlaps.toolWallMs, 300, 'the 120..420 union is counted once');
+  assert.equal(withAdditive.overlaps.toolMsSum, 500, 'the additive tool sum keeps the overlap visible');
+  assert.equal(withAdditive.phases.length, without.phases.length, 'no shadow phase is invented');
+  assert.ok(!JSON.stringify(withAdditive).includes('firstChunkRequestMs'),
+    'the first-chunk fields stay in voice.pipeline.timeline, not in the phase payload');
+  // Old and new coexist: every phase keeps exactly the documented, backward-compatible key set.
+  for (const phase of withAdditive.phases) {
+    assert.deepEqual(Object.keys(phase), ['name', 'actionId', 'startAt', 'endAt', 'startMs', 'endMs',
+      'durMs', 'source', 'status', 'reason', 'wait', 'tool', 'extra']);
+  }
+  const statsWithout = turnTimelineStats(without, { firstTextAt: T0 + 520, audioAt: T0 + 900, collected: plain.length });
+  const statsWith = turnTimelineStats(withAdditive, { firstTextAt: T0 + 520, audioAt: T0 + 900, collected: additive.length });
+  assert.deepEqual(statsWith, statsWithout, 'the derived numbers are identical');
+
+  // Missing boundaries stay null on both shapes (never a fabricated 0).
+  const empty = buildTurnTimeline({ sessionId: SESSION, turn: 13, origin: { at: T0, source: 'injected' } });
+  for (const field of VOICE_LATENCY_TIMELINE_FIELDS) {
+    assert.equal(turnTimelineStats(empty, { collected: null })[field], null, `${field} is null when unobserved`);
+  }
+  assert.equal(empty.residualMs, null);
+});
+
 test('phases are capped at 64 and the dropped count is reported', () => {
   const rows = [];
   for (let round = 1; round <= 40; round += 1) {

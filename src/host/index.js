@@ -2315,11 +2315,23 @@ export function apply(ctx, config) {
   };
   /**
    * The first CHUNK breakdown for `voice.pipeline.timeline`: read back from this round's first
-   * `answer` synthesis row (queue wait, provider time, characters, cold start). A stage that was
-   * never measured stays null. `firstChunkKanaMs` is 0 because the kana rewrite travels in the
-   * same translation request here, so it has no separate stage to measure.
+   * `answer` synthesis row (queue wait, provider time, characters, cold start). Only the reply
+   * body's real block 0 counts; an ack/progress row and a later block are never read and several
+   * blocks are never summed. A stage that was never measured stays null.
+   *
+   * `firstChunkQueueWaitMs`/`firstChunkTtsMs` are kept for compatibility. The explicit
+   * `firstChunkSlotWaitMs`/`firstChunkRequestMs` split the same two clocks, and
+   * `firstChunkAudioReadyMs` is derived from the already-measured first-chunk stage instead of
+   * being re-measured here. `firstChunkKanaMs` is 0 because the kana rewrite travels in the same
+   * translation request, so it has no separate stage to measure.
    */
-  const firstChunkBreakdown = ({ streamed = null, origin = 0 } = {}) => {
+  const firstChunkBreakdown = ({ streamed = null, origin = 0, audioReadyMs = null } = {}) => {
+    if (typeof ttsModule.buildFirstChunkBreakdown === 'function') {
+      return ttsModule.buildFirstChunkBreakdown({
+        rows: ttsRequestRows, streamed, origin, audioReadyMs,
+      });
+    }
+    // Compatibility for a test double that replaces `tts.js` and predates the pure helper.
     const from = Number(origin) > 0 ? Number(origin) : 0;
     let row = null;
     for (const entry of ttsRequestRows) {
@@ -2334,6 +2346,7 @@ export function apply(ctx, config) {
     const request = row?.payload ?? null;
     const translateMs = Number(streamed?.firstTranslateMs);
     const measured = (value) => {
+      if (value === null || value === undefined || value === '') return null;
       const number = Number(value);
       return Number.isFinite(number) && number >= 0 ? Math.round(number) : null;
     };
@@ -2349,6 +2362,9 @@ export function apply(ctx, config) {
       ttsColdStart: request === null
         ? null
         : (typeof request.coldStart === 'boolean' ? request.coldStart : null),
+      firstChunkSlotWaitMs: request === null ? null : measured(request.slotWaitMs),
+      firstChunkRequestMs: request === null ? null : measured(request.requestMs),
+      firstChunkAudioReadyMs: measured(audioReadyMs),
     };
   };
   configureTts({
@@ -4926,8 +4942,10 @@ export function apply(ctx, config) {
   const synthesizeChunked = async (prepared, {
     voice, signal, liveSignal = null, chunking: chunkingOverride = undefined,
     purpose = 'answer', sentenceId = 0, firstBlock = false,
-    // P-46 stage 2: optional turn attribution, forwarded to every block's synthesis.
-    turn = null, deliveryMessageId = null, sessionId = null,
+    // P-46 stage 2: optional turn attribution, forwarded to every block's synthesis. `speechId`
+    // is present only for a lane that already owns a ledger id; a reply body synthesizes before
+    // its playback ledger record exists, so it stays null there.
+    turn = null, deliveryMessageId = null, sessionId = null, speechId = null,
   }) => {
     // `chunking:false` is the streamed spoken-version path: the semantic unit is already sized
     // from measured synthesis cost, so the comma-level block splitter must not cut it again.
@@ -4978,11 +4996,57 @@ export function apply(ctx, config) {
       turn,
       deliveryMessageId,
       sessionId,
+      speechId,
     });
     const firstBlockAt = Date.now();
+    const firstBlockMono = performance.now();
+    const firstBlockChars = speechCharCount(list[0]);
     const audio = await synthesizeBlock(list[0], signal);
-    // The real cost of this provider: the next first block is sized from it (not from a guess).
-    voiceUnitSizer.observe({ ms: Date.now() - firstBlockAt, chars: speechCharCount(list[0]) });
+    // The real provider cost of this first block, from the request's own monotonic `requestMs`
+    // (slot acquired -> synthesis end). The host await time is only the fallback when the row is
+    // missing; queue wait must never be reported as synthesis speed.
+    const unitSample = typeof ttsModule.resolveUnitSizerSample === 'function'
+      ? ttsModule.resolveUnitSizerSample({
+        rows: ttsRequestRows,
+        purpose,
+        turn,
+        deliveryMessageId,
+        sessionId,
+        sentenceId,
+        chunkIndex: 0,
+        // Wall clocks only correlate the row with this call; the sample itself is a duration.
+        from: firstBlockAt,
+        observedAt: Date.now(),
+        fallbackMs: performance.now() - firstBlockMono,
+        chars: firstBlockChars,
+      })
+      : {
+        ms: performance.now() - firstBlockMono,
+        chars: firstBlockChars,
+        source: 'fallback-total',
+        observe: true,
+        slotWaitMs: null,
+        requestMs: null,
+      };
+    if (unitSample.observe === true) {
+      voiceUnitSizer.observe({ ms: unitSample.ms, chars: unitSample.chars });
+    }
+    // Observation only: which clock sourced the sample. `fallback-total` keeps the old behavior
+    // but makes its queue-polluted value explicit instead of silently feeding the EWMA.
+    void log.emit('voice.unit.sizer', {
+      source: unitSample.source,
+      ms: Math.max(0, Math.round(Number(unitSample.ms) || 0)),
+      chars: unitSample.chars,
+      purpose,
+      turn: Number.isInteger(turn) ? turn : null,
+      deliveryMessageId: typeof deliveryMessageId === 'string' && deliveryMessageId.length > 0
+        ? deliveryMessageId : null,
+      sessionId: typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null,
+      sentenceId: Number.isInteger(sentenceId) ? sentenceId : null,
+      chunkIndex: 0,
+      slotWaitMs: unitSample.slotWaitMs ?? null,
+      requestMs: unitSample.requestMs ?? null,
+    }).catch(() => {});
     if (list.length < 2) return { audio, chunkTexts: null, synthesizeChunk: null };
     return {
       audio,
@@ -5824,7 +5888,7 @@ export function apply(ctx, config) {
     // Observation only: the lane purpose reported by the streamed TTS request row.
     purpose = 'speech',
     // P-46 stage 2: optional turn attribution forwarded to the streamed request row.
-    turn = null, deliveryMessageId = null, sessionId = null,
+    turn = null, deliveryMessageId = null, sessionId = null, speechId = null,
     // P2: the text the stream is synthesized from — `text` itself unless a lane says otherwise.
     speechText = text,
     // P-139: speech lane at the playback entrance (see `playAudio`); only `reply` may end an answer.
@@ -5875,6 +5939,7 @@ export function apply(ctx, config) {
         turn,
         deliveryMessageId,
         sessionId,
+        speechId,
         onStart: (info) => {
           // First chunk handed to the player: the transport is no longer pending. Data arrival is
           // not speaker sound, so this session records firstData* only and keeps PCM/audible null.
@@ -8261,7 +8326,7 @@ export function apply(ctx, config) {
               // Observation only: a line spoken by the say tool.
               purpose: 'tool',
               // P-46 stage 2: the tool line's turn attribution (say has no delivery message id).
-              turn: turnId, sessionId,
+              turn: turnId, sessionId, speechId,
             });
             synthMs = Date.now() - synthAt;
             chunkMs = synthMs;
@@ -8304,7 +8369,7 @@ export function apply(ctx, config) {
                 // Observation only: the streamed answer transport.
                 purpose: 'answer',
                 // P-46 stage 2: the streamed line's turn attribution.
-                turn: turnId, sessionId,
+                turn: turnId, sessionId, speechId,
               });
               result = played.result;
               playedSession = played.session;
@@ -8327,7 +8392,7 @@ export function apply(ctx, config) {
               const blockStartedAt = Date.now();
               const chunked = await synthesizeChunked(prepared, {
                 voice, signal: combined, liveSignal: live, purpose: 'tool',
-                turn: turnId, sessionId,
+                turn: turnId, sessionId, speechId,
               });
               // Register ownership the instant block 0 exists, BEFORE the playback-turn wait: a
               // cancel while queued must still delete this file (the finally below owns it).
@@ -16327,33 +16392,40 @@ export function apply(ctx, config) {
             const pipelineInputAt = stage.injectedAt > 0
               ? stage.injectedAt
               : (acceptedAt > 0 ? acceptedAt : (stage.ackAt > 0 ? stage.ackAt : replyAt));
+            const pipelineTimeline = buildPipelineTimeline({
+              turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
+              origin: pipelineInputAt,
+              bodyReadyAt: replyAt,
+              // When the spoken version started (rewrite request / skip decision), kept apart from
+              // the complete body above.
+              spokenStartedAt: spokenMarks.spokenStartedAt,
+              // The first STABLE semantic unit of the spoken version (or the first queued sentence
+              // on the whole-text path) — never the whole reply.
+              spokenFirstSentenceAt: spokenMarks.firstUnitAt > 0
+                ? spokenMarks.firstUnitAt
+                : Number(streamed.firstQueuedAt),
+              translatedFirstAt: streamed.firstTranslated === true ? spokenMarks.firstTranslateDoneAt : 0,
+              firstChunkSynthAt: spokenMarks.firstChunkAt,
+              firstAudioAt: Number(streamed.firstPlayStartedAt),
+              spokenCompleteAt: Date.now(),
+              skippedSpokenVersion: spokenPlan?.source === 'original',
+              reusedTranslation: spokenMarks.reusedTranslation === true,
+            });
             await log.emit('voice.pipeline.timeline', {
               // P-46 stage 0: the same join keys as `voice.latency` / `voice.first-sentence`.
               // Additive only: the existing fields and the accepted-delivery origin are untouched.
               sessionId,
               deliveryMessageId: request.id,
-              ...buildPipelineTimeline({
-                turn: Number.isSafeInteger(stage.turn) ? stage.turn : null,
-                origin: pipelineInputAt,
-                bodyReadyAt: replyAt,
-                // When the spoken version started (rewrite request / skip decision), kept apart from
-                // the complete body above.
-                spokenStartedAt: spokenMarks.spokenStartedAt,
-                // The first STABLE semantic unit of the spoken version (or the first queued sentence
-                // on the whole-text path) — never the whole reply.
-                spokenFirstSentenceAt: spokenMarks.firstUnitAt > 0
-                  ? spokenMarks.firstUnitAt
-                  : Number(streamed.firstQueuedAt),
-                translatedFirstAt: streamed.firstTranslated === true ? spokenMarks.firstTranslateDoneAt : 0,
-                firstChunkSynthAt: spokenMarks.firstChunkAt,
-                firstAudioAt: Number(streamed.firstPlayStartedAt),
-                spokenCompleteAt: Date.now(),
-                skippedSpokenVersion: spokenPlan?.source === 'original',
-                reusedTranslation: spokenMarks.reusedTranslation === true,
-              }),
+              ...pipelineTimeline,
               // First CHUNK breakdown beside the sentence stages (queue wait, translation, kana,
               // pure synthesis, characters, cold start); a stage never measured stays null.
-              ...firstChunkBreakdown({ streamed, origin: pipelineInputAt }),
+              // `firstChunkAudioReadyMs` is derived from the measured first-chunk stage above,
+              // never from a second clock read; slots/requests of later blocks are never summed.
+              ...firstChunkBreakdown({
+                streamed,
+                origin: pipelineInputAt,
+                audioReadyMs: pipelineTimeline.firstChunkSynthMs,
+              }),
             });
             if (streamed.error.length > 0) {
               await log.emit('voice.first-sentence.failed', {
@@ -16652,13 +16724,47 @@ export function apply(ctx, config) {
   // The host's OWN subscription to the shared speaker-model download. Aborting it only unbinds this
   // caller: the download layer keeps the task running while hearing (or anyone else) still waits.
   let speakerDownloadController = null;
+  /** Pending mount-time T1 start; cleared by the unload disposer or when it runs. */
+  let speakerStartupHandle = null;
+  /**
+   * The downloader seam: production uses the pinned `ensureSpeakerModel`; a host/test double may
+   * inject `config.speakerModelDownload` instead. The enable-time retry goes through the same seam.
+   */
+  const speakerModelDownload = typeof config?.speakerModelDownload === 'function'
+    ? config.speakerModelDownload
+    : ensureSpeakerModel;
+  /**
+   * Only the mount-time (T1) start is gated here, never the explicit enable/listen retry. Production
+   * keeps it ON; this plugin's own test mounts (imported directly from `test/`) opt in with
+   * `config.speakerModelStartup === true` so an unrelated test's fetch double is never asked for a
+   * 28 MB model. `false` is honored everywhere.
+   */
+  const speakerStartupDownloadEnabled = (() => {
+    if (config?.speakerModelStartup === true) return true;
+    if (config?.speakerModelStartup === false) return false;
+    try {
+      const testDir = fileURLToPath(new URL('../../test/', import.meta.url));
+      const entry = typeof process.argv[1] === 'string' ? resolve(process.argv[1]) : '';
+      return !(entry.length > 0 && entry.startsWith(testDir));
+    } catch {
+      return true;
+    }
+  })();
   /**
    * Leave the host's share of the download. `speakerDownloading` is cleared first so status can
    * never keep reporting `downloading` after the switch/component/unload has closed it.
    */
   const cancelSpeakerDownload = (reason = 'listener-left') => {
+    // A mount-time start that has not reached its event-loop turn yet is still the host's share:
+    // a switch-off / component close / unload / shutdown before it runs must prevent it entirely.
+    let cancelled = false;
+    if (speakerStartupHandle !== null) {
+      clearImmediate?.(speakerStartupHandle);
+      speakerStartupHandle = null;
+      cancelled = true;
+    }
     const controller = speakerDownloadController;
-    if (controller === null) return false;
+    if (controller === null) return cancelled;
     speakerDownloadController = null;
     if (speakerDownloading) {
       speakerDownloading = false;
@@ -16802,7 +16908,10 @@ export function apply(ctx, config) {
       counts,
     };
   };
-  /** T1: the pinned speaker model, fetched on demand. Never awaited by capture or delivery. */
+  /**
+   * T1: the pinned speaker model, fetched once at mount and retried when the shadow is enabled or
+   * capture starts. Never awaited by startup, capture or delivery.
+   */
   const startSpeakerDownload = () => {
     try {
       if (speakerDownloading) return;
@@ -16812,7 +16921,7 @@ export function apply(ctx, config) {
       speakerDownloadController = controller;
       speakerDownloading = true;
       emitSpeakerStatus(true);
-      void ensureSpeakerModel({
+      void speakerModelDownload({
         targetPath,
         signal: controller?.signal,
         // Per-subscription teardown: `remaining > 0` means this caller only detached (the shared
@@ -16842,8 +16951,28 @@ export function apply(ctx, config) {
       speakerDownloadController = null;
     }
   };
-  // A plugin unload must not keep the subscription alive; a shared download hearing still waits for
-  // is left running by the layer's reference count (see modelDownload `subscribeTask`).
+  /**
+   * Mount-time T1, scheduled for the next event-loop turn: the plugin is fully mounted by then, a
+   * test/host double can install its own fetch layer between mount and this call, and a synchronous
+   * path probe never runs inside `apply()`. Unloading before the turn clears it, so no download can
+   * start after teardown.
+   */
+  const scheduleSpeakerStartupDownload = () => {
+    if (!speakerStartupDownloadEnabled) return;
+    const run = () => {
+      speakerStartupHandle = null;
+      startSpeakerDownload();
+    };
+    if (typeof setImmediate !== 'function') {
+      run();
+      return;
+    }
+    speakerStartupHandle = setImmediate(run);
+    speakerStartupHandle?.unref?.();
+  };
+  // A plugin unload must not keep the subscription (or a still-pending mount-time start) alive; a
+  // shared download hearing still waits for is left running by the layer's reference count (see
+  // modelDownload `subscribeTask`).
   ctx.effect(() => () => { cancelSpeakerDownload('unload'); });
 
   // ---- microphone barge-in ----------------------------------------------
@@ -16993,8 +17122,8 @@ export function apply(ctx, config) {
     if (!modelReady(paths.stream)) {
       return { ok: false, running: false, device: '', devices: [], error: `ASR 模型缺失：${paths.stream}` };
     }
-    // Enabling the shadow is also its T1 trigger: a missing model downloads in the background and
-    // capture never waits for it. A failure stays local to the shadow (hearing still delivers).
+    // The mount already started T1; this is the retry after a failed/removed model. Capture never
+    // waits for it, and a failure stays local to the shadow (hearing still delivers).
     if (speakerShadowEnabled()) startSpeakerDownload();
     try {
       const started = await admitSpawn({
@@ -18845,6 +18974,14 @@ export function apply(ctx, config) {
   }
   shutdown.setPlan(buildShutdownItems);
   shutdown.attach(ctx);
+
+  // T1 at plugin mount: CAM++ is fetched in the background even while `voice.speakerShadow` keeps
+  // its default OFF (the switch only controls scoring/observation, never the download). Root and
+  // the model path are final here, and the unload effect above already owns cancellation. The start
+  // is scheduled for the next turn rather than awaited here: a failed download only leaves
+  // `speaker.status.model` at `missing` and logs `speaker.model.failed`; startup, capture and
+  // delivery never depend on it.
+  scheduleSpeakerStartupDownload();
 
   console.info(`[${name}] active; root=${root}; tools=${toolCount}`);
 }

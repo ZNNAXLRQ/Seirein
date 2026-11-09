@@ -23,6 +23,12 @@
  *  - an explicitly measured 0 is preserved; an unobserved value is null (never a fabricated 0).
  *  - `reason` is an enum or an error CODE of at most 32 characters.
  *
+ * Clock basis: every phase here stays on the EVENT clock (`at`), which is what joins it to the
+ * rest of the session log. This module reads no clock. Process-local monotonic durations (the
+ * TTS first block's slot wait / request) are carried by the pipeline first-chunk fields and are
+ * never added to the phase sum or subtracted from the residual a second time; an additive field
+ * that a future producer puts on an observation is ignored unless it has its own phase.
+ *
  * Nothing here reads the clock, the session, the event log or `pendingTools`; every function is
  * pure, so a builder can never change what a turn does.
  */
