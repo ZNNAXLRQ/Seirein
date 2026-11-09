@@ -32,7 +32,7 @@ const idle = (over = {}) => ({
 });
 const seedAt = index => (0x9e3779b9 + index * 2654435761) >>> 0;
 
-function makeRuntime() {
+function makeRuntime(overrides = {}) {
   return createBehaviorRuntime({
     config: {
       seed: 17,
@@ -40,6 +40,7 @@ function makeRuntime() {
       presetTargetVerified: true,
       presetChannels: [...ALL_CHANNELS],
       presetDebugEvents: true,
+      ...overrides,
     },
   });
 }
@@ -419,51 +420,90 @@ test('E1. base blink and a preset blink are reported as a dual drive, not as div
 });
 
 // ---------------------------------------------------------------------------------------------
-// F. idle-sway execution on the headX channel
+// F. idle-sway execution: a headZ-led light body sway, not a headX-only turn
 // ---------------------------------------------------------------------------------------------
 
-test('F1. idle-sway really oscillates headX left and right, slowly and within bounds', () => {
-  const runtime = makeRuntime();
+test('F1. idle-sway leans on headZ with a small headX companion, asymmetrically and without a forced zero', () => {
+  // Isolate the preset from the continuous idle curve so the measured ratio is the preset's own.
+  const runtime = makeRuntime({ idleSwayScale: 0 });
   const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-sway' });
   assert.ok(selection !== null, 'idle-sway must be selectable');
   assert.deepEqual(selection.operations, ['head-sway']);
 
   const started = runtime.startPreset(selection, { at: 0, context: { state: 'idle', event: 'idle' } });
   assert.equal(started.started, true);
-  assert.deepEqual(started.channels, ['headX'], 'the sway writes the yaw channel only');
+  assert.deepEqual(started.channels, ['headZ', 'headX'], 'the sway is a roll with a small yaw companion');
 
   const samples = [];
-  for (let at = 0; at <= 3200; at += 33) samples.push({ at, x: runtime.tick(at).headX });
+  for (let at = 0; at <= 3600; at += 33) {
+    const pose = runtime.tick(at);
+    samples.push({ at, z: pose.headZ, x: pose.headX });
+  }
   const trace = runtime.snapshot().motion.presets.lastTrace;
   assert.equal(trace.selection.recipe, 'idle-sway');
   assert.deepEqual(trace.output.stages.map(stage => stage.op), ['head-sway']);
-  assert.deepEqual(trace.output.stages[0].channels, ['headX']);
-  assert.deepEqual(trace.output.channels, ['headX'], 'no roll (headZ) overlap with idle-tilt');
-  assert.ok(trace.output.stages[0].activeMs >= 1200,
+  assert.equal(trace.output.stages[0].kind, 'sway', 'sway has its own execution kind');
+  assert.deepEqual(trace.output.stages[0].channels, ['headZ', 'headX']);
+  assert.deepEqual(trace.output.channels, ['headZ', 'headX'], 'roll is the new primary, yaw is the companion');
+  assert.deepEqual(
+    [...new Set(trace.output.stages.flatMap(stageEntry => stageEntry.channels))],
+    started.channels,
+    'one trajectory owns exactly its own channels (single writer, no duplicated axis)',
+  );
+  assert.ok(trace.output.stages[0].activeMs >= 2200 && trace.output.stages[0].activeMs <= 2800,
     `slow active phase ${trace.output.stages[0].activeMs} ms (negation shake is 620 ms)`);
 
-  // Judge the ACTUAL composed output, not the planned amplitude, inside this stage's active phase.
+  // Judge the ACTUAL composed output inside this stage's active phase.
   const stage = trace.output.stages[0];
   const active = samples.filter(sample => sample.at >= stage.startMs + 150
     && sample.at <= stage.startMs + 150 + stage.activeMs);
   assert.ok(active.length >= 20, `active samples ${active.length}`);
-  const values = active.map(sample => sample.x);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const peak = Math.max(Math.abs(min), Math.abs(max));
-  assert.ok(max > 0.02, `rightward yaw ${max.toFixed(4)}`);
-  assert.ok(min < -0.02, `leftward yaw ${min.toFixed(4)}`);
-  assert.ok(max - min > 0.10, `peak-to-peak ${(max - min).toFixed(4)} is perceptible`);
-  assert.ok(peak < 0.30, `peak ${peak.toFixed(4)} stays below 0.30 pose units (9°)`);
+  const zs = active.map(sample => sample.z);
+  const xs = active.map(sample => sample.x);
+  const minZ = Math.min(...zs);
+  const maxZ = Math.max(...zs);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const peakZ = Math.max(Math.abs(minZ), Math.abs(maxZ));
+  const peakX = Math.max(Math.abs(minX), Math.abs(maxX));
 
-  const signs = values.filter(value => Math.abs(value) > 1e-4).map(value => Math.sign(value));
+  assert.ok(maxZ > 0.25, `one side lean ${maxZ.toFixed(4)} pose units`);
+  assert.ok(minZ < -0.15, `the other side lean ${minZ.toFixed(4)} pose units`);
+  assert.ok(maxZ - minZ > 0.50, `peak-to-peak headZ ${(maxZ - minZ).toFixed(4)} is clearly visible`);
+  assert.ok(peakZ <= 14 / 30 + 1e-6,
+    `headZ peak ${peakZ.toFixed(4)} stays under the shared 14° cap (${(peakZ * 30).toFixed(2)}°)`);
+  assert.ok(peakX < peakZ * 0.5, `headX ${peakX.toFixed(4)} follows headZ ${peakZ.toFixed(4)} instead of leading`);
+
+  const ratio = peakX / Math.max(1e-6, peakZ);
+  assert.ok(ratio >= 0.2 && ratio <= 0.3,
+    `headX:headZ ratio ${ratio.toFixed(3)} sits in the requested 0.2–0.3 band`);
+  assert.ok(Math.max(Math.abs(maxZ), Math.abs(minZ)) > Math.min(Math.abs(maxZ), Math.abs(minZ)) * 1.05,
+    'the two sides are deliberately asymmetric, not a mirrored oscillator');
+
+  const signs = zs.filter(value => Math.abs(value) > 1e-4).map(value => Math.sign(value));
   const directionChanges = signs.slice(1).filter((sign, index) => sign !== signs[index]).length;
-  assert.ok(directionChanges >= 1, `the head really changes direction (${directionChanges} change(s))`);
+  assert.ok(directionChanges >= 1, `the sway really changes direction (${directionChanges} change(s))`);
   assert.ok(signs.includes(1) && signs.includes(-1), 'both directions are present');
 
-  console.log(`[F1] recipe=${selection.recipe} op=head-sway headX min=${min.toFixed(4)} `
-    + `max=${max.toFixed(4)} peakToPeak=${(max - min).toFixed(4)} activeMs=${stage.activeMs} `
-    + `directionChanges=${directionChanges}`);
+  // The hold keeps the second lean (no forced zero at the end of the active phase); the exit then
+  // hands the pose back to the natural baseline.
+  const holdFrom = stage.startMs + 150 + stage.activeMs;
+  const hold = samples.filter(sample => sample.at >= holdFrom
+    && sample.at <= holdFrom + stage.holdMs + 33);
+  assert.ok(hold.length > 0, 'the dwell was sampled');
+  const holdPeak = Math.max(...hold.map(sample => Math.abs(sample.z)));
+  assert.ok(holdPeak > 0.05, `the dwell keeps a visible offset (${holdPeak.toFixed(4)}) instead of zeroing`);
+
+  const actionEnd = trace.output.durationMs;
+  const tail = samples.filter(sample => sample.at >= actionEnd + 250);
+  assert.ok(tail.length > 0, 'the post-action tail was sampled');
+  assert.ok(tail.every(sample => Math.abs(sample.z) < 0.05),
+    'the natural exit returns the pose to the baseline after the action');
+
+  console.log(`[F1] recipe=${selection.recipe} op=head-sway headZ min=${minZ.toFixed(4)} `
+    + `max=${maxZ.toFixed(4)} peakToPeak=${(maxZ - minZ).toFixed(4)} `
+    + `headX min=${minX.toFixed(4)} max=${maxX.toFixed(4)} ratio=${ratio.toFixed(3)} `
+    + `activeMs=${stage.activeMs} holdPeak=${holdPeak.toFixed(4)} directionChanges=${directionChanges}`);
 });
 
 test('F2. idle-sway shares the recipe-level anti-repeat bucket', () => {
@@ -479,6 +519,35 @@ test('F2. idle-sway shares the recipe-level anti-repeat bucket', () => {
   assert.ok(repeated < base * 0.8,
     `same-recipe repeat ${repeated.toFixed(4)} must fall below ${(base * 0.8).toFixed(4)}`);
   console.log(`[F2] idle-sway.flow base=${base.toFixed(4)} sameRecipe=${repeated.toFixed(4)}`);
+});
+
+test('F3. sway stops on privacy lock / disconnect: no residual writer, no restart', () => {
+  const stopPaths = [
+    ['privacy', (runtime, at) => runtime.clearIntents({ reason: 'lock:privacy', at })],
+    ['disconnect', (runtime, at) => runtime.clearPresets('disconnect', { at })],
+  ];
+  for (const [label, stop] of stopPaths) {
+    const runtime = makeRuntime({ idleSwayScale: 0 });
+    const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-sway' });
+    assert.ok(selection !== null);
+    runtime.startPreset(selection, { at: 0, context: { state: 'idle', event: 'idle' } });
+    for (let at = 0; at <= 300; at += 33) runtime.tick(at);
+    const before = runtime.presetsSnapshot();
+    assert.equal(before.active.length, 1, `${label}: the sway is running`);
+    assert.deepEqual(before.active[0].channels, ['headZ', 'headX']);
+
+    stop(runtime, 300);
+    const stopped = runtime.presetsSnapshot();
+    assert.equal(stopped.active.length, 0, `${label}: no sway trajectory survives`);
+    const starts = stopped.starts;
+    for (let at = 300; at <= 900; at += 33) runtime.tick(at);
+    const after = runtime.presetsSnapshot();
+    assert.equal(after.active.length, 0, `${label}: no residual writer keeps the channels`);
+    assert.equal(after.starts, starts, `${label}: the stopped sway is not restarted`);
+    assert.equal(after.lastTrace.output.channels.includes('headZ'), true,
+      `${label}: the trace still names the stopped channels (evidence only)`);
+    console.log(`[F3] ${label}: active ${before.active.length} → 0, starts stays ${after.starts}`);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------

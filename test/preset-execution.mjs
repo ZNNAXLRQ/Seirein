@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import {
   createBehaviorRuntime,
   PRESET_EXECUTION,
+  PRESET_GESTURE_GAIN,
 } from '../src/host/avatar/motion-controller.js';
 import { createAvatarRuntime } from '../src/host/avatar/avatarRuntime.js';
 import { PRESETS } from '../src/host/avatar/presets/index.js';
@@ -23,7 +24,9 @@ const ALL_CHANNELS = Object.freeze([
 ]);
 const ALL_FAMILIES = [...new Set(PRESETS.map((preset) => preset.family))];
 
-function makeRuntime({ style = null, enabled = false, overrides = null, debugEvents = true } = {}) {
+function makeRuntime({
+  style = null, enabled = false, overrides = null, debugEvents = true, extraConfig = {},
+} = {}) {
   return createBehaviorRuntime({
     config: {
       seed: 11,
@@ -33,6 +36,7 @@ function makeRuntime({ style = null, enabled = false, overrides = null, debugEve
       presetDebugEvents: debugEvents,
       ...(overrides === null ? {} : { presetOverrides: overrides }),
       ...(style === null ? {} : { style }),
+      ...extraConfig,
     },
   });
 }
@@ -723,6 +727,63 @@ test('17. start 事件带幅度/时长/阶段，并已放开宿主白名单', ()
   // Source wiring proof: index.js forwards the start payload to the host debug log.
   const source = readFileSync(new URL('../src/host/index.js', import.meta.url), 'utf8');
   assert.match(source, /message === 'avatar\.preset\.start'/u);
+});
+
+test('17b. 全局手势增益只放大 preset nominal：idle/speaking 手势变大，眼动保持原样', () => {
+  function gestureProbe(gain, recipe, state, event) {
+    const runtime = makeRuntime({
+      enabled: true,
+      extraConfig: { idleSwayScale: 0, presetGestureGain: gain },
+    });
+    const selection = pick(runtime, { state, event, recipe });
+    assert.ok(selection !== null, `${recipe} must be selectable`);
+    runtime.takeEvents();
+    const started = runtime.startPreset(selection, { at: 0, context: { state, event } });
+    assert.equal(started.started, true);
+    const start = runtime.takeEvents().find(entry => entry.type === 'avatar.preset.start');
+    assert.ok(start, 'the start evidence is emitted');
+    let peak = 0;
+    for (let at = 0; at <= 1800; at += 33) {
+      const pose = runtime.tick(at);
+      peak = Math.max(peak, Math.abs(pose.headX), Math.abs(pose.headZ));
+    }
+    return { start, peak };
+  }
+
+  for (const [recipe, state, event] of [
+    ['idle-side', 'idle', 'idle'],
+    ['speak-turn', 'speaking', 'sentence-gap'],
+  ]) {
+    const legacy = gestureProbe(1, recipe, state, event);
+    const amplified = gestureProbe(PRESET_GESTURE_GAIN, recipe, state, event);
+    assert.equal(amplified.start.stages[0].op, 'head-turn');
+    assert.ok(amplified.start.amplitude > legacy.start.amplitude * 1.45,
+      `${recipe}: planned ${legacy.start.amplitude.toFixed(4)} → ${amplified.start.amplitude.toFixed(4)}`);
+    assert.ok(amplified.peak > legacy.peak * 1.4,
+      `${recipe}: output peak ${legacy.peak.toFixed(4)} → ${amplified.peak.toFixed(4)}`);
+    console.log(`[gain] ${recipe} planned ${legacy.start.amplitude.toFixed(4)} → `
+      + `${amplified.start.amplitude.toFixed(4)} (x${(amplified.start.amplitude / legacy.start.amplitude).toFixed(2)}), `
+      + `peak ${legacy.peak.toFixed(4)} → ${amplified.peak.toFixed(4)}`);
+  }
+
+  // Eye movement is explicitly NOT part of this experiment: its nominal stays bit-identical.
+  function gazeAmplitude(gain) {
+    const runtime = makeRuntime({
+      enabled: true,
+      extraConfig: { idleSwayScale: 0, presetGestureGain: gain },
+    });
+    const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-eye-side' });
+    assert.ok(selection !== null);
+    runtime.takeEvents();
+    const started = runtime.startPreset(selection, { at: 0, context: { state: 'idle', event: 'idle' } });
+    assert.equal(started.started, true);
+    const start = runtime.takeEvents().find(entry => entry.type === 'avatar.preset.start');
+    return start.amplitude;
+  }
+  const legacyGaze = gazeAmplitude(1);
+  const amplifiedGaze = gazeAmplitude(PRESET_GESTURE_GAIN);
+  assert.equal(amplifiedGaze, legacyGaze, 'gaze-only presets keep their old amplitude');
+  console.log(`[gain] gaze-only idle-eye-side unchanged ${legacyGaze.toFixed(4)}`);
 });
 
 test('18. answer-start 空候选：skip 带 reasons 与 state，可区分 state-mismatch / requires-target', () => {

@@ -34,8 +34,10 @@ import {
   INTENT_VARIANTS,
   MOTION_STATUSES,
   PRESET_EXECUTION,
+  PRESET_GESTURE_GAIN,
   PRESET_NATIVE_CHANNELS,
   PRESET_OPERATION_CHANNELS,
+  PRESET_OPERATION_OPTIONAL_CHANNELS,
   SPEECH_HEAD_DAMP,
   STATUS_MODIFIERS,
   STYLE_DIMENSION_APPLICATION,
@@ -548,6 +550,39 @@ const PRESET_EVENT_FOR_PHASE = Object.freeze({
 });
 
 /**
+ * `head-sway` shaping. The primary channel is the head ROLL (headZ), not the yaw (headX): a light
+ * body-weight sway reads as the head leaning left/right, while a tiny yaw keeps it from looking like
+ * a pure two-dimensional turn. The values are fractions of the sway's own nominal amount.
+ */
+export const PRESET_SWAY = Object.freeze({
+  /** headX companion as a fraction of the headZ primary (the requested 0.2–0.3 band). */
+  HEAD_X_RATIO: 0.24,
+  /** Fallback when the model verifies no headZ: keep a small yaw-only sway, never the full nominal. */
+  YAW_ONLY_SCALE: 0.5,
+  /**
+   * Planned roll peak. The final semantic pose still has the shared 14° cap; leaving room for the
+   * idle micro-motion (same 0.2 arbitration ratio as the occasional roll) keeps the sway smooth
+   * instead of flat-topping at the clamp.
+   */
+  HEAD_BUDGET: HEAD_ROLL_CAP / (1 + INTENT_IDLE_RATIO),
+  /** First lean reaches its peak at 42–52 % of the active phase. */
+  TURN_AT_MIN: 0.42,
+  TURN_AT_SPAN: 0.10,
+  /** The crossing ends at the second peak at 78–84 %; the rest settles into the dwell. */
+  CROSS_AT_MIN: 0.78,
+  CROSS_AT_SPAN: 0.06,
+  /** The second side is deliberately not a mirror of the first (asymmetric lean). */
+  SECOND_SCALE_MIN: 0.62,
+  SECOND_SCALE_SPAN: 0.28,
+  /** The dwell keeps 72–90 % of the second lean instead of forcing the pose back to zero. */
+  HOLD_LEVEL_MIN: 0.72,
+  HOLD_LEVEL_SPAN: 0.18,
+  /** Dwell length multiplier for the same reason: two draws must not look identical. */
+  HOLD_SCALE_MIN: 0.85,
+  HOLD_SCALE_SPAN: 0.35,
+});
+
+/**
  * One symbolic operation → the trajectory the executor generates. `amount` is in semantic pose
  * units at persona amplitude 1 (one unit = 30° for head channels); it is scaled by the persona
  * style and the room left in the chosen direction at execution time. Nothing here is a VTS
@@ -565,9 +600,9 @@ const PRESET_OPERATION_PROFILE = Object.freeze({
   nod: Object.freeze({ kind: 'nod', amount: -0.30, sign: -1, active: 'NOD_ACTIVE_MS' }),
   'double-nod': Object.freeze({ kind: 'double-nod', amount: -0.30, sign: -1, active: 'DOUBLE_NOD_ACTIVE_MS' }),
   shake: Object.freeze({ kind: 'shake', amount: 0.32, sign: 0, active: 'SHAKE_ACTIVE_MS' }),
-  // Same signed headX oscillator as `shake`, but smaller and much slower. A distinct operation
-  // keeps the negation gesture's semantics, amplitude and duration untouched.
-  'head-sway': Object.freeze({ kind: 'shake', amount: 0.22, sign: 0, active: 'SWAY_ACTIVE_MS' }),
+  // The idle sway is NOT a slower shake: it has its own `sway` kind, a headZ-led asymmetric lean
+  // (left → through the middle → right → dwell), and it never reverses the negation semantics.
+  'head-sway': Object.freeze({ kind: 'sway', amount: 0.62, sign: 0, active: 'SWAY_ACTIVE_MS' }),
   'gaze-side': Object.freeze({ kind: 'move', amount: 0.34, sign: 0, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
   'gaze-up': Object.freeze({ kind: 'move', amount: 0.30, sign: 1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
   'gaze-down': Object.freeze({ kind: 'move', amount: -0.30, sign: -1, gaze: 'away', active: 'GAZE_ACTIVE_MS' }),
@@ -2356,16 +2391,55 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return sign;
   }
 
+  /** One seeded asymmetric sway plan: which side first, when the crossing happens, how big the
+   * second side is and how much of it the dwell keeps. Nothing here is shared with `shake`. */
+  function planSway(random, sign) {
+    const pick = (min, span) => min + span * clamp01(random());
+    const first = sign >= 0 ? 1 : -1;
+    return {
+      first,
+      second: -first,
+      turnAt: pick(PRESET_SWAY.TURN_AT_MIN, PRESET_SWAY.TURN_AT_SPAN),
+      crossAt: pick(PRESET_SWAY.CROSS_AT_MIN, PRESET_SWAY.CROSS_AT_SPAN),
+      secondScale: pick(PRESET_SWAY.SECOND_SCALE_MIN, PRESET_SWAY.SECOND_SCALE_SPAN),
+      holdLevel: pick(PRESET_SWAY.HOLD_LEVEL_MIN, PRESET_SWAY.HOLD_LEVEL_SPAN),
+      holdScale: pick(PRESET_SWAY.HOLD_SCALE_MIN, PRESET_SWAY.HOLD_SCALE_SPAN),
+    };
+  }
+
+  /** The dwell's signed level: the second lean, reduced but never forced back to zero. */
+  function swayHoldWave(plan) {
+    return plan.second * plan.secondScale * plan.holdLevel;
+  }
+
+  /**
+   * Active-phase shape: zero → first lean (full) → through the middle → second lean (asymmetric)
+   * → settle into the dwell level. Every segment is a smootherstep, so the pose never jerks.
+   */
+  function swayActiveWave(p, plan) {
+    const u = clamp01(p);
+    const secondPeak = plan.second * plan.secondScale;
+    if (u <= 0) return 0;
+    if (u < plan.turnAt) return plan.first * smootherstep(u / Math.max(1e-6, plan.turnAt));
+    if (u < plan.crossAt) {
+      const cross = smootherstep((u - plan.turnAt) / Math.max(1e-6, plan.crossAt - plan.turnAt));
+      return plan.first * (1 - cross) + secondPeak * cross;
+    }
+    const settle = smootherstep((u - plan.crossAt) / Math.max(1e-6, 1 - plan.crossAt));
+    return secondPeak * (1 - settle) + swayHoldWave(plan) * settle;
+  }
+
   function presetOperationChannels(op, selection, context) {
     const required = Array.isArray(selection.effectiveRequires) && selection.effectiveRequires.length > 0
       ? selection.effectiveRequires
       : (Array.isArray(selection.requires) ? selection.requires : []);
+    const optional = PRESET_OPERATION_OPTIONAL_CHANNELS[op] ?? [];
     const verified = new Set(Array.isArray(context?.verifiedChannels) ? context.verifiedChannels : []);
     const operationChannels = PRESET_OPERATION_CHANNEL_ADDITIONS[op]
       ?? PRESET_OPERATION_CHANNELS[op] ?? [];
     return operationChannels.filter((channel) => (
       !presetNative.has(channel)
-      && required.includes(channel)
+      && (required.includes(channel) || optional.includes(channel))
       && (verified.size === 0 || verified.has(channel))
     ));
   }
@@ -2409,6 +2483,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const targetOffsets = {};
       const channel = channels[0];
       const sign = choosePresetSign(op, profile, channel === 'eyeOpenL' ? 'headY' : channel);
+      // Experimental global gain: gestures only, never the gaze operations (eye movement is tuned
+      // separately) and never another layer's amount.
+      const gestureGain = profile.gaze === undefined
+        ? Math.max(0, finite(cfg.presetGestureGain, PRESET_GESTURE_GAIN))
+        : 1;
       // Texture widens the existing seeded jitter band; it never adds another random source.
       const jitterBand = 0.12 * (0.5 + effects.variantSpread);
       const jitter = 0.94 + state.presets.random() * jitterBand;
@@ -2419,6 +2498,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       let holdMs = holdScale / tempo;
       let exitMs = (unstable ? PRESET_EXECUTION.UNHURRIED_EXIT_MS : PRESET_EXECUTION.EXIT_MS)
         / tempo * variantDuration;
+      // The sway owns an asymmetric lean/dwell plan; its dwell length is part of that plan, so two
+      // draws differ in both direction and how long the second side is held.
+      const swayPlan = profile.kind === 'sway' ? planSway(state.presets.random, sign) : null;
+      if (swayPlan !== null) holdMs *= swayPlan.holdScale;
       if (profile.tilt === true) {
         holdMs *= 0.8 + 0.6 * tilt;
         if (tilt > 0.4) exitMs *= 1.12;
@@ -2433,7 +2516,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       for (const target of channels) {
         const global = Math.max(1e-6, finite(style?.amplitude, DEFAULT_AVATAR_STYLE.amplitude));
         const channelScale = styleChannelAmplitude(style, target) / global;
-        let amount = profile.amount * global * amplitudeScale * channelScale * jitter;
+        // A sway's nominal amount is its headZ primary; headX only follows at a small ratio. When
+        // the model has no verified headZ, the yaw-only fallback is deliberately smaller than the
+        // nominal so a missing roll never turns into a full-strength head turn.
+        const swayRatio = profile.kind !== 'sway' || target !== 'headX'
+          ? 1
+          : (channels.includes('headZ') ? PRESET_SWAY.HEAD_X_RATIO : PRESET_SWAY.YAW_ONLY_SCALE);
+        let amount = profile.amount * swayRatio * gestureGain
+          * global * amplitudeScale * channelScale * jitter;
         if (profile.tilt === true) amount *= 0.75 + 0.55 * tilt;
         if (profile.kind === 'center') {
           cancelOffsets[target] = naturalPresetPose(target) - actualPresetPose(target);
@@ -2463,6 +2553,16 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           channelAmounts[target] = amount * sign * headroom;
         }
       }
+      // The sway's planned roll is kept under the shared head budget BEFORE it reaches the frame.
+      // Scaling both channels together preserves the headX:headZ ratio; the final 14° clamp stays
+      // in place as the hard guarantee.
+      if (profile.kind === 'sway' && Number.isFinite(channelAmounts.headZ)) {
+        const peak = Math.abs(channelAmounts.headZ);
+        if (peak > PRESET_SWAY.HEAD_BUDGET) {
+          const scale = PRESET_SWAY.HEAD_BUDGET / peak;
+          for (const key of Object.keys(channelAmounts)) channelAmounts[key] *= scale;
+        }
+      }
       const start = Math.max(0, cursor);
       const end = start + prepareMs + activeMs + holdMs + exitMs;
       const stage = {
@@ -2485,6 +2585,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         channelAmounts,
         cancelOffsets,
         targetOffsets,
+        sway: swayPlan,
       };
       stages.push(stage);
       const gap = separated ? PRESET_EXECUTION.SEPARATED_GAP_MS / tempo : 0;
@@ -2499,12 +2600,18 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const local = elapsed - stage.start;
     if (local < 0) return null;
     if (local < stage.prepareMs) {
+      // The sway starts directly with its first lean (no opposite wind-up), so its prepare leg is
+      // a quiet zero-length hold rather than a small shake in the wrong direction.
+      if (stage.kind === 'sway') return { phase: 'prepare', wave: 0 };
       const u = local / Math.max(1, stage.prepareMs);
       return { phase: 'prepare', wave: -PRESET_EXECUTION.PREPARE_RATIO * Math.sin(Math.PI * u) };
     }
     const activeStart = stage.prepareMs;
     if (local < activeStart + stage.activeMs) {
       const p = clamp01((local - activeStart) / Math.max(1, stage.activeMs));
+      if (stage.kind === 'sway') {
+        return { phase: 'active', wave: swayActiveWave(p, stage.sway), signed: true };
+      }
       if (stage.kind === 'nod') return { phase: 'active', wave: Math.sin(Math.PI * p) };
       if (stage.kind === 'double-nod') {
         return {
@@ -2524,13 +2631,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     const holdEnd = activeStart + stage.activeMs + stage.holdMs;
     if (local < holdEnd) {
+      // The sway dwell keeps the second lean; every other signed/one-shot action returns to zero.
+      if (stage.kind === 'sway') return { phase: 'hold', wave: swayHoldWave(stage.sway) };
       return { phase: 'hold', wave: (stage.kind === 'nod' || stage.kind === 'double-nod'
         || stage.kind === 'shake' || stage.kind === 'blink' || stage.kind === 'double-blink') ? 0 : 1 };
     }
     if (local < holdEnd + stage.exitMs) {
+      const u = smootherstep((local - holdEnd) / Math.max(1, stage.exitMs));
+      // The sway exits from its dwell level back to the natural baseline, not from a forced zero.
+      if (stage.kind === 'sway') return { phase: 'exit', wave: swayHoldWave(stage.sway) * (1 - u) };
       const base = (stage.kind === 'nod' || stage.kind === 'double-nod'
         || stage.kind === 'shake' || stage.kind === 'blink' || stage.kind === 'double-blink') ? 0 : 1;
-      const u = smootherstep((local - holdEnd) / Math.max(1, stage.exitMs));
       return { phase: 'exit', wave: base * (1 - u) };
     }
     return null;
@@ -2551,7 +2662,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       for (const channel of stage.channels) values[channel] = finite(stage.targetOffsets[channel], 0) * wave;
       return values;
     }
-    const signed = stage.kind === 'shake' ? wave : Math.max(0, wave);
+    const signed = stage.kind === 'shake' || stage.kind === 'sway' ? wave : Math.max(0, wave);
     for (const channel of stage.channels) values[channel] = finite(stage.channelAmounts[channel], 0) * signed;
     return values;
   }
@@ -5216,6 +5327,7 @@ export {
   neutralPose,
   levelIndex,
   PRESET_EXECUTION,
+  PRESET_GESTURE_GAIN,
   PRESET_EVENT_BY_STATE,
   PRESET_EVENT_FOR_PHASE,
   PRESET_OPERATION_PROFILE,

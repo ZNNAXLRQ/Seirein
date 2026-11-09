@@ -8,8 +8,10 @@ export const OPERATIONS = Object.freeze({
   'head-tilt': ['headZ'], 'head-center': ['headX', 'headZ'],
   'head-center-lite': ['headX'],
   'nod': ['headY'], 'double-nod': ['headY'], 'shake': ['headX'],
-  // Same headX oscillator as `shake`, but a distinct operation: a slow, small idle sway with no
-  // negation semantics. `shake` keeps its existing amplitude/duration and stays negation-only.
+  // `requires` stays the minimal viable channel (headX), so a yaw-only model can still sway. The
+  // executor upgrades this operation to a headZ-led roll whenever the model verifies headZ (see
+  // PRESET_OPERATION_CHANNELS / PRESET_OPERATION_OPTIONAL_CHANNELS in motion-config.js). `shake`
+  // keeps its negation semantics, amplitude and duration untouched.
   'head-sway': ['headX'],
   'gaze-side': ['gazeX'], 'gaze-down': ['gazeY'], 'gaze-up': ['gazeY'],
   'gaze-target': ['gazeX', 'gazeY'], 'gaze-center': ['gazeX', 'gazeY'],
@@ -104,8 +106,9 @@ const rows = [
   ['answer-nod', '开口节奏点头（不表示赞同）', 'speech-beat', 'speaking', 'answer-start', 'neutral', 'common,earnest', 'nod'],
   ['answer-turn', '开口时自然转头（不指向对象）', 'posture', 'speaking', 'answer-start', 'neutral', 'warm,lively', 'head-turn'],
   ['answer-center-lite', '开口时水平回归自然姿态', 'settle', 'speaking', 'answer-start', 'neutral', 'composed,rational', 'head-center-lite'],
-  // Neutral headX sway: the left/right channel is deliberately distinct from idle-tilt's headZ,
-  // so the two idle postures cannot collapse into the same axis. Appended to keep display ordinals.
+  // Neutral light sway: headZ-led with a small headX companion in the executor; it is not the
+  // negation shake. `requires` remains headX (minimal viable) so the recipe still resolves on a
+  // yaw-only model. Appended to keep display ordinals.
   ['idle-sway', '左右轻摇', 'posture', 'idle,waiting,tired', 'idle', 'neutral', 'gentle,dreamy,composed', 'head-sway'],
 ];
 

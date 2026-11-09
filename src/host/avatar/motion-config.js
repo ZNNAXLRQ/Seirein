@@ -259,7 +259,10 @@ export const PRESET_OPERATION_CHANNELS = Object.freeze({
   nod: Object.freeze(['headY']),
   'double-nod': Object.freeze(['headY']),
   shake: Object.freeze(['headX']),
-  'head-sway': Object.freeze(['headX']),
+  // A body-weight roll (headZ) with a small yaw (headX) companion. `headZ` is preferred but OPTIONAL:
+  // it is listed in `PRESET_OPERATION_OPTIONAL_CHANNELS`, so a model that verifies only headX keeps
+  // the older, smaller yaw-only sway instead of losing the action.
+  'head-sway': Object.freeze(['headZ', 'headX']),
   'gaze-side': Object.freeze(['gazeX']),
   'gaze-down': Object.freeze(['gazeY']),
   'gaze-up': Object.freeze(['gazeY']),
@@ -280,6 +283,24 @@ export const PRESET_OPERATION_CHANNELS = Object.freeze({
 export const PRESET_OPTIONAL_OPERATION_CHANNELS = Object.freeze({
   'brow-one': Object.freeze(['browR']),
 });
+
+/**
+ * Companion channels an operation may add when the model verifies them, without becoming a hard
+ * requirement of the recipe. `head-sway` keeps `headX` as its minimal viable channel (so the
+ * selector contract for a yaw-only model is unchanged) and upgrades to a headZ-led roll whenever
+ * the roll input is verified. An unverified companion is dropped silently; the primary still runs.
+ */
+export const PRESET_OPERATION_OPTIONAL_CHANNELS = Object.freeze({
+  'head-sway': Object.freeze(['headZ']),
+});
+
+/**
+ * Experimental global gesture gain. It multiplies ONLY a preset operation's nominal amount (not the
+ * idle micro-motion, mouth, breath or the always-on head/eye layers) and is applied before the
+ * posture headroom and every channel cap. Gaze-only operations (`gaze-side/up/down/target/center`)
+ * are excluded on purpose: eye movement is tuned separately. Set to 1 to return to the old size.
+ */
+export const PRESET_GESTURE_GAIN = 1.6;
 
 /**
  * Body and breath keep VTS's own native animation ownership. The preset executor NEVER writes
@@ -317,8 +338,8 @@ export const PRESET_EXECUTION = Object.freeze({
   NOD_ACTIVE_MS: 430,
   DOUBLE_NOD_ACTIVE_MS: 780,
   SHAKE_ACTIVE_MS: 620,
-  /** A deliberate slow sway: one full left-right cycle, much longer than the negation shake. */
-  SWAY_ACTIVE_MS: 1_500,
+  /** A deliberate slow sway: roughly 2.2–2.6 s active at a neutral tempo (much longer than shake). */
+  SWAY_ACTIVE_MS: 2_300,
   GAZE_ACTIVE_MS: 540,
   BLINK_ACTIVE_MS: 170,
   DOUBLE_BLINK_ACTIVE_MS: 380,
