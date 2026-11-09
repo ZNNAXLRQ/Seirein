@@ -16,6 +16,20 @@ export const ACTIONS = Object.freeze([
   'langs.set',
 ]);
 
+/** Inputs that make a warm-up reusable; a change needs a new identity warm-up. */
+function warmupInputsChanged(before, after) {
+  const old = before !== null && typeof before === 'object' ? before : {};
+  const value = (source, key) => String(source?.[key] ?? '');
+  for (const key of ['apiBase', 'refAudioPath', 'promptText', 'promptLang', 'textLang',
+    'promptLangPinned', 'textLangPinned']) {
+    if (value(old, key) !== value(after, key)) return true;
+  }
+  for (const key of ['gptModelPath', 'sovitsModelPath']) {
+    if (value(old.models, key) !== value(after.models, key)) return true;
+  }
+  return false;
+}
+
 export function createSpeechSettingsActions(services) {
   const handler = async (body) => {
     switch (body.action) {
@@ -90,7 +104,9 @@ export function createSpeechSettingsActions(services) {
         }
         // Partial update: only the keys the settings card sends are touched.
         const wasEnabled = services.runtime.gptSovits?.enabled === true;
-        const next = { ...(0, services.gptSovitsSettings)() };
+        const previous = (0, services.gptSovitsSettings)();
+        const previousSafe = previous !== null && typeof previous === 'object' ? previous : {};
+        const next = { ...previousSafe, models: { ...(previousSafe.models ?? {}) } };
         if (typeof body.enabled === 'boolean') next.enabled = body.enabled;
         if (typeof body.apiBase === 'string') next.apiBase = body.apiBase.trim();
         if (typeof body.refAudioPath === 'string') next.refAudioPath = body.refAudioPath.trim();
@@ -135,8 +151,12 @@ export function createSpeechSettingsActions(services) {
           hasSovitsModel: next.models.sovitsModelPath.length > 0,
           source: 'settings',
         });
-        // First enable is the other warm-up trigger; the tts layer runs at most one at a time.
-        if (next.enabled && !wasEnabled) (0, services.scheduleGptWarmup)(0);
+        // First enable, or a changed warm-up identity input, loads the new model/reference before
+        // the next real sentence. Unchanged saves are left alone; the tts layer also short-circuits
+        // a `ready` identity, so a duplicate trigger can never warm twice.
+        if (next.enabled && (!wasEnabled || warmupInputsChanged(previous, next))) {
+          (0, services.scheduleGptWarmup)(0);
+        }
         if (typeof body.enabled === 'boolean' && next.enabled !== wasEnabled) {
           await services.log.emit('voice.provider.set', {
             provider: next.enabled ? 'gptsovits' : 'edge',
@@ -217,6 +237,10 @@ export function createSpeechSettingsActions(services) {
         services.runtime.langs = next;
         (0, services.writeSettings)({ langs: next });
         await services.log.emit('langs.set', next);
+        // A speech language changes text_lang/prompt_lang, so it is part of the warm-up identity.
+        if (next.speech !== current.speech && services.runtime.gptSovits?.enabled === true) {
+          (0, services.scheduleGptWarmup)(0);
+        }
         return { ok: true, langs: next };
       }
   }

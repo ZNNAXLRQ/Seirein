@@ -10,8 +10,8 @@
  * Because the Edge bitrate is fixed, its duration is derivable from the file size.
  */
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { createWriteStream, existsSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream, existsSync, statSync } from 'node:fs';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -66,14 +66,22 @@ let gptSovitsFailureHook = null;
 let gptSovitsSkippedHook = null;
 let gptSovitsWarningHook = null;
 let gptSovitsWarmupFailureHook = null;
+/** Additive status stream for the warm-up state machine (`tts.warmup.*`); paths/text never ride it. */
+let gptSovitsWarmupEventHook = null;
 /** Observation only: a synthesis that had to wait for a slot reports its measured queue wait. */
 let ttsSlotWaitHook = null;
 /** Observation only: one `voice.tts.request` row per finished synthesis request. */
 let ttsRequestHook = null;
 let edgeSynthesizeOverride = null;
-/** In-flight / completed warm-up for this provider generation; reset by configureTts(). */
-let gptSovitsWarmupInFlight = null;
-let gptSovitsWarmupDone = false;
+/**
+ * One warm-up record per identity; `null` means the provider generation is unknown. A successful
+ * record stays `ready`, a failed one stays `failed` while bounded retries are pending, and a newer
+ * identity/configuration supersedes the old record without letting the old completion overwrite it.
+ */
+let gptSovitsWarmup = null;
+/** Default bounded retry: first failure waits 15 s, second 60 s, then the identity stays failed. */
+const DEFAULT_WARMUP_RETRY_DELAYS = Object.freeze([15_000, 60_000]);
+let warmupRetryDelays = DEFAULT_WARMUP_RETRY_DELAYS;
 /** Cold-start observation: the first N requests of this generation, plus the one after a warm-up. */
 const TTS_COLD_START_REQUESTS = 3;
 let ttsColdStartLimit = TTS_COLD_START_REQUESTS;
@@ -173,8 +181,19 @@ function createSlots() {
     })();
   };
   return {
-    run(run, signal, { priority = 0 } = {}) {
+    run(run, signal, { priority = 0, preemptWarmup = false } = {}) {
       try { checkAbort(signal); } catch (error) { return Promise.reject(error); }
+      // Warm-up is the only negative-priority producer. A real request that arrives before it
+      // starts cancels it from the waiting list; a warm-up that already owns the slot is never
+      // preempted, so a nearly finished load cannot be thrown away by a later utterance.
+      if (preemptWarmup === true && priority >= 0) {
+        for (let index = waiting.length - 1; index >= 0; index -= 1) {
+          const item = waiting[index];
+          if (item.priority >= 0) continue;
+          waiting.splice(index, 1);
+          item.cancel(Object.assign(new Error('Warm-up superseded by speech'), { code: 'TTS_WARMUP_PREEMPTED' }));
+        }
+      }
       if (waiting.length >= SLOT_LIMIT) return Promise.reject(Object.assign(new Error('TTS queue full'), { code: 'TTS_QUEUE_FULL' }));
       return new Promise((resolve, reject) => {
         const controller = new AbortController();
@@ -198,18 +217,16 @@ function createSlots() {
             reject(controller.signal.reason);
           }
         };
-        entry.cancel = () => {
-          controller.abort(abortError());
+        entry.cancel = (reason = abortError()) => {
+          controller.abort(reason);
           if (!entry.running) { entry.off(); reject(controller.signal.reason); }
         };
         signal?.addEventListener('abort', abort, { once: true });
         // P-65: a block of the sentence already playing jumps ahead of queued sentence prefetch;
-        // equal priorities stay FIFO, so every existing caller keeps the old order.
-        let index = waiting.length;
-        if (priority > 0) {
-          const ahead = waiting.findIndex((item) => item.priority < priority);
-          if (ahead !== -1) index = ahead;
-        }
+        // equal priorities stay FIFO, so every existing caller keeps the old order. Warm-up uses
+        // a negative priority, so every real request (including priority 0) goes before it.
+        const ahead = waiting.findIndex((item) => item.priority < priority);
+        const index = ahead === -1 ? waiting.length : ahead;
         waiting.splice(index, 0, entry);
         pump();
       });
@@ -315,7 +332,9 @@ export function resolveGptSovitsTimeout(settings) {
 /**
  * Wire the provider and the event hooks. `resolveProbe` returns an ffmpeg path (ffprobe is
  * preferred when it sits next to it); `probeReference` replaces the whole measurement.
- * `configureTts` also starts a new warm-up generation: the next `warmupGptSovits()` may run.
+ * `onGptSovitsWarmupEvent` receives `tts.warmup.*` identity/status rows, and `warmupRetryDelays`
+ * bounds automatic retries (default: two retries, 15 s then 60 s). `configureTts` also starts a
+ * new warm-up generation: the next `warmupGptSovits()` may run.
  */
 export function configureTts({
   gptSovits,
@@ -323,6 +342,8 @@ export function configureTts({
   onGptSovitsSkipped,
   onGptSovitsWarning,
   onGptSovitsWarmupFailed,
+  onGptSovitsWarmupEvent,
+  warmupRetryDelays: retryDelays,
   onSlotWait,
   onTtsRequest,
   coldStartRequests,
@@ -338,6 +359,13 @@ export function configureTts({
   gptSovitsSkippedHook = typeof onGptSovitsSkipped === 'function' ? onGptSovitsSkipped : null;
   gptSovitsWarningHook = typeof onGptSovitsWarning === 'function' ? onGptSovitsWarning : null;
   gptSovitsWarmupFailureHook = typeof onGptSovitsWarmupFailed === 'function' ? onGptSovitsWarmupFailed : null;
+  gptSovitsWarmupEventHook = typeof onGptSovitsWarmupEvent === 'function' ? onGptSovitsWarmupEvent : null;
+  warmupRetryDelays = Array.isArray(retryDelays)
+    ? Object.freeze(retryDelays
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .map((value) => Math.min(120_000, Math.round(value)))
+      .slice(0, 5))
+    : DEFAULT_WARMUP_RETRY_DELAYS;
   ttsSlotWaitHook = typeof onSlotWait === 'function' ? onSlotWait : null;
   ttsRequestHook = typeof onTtsRequest === 'function' ? onTtsRequest : null;
   // A fresh provider generation is a fresh service start: cold-start counting begins again.
@@ -351,8 +379,22 @@ export function configureTts({
   audioRemover = typeof removeAudioFile === 'function' ? removeAudioFile : null;
   audioCleanupFailureHook = typeof onAudioCleanupFailed === 'function' ? onAudioCleanupFailed : null;
   referenceCache.clear();
-  gptSovitsWarmupInFlight = null;
-  gptSovitsWarmupDone = false;
+  // A new provider generation supersedes every older warm-up. A queued warm-up is removed before
+  // it can reach the new server; a running one is allowed to finish (no preemption of started
+  // work) but its identity guard marks the completion stale.
+  const previousWarmup = gptSovitsWarmup;
+  gptSovitsWarmup = null;
+  if (previousWarmup !== null) {
+    if (previousWarmup.retryTimer !== null) clearTimeout(previousWarmup.retryTimer);
+    previousWarmup.retryTimer = null;
+    previousWarmup.superseded = true;
+    previousWarmup.staleReason = 'generation-changed';
+    if (previousWarmup.status === 'queued') {
+      previousWarmup.launch?.controller.abort(Object.assign(
+        new Error('Warm-up superseded by configuration'), { code: 'TTS_WARMUP_STALE' },
+      ));
+    }
+  }
 }
 
 function gptSovitsSettings() {
@@ -880,34 +922,342 @@ async function synthesizeGptSovits({ text, dir, speech = 'zh', textLang = '', se
 
 /**
  * Load the model into VRAM before the first real utterance. Fire-and-forget: scheduled by the
- * host after startup and when GPT-SoVITS is first enabled. The request is a one-character
- * synthesis through the same /tts path, so it warms exactly what the first real sentence needs.
+ * host after startup, when GPT-SoVITS is first enabled and after its configuration changes. The
+ * request is a one-character synthesis through the same /tts path, so it warms exactly what the
+ * first real sentence needs.
  *
- * A failure only reaches the dedicated warm-up hook (`tts.gptsovits.warmup.failed`); it never
- * throws, never blocks, and never marks the provider unusable — the next real synthesis (or a
- * later trigger, e.g. the API server finishing its autostart) simply tries again. One successful
- * warm-up per provider generation is enough, so later calls short-circuit.
+ * Identity is the backend address + model configuration version + reference-audio version +
+ * reference text + resolved language configuration. The same identity shares the in-flight
+ * promise and is warmed at most once while it stays `ready`; a changed identity queues a new
+ * warm-up and every completion is guarded so an old run can never mark the new identity ready.
  *
- * @param {{dir: string, speech?: string}} options
- * @returns {Promise<{ok: boolean, skipped?: string, bytes?: number, error?: string}>}
+ * Warm-up uses a negative synthesis-slot priority: any real request goes before it, and a real
+ * request that arrives before the warm-up started removes it from the waiting list. A warm-up
+ * that already owns the slot is never preempted; real speech simply waits behind it.
+ *
+ * A failure only reaches the dedicated warm-up hooks (`tts.warmup.failed` /
+ * `tts.gptsovits.warmup.failed`); it never throws, never blocks a real request, and does not mark
+ * the provider unusable. At most `warmupRetryDelays.length` automatic retries follow, with the
+ * configured backoff, before the identity stays `failed` until it changes.
+ *
+ * @param {{dir: string, speech?: string, signal?: AbortSignal}} options
+ * @returns {Promise<{ok: boolean, skipped?: string, bytes?: number, error?: string,
+ *   key?: string, status?: string}>}
  */
 export function warmupGptSovits({ dir, speech = 'ja', signal } = {}) {
-  if (gptSovitsWarmupDone) return Promise.resolve({ ok: true, skipped: 'already-warm' });
-  if (gptSovitsWarmupInFlight !== null) return gptSovitsWarmupInFlight;
   const snapshot = captureTtsSnapshot();
-  const generation = providerGeneration;
-  const run = synthesisSlots.run((ownedSignal) => runWarmup({ dir, speech, signal: ownedSignal, settings: snapshot.settings, generation }), signal)
-    .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
-    .finally(() => {
-      // Only clear our own slot: a reconfigured provider must not be unlinked by an old run.
-      if (gptSovitsWarmupInFlight === run) gptSovitsWarmupInFlight = null;
-    });
-  gptSovitsWarmupInFlight = run;
-  return run;
+  const settings = snapshot.settings;
+  if (settings === null || settings.enabled !== true) {
+    return Promise.resolve({ ok: false, skipped: 'disabled', status: 'unknown' });
+  }
+  const identity = buildWarmupIdentity(settings, speech, snapshot.weightsEpoch);
+  const same = gptSovitsWarmup !== null
+    && gptSovitsWarmup.key === identity.key
+    && gptSovitsWarmup.generation === providerGeneration;
+  if (same) {
+    const current = gptSovitsWarmup;
+    if (current.status === 'ready') {
+      return Promise.resolve({ ok: true, skipped: 'already-warm', key: current.key, status: 'ready' });
+    }
+    if (current.status === 'queued' || current.status === 'warming') return current.promise;
+    if (current.status === 'failed') {
+      if (current.retryTimer !== null) {
+        return Promise.resolve({
+          ok: false, skipped: 'retry-scheduled', key: current.key, status: 'failed',
+          attempts: current.attempts, retryInMs: Math.max(0, current.retryAt - Date.now()),
+        });
+      }
+      if (current.retryable === true && current.attempts > warmupRetryDelays.length) {
+        return Promise.resolve({
+          ok: false, skipped: 'retry-exhausted', key: current.key, status: 'failed',
+          attempts: current.attempts,
+        });
+      }
+      // A manual trigger after a non-retryable skip, or after the last backoff elapsed, starts a
+      // fresh attempt for the same identity. Attempts are retained so repeated failures stay capped.
+      current.status = 'unknown';
+    }
+    return startWarmupAttempt(current, { dir, speech, signal, reason: 'manual' });
+  }
+
+  const previous = gptSovitsWarmup;
+  if (previous !== null) {
+    if (previous.retryTimer !== null) clearTimeout(previous.retryTimer);
+    previous.retryTimer = null;
+    previous.retryAt = 0;
+    previous.superseded = true;
+    previous.staleReason = 'identity-changed';
+    // A warm-up that has not started yet must not hold the slot or reach the new backend. One
+    // that is already warming is allowed to finish; its completion is guarded as stale.
+    if (previous.status === 'queued') {
+      previous.launch?.controller.abort(Object.assign(
+        new Error('Warm-up superseded by a new identity'), { code: 'TTS_WARMUP_STALE' },
+      ));
+    }
+  }
+  const state = {
+    key: identity.key,
+    identity,
+    generation: providerGeneration,
+    snapshot,
+    request: { dir, speech },
+    status: 'unknown',
+    attempts: 0,
+    retryable: false,
+    lastErrorCode: null,
+    retryTimer: null,
+    retryAt: 0,
+    promise: null,
+    launch: null,
+    superseded: false,
+    staleReason: '',
+    startedAt: 0,
+    finishedAt: 0,
+  };
+  gptSovitsWarmup = state;
+  return startWarmupAttempt(state, { dir, speech, signal, reason: 'request' });
 }
 
-async function runWarmup({ dir, speech, signal, settings, generation }) {
+/** A stable identity for the current warm-up inputs; deliberately hash-only for event payloads. */
+function buildWarmupIdentity(settings, speech, epoch) {
+  const lang = TTS_LANGS.has(String(speech ?? '').toLowerCase())
+    ? String(speech).toLowerCase() : 'ja';
+  const langs = resolveGptLangs(settings, lang);
+  const apiBase = String(settings?.apiBase ?? '').trim().replace(/\/+$/u, '');
+  const models = settings?.models ?? {};
+  const applied = settings?.applied ?? {};
+  const referencePath = String(settings?.refAudioPath ?? '').trim();
+  const referenceVersion = (() => {
+    if (referencePath.length === 0) return '';
+    try {
+      const info = statSync(referencePath);
+      return `${info.size}:${Math.round(info.mtimeMs)}`;
+    } catch {
+      return 'missing';
+    }
+  })();
+  const modelVersion = [
+    String(models.gptModelPath ?? ''), String(models.sovitsModelPath ?? ''),
+    String(applied.gptPath ?? ''), String(applied.sovitsPath ?? ''),
+    Number(applied.at) || 0, Number(epoch) || 0,
+  ].join('\u0000');
+  const parts = [
+    apiBase, modelVersion, referencePath, referenceVersion,
+    String(settings?.promptText ?? ''), langs.textLang, langs.promptLang, lang,
+  ];
+  return {
+    key: createHash('sha1').update(JSON.stringify(parts)).digest('hex'),
+    speech: lang,
+    langs,
+  };
+}
+
+/**
+ * Read the warm-up identity without revealing paths or the reference text. The key is a digest of
+ * every input that makes a warm-up reusable; tests and diagnostics can compare it across edits.
+ */
+export function gptSovitsWarmupIdentity(options = {}) {
+  const settings = options.settings === undefined ? gptSovitsSettings() : options.settings;
+  if (settings === null || typeof settings !== 'object') return null;
+  const identity = buildWarmupIdentity(settings, options.speech ?? 'ja', weightsEpoch);
+  return {
+    key: identity.key,
+    generation: providerGeneration,
+    speech: identity.speech,
+    textLang: identity.langs.textLang,
+    promptLang: identity.langs.promptLang,
+  };
+}
+
+/** Current warm-up state, safe for the event log/status card: no paths, no text, no error bodies. */
+export function gptSovitsWarmupStatus() {
+  const state = gptSovitsWarmup;
+  if (state === null) {
+    return {
+      status: 'unknown', key: null, generation: providerGeneration, attempts: 0,
+      retryInMs: null, lastErrorCode: null, retryable: false,
+    };
+  }
+  return {
+    status: state.status,
+    key: state.key,
+    generation: state.generation,
+    attempts: state.attempts,
+    retryInMs: state.retryTimer === null ? null : Math.max(0, state.retryAt - Date.now()),
+    lastErrorCode: state.lastErrorCode,
+    retryable: state.retryable,
+    startedAt: state.startedAt > 0 ? state.startedAt : null,
+    finishedAt: state.finishedAt > 0 ? state.finishedAt : null,
+  };
+}
+
+function emitWarmupEvent(event, state, extra = {}) {
+  void notifyHook(gptSovitsWarmupEventHook, {
+    event,
+    type: event,
+    key: state.key,
+    generation: state.generation,
+    status: state.status,
+    at: Date.now(),
+    ...extra,
+  });
+}
+
+function warmupStaleReason(state, error) {
+  if (state.superseded === true) return state.staleReason || 'superseded';
+  if (error?.code === 'TTS_WARMUP_PREEMPTED') return 'preempted';
+  if (error?.code === 'TTS_WARMUP_STALE') return 'superseded';
+  if (state.generation !== providerGeneration) return 'generation-changed';
+  if (state.snapshot.weightsEpoch !== weightsEpoch) return 'weights-changed';
+  return 'cancelled';
+}
+
+function isCurrentWarmup(state, launch) {
+  return gptSovitsWarmup === state
+    && state.launch === launch
+    && launch.controller.signal.aborted === false
+    && state.generation === providerGeneration
+    && state.snapshot.weightsEpoch === weightsEpoch;
+}
+
+function startWarmupAttempt(state, { dir, speech, signal, reason }) {
+  state.status = 'queued';
+  state.startedAt = 0;
+  state.finishedAt = 0;
+  state.lastErrorCode = null;
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(signal?.reason ?? abortError());
+  const launch = { controller, started: false };
+  state.launch = launch;
+  if (signal?.aborted) forwardAbort();
+  else signal?.addEventListener('abort', forwardAbort, { once: true });
+  emitWarmupEvent('tts.warmup.queued', state, { reason });
+  const promise = synthesisSlots.run(async (ownedSignal) => {
+    if (!isCurrentWarmup(state, launch)) throw Object.assign(
+      new Error('Warm-up superseded'), { code: 'TTS_WARMUP_STALE' },
+    );
+    launch.started = true;
+    state.status = 'warming';
+    state.startedAt = Date.now();
+    emitWarmupEvent('tts.warmup.started', state);
+    const result = await runWarmupSynthesis({
+      dir, speech, signal: ownedSignal, settings: state.snapshot.settings, snapshot: state.snapshot,
+    });
+    return result;
+  }, controller.signal, { priority: -1 })
+    .then((result) => settleWarmup(state, launch, result))
+    .catch((error) => failWarmupAttempt(state, launch, error))
+    .finally(() => {
+      signal?.removeEventListener('abort', forwardAbort);
+      if (state.launch === launch) state.launch = null;
+    });
+  state.promise = promise;
+  return promise;
+}
+
+function settleWarmup(state, launch, result) {
+  const current = isCurrentWarmup(state, launch);
+  if (!current) {
+    emitWarmupEvent('tts.warmup.stale', state, { reason: warmupStaleReason(state) });
+    return { ok: false, skipped: 'stale', key: state.key, status: state.status };
+  }
+  if (result?.ok !== true) {
+    // A configuration skip is not a transport failure: report it once, but do not back off or
+    // blame the server. A later explicit trigger may try again for the same identity.
+    state.status = 'failed';
+    state.retryable = false;
+    state.lastErrorCode = `TTS_WARMUP_${String(result?.skipped ?? 'SKIPPED').toUpperCase().replace(/[^A-Z0-9]+/gu, '_')}`;
+    state.finishedAt = Date.now();
+    emitWarmupEvent('tts.warmup.failed', state, {
+      reason: result?.skipped ?? 'skipped', errorCode: state.lastErrorCode, retryable: false,
+    });
+    return {
+      ok: false, skipped: result?.skipped ?? 'skipped', key: state.key,
+      status: 'failed', errorCode: state.lastErrorCode,
+    };
+  }
+  state.status = 'ready';
+  state.retryable = false;
+  state.lastErrorCode = null;
+  state.finishedAt = Date.now();
+  // The first real request after a successful warm-up is still reported as cold.
+  ttsColdAfterWarmup = true;
+  emitWarmupEvent('tts.warmup.succeeded', state, { bytes: result.bytes });
+  return { ok: true, bytes: result.bytes, key: state.key, status: 'ready' };
+}
+
+function failWarmupAttempt(state, launch, error) {
+  const current = gptSovitsWarmup === state && state.launch === launch;
+  const aborted = error?.name === 'AbortError'
+    || error?.code === 'TTS_WARMUP_PREEMPTED'
+    || error?.code === 'TTS_WARMUP_STALE';
+  if (!current || aborted) {
+    if (current) {
+      state.status = 'unknown';
+      state.retryable = false;
+      state.lastErrorCode = null;
+      state.finishedAt = Date.now();
+    }
+    emitWarmupEvent('tts.warmup.stale', state, { reason: warmupStaleReason(state, error) });
+    return {
+      ok: false, skipped: error?.code === 'TTS_WARMUP_PREEMPTED' ? 'preempted' : 'stale',
+      key: state.key, status: state.status,
+    };
+  }
+  state.attempts += 1;
+  state.status = 'failed';
+  state.retryable = true;
+  state.lastErrorCode = ttsErrorCode(error);
+  state.finishedAt = Date.now();
+  scheduleWarmupRetry(state);
+  emitWarmupEvent('tts.warmup.failed', state, {
+    attempt: state.attempts,
+    errorCode: state.lastErrorCode,
+    retryable: state.retryTimer !== null,
+    retryInMs: state.retryTimer === null ? null : Math.max(0, state.retryAt - Date.now()),
+  });
+  // Existing hook/event name kept for compatibility; it may carry the provider message, while the
+  // additive `tts.warmup.*` stream above carries only the stable code.
+  void notifyHook(gptSovitsWarmupFailureHook, {
+    event: 'tts.warmup.failed',
+    type: 'tts.warmup.failed',
+    key: state.key,
+    status: 'failed',
+    attempt: state.attempts,
+    errorCode: state.lastErrorCode,
+    error: error?.message ?? String(error),
+  });
+  return {
+    ok: false,
+    error: error?.message ?? String(error),
+    key: state.key,
+    status: 'failed',
+    attempt: state.attempts,
+  };
+}
+
+function scheduleWarmupRetry(state) {
+  if (state.retryTimer !== null) return;
+  if (state.attempts > warmupRetryDelays.length) return;
+  const delay = warmupRetryDelays[state.attempts - 1] ?? warmupRetryDelays.at(-1) ?? 0;
+  state.retryAt = Date.now() + delay;
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = null;
+    state.retryAt = 0;
+    if (gptSovitsWarmup !== state || state.status !== 'failed') return;
+    state.status = 'unknown';
+    void warmupGptSovits(state.request).catch(() => {});
+  }, delay);
+  state.retryTimer.unref?.();
+}
+
+/**
+ * The slot-owned half of a warm-up. It only synthesizes: playback is never opened. The clip is
+ * deleted before the promise settles, including after an abort or a stale completion.
+ */
+async function runWarmupSynthesis({ dir, speech, signal, settings, snapshot }) {
   checkAbort(signal);
+  if (snapshot.weightsEpoch !== weightsEpoch) throw abortError();
   if (settings?.enabled !== true) return { ok: false, skipped: 'disabled' };
   if (!hasReference(settings) && !hasLoadedModels(settings)) return { ok: false, skipped: 'no-reference' };
   if (typeof dir !== 'string' || dir.trim().length === 0) return { ok: false, skipped: 'no-dir' };
@@ -922,21 +1272,18 @@ async function runWarmup({ dir, speech, signal, settings, generation }) {
     }
   }
   const lang = TTS_LANGS.has(String(speech ?? '').toLowerCase()) ? String(speech).toLowerCase() : 'ja';
+  let result = null;
   try {
-    const result = await synthesizeGptSovits({ text: WARMUP_TEXT[lang] ?? 'あ', dir, speech: lang, settings, signal });
-    if (providerGeneration === generation) {
-      gptSovitsWarmupDone = true;
-      // The first real request after a successful warm-up is still reported as cold.
-      ttsColdAfterWarmup = true;
-    }
-    // The tiny clip only exists to load the model; do not leave it in the cache.
-    await rm(result.file, { force: true }).catch(() => {});
-    return { ok: true, bytes: result.bytes };
-  } catch (error) {
+    result = await synthesizeGptSovits({
+      text: WARMUP_TEXT[lang] ?? 'あ', dir, speech: lang, settings, signal,
+    });
     checkAbort(signal);
-    const message = error?.message ?? String(error);
-    await notifyHook(gptSovitsWarmupFailureHook, { error: message });
-    return { ok: false, error: message };
+    if (snapshot.weightsEpoch !== weightsEpoch) throw abortError();
+    return { ok: true, bytes: result.bytes, durationMs: result.durationMs };
+  } finally {
+    // The tiny clip only exists to load the model; do not leave it in the cache, and do not leave
+    // it behind when the run turned stale or was aborted.
+    if (result?.file) await rm(result.file, { force: true }).catch(() => {});
   }
 }
 
@@ -955,7 +1302,7 @@ export function loadGptSovitsModels() {
     await playbackSlots.drain();
     checkAbort(signal);
     return loadGptSovitsModelsNow(snapshot.settings, signal);
-  });
+  }, undefined, { preemptWarmup: true });
 }
 
 async function loadGptSovitsModelsNow(settings, signal) {
@@ -1090,7 +1437,7 @@ export function synthesize(options) {
       return { ...result, slotWaitMs };
     },
     request.signal,
-    { priority: Number(request.priority) || 0 },
+    { priority: Number(request.priority) || 0, preemptWarmup: true },
   );
 }
 
@@ -1398,7 +1745,7 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
           close();
         }
       }, synthSignal);
-    }, signal).catch(reject);
+    }, signal, { preemptWarmup: true }).catch(reject);
   });
 }
 
@@ -1997,7 +2344,7 @@ export function applyGptSovitsModels() {
     await playbackSlots.drain();
     checkAbort(signal);
     return applyGptSovitsModelsNow(settings, signal);
-  });
+  }, undefined, { preemptWarmup: true });
 }
 
 async function applyGptSovitsModelsNow(settings, signal) {
