@@ -79,6 +79,15 @@
  * so. Relaxation only changes weights, never eligibility, so `hold` is returned when the
  * hard-filtered candidate set is empty — an empty set can never be relaxed back to life.
  *
+ * Idle recipe cooldown (select-only, `event === 'idle'`): after the hard filter and before the
+ * score, the newest 1–2 recipes from `recent.recipes` are excluded outright (reason
+ * `recipe-cooldown`) while at least `RECIPE_COOLDOWN_MIN_FAMILIES` (3) families and
+ * `RECIPE_COOLDOWN_MIN_PRESETS` (6) presets remain. If dropping them would leave a short pool,
+ * every candidate is kept and the existing soft repeat penalty still applies. The cooldown never
+ * empties the pool, never relaxes a hard constraint and never touches a semantic event
+ * (answer-start / affirm / confused / …). All timing variants of one `recipeId` share the bucket.
+ * `explain` intentionally reports the un-cooled scoring pool so weight evidence stays inspectable.
+ *
  * Errors: construction validates the catalog and throws TypeError for a malformed catalog.
  * `select`/`query`/`explain` never throw for bad context — privacy, disposal, missing
  * state/event or an unverified channel set all fail closed to a hold (or an empty list),
@@ -102,6 +111,10 @@ const PRIORITY_LOW = 0.25;
 const PRIORITY_SPAN = 1.75;
 /** Fewer eligible families than this counts as "candidate shortage" and relaxes soft penalties. */
 const MIN_FAMILIES = 3;
+/** Idle-only recipe cooldown: drop the newest 1–2 recipes ONLY while this much remains. */
+const RECIPE_COOLDOWN_RECENT = 2;
+const RECIPE_COOLDOWN_MIN_FAMILIES = MIN_FAMILIES;
+const RECIPE_COOLDOWN_MIN_PRESETS = 6;
 const DEFAULT_RECENT_WINDOW = 4;
 const DEFAULT_FREQUENCY_WINDOW_MS = 60_000;
 /** Persona affinity maps onto [0.6, 1.4]; a missing persona is exactly 1.0 (neutral). */
@@ -424,6 +437,28 @@ function normalizePersona(input) {
   };
 }
 
+/**
+ * Newest-last recipe memory for the idle recipe cooldown. An array keeps its order; a count map
+ * has no reliable recency, so its key insertion order is the only available approximation.
+ */
+function recentRecipeOrder(input) {
+  const out = [];
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      if (typeof entry === 'string' && entry.length > 0) out.push(entry);
+    }
+    return out;
+  }
+  if (input !== null && typeof input === 'object') {
+    for (const [key, raw] of Object.entries(input)) {
+      const count = Number(raw);
+      if (!Number.isFinite(count) || count <= 0) continue;
+      if (key.length > 0) out.push(key);
+    }
+  }
+  return out;
+}
+
 /** Recent-list input becomes a count map. Arrays are newest-last; maps are counts already. */
 function recentCounts(input, window) {
   const counts = new Map();
@@ -499,6 +534,8 @@ function normalizeContext(context) {
       recentFamilies: recentCounts(context.recent?.families, window),
       recentActions: recentCounts(context.recent?.actions, window),
       recentRecipes: recentCounts(context.recent?.recipes, window),
+      /** Ordered newest-last recipe ids, used only by the idle hard cooldown. */
+      recentRecipeOrder: recentRecipeOrder(context.recent?.recipes),
       history: Array.isArray(context.history) ? context.history : [],
       postureOffset: normalizePostureOffset(context.postureOffset),
       postureHeld: context.postureHeld === true,
@@ -660,6 +697,54 @@ function collectCandidates(context, overrides, index) {
     candidates.push({ preset, droppedChannels: channels.droppedChannels });
   }
   return { entries: candidates, excluded };
+}
+
+/**
+ * Idle-only recipe cooldown, applied AFTER the hard filter and BEFORE scoring.
+ *
+ * The repeat penalties can only make a selection less likely; they cannot stop an autonomous idle
+ * draw from immediately replaying the same action (especially when its family has several recipes
+ * or several timing variants). This step turns the newest 1–2 recipes into a hard exclusion, but
+ * ONLY while enough candidates remain (at least 3 families and 6 presets). When dropping them
+ * would leave a short pool, the candidates are kept and the existing soft repeat penalty still
+ * applies — the cooldown never empties the pool and never forces a hold to "keep moving".
+ *
+ * Only `event === 'idle'` is affected. Semantic boundaries (answer-start / affirm / confused / …)
+ * keep every candidate at full weight. A timing variant and the recipe's other variants share one
+ * `recipeId`, so all four are excluded as the SAME action.
+ */
+function applyIdleRecipeCooldown(entries, context) {
+  if (context.event !== 'idle' || entries.length === 0) {
+    return { entries, excluded: [], applied: [] };
+  }
+  const candidateRecipes = new Set(entries.map(entry => entry.preset.recipeId));
+  const recent = [];
+  for (const recipe of context.recentRecipeOrder) {
+    // Only a recipe that is actually in the hard-filtered pool can be cooled. A semantic recipe
+    // that just fired (e.g. agree-nod) is not an idle candidate and must not become fake evidence.
+    if (candidateRecipes.has(recipe) && !recent.includes(recipe)) recent.push(recipe);
+  }
+  const newest = recent.slice(-RECIPE_COOLDOWN_RECENT);
+  if (newest.length === 0) return { entries, excluded: [], applied: [] };
+
+  const sufficient = (remaining) => {
+    const families = new Set(remaining.map(entry => entry.preset.family));
+    return families.size >= RECIPE_COOLDOWN_MIN_FAMILIES
+      && remaining.length >= RECIPE_COOLDOWN_MIN_PRESETS;
+  };
+
+  // Prefer the two newest recipes; fall back to only the newest one; otherwise keep everything.
+  for (let count = newest.length; count >= 1; count -= 1) {
+    const blocked = new Set(newest.slice(-count));
+    const remaining = entries.filter(entry => !blocked.has(entry.preset.recipeId));
+    if (!sufficient(remaining)) continue;
+    return {
+      entries: remaining,
+      excluded: entries.filter(entry => blocked.has(entry.preset.recipeId)),
+      applied: [...blocked],
+    };
+  }
+  return { entries, excluded: [], applied: [] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1044,43 +1129,59 @@ export function createPresetSelector({
     const resolved = resolve(context);
     if (!resolved.ok) return holdResult(resolved.reason);
     const { context: ctx, overrides: callOverrides } = resolved;
+    const collected = collectCandidates(ctx, callOverrides, index);
+    // Idle recipe cooldown after the hard filter: it can only narrow an already legal pool, and
+    // only while enough candidates remain. Semantic events are untouched.
+    const cooled = applyIdleRecipeCooldown(collected.entries, ctx);
+    const cooldownReasons = cooled.applied.length > 0
+      ? ['recipe-cooldown', `recipe-cooldown:${cooled.applied.join(',')}`]
+      : [];
+    const excluded = [
+      ...collected.excluded,
+      ...cooled.excluded.map(entry => ({ ...entry, reason: 'recipe-cooldown' })),
+    ];
+    const blocked = excludedReasons(excluded);
     let relaxed = false;
-    let evaluation = evaluate(ctx, callOverrides, index, false);
-    const blocked = excludedReasons(evaluation.excluded);
-    if (evaluation.families.length === 0) {
-      return holdResult('no-candidates', Object.keys(blocked));
+    let families = groupWeights(cooled.entries.map(entry => (
+      scoreCandidate(entry, ctx, callOverrides, false)
+    )));
+    if (families.length === 0) {
+      return holdResult('no-candidates', [...new Set([...cooldownReasons, ...Object.keys(blocked)])]);
     }
     let relaxReasons = [];
-    if (evaluation.families.length < minFamilies) {
+    if (families.length < minFamilies) {
       relaxed = true;
-      evaluation = evaluate(ctx, callOverrides, index, true);
+      families = groupWeights(cooled.entries.map(entry => (
+        scoreCandidate(entry, ctx, callOverrides, true)
+      )));
       relaxReasons = ['candidate-shortage', 'relaxed-soft-penalties'];
     }
-    if (evaluation.families.length === 0) {
-      return holdResult('no-candidates', [...new Set([...relaxReasons, ...Object.keys(blocked)])]);
+    if (families.length === 0) {
+      return holdResult('no-candidates', [...new Set([...relaxReasons, ...cooldownReasons, ...Object.keys(blocked)])]);
     }
-    const total = evaluation.families.reduce((sum, family) => sum + family.weight, 0) + HOLD_WEIGHT;
+    const total = families.reduce((sum, family) => sum + family.weight, 0) + HOLD_WEIGHT;
     const rand = createRandom({
       seed: context?.seed,
       rand: context?.rand,
     });
-    const options = [...evaluation.families.map(family => ({ kind: 'family', family })), { kind: 'hold' }];
+    const options = [...families.map(family => ({ kind: 'family', family })), { kind: 'hold' }];
     const picked = pickWeighted(
       options,
       option => (option.kind === 'hold' ? HOLD_WEIGHT : option.family.weight),
       rand,
     );
+    const drawReasons = [...new Set([...relaxReasons, ...cooldownReasons, ...Object.keys(blocked)])];
     if (picked === null || picked.kind === 'hold') {
       return holdResult(
-        evaluation.families.length < minFamilies ? 'candidate-shortage' : 'hold-draw',
-        [...relaxReasons, ...Object.keys(blocked)],
+        families.length < minFamilies ? 'candidate-shortage' : 'hold-draw',
+        drawReasons,
       );
     }
     const family = picked.family;
     const recipe = pickWeighted(family.recipes, item => item.weight, rand);
-    if (recipe === null) return holdResult('hold-draw', [...relaxReasons, ...Object.keys(blocked)]);
+    if (recipe === null) return holdResult('hold-draw', drawReasons);
     const variant = pickWeighted(recipe.variants, item => item.weight, rand);
-    if (variant === null) return holdResult('hold-draw', [...relaxReasons, ...Object.keys(blocked)]);
+    if (variant === null) return holdResult('hold-draw', drawReasons);
     const chosen = variant.candidate;
     // A delivery variant is picked AFTER the timing variant, from the same seeded stream. It is a
     // second dimension of choice, not another preset candidate: recipe-level anti-repeat is
@@ -1104,6 +1205,7 @@ export function createPresetSelector({
       `family-weight:${round(family.weight)}`,
       `probability:${round(probability, 4)}`,
       ...(actionVariant === null ? [] : [`action-variant:${actionVariant.id}`]),
+      ...cooldownReasons,
       ...relaxReasons,
     ];
     for (const [reason, count] of Object.entries(blocked)) reasons.push(`excluded:${reason}:${count}`);
@@ -1143,6 +1245,9 @@ export function createPresetSelector({
 export const PRESET_SELECTOR_CONSTANTS = Object.freeze({
   HOLD_WEIGHT,
   MIN_FAMILIES,
+  RECIPE_COOLDOWN_RECENT,
+  RECIPE_COOLDOWN_MIN_FAMILIES,
+  RECIPE_COOLDOWN_MIN_PRESETS,
   DEFAULT_PRIORITY,
   DEFAULT_RECENT_WINDOW,
   DEFAULT_FREQUENCY_WINDOW_MS,

@@ -62,11 +62,6 @@ function variantWeight(selector, context, recipe, presetId) {
   return found?.variants.find(item => item.presetId === presetId)?.weight ?? null;
 }
 
-function repeatFactor(selection) {
-  const reason = selection.reasons.find(item => item.startsWith('repeat:'));
-  return reason === undefined ? null : Number(reason.slice('repeat:'.length));
-}
-
 const recipesOf = presets => [...new Set(presets.map(preset => preset.recipeId))];
 const familiesOf = presets => new Set(presets.map(preset => preset.family));
 
@@ -169,15 +164,20 @@ test('A3. only a real start appends selection memory; hold/refusal/cancel do not
   assert.ok(memory.recentActions.includes('idle-tilt'));
   assert.ok(memory.recentActions.includes(chosen.presetId));
 
-  // The next same-recipe draw is visibly down-weighted. Draw WITHOUT narrowing to one recipe:
-  // a one-recipe context is a candidate shortage, which intentionally relaxes soft penalties.
-  let repeat = null;
-  for (let seed = 0; seed < 5000 && repeat === null; seed += 1) {
+  // The next autonomous idle draw hard-excludes the just-used recipe while the pool is healthy
+  // (recipe cooldown); the recipe is not cleared, the rest of the pool simply stays available.
+  let cooled = 0;
+  let repeatedRecipe = 0;
+  let nextPresets = 0;
+  for (let seed = 0; seed < 500; seed += 1) {
     const next = runtime.selectPreset({ state: 'idle', event: 'idle', seed });
-    if (next.kind === 'preset' && next.recipe === 'idle-tilt') repeat = repeatFactor(next);
+    if (next.reasons.includes('recipe-cooldown')) cooled += 1;
+    if (next.kind === 'preset') nextPresets += 1;
+    if (next.kind === 'preset' && next.recipe === 'idle-tilt') repeatedRecipe += 1;
   }
-  assert.ok(repeat !== null && repeat < 0.8,
-    `same-recipe repeat factor ${repeat} must be below 0.8 after a start`);
+  assert.ok(cooled > 0, 'the just-used recipe is put on an idle cooldown');
+  assert.ok(nextPresets > 400, `the cooldown keeps the rest of the idle pool alive: ${nextPresets}`);
+  assert.equal(repeatedRecipe, 0, 'a healthy idle pool does not immediately replay the same recipe');
 
   // Cancelling a started action keeps the fact that it really performed.
   const beforeCancel = runtime.presetsSnapshot().selectionMemory.history.length;
@@ -185,8 +185,8 @@ test('A3. only a real start appends selection memory; hold/refusal/cancel do not
   assert.equal(runtime.presetsSnapshot().selectionMemory.history.length, beforeCancel,
     'cancel must not append or erase a performed start');
 
-  console.log(`[A3] history=${JSON.stringify(memory.history[0])} repeatAfterStart=${repeat} `
-    + `historyAfterCancel=${beforeCancel}`);
+  console.log(`[A3] history=${JSON.stringify(memory.history[0])} cooldownDraws=${cooled} `
+    + `repeatedRecipe=${repeatedRecipe} nextPresets=${nextPresets} historyAfterCancel=${beforeCancel}`);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -580,6 +580,11 @@ test('SUMMARY. same-recipe repeat rate and near-baseline settle draws (before vs
   const withMemory = observe(true);
   assert.ok(withMemory < withoutMemory,
     `recipe memory must lower the repeat rate: ${withMemory} < ${withoutMemory}`);
+  // The idle recipe cooldown is a hard exclusion while the pool is healthy, so consecutive
+  // same-recipe draws should drop sharply rather than merely become less likely.
+  assert.ok(withMemory <= withoutMemory * 0.25,
+    `consecutive same-recipe draws must drop sharply: ${withMemory} vs ${withoutMemory}`);
+  const dropped = withoutMemory > 0 ? (1 - withMemory / withoutMemory) * 100 : 0;
 
   // "Before" = offset unknown (the pre-change selector behaved this way); "after" = near baseline.
   const beforeSelector = createPresetSelector();
@@ -598,7 +603,7 @@ test('SUMMARY. same-recipe repeat rate and near-baseline settle draws (before vs
   assert.equal(afterSettle, 0, 'near baseline must produce zero automatic settle draws');
 
   console.log(`[SUMMARY] same-recipe repeat rate: noMemory=${withoutMemory.toFixed(3)} `
-    + `withMemory=${withMemory.toFixed(3)} (${sample} draws)`);
+    + `withMemory=${withMemory.toFixed(3)} (${sample} draws, drop=${dropped.toFixed(1)}%)`);
   console.log(`[SUMMARY] settle draws near baseline: before(unknownOffset)=${beforeSettle}/1000 `
     + `after(nearBaseline)=${afterSettle}/1000`);
 });

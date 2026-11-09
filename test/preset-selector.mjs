@@ -525,3 +525,95 @@ test('idle-sway is catalogued, unique, and selectable on the headX idle channel'
   assert.deepEqual([...narrowed.requires], ['headX']);
 });
 
+// ---------------------------------------------------------------------------------------------
+// 17. Idle recipe cooldown: hard anti-repeat only while the pool is healthy
+// ---------------------------------------------------------------------------------------------
+test('idle recipe cooldown excludes the newest 1–2 recipes while candidates remain', () => {
+  assert.equal(PRESET_SELECTOR_CONSTANTS.RECIPE_COOLDOWN_RECENT, 2);
+  assert.equal(PRESET_SELECTOR_CONSTANTS.RECIPE_COOLDOWN_MIN_FAMILIES, 3);
+  assert.equal(PRESET_SELECTOR_CONSTANTS.RECIPE_COOLDOWN_MIN_PRESETS, 6);
+
+  const selector = createPresetSelector();
+  const one = draw(selector, idle({ recent: { recipes: ['idle-tilt'] } }), 400);
+  const oneDraws = presetsOnly(one);
+  assert.ok(oneDraws.length > 250, `healthy idle pool still draws: ${oneDraws.length}`);
+  assert.equal(oneDraws.filter(result => result.recipe === 'idle-tilt').length, 0,
+    'the newest recent recipe is hard-excluded');
+  assert.ok(oneDraws.every(result => result.reasons.includes('recipe-cooldown')),
+    'the exclusion has a visible reason');
+  assert.ok(oneDraws.some(result => result.reasons.includes('recipe-cooldown:idle-tilt')));
+
+  const two = draw(selector, idle({ recent: { recipes: ['idle-down', 'idle-tilt'] } }), 400);
+  const twoDraws = presetsOnly(two);
+  assert.ok(twoDraws.length > 250, `two-recipe cooldown still draws: ${twoDraws.length}`);
+  assert.equal(twoDraws.filter(result => ['idle-down', 'idle-tilt'].includes(result.recipe)).length, 0,
+    'both of the newest two recipes are excluded when enough candidates remain');
+  assert.ok(twoDraws.some(result => result.reasons.includes('recipe-cooldown:idle-down,idle-tilt')));
+});
+
+test('idle recipe cooldown never empties a short pool and never forces a hold', () => {
+  const families = [...new Set(PRESETS.map(preset => preset.family))];
+  const postureOnly = createPresetSelector({
+    overrides: { disabledFamilies: families.filter(family => family !== 'posture') },
+  });
+
+  // A one-recipe pool: excluding idle-tilt would leave zero candidates, so the cooldown is skipped
+  // and the recent recipe stays selectable (soft repeat relaxation still applies).
+  const narrowed = Array.from({ length: 120 }, (_, seed) => postureOnly.select(idle({
+    recipe: 'idle-tilt',
+    recent: { recipes: ['idle-tilt'] },
+    seed,
+  })));
+  const narrowedDraws = presetsOnly(narrowed);
+  assert.ok(narrowedDraws.length > 0, 'the recent recipe is not cleared out of a short pool');
+  assert.ok(narrowedDraws.every(result => result.recipe === 'idle-tilt'));
+  assert.ok(narrowed.every(result => !result.reasons.includes('recipe-cooldown')),
+    'a short pool never reports a cooldown exclusion');
+
+  // A one-family pool (several recipes) also keeps the recent recipe reachable.
+  const sameFamily = draw(postureOnly, idle({ recent: { recipes: ['idle-tilt'] } }), 400);
+  const sameFamilyDraws = presetsOnly(sameFamily);
+  assert.ok(sameFamilyDraws.length > 150, `one-family pool still draws: ${sameFamilyDraws.length}`);
+  assert.ok(sameFamilyDraws.some(result => result.recipe === 'idle-tilt'),
+    'the recent recipe may repeat when the pool is too small to cool it');
+  assert.ok(sameFamily.every(result => !result.reasons.includes('recipe-cooldown')));
+
+  // The hard filter still fails closed on an empty pool: cooldown must not invent candidates.
+  assert.equal(postureOnly.select(idle({ verifiedChannels: [] })).kind, 'hold');
+});
+
+test('idle recipe cooldown treats all four timing variants as one action', () => {
+  const variants = PRESETS.filter(preset => preset.recipeId === 'idle-tilt');
+  assert.equal(variants.length, 4, 'idle-tilt has four timing variants');
+
+  const selector = createPresetSelector();
+  const baseline = presetsOnly(draw(selector, idle(), 800));
+  assert.equal(new Set(baseline.filter(result => result.recipe === 'idle-tilt')
+    .map(result => result.presetId)).size, 4,
+  'a fresh idle pool can draw all four timing variants');
+
+  const cooled = presetsOnly(draw(selector, idle({ recent: { recipes: ['idle-tilt'] } }), 800));
+  assert.ok(cooled.length > 500);
+  assert.equal(cooled.filter(result => result.recipe === 'idle-tilt').length, 0,
+    'every timing variant of the same recipe is covered by the same cooldown');
+});
+
+test('semantic events bypass the idle recipe cooldown and keep full repeat weight', () => {
+  const selector = createPresetSelector();
+  const context = {
+    state: 'speaking',
+    event: 'affirm',
+    intent: 'agreement',
+    verifiedChannels: FULL_CHANNELS,
+    recent: { recipes: ['agree-nod'] },
+  };
+  const results = draw(selector, context, 300);
+  const draws = presetsOnly(results);
+  assert.ok(draws.length > 80, `semantic affirm still draws: ${draws.length}`);
+  assert.ok(draws.some(result => result.recipe === 'agree-nod'),
+    'a semantic event may reuse the recipe it just used');
+  assert.ok(draws.every(result => result.reasons.includes('repeat:1')),
+    'the idle repeat penalty is not applied to a semantic event');
+  assert.ok(results.every(result => !result.reasons.includes('recipe-cooldown')));
+});
+
