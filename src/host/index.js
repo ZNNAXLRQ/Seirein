@@ -8758,7 +8758,18 @@ export function apply(ctx, config) {
    * 每次理解推进最多登记 2 条带 reaction 的候选；只有仲裁通过才发生一次 ≤120 token 的调用。
    */
   const PROACTIVE_IGNORED_MS = 45_000;
-  const proactiveEnabled = () => config?.proactiveEnabled !== false;
+  /**
+   * 主动回应总开关：用户设置（settings.json 的 `proactive.enabled`）优先；没有存过布尔值时才
+   * 退回插件配置，`config.proactiveEnabled !== false` 即默认开启。设置页动作写盘后下一轮
+   * evaluate/status 直接读新值，不需要重启或重建运行时。
+   */
+  const proactiveEnabled = () => {
+    const stored = readSettings()?.proactive;
+    if (stored !== null && typeof stored === 'object' && typeof stored.enabled === 'boolean') {
+      return stored.enabled;
+    }
+    return config?.proactiveEnabled !== false;
+  };
   const proactiveMaxPerHour = () => config?.proactiveMaxPerHour ?? 3;
   const proactiveMinGapMs = () => config?.proactiveMinGapMs ?? 60_000;
   const proactive = createProactiveArbiter();
@@ -9096,6 +9107,37 @@ export function apply(ctx, config) {
       // 避免同一事件被用户先评论后助手再主动说一遍。
       clearProactiveIgnored();
       proactive.cancelAll('user-comment');
+      /**
+       * P-187 阶段 4：评论对齐不确定时补一次定向分析。只在窗口里确实有可看的帧、且距上一次
+       * 普通理解已至少 5 秒时触发，避免和刚跑完的分析重复烧钱。fire-and-forget：既不等待结果，
+       * 也不让异常影响投递、attach 或主动候选；只记录计数，不把事件正文写进日志。
+       */
+      try {
+        const relatedCount = Array.isArray(alignment?.relatedFrameIds)
+          ? alignment.relatedFrameIds.length
+          : 0;
+        const uncertain = alignment?.ok !== true
+          || alignment?.confidence !== 'high'
+          || relatedCount === 0;
+        const lastAt = Number(understanding.status()?.lastAt ?? 0);
+        if (uncertain && evidence.length > 0 && Date.now() - lastAt >= 5_000) {
+          const focus = `用户刚评论：「${proactiveClip(text, 80)}」。请只判断这句话最可能指这段画面里的哪个动作或事件，按时间比较，不要自由描述整段。`;
+          void understanding.runNow({
+            from: pending.from,
+            to: end,
+            reason: 'comment-focus',
+            focus,
+          }).then((result) => {
+            void log.emit('vision.comment.focus-analysis', {
+              ok: result?.ok === true,
+              reason: typeof result?.reason === 'string' ? result.reason : '',
+              events: Array.isArray(result?.parsed?.events) ? result.parsed.events.length : 0,
+            }).catch(() => {});
+          }).catch(() => {});
+        }
+      } catch {
+        /* 定向补看只是旁路：任何失败都不能影响投递、attach 与主动候选。 */
+      }
     } catch (error) {
       void log.emit('vision.comment.align.failed', {
         error: error?.message ?? String(error),
@@ -16795,12 +16837,14 @@ export function apply(ctx, config) {
     get ensureComponent() { return ensureComponent; },
     get ensureVisionModeDependencies() { return ensureVisionModeDependencies; },
     get invalidateVision() { return invalidateVision; },
+    get readSettings() { return readSettings; },
     get refreshObsScenes() { return refreshObsScenes; },
     get startWatcher() { return startWatcher; },
     get stopWatch() { return stopWatch; },
     get virtualCamOn() { return virtualCamOn; },
     get vision() { return vision; },
-    get visionToken() { return visionToken; }
+    get visionToken() { return visionToken; },
+    get writeSettings() { return writeSettings; }
   }) },
 { actions: profileActions, handle: createProfileSettingsActions({
     get log() { return log; },

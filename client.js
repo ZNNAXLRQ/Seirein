@@ -4705,6 +4705,9 @@ window.__ModuleLoader__.load({
       const [lastRestart, setLastRestart] = useState(null);
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
       const [expandedAmbient, setExpandedAmbient] = useState(false);
+      // 「主动回应」开关：null = 跟随 status 里的已保存值；点击先乐观写本地，失败再回滚。
+      const [proactiveDraft, setProactiveDraft] = useState(null);
+      const [proactiveError, setProactiveError] = useState('');
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
       const [profileMaintain, setProfileMaintain] = useState(null);
       const [profileDraft, setProfileDraft] = useState(null);
@@ -5839,6 +5842,10 @@ window.__ModuleLoader__.load({
             const scenes = vm.scenes ?? [];
             const capturing = vm.capturing === true;
             const busyNow = busy !== '';
+            // 初值来自 /assistant/status 的 vision.proactive.enabled；未知（非布尔）时按开启展示，
+            // 但不强行写回设置。proactiveDraft 只承载本次点击的乐观值，失败时清掉即回滚。
+            const proactiveSaved = typeof vm.proactive?.enabled === 'boolean' ? vm.proactive.enabled : true;
+            const proactiveOn = typeof proactiveDraft === 'boolean' ? proactiveDraft : proactiveSaved;
             const visionHotkey = (status.hotkeys ?? []).find((entry) => entry.action === 'vision')?.combo ?? 'Ctrl+Alt+V';
             const lastCaptureAt = Number(vm.lastCaptureAt) || 0;
             const lastCaptureText = lastCaptureAt > 0 ? new Date(lastCaptureAt).toLocaleTimeString() : '—';
@@ -5877,6 +5884,32 @@ window.__ModuleLoader__.load({
                 : '已停止（取景时按需启动；用户自启的不会关闭）'),
               line('OBS 进程', vm.obsRunning ? '运行中' : '未运行 / 未连接'),
               line('OBS 场景', status.obsScene || '未连接 / 未知'),
+              h('div', { style: styles.row },
+                h('span', { style: styles.label },
+                  '主动回应',
+                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（看到值得说的事时主动开口）')),
+                h('button', {
+                  'data-settings-toggle': 'vision-proactive',
+                  style: { ...(proactiveOn ? styles.btnActive : styles.btn), ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow,
+                  onClick: async () => {
+                    const next = !proactiveOn;
+                    setProactiveDraft(next);
+                    setProactiveError('');
+                    const result = await act({ action: 'vision.proactive', enabled: next }, 'vision-proactive');
+                    if (result?.ok === true) {
+                      // 成功以宿主返回的有效值为准；没带布尔值时保留乐观值，等 status 刷新校正。
+                      setProactiveDraft(typeof result.enabled === 'boolean' ? result.enabled : next);
+                      return;
+                    }
+                    // 失败回滚：清掉乐观值，界面回到 status.vision.proactive.enabled。
+                    setProactiveDraft(null);
+                    setProactiveError(String(result?.error ?? '保存失败'));
+                  },
+                }, proactiveOn ? '已开启' : '已关闭')),
+              proactiveError !== ''
+                ? h('div', { style: { ...styles.hint, color: DANGER } }, `主动回应保存失败：${proactiveError}`)
+                : null,
               h('div', { style: styles.field },
                 h('span', { style: styles.value }, '选择观看来源'),
                 h('div', { style: { display: 'flex', gap: 8 } },

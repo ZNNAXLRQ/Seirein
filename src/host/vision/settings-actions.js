@@ -9,6 +9,8 @@ export const ACTIONS = Object.freeze([
   'vision.snapshot',
   'vision.watch.start',
   'vision.watch.stop',
+  // P-187 阶段 5：设置页「主动回应」开关，只持久化，下一轮 evaluate 直接读新值。
+  'vision.proactive',
 ]);
 
 export function createVisionSettingsActions(services) {
@@ -88,6 +90,21 @@ export function createVisionSettingsActions(services) {
           const shot = await (0, services.captureForAgent)('settings-test');
           (0, services.assertVisionToken)(services.capturedTokens.get(shot));
           return { ok: true, file: shot.file };
+        } catch (error) {
+          return { ok: false, error: error?.message ?? String(error) };
+        }
+      }
+      case 'vision.proactive': {
+        // 契约：enabled 必须是布尔；只写 settings.json，不重启任何采集/运行时。
+        try {
+          if (typeof body.enabled !== 'boolean') {
+            return { ok: false, error: 'enabled 必须是布尔值' };
+          }
+          const settings = (0, services.readSettings)() ?? {};
+          (0, services.writeSettings)({
+            proactive: { ...(settings.proactive ?? {}), enabled: body.enabled },
+          });
+          return { ok: true, enabled: body.enabled };
         } catch (error) {
           return { ok: false, error: error?.message ?? String(error) };
         }
