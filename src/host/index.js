@@ -671,6 +671,24 @@ function shortStamp(ts) {
 }
 
 /**
+ * One short model-facing line for the manual-write `timeResolved` report. Only successfully
+ * resolved dates are reported: a failed or absent parse never adds an empty line, and the
+ * memory body itself is never repeated. Returns null when there is nothing to show.
+ * @param {{timeResolved?: Array<{term?: string, date?: string|null, ok?: boolean}>}} value
+ */
+function memoryTimeResolvedLine(value) {
+  const items = Array.isArray(value?.timeResolved) ? value.timeResolved : [];
+  const resolved = items.filter((item) => item !== null && typeof item === 'object'
+    && item.ok === true && typeof item.date === 'string' && item.date.length > 0);
+  if (resolved.length === 0) return null;
+  const terms = resolved.map((item) => {
+    const term = typeof item.term === 'string' ? item.term : '';
+    return term.length > 0 ? `${item.date}（${term}）` : item.date;
+  });
+  return `时间已解析：${terms.join('；')}`;
+}
+
+/**
  * The model-facing summary of one delivered frame: metadata only, never anything read out of
  * the picture itself. The image block that follows carries the pixels.
  * @param {{width: number, height: number, bytes: number, createdAt: number, mode: string, scaled: boolean}} value
@@ -7918,12 +7936,30 @@ export function apply(ctx, config) {
           id: { type: 'string' },
           domain: { type: 'string' },
           ts: { type: 'string' },
+          timeResolved: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                term: { type: 'string' },
+                date: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                ok: { type: 'boolean' },
+                reason: { type: 'string' },
+                note: { type: 'string' },
+              },
+              required: ['term', 'date', 'ok'],
+            },
+          },
         },
         required: ['id', 'domain', 'ts'],
       },
-      render: (_args, value) => [
-        { type: 'text', text: `Remembered in "${value.domain}" (${value.id}).` },
-      ],
+      render: (_args, value) => {
+        const blocks = [{ type: 'text', text: `Remembered in "${value.domain}" (${value.id}).` }];
+        const timeLine = memoryTimeResolvedLine(value);
+        if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+        return blocks;
+      },
     },
     execute: tools.executeRemember,
   });
@@ -7999,6 +8035,21 @@ export function apply(ctx, config) {
               required: ['id', 'version', 'domain', 'text', 'ts'],
             },
           },
+          timeResolved: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                term: { type: 'string' },
+                date: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                ok: { type: 'boolean' },
+                reason: { type: 'string' },
+                note: { type: 'string' },
+              },
+              required: ['term', 'date', 'ok'],
+            },
+          },
         },
         required: ['ok', 'error', 'id', 'version', 'idempotent', 'sourceMerged'],
       },
@@ -8029,13 +8080,19 @@ export function apply(ctx, config) {
           return [{ type: 'text', text: `更正失败（${value.error || 'unknown'}）；未做任何修改。` }];
         }
         if (value.idempotent === true) {
-          return [{ type: 'text', text: `这条纠正已经应用过（记录 ${value.id}，当前第 ${value.version} 版），未重复修改。` }];
+          const blocks = [{ type: 'text', text: `这条纠正已经应用过（记录 ${value.id}，当前第 ${value.version} 版），未重复修改。` }];
+          const timeLine = memoryTimeResolvedLine(value);
+          if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+          return blocks;
         }
         const extra = value.extraId.length > 0 ? '；同句的新内容已另记 1 条' : '';
-        return [{
+        const blocks = [{
           type: 'text',
           text: `已更正（第 ${value.version} 版，记录 ${value.id}）：「${value.from}」→「${value.to}」${extra}。`,
         }];
+        const timeLine = memoryTimeResolvedLine(value);
+        if (timeLine !== null) blocks.push({ type: 'text', text: timeLine });
+        return blocks;
       },
     },
     execute: tools.executeMemoryCorrect,

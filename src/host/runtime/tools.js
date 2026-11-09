@@ -16,8 +16,41 @@
 import { AVATAR_ERROR_CODES } from '../avatar/avatarRuntime.js';
 import { truncationNotice } from '../hearing/hearing.js';
 import { deliveredRecallRows, memoryReferentRecord } from '../memory/memory-injection.js';
+import { resolveMemoryTimeZone } from '../memory/memory-normalize.js';
 import { DEFAULT_HOTKEYS, HOTKEY_ACTIONS, hotkeyActionsForCombo, parseBinding } from '../platform/hotkeys.js';
 import { displayMessageSnippet, normalizeDomain, scoreImportance, tokenizeQuery } from '../memory/store.js';
+
+/**
+ * The `timeResolved` contract shared by the two MANUAL write tools (`assistant_remember`,
+ * `assistant_memory_correct`): ALWAYS an array, never `null`/`undefined`.
+ *
+ *   []                                    no relative expression was found
+ *   [{ term, date: 'YYYY-MM-DD', ok: true, note? }]
+ *   [{ term, date: null, ok: false, reason }]   found but deliberately not guessed
+ *
+ * `term` is the user's own word (下周三/明天) and `reason` is a fixed code (recurring, vague,
+ * invalid-date, …). The report never carries the memory body — only this structure. Store
+ * `timeResolved` uses `null` for "nothing found"; this bridge normalizes it to `[]` so callers
+ * have one contract to check.
+ */
+function timeResolvedReport(value) {
+  if (!Array.isArray(value)) return [];
+  const report = [];
+  for (const item of value) {
+    if (item === null || typeof item !== 'object') continue;
+    const term = typeof item.term === 'string' ? item.term : '';
+    if (term.length === 0) continue;
+    const entry = {
+      term,
+      date: typeof item.date === 'string' ? item.date : null,
+      ok: item.ok === true,
+    };
+    if (typeof item.reason === 'string' && item.reason.length > 0) entry.reason = item.reason;
+    if (typeof item.note === 'string' && item.note.length > 0) entry.note = item.note;
+    report.push(entry);
+  }
+  return report;
+}
 
 export function createHostTools(deps) {
   return {
@@ -110,12 +143,19 @@ export function createHostTools(deps) {
       const importance = Number.isFinite(modelImportance)
         ? Math.min(100, Math.max(50, Math.round(modelImportance)))
         : Math.min(100, Math.max(50, scoreImportance(normalized.text, kind)));
+      // Raw vs normalized stay separate: `normalized.text` is what gets indexed (pronouns
+      // resolved, relative dates absolute on this manual lane), while `rawText` is the model's
+      // submitted wording. `add()` re-runs `resolveRelativeTime` on the raw wording to restore the
+      // `2026-11-18（下周三）` bracket and to report `timeResolved`; the store never receives only
+      // an already-absolute body, which would lose the original term.
+      const timeZone = resolveMemoryTimeZone(config?.memory?.timeZone);
       const record = memory.add(domain, normalized.text, kind, {
         source: 'manual',
         importance,
         rawText: normalized.text === normalized.rawText ? null : normalized.rawText,
         unresolved: normalized.unresolved,
         tzUsed: normalized.tz,
+        timeZone,
       });
       if (typeof memory.addLink === 'function') {
         const referentId = memoryReferentRecord(normalized);
@@ -140,11 +180,16 @@ export function createHostTools(deps) {
         source: 'manual',
         promoted: promoted.length,
       });
-      return { id: record.id, domain, ts: record.ts };
+      return {
+        id: record.id,
+        domain,
+        ts: record.ts,
+        timeResolved: timeResolvedReport(record.timeResolved),
+      };
     },
     async executeMemoryCorrect(args, exec) {
       const {
-        SCOPE_ERROR, currentUserMessageId, emitMemoryNormalize, features, log, memory,
+        SCOPE_ERROR, config, currentUserMessageId, emitMemoryNormalize, features, log, memory,
         memoryNormalizeSafe, memoryTurnLedger, memoryTurnScope, scopeBlocksTool,
       } = deps;
       const shape = {
@@ -164,6 +209,7 @@ export function createHostTools(deps) {
         currentVersion: 0,
         text: '',
         candidates: [],
+        timeResolved: [],
       };
       if (scopeBlocksTool(exec)) return { ...shape, error: SCOPE_ERROR };
       if (!features.enabled('memory')) return { ...shape, error: '记忆组件已关闭' };
@@ -174,14 +220,18 @@ export function createHostTools(deps) {
       const sourceMessageId = providedSource.length > 0 ? providedSource : currentUserMessageId(exec);
       // A correction only rewrites an existing fragment, so it gets the time normalization but
       // NEVER pronoun expansion: resolving a pronoun here would change more than the user asked.
-      const replacement = memoryNormalizeSafe(String(args.replacement ?? ''), { expand: false });
+      // The normalized copy is for the audit event; the RAW replacement is what the store gets,
+      // so its own `resolveRelativeTime` can still see `明天` and write `2026-11-10（明天）`.
+      const rawReplacement = String(args.replacement ?? '');
+      const replacement = memoryNormalizeSafe(rawReplacement, { expand: false });
       const result = memory.correct({
         targetId: args.targetId,
         expectedVersion: args.expectedVersion,
         expectedText: args.expectedText,
-        replacement: replacement.text,
+        replacement: rawReplacement,
         sourceMessageId,
         extraText: args.extraText,
+        timeZone: resolveMemoryTimeZone(config?.memory?.timeZone),
       });
       if (result.ok === true && result.idempotent !== true) await emitMemoryNormalize(replacement);
       // E: remember the new version for this turn. The next lookup for that id must re-query
@@ -206,6 +256,7 @@ export function createHostTools(deps) {
       return {
         ...shape,
         ...result,
+        timeResolved: timeResolvedReport(result.timeResolved),
         sourceMerged: result.sourceMerged === true,
         mergeReason: result.mergeReason || (sourceMessageId.length > 0 ? '' : 'no-source'),
       };

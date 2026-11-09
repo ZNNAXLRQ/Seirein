@@ -9,14 +9,15 @@
  *   5. 今天/明天/后天/本周X/下周X/上周X → the right absolute date;
  *   6. a 01:30 local utterance keeps ITS local date (not the 04:00 session boundary);
  *   7. a vague time → original words, unresolved=1;
- *   8. raw_text keeps the original, text is the absolute version;
+ *   8. a manual write keeps the original in raw_text and stores the absolute version;
  *   9. tz_used is persisted and correct (including a non-default zone);
  *  10. normalizing twice changes nothing;
  *  11. manual remember and automatic recording go through the SAME function (injected counter);
  *  12. plain text with no pronoun and no date is untouched and reports no change;
  *  13. the correction replacement is time-normalized but never pronoun-expanded;
  *  14. demonstratives use the same unique object, while 这个方案 stays self-contained;
- *  15. the event carries kinds only, never the memory body.
+ *  15. the event carries kinds only, never the memory body;
+ *  16. the automatic evidence lane keeps relative wording while still expanding pronouns (§6.4).
  *
  * Run: node --test test/memory-normalize.mjs
  */
@@ -249,7 +250,7 @@ test('7) a vague time keeps the original wording and reports unresolved=1', (t) 
   }
 });
 
-test('8) raw_text keeps the original, text is the absolute version', async (t) => {
+test('8) the automatic lane keeps the relative wording verbatim (§6.4)', async (t) => {
   const root = await tempRoot();
   const { memory, recorder } = autoLane(root);
   t.after(() => cleanup(root, memory));
@@ -258,9 +259,9 @@ test('8) raw_text keeps the original, text is the absolute version', async (t) =
   await recorder.handle({ id: 's1' }, userEvent('m8', '明天上午交报告', at));
   const row = rowFor(memory, 'm8');
   t.diagnostic(`text=${row.text} raw_text=${row.raw_text}`);
-  assert.equal(row.text, '2026-11-07上午交报告');
-  assert.equal(row.raw_text, '明天上午交报告');
-  assert.equal(row.unresolved, 0);
+  assert.equal(row.text, '明天上午交报告', 'evidence wording is never rewritten');
+  assert.equal(row.raw_text, null, 'an unchanged body needs no separate raw copy');
+  assert.equal(row.unresolved, 0, 'keeping the wording is intentional, not unresolved');
 });
 
 test('9) tz_used is persisted and honours memory.timeZone', async (t) => {
@@ -279,9 +280,9 @@ test('9) tz_used is persisted and honours memory.timeZone', async (t) => {
   const ny = rowFor(newYork.memory, 'tz-ny');
   t.diagnostic(`shanghai tz=${sh.tz_used} text=${sh.text}; new york tz=${ny.tz_used} text=${ny.text}`);
   assert.equal(sh.tz_used, 'Asia/Shanghai');
-  assert.equal(sh.text, '2026-11-06交报告');
+  assert.equal(sh.text, '今天交报告', 'the automatic lane keeps the spoken wording');
   assert.equal(ny.tz_used, 'America/New_York');
-  assert.equal(ny.text, '2026-11-05交报告');
+  assert.equal(ny.text, '今天交报告', 'the zone is still stamped for later derivation');
   // A broken config falls back to the default zone instead of throwing.
   assert.equal(resolveMemoryTimeZone('Not/AZone'), 'Asia/Shanghai');
 });
@@ -383,7 +384,7 @@ test('15) the memory.normalize event carries kinds only, never the body', async 
   t.diagnostic(`event=${JSON.stringify(event?.payload)}`);
   assert.ok(event !== undefined, 'a normalized write emits memory.normalize');
   assert.deepEqual(Object.keys(event.payload).sort(), ['changes', 'tz', 'unresolved']);
-  assert.ok(event.payload.changes.includes('time'));
+  assert.ok(!event.payload.changes.includes('time'), 'the automatic lane never reports an absolutized date');
   assert.ok(!JSON.stringify(event.payload).includes('要去医院'), 'no memory body in the event');
 });
 
@@ -404,6 +405,9 @@ test('17) the same sentence names the subject first: 他 -> 小明, not the hist
   const out = normalizeForMemory(text, {
     now: BASE,
     context: { previous: ['我养了一只猫，叫团子'] },
+    // A direct comparison caller states its lane; only the recorder's context-without-expand
+    // shape is the evidence lane.
+    resolveTime: true,
   });
   t.diagnostic(`before: ${text} -> after: ${out.text}; unresolved=${out.unresolved}`);
   assert.equal(out.text, '我朋友叫小明，小明2026-11-06来看我');
@@ -652,4 +656,50 @@ test('35) no speaker: 「我明天去」 keeps the original words and reports un
   assert.ok(!out.text.includes('2026-'), 'no date was invented either');
   assert.deepEqual(out.changes, []);
   assert.equal(out.unresolved, 1);
+});
+
+test('36) the automatic-lane call shape keeps relative time; an explicit lane still resolves it', (t) => {
+  // This is the recorder's own call shape: a captured context, no `expand` decision.
+  const auto = normalizeForMemory('明天交报告', {
+    now: BASE, timeZone: 'Asia/Shanghai', context: {},
+  });
+  t.diagnostic(`auto -> ${auto.text}; changes=${auto.changes.join(',')}`);
+  assert.equal(auto.text, '明天交报告');
+  assert.deepEqual(auto.changes, []);
+  assert.equal(auto.rawText, '明天交报告');
+
+  // A manual/comparison caller either states `expand` or `resolveTime`; both still absolutize.
+  const manual = normalizeForMemory('明天交报告', {
+    now: BASE, timeZone: 'Asia/Shanghai', context: {}, expand: true,
+  });
+  assert.equal(manual.text, '2026-11-07交报告');
+  assert.deepEqual(manual.changes, ['time']);
+
+  const explicit = normalizeForMemory('明天交报告', {
+    now: BASE, timeZone: 'Asia/Shanghai', context: {}, resolveTime: true,
+  });
+  assert.equal(explicit.text, '2026-11-07交报告');
+
+  // Backward-compatible default when no context is supplied (plain library call).
+  const plain = normalizeForMemory('明天交报告', { now: BASE });
+  assert.equal(plain.text, '2026-11-07交报告');
+  assert.deepEqual(plain.changes, ['time']);
+
+  // An explicit false wins even for a manual-shaped call.
+  const kept = normalizeForMemory('明天交报告', { now: BASE, expand: true, resolveTime: false });
+  assert.equal(kept.text, '明天交报告');
+  assert.deepEqual(kept.changes, []);
+});
+
+test('37) the automatic lane still expands pronouns, only the date stays as spoken', (t) => {
+  const out = normalizeForMemory('她明天要去医院', {
+    now: BASE,
+    timeZone: 'Asia/Shanghai',
+    context: { previous: ['我养了一只猫，叫团子'] },
+  });
+  t.diagnostic(`auto pronoun+time -> ${out.text}; changes=${out.changes.join(',')}`);
+  assert.equal(out.text, '团子明天要去医院', 'stage-2 anaphora is still applied');
+  assert.deepEqual(out.changes, ['pronoun']);
+  assert.equal(out.unresolved, 0);
+  assert.equal(out.referentId, '');
 });

@@ -20,6 +20,12 @@
  *      the words stay and `unresolved = 1`. Vague expressions (改天/找个时间/下周 without a
  *      weekday) stay as written and set `unresolved = 1`.
  *
+ *      The automatic evidence lane is the exception (§6.4): its body is what the user actually
+ *      said, so relative wording stays verbatim. The recorder is the only caller that supplies a
+ *      captured context without an explicit `expand` decision; every manual/comparison caller
+ *      states `expand` (or `resolveTime`), so this inference is stable. A caller can always state
+ *      `resolveTime` to override it.
+ *
  * Pure and store-free: the auto recorder, `assistant_remember` and the correction replacement
  * all call this one function. Idempotent — normalizing an already-normalized body changes
  * nothing and reports no change.
@@ -601,18 +607,32 @@ function speechTimeBase(prefix, today) {
  * Normalize one memory body before it is written.
  *
  * @param {string} text the sentence as spoken / as the model wrote it
- * @param {{now?: Date|number|string, timeZone?: string, context?: object, expand?: boolean}} [options]
+ * @param {{now?: Date|number|string, timeZone?: string, context?: object, expand?: boolean,
+ *          resolveTime?: boolean}} [options]
  *   `now` is the utterance instant (default: now); `context.previous` is the recent conversation
  *   (chronological) and `context.entities` an explicit candidate list; `expand:false` turns off
  *   pronoun expansion (used by the correction replacement).
+ *   `resolveTime` states whether relative dates are absolutized. When it is omitted, the
+ *   automatic evidence lane (a captured `context` with no explicit `expand`) keeps the words
+ *   verbatim (§6.4); every other call resolves them as before.
  * @returns {{text: string, rawText: string, changes: string[], unresolved: 0|1, tz: string,
  *            referentId: string}} `referentId` is the stored record the expanded pronoun was
  *   read from (the `referent` link basis), or '' when there is none.
  */
-export function normalizeForMemory(
-  text,
-  { now = new Date(), timeZone = DEFAULT_MEMORY_TIME_ZONE, context = null, expand = true } = {},
-) {
+export function normalizeForMemory(text, options = {}) {
+  const {
+    now = new Date(),
+    timeZone = DEFAULT_MEMORY_TIME_ZONE,
+    context = null,
+    expand = true,
+  } = options;
+  // §6.4 lane decision. The recorder supplies the captured context but never an `expand`
+  // decision; manual remember/correction and the dedup projection all state `expand`, so they
+  // keep resolving. `resolveTime` is the explicit override (and the only stable contract for a
+  // future caller that happens to look recorder-shaped).
+  const resolveTime = options.resolveTime === undefined
+    ? !(options.context !== undefined && options.context !== null && options.expand === undefined)
+    : options.resolveTime === true;
   const rawText = typeof text === 'string' ? text : '';
   const tz = resolveMemoryTimeZone(timeZone);
   if (rawText.trim().length === 0) {
@@ -645,33 +665,36 @@ export function normalizeForMemory(
   }
 
   // Relative dates are resolved against the utterance's LOCAL date, then written absolutely.
+  // The automatic evidence lane skips this block entirely: its wording is the record.
   let timeChanged = false;
   let quoteTimeUnknown = false;
-  const timePieces = [];
-  for (const node of splitProtected(body)) {
-    if (node.type === 'text') {
-      const replaced = replaceRelativeDates(node.text, today);
+  if (resolveTime) {
+    const timePieces = [];
+    for (const node of splitProtected(body)) {
+      if (node.type === 'text') {
+        const replaced = replaceRelativeDates(node.text, today);
+        if (replaced.changed) timeChanged = true;
+        timePieces.push(replaced.text);
+        continue;
+      }
+      if (node.type === 'title') {
+        // 《明天会更好》 is a title, not a date.
+        timePieces.push(node.raw);
+        continue;
+      }
+      const speech = speechTimeBase(body.slice(0, node.start), today);
+      if (!speech.attributed || speech.base === null) {
+        // Without a speaker time base a quoted date is left as spoken, never guessed.
+        if (hasRelativeDate(node.text)) quoteTimeUnknown = true;
+        timePieces.push(node.raw);
+        continue;
+      }
+      const replaced = replaceRelativeDates(node.text, speech.base);
       if (replaced.changed) timeChanged = true;
-      timePieces.push(replaced.text);
-      continue;
+      timePieces.push(`${node.open}${replaced.text}${node.close}`);
     }
-    if (node.type === 'title') {
-      // 《明天会更好》 is a title, not a date.
-      timePieces.push(node.raw);
-      continue;
-    }
-    const speech = speechTimeBase(body.slice(0, node.start), today);
-    if (!speech.attributed || speech.base === null) {
-      // Without a speaker time base a quoted date is left as spoken, never guessed.
-      if (hasRelativeDate(node.text)) quoteTimeUnknown = true;
-      timePieces.push(node.raw);
-      continue;
-    }
-    const replaced = replaceRelativeDates(node.text, speech.base);
-    if (replaced.changed) timeChanged = true;
-    timePieces.push(`${node.open}${replaced.text}${node.close}`);
+    body = timePieces.join('');
   }
-  body = timePieces.join('');
   if (timeChanged) changes.push(NORMALIZE_CHANGES.TIME);
   if (quoteTimeUnknown) unresolved = 1;
 
