@@ -11,6 +11,8 @@ export const ACTIONS = Object.freeze([
   'vision.watch.stop',
   // P-187 阶段 5：设置页「主动回应」开关，只持久化，下一轮 evaluate 直接读新值。
   'vision.proactive',
+  // 持续观看的独立开关：只写 settings.vision.continuousView；关闭时宿主会立即停采集/理解/候选。
+  'vision.continuousView',
 ]);
 
 export function createVisionSettingsActions(services) {
@@ -125,7 +127,28 @@ export function createVisionSettingsActions(services) {
           return { ok: false, error: error?.message ?? String(error) };
         }
       }
-  }
-};
+      case 'vision.continuousView': {
+        // 持续观看的独立开关。无记录默认 true（兼容旧自动行为），显式 false 原样持久化。
+        // 只写设置并让宿主立即应用停止/等待；不重启插件，也不在这里切换视觉模式。
+        try {
+          if (typeof body.enabled !== 'boolean') {
+            return { ok: false, error: 'enabled 必须是布尔值' };
+          }
+          const settings = (0, services.readSettings)() ?? {};
+          const storedVision = settings.vision !== null && typeof settings.vision === 'object'
+            && !Array.isArray(settings.vision)
+            ? settings.vision
+            : {};
+          (0, services.writeSettings)({
+            vision: { ...storedVision, continuousView: body.enabled },
+          });
+          const state = await (0, services.applyContinuousView)(body.enabled, { reason: 'settings' });
+          return { ok: true, enabled: body.enabled, state: state.state, continuous: state };
+        } catch (error) {
+          return { ok: false, error: error?.message ?? String(error) };
+        }
+      }
+    }
+  };
   return handler;
 }

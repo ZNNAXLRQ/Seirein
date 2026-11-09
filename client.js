@@ -4787,6 +4787,9 @@ window.__ModuleLoader__.load({
       const [proactiveDraft, setProactiveDraft] = useState(null);
       const [proactiveRateDraft, setProactiveRateDraft] = useState(null);
       const [proactiveError, setProactiveError] = useState('');
+      // 持续观看的独立开关：只作为本次动作的乐观值，最终以 status.vision.continuous.enabled 为准。
+      const [continuousDraft, setContinuousDraft] = useState(null);
+      const [continuousError, setContinuousError] = useState('');
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
       const [profileMaintain, setProfileMaintain] = useState(null);
       const [profileDraft, setProfileDraft] = useState(null);
@@ -5934,6 +5937,32 @@ window.__ModuleLoader__.load({
             const proactiveRate = typeof proactiveRateDraft === 'number'
               ? proactiveRateDraft
               : proactiveRateSaved;
+            // 持续观看独立设置：未知（旧 status / 首次加载）按默认开启展示，不写回。
+            const continuousView = vm.continuous ?? {};
+            const continuousSaved = typeof continuousView.enabled === 'boolean'
+              ? continuousView.enabled
+              : true;
+            const continuousOn = typeof continuousDraft === 'boolean' ? continuousDraft : continuousSaved;
+            const continuousState = typeof continuousView.state === 'string'
+              ? continuousView.state
+              : (continuousOn ? 'waiting' : 'off');
+            const continuousLabels = {
+              off: '已关闭',
+              waiting: '等待首次真实陪伴轮 / 依赖就绪',
+              starting: '正在启动',
+              capturing: '采集中',
+              privacy: '隐私模式暂停',
+              failed: '启动失败',
+              retrying: '等待重试',
+            };
+            const continuousStateLabel = continuousLabels[continuousState] ?? continuousState;
+            const continuousSourceLabel = continuousView.source === 'obs'
+              ? `OBS 场景「${vm.scene || '未指定'}」`
+              : '桌面';
+            const continuousAt = (value) => {
+              const at = Number(value);
+              return Number.isFinite(at) && at > 0 ? new Date(at).toLocaleTimeString() : '—';
+            };
             // 通过率提交：先乐观写本地，成功以宿主返回的 0–100 值为准，失败清掉乐观值回滚。
             const commitProactiveRate = async () => {
               const next = clampProactiveRate(proactiveRate);
@@ -6006,9 +6035,53 @@ window.__ModuleLoader__.load({
                 : source === 'obs'
                   ? `${sourceLabel}（虚拟摄像头）`
                   : '桌面（ffmpeg ddagrab，不经 OBS）'),
-              line('持续观看', capturing
+              line('即时观看', capturing
                 ? `采集中 · 最近取景 ${lastCaptureText}`
                 : vm.lastCaptureAt ? `未启动 · 最近取景 ${lastCaptureText}` : '未启动'),
+              h('div', { style: styles.row },
+                h('span', { style: styles.label },
+                  '持续观看（后台证据采集）',
+                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（默认开启；关闭后不会自动恢复）')),
+                h('button', {
+                  'data-settings-toggle': 'vision-continuous-view',
+                  style: { ...(continuousOn ? styles.btnActive : styles.btn), ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow,
+                  onClick: async () => {
+                    const next = !continuousOn;
+                    setContinuousDraft(next);
+                    setContinuousError('');
+                    const result = await act(
+                      { action: 'vision.continuousView', enabled: next },
+                      'vision-continuous-view',
+                    );
+                    if (result?.ok === true) {
+                      // 成功以宿主返回的有效值为准；没带布尔值时保留乐观值，等 status 刷新校正。
+                      setContinuousDraft(typeof result.enabled === 'boolean' ? result.enabled : next);
+                      return;
+                    }
+                    // 失败回滚：清掉乐观值，界面回到 status.vision.continuous.enabled。
+                    setContinuousDraft(null);
+                    setContinuousError(String(result?.error ?? '保存失败'));
+                  },
+                }, continuousOn ? '已开启' : '已关闭')),
+              line('持续观看状态', continuousOn
+                ? `${continuousStateLabel}${continuousState === 'capturing' ? ` · ${continuousSourceLabel}` : ''}`
+                : '已关闭，不会自动恢复'),
+              line('持续观看来源', continuousView.source === 'obs' ? 'OBS 场景' : '桌面'),
+              line('最近帧', continuousAt(continuousView.lastFrameAt)),
+              line('最近理解', continuousAt(continuousView.lastUnderstandingAt)),
+              continuousOn && continuousView.retryAt
+                ? line('下次重试', continuousAt(continuousView.retryAt))
+                : null,
+              continuousOn && continuousView.error
+                ? line('失败原因', String(continuousView.error))
+                : null,
+              continuousError !== ''
+                ? h('div', { style: { ...styles.hint, color: DANGER } }, `持续观看保存失败：${continuousError}`)
+                : null,
+              h('div', { style: styles.hint }, continuousOn
+                ? '持续观看默认开启（兼容旧版自动行为）：只有真实陪伴轮出现后才开始；隐私、视觉组件关闭或依赖缺失时暂停/失败。'
+                : '已关闭，不会自动恢复：首轮、切换来源、重试和重启插件都不会重新打开；只有再次打开这个开关才会恢复。'),
               line('虚拟摄像头', vm.virtualCam
                 ? capturing ? '运行中（持续观看占用）' : `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
                 : '已停止（取景时按需启动；用户自启的不会关闭）'),

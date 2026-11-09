@@ -9831,6 +9831,15 @@ export function apply(ctx, config) {
     const stored = readSettings()?.proactive?.rate;
     return Number.isInteger(stored) && stored >= 0 && stored <= 100 ? stored : 100;
   };
+  /**
+   * 持续观看（后台证据采集）的独立设置：`settings.vision.continuousView`。
+   * 无记录时默认 `true`，兼容旧版“进入陪伴会话后自动持续观看”的行为；用户显式写下的
+   * `false` 必须原样保留，任何首轮/切源/重试路径都不得把它翻回 true。
+   */
+  const continuousViewEnabled = () => {
+    const stored = readSettings()?.vision?.continuousView;
+    return typeof stored === 'boolean' ? stored : true;
+  };
   const proactive = createProactiveArbiter();
   const proactiveLine = createProactiveLineGenerator({
     getService,
@@ -10184,7 +10193,9 @@ export function apply(ctx, config) {
     }).filter((entry) => typeof entry.file === 'string'),
     audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
     isBlocked: () => companionSessionSeen !== true || visionDisposed || visionChanging
-      || shutdown.closing || vision.mode === 'privacy' || features.enabled('vision') !== true,
+      || shutdown.closing || vision.mode === 'privacy' || features.enabled('vision') !== true
+      // 持续观看关闭后，后台理解也必须停：评论定向补看等旁路不能再凭旧材料排一次分析。
+      || !continuousViewEnabled(),
     minIntervalMs: understandingMinIntervalMs,
     // 运行时以单对象 `{type, ok, reason, ...}` 回调 emit；展开成宿主事件名，避免 type 变成对象。
     emit: (event, payload) => {
@@ -10196,7 +10207,11 @@ export function apply(ctx, config) {
       void log.emit(event, payload).catch(() => {});
     },
     // 阶段 5：成功并入状态后登记带 reaction 的主动候选（回调只看副本，抛错由运行时兜底）。
-    onAdvance: (update) => proposeProactive(update),
+    // 同时记录最近一次成功的后台理解时间：设置页的“最近理解”只认成功结果，不认进程存活。
+    onAdvance: (update) => {
+      continuousViewLastUnderstandingAt = Date.now();
+      proposeProactive(update);
+    },
   });
   /**
    * 设置页成本概览的只读数值：最短间隔是限速下限，`theoretical*` 只是“持续有变化可触发”时
@@ -10464,18 +10479,40 @@ export function apply(ctx, config) {
   let evidenceCaptureAbort = null;
   let evidenceRetryTimer = null;
   /**
+   * 持续观看状态机（`/assistant/status.vision.continuous`）。与 `evidenceCapture.running`
+   * 分开：进程在跑只说明会话存在，`lastFrameAt` 必须来自真正登记进证据窗口的帧。
+   * `starting` 只在启动 await 期间为 true，绝不能在此时把状态写成 `capturing`。
+   */
+  let continuousViewStarting = false;
+  /** 每次 start/stop 递增；迟到回来的启动结果不得覆盖新一代状态。 */
+  let continuousViewAttempt = 0;
+  let continuousViewLastFrameAt = null;
+  let continuousViewLastUnderstandingAt = null;
+  let continuousViewLastError = '';
+  /** 失败分类：`deterministic` 不排定时重试；`transient` 才按退避重试。 */
+  let continuousViewErrorKind = '';
+  let continuousViewRetryAt = null;
+  let continuousViewRetryAttempt = 0;
+  /**
    * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到非子代理、工作区内的真实 pre-step 时才置位。
    * 工具挂载、设置页、裸宿主 mount 都不置位，所以后台证据采集不会在测试/开机未使用时碰屏幕。
    */
   let companionSessionSeen = false;
   const clearEvidenceRetry = () => {
+    continuousViewRetryAt = null;
     if (evidenceRetryTimer === null) return;
     clearTimeout(evidenceRetryTimer);
     evidenceRetryTimer = null;
   };
+  /** 持续采集的最小依赖：ffmpeg 可解析。OBS 连接在真正的场景启动路径里再核。 */
+  const continuousDependenciesReady = () => {
+    try { return resolveFfmpeg(root, config) !== null; } catch { return false; }
+  };
   const evidenceCaptureAllowed = () => {
     // 测试/诊断逃生阀：显式关闭时绝不启动持续采集；默认 undefined 视作开启，生产行为不变。
     if (config?.evidenceCaptureEnabled === false) return false;
+    // 独立设置优先：关闭后任何启动路径（首轮/切模式/feature enable/retry）都不得重新打开。
+    if (!continuousViewEnabled()) return false;
     if (companionSessionSeen !== true) return false;
     if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return false;
     try { return features.enabled('vision') === true; } catch { return false; }
@@ -10535,6 +10572,10 @@ export function apply(ctx, config) {
       const capturedAt = Number.isFinite(sheetCapturedAt) && sheetCapturedAt > 0
         ? sheetCapturedAt
         : Date.now();
+      // “最近帧”只认真正落进证据窗口的帧，不认 ffmpeg 进程/会话的 startedAt。
+      continuousViewLastFrameAt = continuousViewLastFrameAt === null
+        ? capturedAt
+        : Math.max(continuousViewLastFrameAt, capturedAt);
       // 材料签名只做去重：同一份 sheet 被重复投递时不再排一次理解（不读像素）。
       noteUnderstandingChange({
         reason: 'sheet',
@@ -10547,43 +10588,93 @@ export function apply(ctx, config) {
     isBlocked: () => evidenceCaptureHolding !== true || visionDisposed || visionChanging
       || shutdown.closing || vision.mode === 'privacy',
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
+    // 测试缝：缩短取帧节奏，不需要真实等待 2 秒；生产默认仍由 evidence-capture 决定。
+    ...(Number.isFinite(Number(config?.evidenceCaptureTickMs)) && Number(config.evidenceCaptureTickMs) > 0
+      ? { tickMs: Math.max(1, Math.floor(Number(config.evidenceCaptureTickMs))) }
+      : {}),
   });
   /**
-   * 启动持续证据采集。失败（例如没有 ffmpeg、OBS 摄像头未就绪）只记事件；最多每分钟重试一次，
-   * 下一次切源/启停组件也会重新尝试，绝不 tight-loop。
+   * 确定性错误：再等 60 秒也只会得到同一个结果（缺 ffmpeg、场景未配置、组件被关闭、
+   * 隐私锁定、来源与代次不一致）。这类失败不排定时重试，等依赖/配置变化后的下一次显式
+   * 启动（首轮、切模式、feature enable、设置开关）再试。
+   */
+  const isDeterministicEvidenceError = (error) => {
+    const message = error?.message ?? String(error ?? '');
+    if (message.length === 0) return false;
+    return /未找到\s*ffmpeg|ffmpeg\s*(?:未找到|not found|is missing)|缺少\s*ffmpeg/iu.test(message)
+      || /场景模式需要|未找到\s*OBS|OBS\s*(?:未运行|不可用|未连接|无法连接)/iu.test(message)
+      || /来源与当前视觉模式不一致|隐私|组件.*(?:关闭|未启用)|FEATURE_DISABLED/iu.test(message);
+  };
+  /** 非确定性错误才退避重试：60s → 120s → 240s，最长 5 分钟；测试可用配置缩短。 */
+  const evidenceRetryDelayMs = (attempt) => {
+    const configured = Number(config?.evidenceCaptureRetryBaseMs);
+    const base = Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 60_000;
+    return Math.min(300_000, base * 2 ** Math.max(0, attempt - 1));
+  };
+  /**
+   * 启动持续证据采集。门禁关闭时返回 false 且不产生任何副作用。失败只记事件：
+   * 确定性错误进入 `failed` 并等待依赖/配置变化；其它错误进入退避 `retrying`，绝不 tight-loop。
    */
   const startEvidenceCapture = async (reason = 'startup') => {
     clearEvidenceRetry();
     if (!evidenceCaptureAllowed()) return false;
+    const attempt = ++continuousViewAttempt;
+    continuousViewStarting = true;
+    continuousViewLastError = '';
+    continuousViewErrorKind = '';
     evidenceCaptureHolding = true;
     try {
       const result = await evidenceCapture.start({
         source: vision.mode === 'scene' ? 'obs' : 'screen',
       });
+      if (attempt !== continuousViewAttempt) return false;
       const active = result?.running === true;
       evidenceCaptureHolding = active;
-      // 证据故事板同样占着虚拟摄像头：场景空闲关摄像头必须让路。
-      if (active) clearSceneIdle();
+      if (active) {
+        continuousViewLastError = '';
+        continuousViewErrorKind = '';
+        continuousViewRetryAttempt = 0;
+        // 证据故事板同样占着虚拟摄像头：场景空闲关摄像头必须让路。
+        clearSceneIdle();
+      }
       return active;
     } catch (error) {
+      if (attempt !== continuousViewAttempt) return false;
       try { evidenceCaptureAbort?.abort(error); } catch { /* already aborted */ }
       evidenceCaptureAbort = null;
       evidenceCaptureHolding = false;
+      const message = error?.message ?? String(error);
+      continuousViewLastError = message;
+      continuousViewErrorKind = isDeterministicEvidenceError(error) ? 'deterministic' : 'transient';
       await log.emit('vision.evidence.capture.start-failed', {
-        reason, error: error?.message ?? String(error),
+        reason,
+        error: message,
+        retry: continuousViewErrorKind === 'deterministic' ? 'none' : 'backoff',
       }).catch(() => {});
-      if (evidenceCaptureAllowed() && !visionDisposed && !shutdown.closing) {
+      if (continuousViewErrorKind === 'deterministic') {
+        // 等依赖/配置变化：不排定时器，retryAt 保持 null。
+        continuousViewRetryAt = null;
+      } else if (evidenceCaptureAllowed() && !visionDisposed && !shutdown.closing) {
+        continuousViewRetryAttempt += 1;
+        const delay = evidenceRetryDelayMs(continuousViewRetryAttempt);
+        continuousViewRetryAt = Date.now() + delay;
         evidenceRetryTimer = setTimeout(() => {
           evidenceRetryTimer = null;
+          if (!evidenceCaptureAllowed()) return;
           void startEvidenceCapture('retry');
-        }, 60_000);
+        }, delay);
         evidenceRetryTimer.unref?.();
       }
       return false;
+    } finally {
+      if (attempt === continuousViewAttempt) continuousViewStarting = false;
     }
   };
-  /** 停止持续证据采集；代次一停，旧会话迟到的 sheet/错误由模块丢弃。 */
+  /** 停止持续证据采集；代次一停，旧会话迟到的 sheet/错误由模块丢弃，在途重试也一并取消。 */
   const stopEvidenceCapture = async (reason = 'stop') => {
+    // 关闭/切源/隐私都是新的代次：迟到回来的 start 结果不得再改状态。
+    continuousViewAttempt += 1;
+    continuousViewStarting = false;
     clearEvidenceRetry();
     // 采集停止是材料代次的边界：下一次启动的第一张 sheet 必须能重新触发理解。
     resetUnderstandingMaterial();
@@ -10599,6 +10690,62 @@ export function apply(ctx, config) {
       }).catch(() => {});
       return evidenceCapture.status();
     }
+  };
+  /**
+   * `/assistant/status.vision.continuous`：独立于 `evidenceCapture.running` 的状态机。
+   * `off` 优先于隐私/重试；`capturing` 只在采集会话真的 running 时出现，启动 await 期间是
+   * `starting`，进程存在但还没有有效帧也不算“有画面”。
+   */
+  const continuousViewStatus = () => {
+    const enabled = continuousViewEnabled();
+    const capture = evidenceCapture.status();
+    const mode = vision.mode === 'privacy' ? visionReturn.mode : vision.mode;
+    let state = 'waiting';
+    if (!enabled) state = 'off';
+    else if (vision.mode === 'privacy') state = 'privacy';
+    else if (continuousViewRetryAt !== null) state = 'retrying';
+    else if (continuousViewStarting) state = 'starting';
+    else if (capture.running === true) state = 'capturing';
+    else if (continuousViewLastError !== '') state = 'failed';
+    return {
+      enabled,
+      state,
+      source: mode === 'scene' ? 'obs' : 'desktop',
+      lastFrameAt: continuousViewLastFrameAt,
+      lastUnderstandingAt: continuousViewLastUnderstandingAt,
+      error: continuousViewLastError,
+      retryAt: continuousViewRetryAt,
+      companionSeen: companionSessionSeen === true,
+    };
+  };
+  /**
+   * 设置页动作 `vision.continuousView` 的运行时半段：设置已经写盘，这里只负责立即生效。
+   * 关闭：停采集、清后台理解、取消在途分析/主动候选、取消重试；不重建任何运行时。
+   * 开启：只有门禁全开且依赖就绪才启动，否则保持 `waiting`，等首次真实陪伴轮/依赖恢复。
+   */
+  const applyContinuousView = async (enabled, { reason = 'settings' } = {}) => {
+    if (enabled !== true) {
+      // 先同步关掉所有门禁/在途工作，再等待采集会话退出：关闭是立即生效的，不能被
+      // stop() 的最长 5 秒等待拖住理解/候选的取消。
+      continuousViewAttempt += 1;
+      continuousViewStarting = false;
+      evidenceCaptureHolding = false;
+      clearEvidenceRetry();
+      try { understanding.clear(`continuous-off:${reason}`); } catch { /* runtime may be disposing */ }
+      abortProactive();
+      proactive.cancelAll('continuous-disabled');
+      resetProactive('continuous-disabled');
+      continuousViewLastError = '';
+      continuousViewErrorKind = '';
+      continuousViewRetryAttempt = 0;
+      continuousViewRetryAt = null;
+      await stopEvidenceCapture(`continuous-off:${reason}`);
+      return continuousViewStatus();
+    }
+    if (evidenceCaptureAllowed() && continuousDependenciesReady()) {
+      void startEvidenceCapture(`continuous-on:${reason}`);
+    }
+    return continuousViewStatus();
   };
   /**
    * Session -> the turn the pre-step opened. A tool call does not carry the pre-step payload, so
@@ -10740,8 +10887,15 @@ export function apply(ctx, config) {
 
   const persistVision = () => {
     const snapshot = vision.snapshot();
+    // Preserve independent vision settings (e.g. continuousView): this writer owns only the
+    // mode/scene/return fields and must never drop a user's persisted switch.
+    const stored = readSettings()?.vision;
+    const storedVision = stored !== null && typeof stored === 'object' && !Array.isArray(stored)
+      ? stored
+      : {};
     writeSettings({
       vision: {
+        ...storedVision,
         mode: snapshot.mode,
         scene: snapshot.scene,
         returnMode: visionReturn.mode,
@@ -11418,6 +11572,26 @@ export function apply(ctx, config) {
    * preparation capture before the first model request. Returns nothing and never throws: a
    * failed preparation leaves the turn running and the first visual read captures normally.
    */
+  /**
+   * 持续观看只认“真实陪伴轮”：必须是陪伴会话本身（`isCompanionAgent`），且不是子代理、
+   * 编码代理、摘要/后台维护轮。`isCompanionAgent` 已覆盖子代理与当日陪伴 id，这里把
+   * maintenance/background purpose 显式挡住，避免以后新增后台轮次时误置位 companionSessionSeen。
+   */
+  const isCompanionEvidenceTurn = (agent) => {
+    try {
+      if (isSubagentAgent(agent)) return false;
+      if (agent?.options?.background === true) return false;
+      const purpose = String(agent?.options?.purpose ?? agent?.session?.header?.purpose ?? '')
+        .trim()
+        .toLowerCase();
+      if (/^(?:compaction|summary|summarize|maintenance|background|digest|profile|memory)(?:[-_:].*)?$/u.test(purpose)) {
+        return false;
+      }
+      return isCompanionAgent(agent);
+    } catch {
+      return false;
+    }
+  };
   const prepareVisionForTurn = async (payload, decision) => {
     if (Number(payload?.step) !== 1) return;
     if (decision === null || typeof decision !== 'object' || decision.kind === 'reject') return;
@@ -11427,10 +11601,12 @@ export function apply(ctx, config) {
     const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : '';
     const turn = Number.isSafeInteger(payload?.turn) ? payload.turn : -1;
     if (sessionId.length === 0 || turn < 0) return;
-    // 只有这一条路径能证明“用户真的进入了陪伴会话”：工具挂载、设置页、裸宿主 mount 都走不到。
-    // 置位后持续证据采集才被允许；首次置位同时尝试启动一次（隐私/组件关闭时由 allowed 拒绝）。
-    const firstCompanionTurn = companionSessionSeen !== true;
-    companionSessionSeen = true;
+    // 只有真实陪伴轮能证明“用户真的进入了陪伴会话”：工具挂载、设置页、裸宿主 mount、
+    // 编码代理/子代理/摘要后台轮都走不到这里。首次置位同时尝试启动一次（开关/隐私/
+    // 组件关闭时由 evidenceCaptureAllowed 拒绝）。
+    const companionTurn = isCompanionEvidenceTurn(agent);
+    const firstCompanionTurn = companionTurn && companionSessionSeen !== true;
+    if (companionTurn) companionSessionSeen = true;
     const source = vision.mode === 'scene' ? 'obs' : 'desktop';
     const scene = vision.mode === 'scene' ? vision.scene : '';
     // Always open the turn scope: a snapshot from the previous turn must not be reused even
@@ -11445,7 +11621,8 @@ export function apply(ctx, config) {
       enabled = false;
     }
     if (!enabled) return;
-    if (firstCompanionTurn) void startEvidenceCapture('first-turn');
+    // 独立开关关闭时，首轮也不得启动持续采集；evidenceCaptureAllowed 还会再核一次。
+    if (firstCompanionTurn && continuousViewEnabled()) void startEvidenceCapture('first-turn');
     if (!visionLookRequested(payload?.messages)) return;
     // `prepare` reports its own miss and swallows the failure (fail-open).
     await preRequestVision.prepare({
@@ -18141,6 +18318,8 @@ export function apply(ctx, config) {
         evidence: evidenceWindow.state(),
         // 持续证据采集的只读状态：计数/时间/来源，不含文件路径；不启动或停止任何东西。
         evidenceCapture: evidenceCapture.status(),
+        // 持续观看的独立设置 + 状态机：关闭后任何路径都不得自动恢复；`running` 不能代表有画面。
+        continuous: continuousViewStatus(),
         // P-186/P-187 阶段 2 的只读评论证据计数：sessions/latestAt/attached，绝不含对齐正文。
         comment: commentEvidence.state(),
         // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
@@ -18719,6 +18898,7 @@ export function apply(ctx, config) {
   }) },
 { actions: visionActions, handle: createVisionSettingsActions({
     get applyVisionMode() { return applyVisionMode; },
+    get applyContinuousView() { return applyContinuousView; },
     get assertVisionToken() { return assertVisionToken; },
     get captureForAgent() { return captureForAgent; },
     get capturedTokens() { return capturedTokens; },
