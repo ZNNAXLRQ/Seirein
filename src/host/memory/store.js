@@ -15,6 +15,18 @@ import { DatabaseSync } from 'node:sqlite';
 import { DOMAIN_RE, nowIso } from '../runtime/event-log.js';
 export { nowIso, resolveRoot, normalizeDomain, EventLog } from '../runtime/event-log.js';
 import {
+  DEFAULT_MEMORY_TIME_ZONE,
+  resolveMemoryTimeZone,
+  zonedDateParts,
+} from './memory-normalize.js';
+import { dedupCandidates as findDedupCandidates } from './dedup-candidates.js';
+export {
+  DEDUP_DEFAULTS,
+  dedupCandidates,
+  dedupSimilarity,
+  normalizeForDedup,
+} from './dedup-candidates.js';
+import {
   CLARITY_LEVELS,
   BAND_CUTOFFS,
   PRESSURE_RELEASE_RATIO,
@@ -101,6 +113,353 @@ function serializeSpeakerAttribution(value) {
     : (value.confidence === 'mismatch' ? 'mismatch' : 'unsure');
   const at = typeof value.at === 'string' && value.at.length > 0 ? value.at : null;
   return JSON.stringify({ speakerId, assigned, confidence, source: 'shadow', at });
+}
+
+// ---- P-67 §6: manual-lane relative time ------------------------------------
+//
+// The MANUAL lane (`assistant_remember` → add(), `correct()`) stores a concrete calendar date
+// and keeps the original wording in full-width parentheses: `下周三` → `2026-11-18（下周三）`.
+// The automatic lane is deliberately NOT rewritten (design §6.4: a quoted message is evidence
+// of what the user said, and its `ts` + the 04:00 day boundary already carry the date).
+//
+// Parsing is conservative: every expression below is deterministically resolvable, and anything
+// vague/ambiguous keeps its original wording and is REPORTED (`ok:false`, `reason`) instead of
+// being guessed. `now` is the injected reference instant; the day anchor uses the same 04:00
+// boundary as `dayStampFor` (design §6.2), never the UTC date.
+const TIME_DAY_MS = 86_400_000;
+const TIME_ROLLOVER_HOUR = 4;
+const TIME_MAX_ITEMS = 16;
+const TIME_MAX_OFFSET_DAYS = 366;
+
+const TIME_CN_DIGITS = new Map([
+  ['零', 0], ['〇', 0], ['一', 1], ['二', 2], ['两', 2], ['三', 3], ['四', 4],
+  ['五', 5], ['六', 6], ['七', 7], ['八', 8], ['九', 9],
+]);
+const TIME_DAY_OFFSETS = new Map([
+  ['大后天', 3], ['大前天', -3], ['今天', 0], ['今日', 0], ['今儿', 0],
+  ['明天', 1], ['明日', 1], ['明儿', 1], ['后天', 2],
+  ['昨天', -1], ['昨日', -1], ['前天', -2],
+]);
+const TIME_COMPOUND_OFFSETS = new Map([
+  ['今晚', 0], ['今早', 0], ['明晚', 1], ['明早', 1], ['昨晚', -1], ['昨早', -1],
+]);
+const TIME_WEEKDAYS = new Map([
+  ['一', 1], ['二', 2], ['三', 3], ['四', 4], ['五', 5], ['六', 6], ['日', 7], ['天', 7],
+]);
+/** Spans whose contents are quoted/titled (or already annotated); never rewritten. */
+const TIME_SPAN_CLOSE = new Map([
+  ['《', '》'], ['「', '」'], ['『', '』'], ['【', '】'], ['“', '”'],
+  ['（', '）'], ['(', ')'], ['"', '"'],
+]);
+/** "改天/那天/过几天" name a moment but cannot be turned into one calendar day. */
+const TIME_VAGUE_RE = /(改天|改日|那天|到时候|某天|某日|过几天|过阵子|以后再说|回头)/u;
+
+/**
+ * One combined matcher, longest/most specific first. Named groups tell the resolver which
+ * expression fired; the order also prevents `每周三` from being read as a one-off `周三`.
+ */
+const TIME_RE = new RegExp(
+  [
+    String.raw`(?<recurring>每\s*(?:天|日|周|星期|礼拜|月|年|逢)[一二三四五六日天\d]*)`,
+    String.raw`(?<monthRange>(?<monthPrefix>下|上|本|这)\s*个?\s*月(?:\s*(?<monthEdge>初|底|末)|(?<monthDay>[一二三四五六七八九十\d]{1,3})\s*[号日])?)`,
+    String.raw`(?<bareMonthEdge>月(?:底|末|初))`,
+    String.raw`(?<weekRange>(?<weekPrefix>上上|下下|上|下|本|这)\s*个?\s*(?:周|星期|礼拜)\s*(?<weekDay>[一二三四五六日天])?)`,
+    String.raw`(?<bareWeek>(?:周|星期|礼拜)\s*(?<bareWeekDay>[一二三四五六日天]))`,
+    String.raw`(?<day>大后天|大前天|今天|今日|今儿|明天|明日|明儿|后天|昨天|昨日|前天)`,
+    String.raw`(?<compound>今(?:晚|早)|明(?:晚|早)|昨(?:晚|早))`,
+    String.raw`(?<!每)(?<offsetAfter>(?<offsetAfterNum>\d+|[一二三四五六七八九十两]+)\s*天\s*(?:之)?(?:后|後))`,
+    String.raw`(?<!每)(?<offsetBefore>(?<offsetBeforeNum>\d+|[一二三四五六七八九十两]+)\s*天\s*前)`,
+    String.raw`(?<offsetOver>过\s*(?<offsetOverNum>\d+|[一二三四五六七八九十两]+)\s*天)`,
+  ].join('|'),
+  'gu',
+);
+
+function timePad(value) {
+  return String(value).padStart(2, '0');
+}
+
+/** A usable instant from a Date/number/ISO string; never throws on bad input. */
+function timeInstant(value) {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value : new Date();
+  if (typeof value === 'number') return Number.isFinite(value) ? new Date(value) : new Date();
+  if (typeof value === 'string') {
+    const stamp = Date.parse(value);
+    return Number.isFinite(stamp) ? new Date(stamp) : new Date();
+  }
+  return new Date();
+}
+
+/** Local calendar anchor with the 04:00 day boundary (§6.2), never the UTC date. */
+function timeAnchor(now, timeZone) {
+  const instant = timeInstant(now);
+  const zone = resolveMemoryTimeZone(timeZone);
+  const shifted = new Date(instant.getTime() - TIME_ROLLOVER_HOUR * 3_600_000);
+  return { ...zonedDateParts(shifted, zone), timeZone: zone };
+}
+
+function timeShift(parts, days) {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day) + days * TIME_DAY_MS);
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+/** Monday-based weekday: 1 = Monday … 7 = Sunday. */
+function timeWeekday(parts) {
+  return ((new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay() + 6) % 7) + 1;
+}
+
+/** `YYYY-MM-DD` of calendar parts, or null when the parts do not name a real day. */
+function timeStamp(parts) {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+  if (
+    date.getUTCFullYear() !== parts.year
+    || date.getUTCMonth() !== parts.month - 1
+    || date.getUTCDate() !== parts.day
+  ) {
+    return null;
+  }
+  return `${parts.year}-${timePad(parts.month)}-${timePad(parts.day)}`;
+}
+
+function timeLastDay(year, month) {
+  return new Date(Date.UTC(year, month, 0)).getUTCDate();
+}
+
+/** Arabic or simple Chinese numeral (1..99); anything else is refused, not guessed. */
+function timeNumber(value) {
+  const text = String(value ?? '').trim();
+  if (/^\d+$/u.test(text)) return Number(text);
+  if (text.length === 0) return Number.NaN;
+  if (text.includes('十')) {
+    const [tensRaw, onesRaw] = text.split('十');
+    const tens = tensRaw.length === 0 ? 1 : TIME_CN_DIGITS.get(tensRaw);
+    const ones = onesRaw.length === 0 ? 0 : TIME_CN_DIGITS.get(onesRaw);
+    return Number.isInteger(tens) && Number.isInteger(ones) ? tens * 10 + ones : Number.NaN;
+  }
+  if (text.length === 1) return TIME_CN_DIGITS.get(text) ?? Number.NaN;
+  return Number.NaN;
+}
+
+function timeMonthDate(anchor, prefix, edge, dayText) {
+  const shift = prefix === '下' ? 1 : prefix === '上' ? -1 : 0;
+  const index = anchor.year * 12 + (anchor.month - 1) + shift;
+  const year = Math.floor(index / 12);
+  const month = ((index % 12) + 12) % 12 + 1;
+  let day;
+  if (edge === '初') day = 1;
+  else if (edge === '底' || edge === '末') day = timeLastDay(year, month);
+  else if (typeof dayText === 'string') day = timeNumber(dayText);
+  else return { date: null, ok: false, reason: 'missing-day' };
+  if (!Number.isInteger(day) || day < 1 || day > 31) {
+    return { date: null, ok: false, reason: 'invalid-date' };
+  }
+  const date = timeStamp({ year, month, day });
+  return date === null
+    ? { date: null, ok: false, reason: 'invalid-date' }
+    : { date, ok: true };
+}
+
+function timeWeekDate(anchor, prefix, weekdayText) {
+  const weekday = TIME_WEEKDAYS.get(weekdayText);
+  if (weekday === undefined) return { date: null, ok: false, reason: 'missing-weekday' };
+  const current = timeWeekday(anchor);
+  let delta;
+  if (prefix === '上上') delta = -14 + (weekday - current);
+  else if (prefix === '下下') delta = 14 + (weekday - current);
+  else if (prefix === '上') delta = -7 + (weekday - current);
+  else if (prefix === '下') delta = 7 + (weekday - current);
+  else if (prefix === '本' || prefix === '这') delta = weekday - current;
+  else delta = (weekday - current + 7) % 7; // bare 周X = nearest future occurrence
+  const date = timeStamp(timeShift(anchor, delta));
+  if (date === null) return { date: null, ok: false, reason: 'invalid-date' };
+  return prefix === undefined
+    ? { date, ok: true, note: 'next-occurrence' }
+    : { date, ok: true };
+}
+
+function timeOffsetDate(anchor, amount, direction) {
+  const days = timeNumber(amount);
+  if (!Number.isInteger(days) || days < 1 || days > TIME_MAX_OFFSET_DAYS) {
+    return { date: null, ok: false, reason: 'out-of-range' };
+  }
+  const date = timeStamp(timeShift(anchor, direction * days));
+  return date === null
+    ? { date: null, ok: false, reason: 'invalid-date' }
+    : { date, ok: true };
+}
+
+function timeResolveTerm(term, groups, anchor, { bareWeekdays }) {
+  if (groups.recurring !== undefined) return { date: null, ok: false, reason: 'recurring' };
+  if (groups.monthRange !== undefined) {
+    return timeMonthDate(anchor, groups.monthPrefix, groups.monthEdge, groups.monthDay);
+  }
+  if (groups.bareMonthEdge !== undefined) {
+    return timeMonthDate(anchor, '本', groups.bareMonthEdge.slice(1), undefined);
+  }
+  if (groups.weekRange !== undefined) {
+    if (groups.weekDay === undefined) return { date: null, ok: false, reason: 'missing-weekday' };
+    return timeWeekDate(anchor, groups.weekPrefix, groups.weekDay);
+  }
+  if (groups.bareWeek !== undefined) {
+    if (!bareWeekdays) return { date: null, ok: false, reason: 'ambiguous-weekday' };
+    return timeWeekDate(anchor, undefined, groups.bareWeekDay);
+  }
+  if (groups.day !== undefined) {
+    const offset = TIME_DAY_OFFSETS.get(term);
+    if (offset === undefined) return { date: null, ok: false, reason: 'unresolved-term' };
+    const date = timeStamp(timeShift(anchor, offset));
+    return date === null ? { date: null, ok: false, reason: 'invalid-date' } : { date, ok: true };
+  }
+  if (groups.compound !== undefined) {
+    const offset = TIME_COMPOUND_OFFSETS.get(term);
+    if (offset === undefined) return { date: null, ok: false, reason: 'unresolved-term' };
+    const date = timeStamp(timeShift(anchor, offset));
+    return date === null ? { date: null, ok: false, reason: 'invalid-date' } : { date, ok: true };
+  }
+  if (groups.offsetAfter !== undefined) {
+    return timeOffsetDate(anchor, groups.offsetAfterNum, 1);
+  }
+  if (groups.offsetBefore !== undefined) {
+    return timeOffsetDate(anchor, groups.offsetBeforeNum, -1);
+  }
+  if (groups.offsetOver !== undefined) {
+    return timeOffsetDate(anchor, groups.offsetOverNum, 1);
+  }
+  return null;
+}
+
+/**
+ * Split text into plain and protected spans. A title/quotation/parenthetical is never rewritten:
+ * `《明天会更好》` is a name, and `2026-11-11（下周三）` is already annotated. An unmatched opener
+ * stays plain (there is no reliable span to protect).
+ */
+function splitTimeSpans(text) {
+  const nodes = [];
+  let index = 0;
+  let plainStart = 0;
+  while (index < text.length) {
+    const open = text[index];
+    const close = TIME_SPAN_CLOSE.get(open);
+    if (close === undefined) {
+      index += 1;
+      continue;
+    }
+    const closeIndex = text.indexOf(close, index + 1);
+    if (closeIndex < 0) {
+      index += 1;
+      continue;
+    }
+    if (index > plainStart) nodes.push({ text: text.slice(plainStart, index), protected: false });
+    nodes.push({ text: text.slice(index, closeIndex + 1), protected: true });
+    index = closeIndex + 1;
+    plainStart = index;
+  }
+  if (plainStart < text.length) nodes.push({ text: text.slice(plainStart), protected: false });
+  return nodes;
+}
+
+/**
+ * Resolve relative dates in one memory body against the injected reference instant.
+ *
+ * @param {string} text the memory body (model wording, not already normalized necessarily)
+ * @param {{now?: Date|number|string, timeZone?: string, bareWeekdays?: boolean,
+ *          maxTerms?: number}} [options] `bareWeekdays:false` leaves a bare `周三` alone (an
+ *   ambiguous expression); prefixed forms (下周X/本周X/…) are resolved either way. `now` is the
+ *   injected reference instant and uses the 04:00 local day anchor.
+ * @returns {{text: string, changed: boolean,
+ *            items: Array<{term:string, date:string|null, ok:boolean, reason?:string,
+ *                          note?:string}>|null,
+ *            unresolved: boolean, timeZone: string}}
+ *   `items` is the structured `timeResolved` report (null when no relative expression exists);
+ *   `text` contains `YYYY-MM-DD（原词）` for every successfully resolved expression.
+ */
+export function resolveRelativeTime(text, {
+  now = new Date(),
+  timeZone = DEFAULT_MEMORY_TIME_ZONE,
+  bareWeekdays = true,
+  maxTerms = TIME_MAX_ITEMS,
+} = {}) {
+  const body = typeof text === 'string' ? text : '';
+  const anchor = timeAnchor(now, timeZone);
+  const parsedCap = Number(maxTerms);
+  const cap = Number.isFinite(parsedCap)
+    ? Math.max(0, Math.min(64, Math.floor(parsedCap)))
+    : TIME_MAX_ITEMS;
+  const items = [];
+  let changed = false;
+  let resolvedText = body;
+  if (body.length > 0 && cap > 0) {
+    resolvedText = splitTimeSpans(body).map((node) => {
+      if (node.protected) return node.text;
+      return node.text.replace(TIME_RE, (match, ...rest) => {
+        if (items.length >= cap) return match;
+        const groups = rest[rest.length - 1];
+        const resolution = timeResolveTerm(match, groups, anchor, { bareWeekdays });
+        if (resolution === null) return match;
+        items.push({ term: match, ...resolution });
+        if (resolution.ok === true && typeof resolution.date === 'string') {
+          changed = true;
+          return `${resolution.date}（${match}）`;
+        }
+        return match;
+      });
+    }).join('');
+  }
+  if (items.length === 0) {
+    const vague = TIME_VAGUE_RE.exec(body);
+    if (vague !== null) items.push({ term: vague[0], date: null, ok: false, reason: 'vague' });
+  }
+  return {
+    text: changed ? resolvedText : body,
+    changed,
+    items: items.length > 0 ? items : null,
+    unresolved: items.some((item) => item.ok !== true && item.reason !== 'recurring'),
+    timeZone: anchor.timeZone,
+  };
+}
+
+/**
+ * Bridge for the `assistant_remember` path: the tool already ran `normalizeForMemory` (which
+ * writes the absolute date but not the original word), while `rawText` still has the model's
+ * wording. Annotate each absolute date that has exactly ONE matching raw expression; a repeated
+ * date is left alone (choosing one would be a guess).
+ */
+function annotateManualTime(body, rawText, { now, timeZone }) {
+  if (typeof body !== 'string' || typeof rawText !== 'string' || rawText.length === 0) return null;
+  if (rawText === body) return null;
+  const raw = resolveRelativeTime(rawText, { now, timeZone, bareWeekdays: true });
+  if (!raw.changed || raw.items === null) return null;
+  const terms = raw.items.filter((item) => item.ok === true && typeof item.date === 'string');
+  if (terms.length === 0) return null;
+  let output = body;
+  let inserted = 0;
+  for (const item of terms) {
+    const decorated = `${item.date}（${item.term}）`;
+    if (output.includes(decorated)) continue;
+    const positions = [];
+    let from = 0;
+    while (from <= output.length) {
+      const at = output.indexOf(item.date, from);
+      if (at < 0) break;
+      positions.push(at);
+      from = at + item.date.length;
+    }
+    const bare = positions.filter((at) => {
+      const next = output.slice(at + item.date.length, at + item.date.length + 1);
+      return next !== '（' && next !== '(';
+    });
+    if (bare.length !== 1) continue;
+    const at = bare[0];
+    output = `${output.slice(0, at)}${decorated}${output.slice(at + item.date.length)}`;
+    inserted += 1;
+  }
+  return inserted > 0 ? { text: output, items: raw.items } : null;
+}
+
+/** Small bounded-integer helper for the duplicate-candidate LIMIT clauses. */
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
 }
 
 
@@ -745,25 +1104,68 @@ export class MemoryStore {
 
   /**
    * Store one memory.
+   *
+   * The MANUAL lane resolves relative dates before the row is written (P-67 §6): the body keeps
+   * the concrete date plus the original word in parentheses (`2026-11-18（下周三）`), while
+   * `raw_text` keeps the submitted wording. The automatic/candidate lanes are deliberately NOT
+   * rewritten (§6.4). Resolution never throws: an ambiguous expression stays as written and the
+   * returned `timeResolved` says why.
+   *
    * @param {string} domain scope tag (chat, work, bili, …)
    * @param {string} text the fact itself
    * @param {string} kind preference | habit | fact | event | decision
    * @param {{importance?: number, source?: string, rawText?: string|null,
-   *          unresolved?: number, tzUsed?: string|null}} [extra]
+   *          unresolved?: number, tzUsed?: string|null, now?: Date|number|string,
+   *          timeZone?: string, resolveTime?: boolean}} [extra]
+   *   `now`/`timeZone` inject the reference instant; `resolveTime:true` opts a non-manual caller
+   *   in explicitly (the manual source is already opted in).
+   * @returns {object} the stored record plus `timeResolved` (structured report or null)
    */
   add(domain, text, kind, extra = {}) {
     this.open();
+    const original = typeof text === 'string' ? text : '';
+    let body = text;
+    let timeResolved = null;
+    let timeUnresolved = 0;
+    let tzUsed = extra.tzUsed ?? null;
+    const resolveTime = extra.source === 'manual' || extra.resolveTime === true;
+    if (resolveTime && typeof body === 'string') {
+      const now = extra.now ?? new Date();
+      const timeZone = extra.timeZone ?? DEFAULT_MEMORY_TIME_ZONE;
+      const resolved = resolveRelativeTime(body, { now, timeZone, bareWeekdays: true });
+      if (resolved.changed) body = resolved.text;
+      if (resolved.items !== null) {
+        timeResolved = resolved.items;
+        tzUsed = tzUsed ?? resolved.timeZone;
+      }
+      // `assistant_remember` normalizes before calling `add()`; the submitted wording is still in
+      // `rawText`, so annotate the already-absolute date with the original expression.
+      if (!resolved.changed && typeof extra.rawText === 'string') {
+        const annotated = annotateManualTime(body, extra.rawText, { now, timeZone });
+        if (annotated !== null) {
+          body = annotated.text;
+          timeResolved = annotated.items;
+          tzUsed = tzUsed ?? resolveMemoryTimeZone(timeZone);
+        }
+      }
+      if (resolved.unresolved || (timeResolved ?? []).some(
+        (item) => item.ok !== true && item.reason !== 'recurring',
+      )) {
+        timeUnresolved = 1;
+      }
+    }
     const record = {
       id: randomUUID(),
       ts: nowIso(),
       domain,
       kind: kind ?? 'fact',
-      text,
-      importance: extra.importance ?? scoreImportance(text, kind ?? 'fact'),
+      text: body,
+      importance: extra.importance ?? scoreImportance(body, kind ?? 'fact'),
       source: extra.source ?? '',
-      raw_text: extra.rawText ?? null,
-      unresolved: extra.unresolved ? 1 : 0,
-      tz_used: extra.tzUsed ?? null,
+      raw_text: extra.rawText ?? (typeof body === 'string' && body !== original ? original : null),
+      unresolved: extra.unresolved || timeUnresolved ? 1 : 0,
+      tz_used: tzUsed,
+      timeResolved,
     };
     this.insert({ ...record, clarity: 'vivid', last_seen: record.ts });
     return record;
@@ -1331,6 +1733,87 @@ export class MemoryStore {
   }
 
   /**
+   * Read-only duplicate-candidate report (P-67 §2.4 / §7.5: REPORT ONLY).
+   *
+   * Two manual (or direct `add()`) records that look like the same fact are returned as a pair
+   * with their ids, kind, similarity score and reasons. This method NEVER merges, deletes or
+   * updates a row: `ts` / `clarity` / `recall_count`, `message_id`, the FTS mirror and the archive
+   * are all untouched. The scan is bounded both in rows (`scanLimit`) and reported pairs
+   * (`limit`), and it runs only when the caller asks — never on the write path.
+   *
+   * @param {{limit?: number, scanLimit?: number, threshold?: number, domain?: string|null,
+   *          now?: Date|number|string, timeZone?: string, emit?: boolean}} [options]
+   * @returns {Array<{a:{id:string,kind:string,text:string},
+   *   b:{id:string,kind:string,text:string}, kind:string, score:number,
+   *   reasons:string[], reason:string}>} highest score first, at most `limit` pairs.
+   *   An empty store or malformed row returns `[]`, never throws.
+   */
+  dedupeCandidates({
+    limit = 10,
+    scanLimit = 60,
+    threshold = undefined,
+    domain = null,
+    now = new Date(),
+    timeZone = DEFAULT_MEMORY_TIME_ZONE,
+    emit = true,
+  } = {}) {
+    try {
+      this.open();
+      const maxPairs = boundedInteger(limit, 10, 0, 50);
+      if (maxPairs === 0) return [];
+      const maxRows = boundedInteger(scanLimit, 60, 2, 200);
+      const params = [];
+      let sql = `SELECT id, ts, domain, kind, text, clarity FROM memory_event
+        WHERE superseded_by IS NULL AND hidden = 0 AND source IN ('manual', '')`;
+      if (typeof domain === 'string' && domain.length > 0) {
+        sql += ' AND domain = ?';
+        params.push(domain);
+      }
+      sql += ' ORDER BY ts DESC, id DESC LIMIT ?';
+      params.push(maxRows);
+      const rows = this.db.prepare(sql).all(...params);
+      if (rows.length < 2) return [];
+      const found = findDedupCandidates(rows, {
+        limit: maxPairs,
+        ...(threshold === undefined ? {} : { threshold }),
+        now,
+        timeZone,
+      });
+      const byId = new Map(rows.map((row) => [row.id, row]));
+      const pairs = found.map((pair) => {
+        const left = byId.get(pair.a.id);
+        const right = byId.get(pair.b.id);
+        const kind = left?.kind === right?.kind ? (left?.kind ?? '') : '';
+        return {
+          a: { id: pair.a.id, kind: left?.kind ?? '', text: pair.a.text },
+          b: { id: pair.b.id, kind: right?.kind ?? '', text: pair.b.text },
+          kind,
+          score: pair.score,
+          reasons: pair.reasons,
+          reason: pair.reasons.join(', '),
+        };
+      });
+      if (emit && pairs.length > 0) {
+        // Event payload carries ids/kind/score/reasons only — never the memory body.
+        this.emitEvent('memory.dedup.candidates', {
+          count: pairs.length,
+          pairs: pairs.map((pair) => ({
+            a: pair.a.id,
+            b: pair.b.id,
+            kind: pair.kind,
+            score: pair.score,
+            reasons: pair.reasons,
+          })),
+        });
+      }
+      return pairs;
+    } catch {
+      // A read-only report must never turn a bad row / unavailable FTS into a failure.
+      return [];
+    }
+  }
+
+  /**
    * Apply one correction as a LOCAL fragment replacement on an existing active record.
    *
    * Everything happens in one transaction: version check → fragment check → UPDATE (saving the
@@ -1352,8 +1835,14 @@ export class MemoryStore {
    * record. No unique target returns `needs-target` untouched, with the matching candidates (an
    * empty list when nothing matched) so the caller can retry with an explicit `targetId`.
    *
+   * Relative time in `replacement` is resolved like the manual write path (P-67 §6): the stored
+   * fragment becomes `2026-11-18（下周三）` and `timeResolved` reports the original term/date.
+   * A bare `周三` is only resolved when the caller injects `now` (otherwise it stays literal —
+   * historical corrections rely on exact fragment replacement); prefixed forms are deterministic.
+   *
    * @param {{targetId?: string, expectedVersion: number, expectedText: string,
-   *          replacement: string, sourceMessageId?: string, extraText?: string}} [input]
+   *          replacement: string, sourceMessageId?: string, extraText?: string,
+   *          now?: Date|number|string|null, timeZone?: string|null}} [input]
    */
   correct({
     targetId = '',
@@ -1362,12 +1851,40 @@ export class MemoryStore {
     replacement,
     sourceMessageId = '',
     extraText = '',
+    now = null,
+    timeZone = null,
   } = {}) {
     this.open();
     const source = typeof sourceMessageId === 'string' ? sourceMessageId.trim() : '';
     const fragment = typeof expectedText === 'string' ? expectedText : '';
     const version = Number(expectedVersion);
     const wantedId = typeof targetId === 'string' ? targetId.trim() : '';
+    const pinnedNow = now !== null && now !== undefined;
+    const inputReplacement = typeof replacement === 'string' ? replacement : '';
+    const time = inputReplacement.length > 0
+      ? resolveRelativeTime(inputReplacement, {
+        now: pinnedNow ? now : new Date(),
+        timeZone: timeZone ?? DEFAULT_MEMORY_TIME_ZONE,
+        bareWeekdays: pinnedNow,
+      })
+      : {
+        text: inputReplacement,
+        changed: false,
+        items: null,
+        unresolved: false,
+        timeZone: resolveMemoryTimeZone(timeZone),
+      };
+    const resolvedReplacement = time.changed ? time.text : inputReplacement;
+    // Without an injected reference a bare weekday is deliberately left alone; do not report that
+    // intentional no-op as a resolution failure.
+    const timeItems = time.items === null
+      ? null
+      : (() => {
+        const kept = pinnedNow
+          ? time.items
+          : time.items.filter((item) => item.reason !== 'ambiguous-weekday');
+        return kept.length > 0 ? kept : null;
+      })();
     const empty = (error, extra = {}) => ({
       ok: false,
       error,
@@ -1386,6 +1903,7 @@ export class MemoryStore {
       text: '',
       candidates: [],
       staleLinkIds: [],
+      timeResolved: timeItems,
       ...extra,
     });
     if (
@@ -1437,13 +1955,14 @@ export class MemoryStore {
 
         // Key = resolved target + the operation's pre-version + the two fragments. The same
         // replacement on a different record is a different operation; a retry still carries the
-        // version fetched before the first success, so it matches and stays idempotent.
+        // version fetched before the first success, so it matches and stays idempotent. The
+        // resolved replacement is used so a retry of `下周三` matches the already-absolute write.
         const operationId = correctionOperationId({
           source,
           targetId: row.id,
           version,
           expectedText: fragment,
-          replacement,
+          replacement: resolvedReplacement,
         });
         // Checked BEFORE the version check: a retry carries the version the caller fetched before
         // the first success, so it must not look stale.
@@ -1469,7 +1988,7 @@ export class MemoryStore {
         if (first < 0 || before.indexOf(fragment, first + fragment.length) >= 0) {
           return empty('fragment-mismatch', { id: row.id, currentVersion });
         }
-        const after = `${before.slice(0, first)}${replacement}${before.slice(first + fragment.length)}`;
+        const after = `${before.slice(0, first)}${resolvedReplacement}${before.slice(first + fragment.length)}`;
         const stamp = nowIso();
         const updated = this.db
           .prepare(`UPDATE memory_event
@@ -1556,7 +2075,7 @@ export class MemoryStore {
           id: row.id,
           version: version + 1,
           from: fragment,
-          to: replacement,
+          to: resolvedReplacement,
           sourceMessageId: source,
           sourceMerged: source.length > 0,
           mergeReason: source.length > 0 ? '' : 'no-source',
@@ -1568,6 +2087,7 @@ export class MemoryStore {
           text: after,
           candidates: [],
           staleLinkIds,
+          timeResolved: timeItems,
         };
       });
     } catch (error) {
