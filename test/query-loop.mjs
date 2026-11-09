@@ -155,8 +155,13 @@ test('1. a reused result is marked queried:false and never reads as "no memory"'
     return EMPTY;
   };
   const first = await app.sessionSearchBudget()(exec, body);
-  // A non-today empty result stays the framework result, so the empty-scope hint is not invented.
-  assert.equal(first, EMPTY, 'a non-today empty result is returned by identity');
+  // A non-today empty result is annotated with the window it actually queried: a zero hit is not
+  // "no memory", and it is no longer returned as the bare framework result.
+  assert.notEqual(first, EMPTY, 'a non-today empty result gains a coverage note');
+  assert.match(first.value, /^No prior session matches found\./u, 'the framework result body is kept');
+  assert.match(first.value, /本轮只查了 2026-11-01–2026-11-07/u, 'the actual window is visible');
+  assert.match(first.value, /不能据此断言没有发生/u, 'an empty window is not evidence of absence');
+  assert.doesNotMatch(first.value, /今天没有记录/u, 'a non-today empty result is not called today');
   const second = await app.sessionSearchBudget()(exec, body);
 
   assert.equal(nextCalls, 1, 'the repeat never ran the search again');
@@ -475,4 +480,106 @@ test('8. a changed turn opens a new slot and never reuses the previous turn', as
   assert.equal(newSlot.outcome, undefined, 'the old turn outcome is not carried over');
   assert.notEqual(newSlot.slot, oldSlot.slot, 'the new turn owns a new generation');
   console.log(`[8] calls=${calls} reused=${newSlot.reused} slots=${oldSlot.slot}->${newSlot.slot} second=${second.value}`);
+});
+
+// ---------------------------------------------------------------------------
+// 9. Rewritten queries stop at the per-turn attempt limit; a new turn starts over
+// ---------------------------------------------------------------------------
+
+test('9. a turn stops querying after the attempt limit and a new turn gets a fresh budget', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-query-loop-attempts-'));
+  const app = mount(root);
+  t.after(() => cleanupRoot(root, app.disposers));
+
+  const events = [{ data: { turn: 11 } }];
+  let nextCalls = 0;
+  const body = async () => {
+    nextCalls += 1;
+    return EMPTY;
+  };
+
+  // Three different rewritten queries in one turn are allowed (the default limit).
+  for (let index = 1; index <= 3; index += 1) {
+    const result = await app.sessionSearchBudget()(
+      execFor(join(root, 'workspace'), { arguments: { query: `改写查询 ${index}` }, events }),
+      body,
+    );
+    assert.notEqual(result, EMPTY, 'each empty run is annotated with its coverage');
+    assert.match(result.value, /不能据此断言没有发生/u);
+  }
+  assert.equal(nextCalls, 3, 'three distinct queries ran within the limit');
+
+  // The fourth distinct query is refused: no body call, and the limit is explicit.
+  const fourth = await app.sessionSearchBudget()(
+    execFor(join(root, 'workspace'), { arguments: { query: '第四次改写' }, events }),
+    body,
+  );
+  assert.equal(nextCalls, 3, 'the fourth rewritten query never reaches the framework body');
+  assert.match(fourth.value, /^session_search evidence: queried=false, reason=attempt-limit, evidenceType=none, attempts=3\/3$/mu);
+  assert.match(fourth.value, /本轮已查询 3 次，未找到；不要继续改写查询/u);
+  assert.doesNotMatch(fourth.value, /evidenceType=history/u, 'a limit is not a history hit');
+
+  // The ledger keeps attempts and query digests only, never the query body.
+  const limitEvent = await waitForEvent(root, 'session_search.attempt-limit');
+  assert.notEqual(limitEvent, null, 'the limit is observable');
+  assert.equal(limitEvent.payload.attempts, 3);
+  assert.equal(limitEvent.payload.limit, 3);
+  assert.equal(limitEvent.payload.queries.length, 3, 'every attempted query has a digest');
+  for (const summary of limitEvent.payload.queries) {
+    assert.deepEqual(Object.keys(summary).sort(), ['hash', 'length']);
+  }
+  assert.doesNotMatch(JSON.stringify(limitEvent.payload.queries), /改写查询|第四次改写/u, 'no query body is stored');
+
+  // A new turn resets the attempt count: the same session may query again.
+  events.push({ data: { turn: 12 } });
+  const nextTurn = await app.sessionSearchBudget()(
+    execFor(join(root, 'workspace'), { arguments: { query: '下一轮查询' }, events }),
+    body,
+  );
+  assert.equal(nextCalls, 4, 'a new turn re-queries');
+  assert.notEqual(nextTurn, EMPTY, 'the new turn gets the normal coverage result');
+  console.log(`[9] nextCalls=${nextCalls} limit=${limitEvent.payload.attempts}/${limitEvent.payload.limit} summaries=${limitEvent.payload.queries.length}`);
+});
+
+// ---------------------------------------------------------------------------
+// 10. The attempt limit is configurable; failures count as attempts too
+// ---------------------------------------------------------------------------
+
+test('10. queryAttemptLimit is configurable and counts failed and timed-out attempts', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-query-loop-attempt-config-'));
+  const app = mount(root, { queryAttemptLimit: 2, sessionSearchBudgetMs: 25 });
+  t.after(() => cleanupRoot(root, app.disposers));
+
+  const events = [{ data: { turn: 3 } }];
+  let nextCalls = 0;
+  const failing = async () => {
+    nextCalls += 1;
+    return { isError: true, value: 'Error: session history storage is unavailable', content: [] };
+  };
+
+  const first = await app.sessionSearchBudget()(
+    execFor(join(root, 'workspace'), { arguments: { query: '失败一' }, events }),
+    failing,
+  );
+  assert.match(first.value, /reason=error/u);
+
+  // A timed-out attempt is still an attempt: it must count toward the same limit.
+  const second = await app.sessionSearchBudget()(
+    execFor(join(root, 'workspace'), { arguments: { query: '超时二' }, events }),
+    () => {
+      nextCalls += 1;
+      return new Promise(() => {});
+    },
+  );
+  assert.match(second.value, /^session_search partial: true/u);
+  assert.equal(nextCalls, 2, 'the failure and the timeout both counted');
+
+  const third = await app.sessionSearchBudget()(
+    execFor(join(root, 'workspace'), { arguments: { query: '失败三' }, events }),
+    failing,
+  );
+  assert.equal(nextCalls, 2, 'the configured limit of 2 stops the third rewritten query');
+  assert.match(third.value, /reason=attempt-limit/u);
+  assert.match(third.value, /attempts=2\/2/u);
+  console.log(`[10] nextCalls=${nextCalls} limitText=${third.value.split('\n')[1]}`);
 });

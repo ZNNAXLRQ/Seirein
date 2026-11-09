@@ -5,7 +5,7 @@
  * Uses `agentLoop.createAgent` with a seeded user message. The seed shape is the public session
  * event shape; if a Harness version rejects it, the failure is reported instead of thrown.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { resolveInstanceRoot } from '../../runtime/root.js';
@@ -1493,6 +1493,9 @@ export function awaitSessionResult({
 /** Default wall-clock budget for one `session_search` run (PLAN P-112: 8 s, configurable). */
 export const SESSION_SEARCH_BUDGET_MS = 8_000;
 
+/** Default per-session+turn attempt cap for `session_search` (PLAN P-127: stop query rewrites). */
+export const SESSION_SEARCH_ATTEMPT_LIMIT = 3;
+
 /** Marker resolved by the budget timer, so a timeout is distinguishable from a real result. */
 const SESSION_SEARCH_TIMEOUT = Symbol('session-search-timeout');
 
@@ -1503,6 +1506,19 @@ export function sessionSearchBudgetMs({ budgetMs, config = null } = {}) {
     if (Number.isFinite(n) && n > 0) return Math.round(n);
   }
   return SESSION_SEARCH_BUDGET_MS;
+}
+
+/**
+ * The per-turn query attempt limit: explicit option, then `config.queryAttemptLimit`, then the
+ * `config.sessionSearch.queryAttemptLimit` alias, then 3. Only positive integers count, so a bad
+ * config never disables the guard.
+ */
+export function sessionSearchAttemptLimit({ attemptLimit, config = null } = {}) {
+  for (const value of [attemptLimit, config?.queryAttemptLimit, config?.sessionSearch?.queryAttemptLimit]) {
+    const n = Number(value);
+    if (Number.isInteger(n) && n > 0) return n;
+  }
+  return SESSION_SEARCH_ATTEMPT_LIMIT;
 }
 
 /**
@@ -1564,6 +1580,23 @@ export function emptyScopeNotice({ suggestEarliest = '' } = {}) {
     ? `该会话最早的记录时间：${earliest}；把时间范围放宽到该日期即可重查。`
     : '无法确认该会话最早的记录时间，可放宽到更早的日期重查。';
   return `今天没有记录；更早的记录未纳入本次查询。${tail}`;
+}
+
+/**
+ * Coverage line for a successful empty run that is not "today only": a zero hit only says the
+ * scanned range had no match. It must never be reported as "memory has nothing" or "it did not
+ * happen", because earlier / unscanned sessions were not part of this query.
+ */
+export function emptyCoverageNotice({ range = {} } = {}) {
+  const from = typeof range?.from === 'string' ? range.from.trim() : '';
+  const to = typeof range?.to === 'string' ? range.to.trim() : '';
+  const bounds = from.length > 0 && to.length > 0
+    ? `${from}–${to}`
+    : rangeLabel(range);
+  const scope = bounds.length > 0
+    ? `本轮只查了 ${bounds}，不能据此断言没有发生。`
+    : '本轮查询没有限定时间范围（只查了已扫描的会话），不能据此断言没有发生。';
+  return `${scope}0 命中只表示已查范围内没有匹配，不等于「记忆里没有」。`;
 }
 
 /** `suggestEarliest` as a printable local stamp: a string/number/Date, or an object carrying one. */
@@ -1649,8 +1682,19 @@ export async function runSessionSearch({
       evidenceType: queryEvidenceType({ query, hits: result.hits }),
     };
   }
-  if ('error' in outcome) throw outcome.error;
+  // A failure is a first-class result, never a throw and never a hit. `queried:false` says no
+  // completed query produced evidence; the error text is kept out of `hits` on purpose.
+  if ('error' in outcome) {
+    const info = toolFailureInfo(outcome.error);
+    emit('session_search.error', withScope({ name: info.name, code: info.code }));
+    return sessionSearchFailureResult({ ...info, elapsedMs, scanned });
+  }
   const value = outcome.value ?? {};
+  if (value.failure !== undefined || value.isError === true) {
+    const info = toolFailureInfo(value.failure ?? value);
+    emit('session_search.error', withScope({ name: info.name, code: info.code }));
+    return sessionSearchFailureResult({ ...info, elapsedMs, scanned });
+  }
   const found = Array.isArray(value.hits) ? value.hits : [];
   const result = {
     ok: true,
@@ -1660,6 +1704,7 @@ export async function runSessionSearch({
     hits: found,
     scanned: Number.isSafeInteger(value.scanned) ? value.scanned : scanned,
     elapsedMs,
+    range,
   };
   if (found.length === 0 && isTodayOnlyRange(range, new Date(clock()))) {
     const suggestEarliest = earliestStamp(value.suggestEarliest ?? value.earliest);
@@ -1672,6 +1717,13 @@ export async function runSessionSearch({
     };
     emit('session_search.empty-scope', withScope({ range }));
     return emptyScope;
+  }
+  if (found.length === 0) {
+    // A successful empty run still names its actual window: "0 hits here" is not "never happened"
+    // and must never be reported as "memory has nothing".
+    const notice = emptyCoverageNotice({ range });
+    emit('session_search.empty-coverage', withScope({ range }));
+    return { ...result, coverage: true, notice };
   }
   return result;
 }
@@ -1708,6 +1760,106 @@ export function sessionSearchTimeoutText({
   const head = `session_search partial: true (reason=timeout, elapsedMs=${ms}, scanned=${count}, budgetMs=${budget})`;
   const tail = typeof notice === 'string' ? notice.trim() : '';
   return tail.length > 0 ? `${head}\n${tail}` : head;
+}
+
+/**
+ * The text a failed tool result carries: its `value` first, then text content blocks. Never a
+ * hit row and never a projection of an error into a successful search result.
+ */
+export function toolResultText(result) {
+  const value = result?.value;
+  if (typeof value === 'string' && value.trim().length > 0) return value;
+  const content = Array.isArray(result?.content) ? result.content : [];
+  const parts = content
+    .map((block) => (typeof block === 'string' ? block : (typeof block?.text === 'string' ? block.text : '')))
+    .filter((part) => part.length > 0);
+  const text = parts.join('\n');
+  return text.trim().length > 0 ? text : '';
+}
+
+/** name/code/message of a failure, from an `Error` or an `isError` tool result (no hit text). */
+export function toolFailureInfo(failure) {
+  if (failure instanceof Error) {
+    return {
+      name: typeof failure.name === 'string' && failure.name.length > 0 ? failure.name : 'Error',
+      code: failure.code === undefined || failure.code === null ? '' : String(failure.code),
+      message: typeof failure.message === 'string' ? failure.message : String(failure),
+    };
+  }
+  if (typeof failure === 'string') return { name: '', code: '', message: failure };
+  const name = failure?.errorName ?? failure?.name ?? failure?.error?.name;
+  const code = failure?.errorCode ?? failure?.code ?? failure?.error?.code;
+  const message = failure?.error?.message ?? failure?.message ?? toolResultText(failure);
+  return {
+    name: typeof name === 'string' ? name.trim() : '',
+    code: code === undefined || code === null ? '' : String(code),
+    message: typeof message === 'string' ? message : '',
+  };
+}
+
+/**
+ * The degraded result of a failed `session_search`: `queried:false` (no completed query),
+ * `reason:'error'`, `evidenceType:'none'` and **no hits**. The error text stays in `error` as
+ * error information, so a failure can never be reused as a history hit.
+ */
+export function sessionSearchFailureResult({
+  name = '',
+  code = '',
+  message = '',
+  elapsedMs = 0,
+  scanned = 0,
+} = {}) {
+  const errorName = typeof name === 'string' ? name.trim() : '';
+  const errorCode = typeof code === 'string' ? code.trim() : '';
+  const error = typeof message === 'string' ? message : String(message ?? '');
+  return {
+    ok: false,
+    queried: false,
+    reason: 'error',
+    evidenceType: 'none',
+    hits: [],
+    scanned: Math.max(0, Math.round(Number(scanned) || 0)),
+    elapsedMs: Math.max(0, Math.round(Number(elapsedMs) || 0)),
+    errorName,
+    errorCode,
+    error,
+    notice: '查询失败，本轮没有返回结果；失败不能当作「没有记录」，也不能当作历史证据。',
+  };
+}
+
+/** Model-facing text for a failed run: explicit failure marker, the notice, then the error text. */
+export function sessionSearchFailureText({
+  errorName = '',
+  errorCode = '',
+  error = '',
+  message = '',
+} = {}) {
+  const fields = ['failed=true', 'queried=false', 'reason=error', 'evidenceType=none'];
+  if (typeof errorName === 'string' && errorName.trim().length > 0) fields.push(`name=${errorName.trim()}`);
+  if (typeof errorCode === 'string' && errorCode.trim().length > 0) fields.push(`code=${errorCode.trim()}`);
+  const detail = typeof message === 'string' && message.trim().length > 0
+    ? message.trim()
+    : (typeof error === 'string' ? error.trim() : '');
+  const head = `session_search ${fields.join(', ')}`;
+  const notice = '查询失败，本轮没有返回结果；失败不能当作「没有记录」，也不能当作历史证据。';
+  return detail.length > 0 ? `${head}\n${notice}\n${detail}` : `${head}\n${notice}`;
+}
+
+/**
+ * Model-facing text for a turn that exhausted its query attempts: no new query is run, and the
+ * model is told to stop rewriting. The diagnostics name only lengths and hashes, never the query.
+ */
+export function sessionSearchAttemptLimitText({
+  attempts = 0,
+  attemptLimit = SESSION_SEARCH_ATTEMPT_LIMIT,
+} = {}) {
+  const count = Math.max(0, Math.round(Number(attempts) || 0));
+  const limit = Math.max(1, Math.round(Number(attemptLimit) || SESSION_SEARCH_ATTEMPT_LIMIT));
+  return [
+    `session_search evidence: queried=false, reason=attempt-limit, evidenceType=none, attempts=${count}/${limit}`,
+    `本轮已查询 ${count} 次，未找到；不要继续改写查询。`,
+    '已查范围不等于「没有发生」；如果仍需更多证据，请先说明要放宽的时间范围，再由用户决定是否继续。',
+  ].join('\n');
 }
 
 // ---- session_search semantics: queried vs empty, and current state vs history (P-127) ----------
@@ -1780,7 +1932,13 @@ export function sessionSearchSemanticsText({
   if (bounds.length > 0) fields.push(`range=${bounds}`);
   const head = `session_search evidence: ${fields.join(', ')}`;
   if (queried === false) {
+    if (reason === 'error') {
+      return `${head}\n上次查询失败（reason=error），本轮未重试；失败不能当作「没有记录」，也不能当作历史证据。`;
+    }
     return `${head}\n本轮已经用相同条件（query=${queryLabel(query)}）查过一次，这里直接复用上次结果、没有重复查询；复用不新增证据，也不能单独当作「没有记录」。`;
+  }
+  if (reason === 'error') {
+    return `${head}\n查询失败，不能当作「没有记录」，也不能当作历史证据。`;
   }
   if (evidenceType === 'current-state') {
     return `${head}\n这些是「当前状态」的记录，只能说明现在，不能证明过去发生过什么；要判断「以前是否发生」，请用带时间范围的历史检索。`;
@@ -1818,9 +1976,20 @@ export function createSessionQueryLedger({
   clock = Date.now,
   windowMs = SESSION_SEARCH_DEDUP_MS,
   limit = 64,
+  attemptLimit = SESSION_SEARCH_ATTEMPT_LIMIT,
   onStale = null,
 } = {}) {
   const entries = new Map();
+  /**
+   * Per `sessionId + turn` query-attempt counters. Attempt summaries keep a length and a hash
+   * only, never the query body, so diagnostics cannot leak user text.
+   */
+  const attempts = new Map();
+  const maxAttempts = Number.isInteger(attemptLimit) && attemptLimit > 0
+    ? attemptLimit
+    : SESSION_SEARCH_ATTEMPT_LIMIT;
+  /** Enough digests to explain a limited turn without unbounded growth. */
+  const summaryLimit = Math.max(1, Math.min(16, maxAttempts));
   /** Monotonic request generation: every non-reused `begin` opens a new slot. */
   let generation = 0;
   const prune = () => {
@@ -1837,17 +2006,83 @@ export function createSessionQueryLedger({
       entries.delete(oldestKey);
     }
   };
-  const reserve = (key, { turn, now, count, query }) => {
-    generation += 1;
-    entries.set(key, { slot: generation, turn, at: now, count, outcome: null, evidenceType: 'none', query });
-    prune();
-    return { reused: false, key, slot: generation, turn, count, query };
+  const pruneAttempts = () => {
+    while (attempts.size > limit) {
+      let oldestKey = null;
+      let oldestAt = Infinity;
+      for (const [key, entry] of attempts) {
+        if (entry.at < oldestAt) {
+          oldestAt = entry.at;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey === null) return;
+      attempts.delete(oldestKey);
+    }
   };
+  /** Keep only a digest and the length of each attempted query. */
+  const querySummary = (query) => {
+    const text = String(query ?? '');
+    return {
+      length: text.length,
+      hash: createHash('sha256').update(text).digest('hex').slice(0, 12),
+    };
+  };
+  /** The attempt bucket for one session + turn; a no-turn session falls back to a time window. */
+  const attemptBucket = ({ sessionId, turn, now }) => {
+    const key = JSON.stringify([sessionId, turn === null ? null : String(turn)]);
+    const existing = attempts.get(key);
+    if (existing !== undefined && turn === null && now - existing.at > windowMs) attempts.delete(key);
+    const bucket = attempts.get(key) ?? { turn, at: now, count: 0, summaries: [] };
+    attempts.set(key, bucket);
+    bucket.at = now;
+    pruneAttempts();
+    return bucket;
+  };
+  const reserve = (key, { turn, now, count, query, bucket }) => {
+    generation += 1;
+    entries.set(key, {
+      slot: generation,
+      turn,
+      at: now,
+      count,
+      outcome: null,
+      evidenceType: 'none',
+      reason: null,
+      query,
+      attempts: bucket.count,
+    });
+    prune();
+    return {
+      reused: false,
+      key,
+      slot: generation,
+      turn,
+      count,
+      query,
+      attempts: bucket.count,
+      attemptLimit: maxAttempts,
+      querySummaries: bucket.summaries.slice(),
+    };
+  };
+  /** A limited call never reserves a slot, so no query body runs under it. */
+  const limited = (key, { turn, bucket }) => ({
+    reused: false,
+    limited: true,
+    key,
+    slot: null,
+    turn,
+    count: bucket.count,
+    attempts: bucket.count,
+    attemptLimit: maxAttempts,
+    querySummaries: bucket.summaries.slice(),
+  });
   return {
     /** Reserve one call's slot; `reused:true` carries the stored outcome and its evidence type. */
     begin({ sessionId = '', query = '', range = {}, turn = null } = {}) {
       const key = JSON.stringify([sessionId, queryKey(query), rangeKey(range)]);
       const now = clock();
+      const bucket = attemptBucket({ sessionId, turn, now });
       const existing = entries.get(key);
       if (existing !== undefined) {
         const sameTurn = turn !== null && existing.turn !== null
@@ -1863,25 +2098,37 @@ export function createSessionQueryLedger({
             count: existing.count,
             outcome: existing.outcome,
             evidenceType: existing.evidenceType,
+            reason: existing.reason ?? null,
             query,
+            attempts: bucket.count,
+            attemptLimit: maxAttempts,
           };
         }
         if (sameTurn) {
           // Still running: keep the slot reserved, but never pretend this call reused a result.
           // The fresh in-flight request gets its own generation, so an older completion is stale.
           existing.count += 1;
-          return reserve(key, { turn, now, count: existing.count, query });
+          if (bucket.count >= maxAttempts) return limited(key, { turn, bucket });
+          bucket.count += 1;
+          bucket.summaries.push(querySummary(query));
+          if (bucket.summaries.length > summaryLimit) bucket.summaries.shift();
+          return reserve(key, { turn, now, count: existing.count, query, bucket });
         }
       }
-      return reserve(key, { turn, now, count: 1, query });
+      if (bucket.count >= maxAttempts) return limited(key, { turn, bucket });
+      bucket.count += 1;
+      bucket.summaries.push(querySummary(query));
+      if (bucket.summaries.length > summaryLimit) bucket.summaries.shift();
+      return reserve(key, { turn, now, count: 1, query, bucket });
     },
     /** Store what a repeat returns; only the current slot may write, a superseded one is dropped. */
-    complete(shot, outcome, { evidenceType = 'none' } = {}) {
+    complete(shot, outcome, { evidenceType = 'none', reason = null } = {}) {
       if (shot?.reused === true || typeof shot?.key !== 'string') return false;
       const stored = entries.get(shot.key);
       if (stored !== undefined && stored.slot === shot.slot) {
         stored.outcome = outcome ?? null;
         stored.evidenceType = evidenceType;
+        stored.reason = reason ?? null;
         stored.at = clock();
         return true;
       }
@@ -1979,6 +2226,7 @@ export function createSessionSearchBudget({
   /** The reuse cache reports a superseded slot; a caller-supplied ledger wires its own telemetry. */
   const cacheLedger = ledger ?? createSessionQueryLedger({
     clock,
+    attemptLimit: sessionSearchAttemptLimit({ config }),
     onStale: (event) => emitEvent('session_search.cache.stale', event),
   });
   /** Debug-only: a non-`session_search.*` type, so an out-of-scope call stays event-free there. */
@@ -2004,12 +2252,23 @@ export function createSessionSearchBudget({
     // Same condition in the same turn: reuse the earlier result instead of firing the same shot
     // again. Decided before the budget window, so a reuse never waits and never touches the signal.
     const shot = cacheLedger.begin({ sessionId: sessionIdOf(exec) || cwd, query, range, turn: sessionTurnOf(exec) });
+    if (shot.limited === true) {
+      // The turn already spent its attempts on different query/range combinations. Do not run a
+      // fourth rewritten query; make the limit and the already-tried conditions explicit.
+      emitEvent('session_search.attempt-limit', {
+        attempts: shot.attempts,
+        limit: shot.attemptLimit,
+        queries: shot.querySummaries ?? [],
+      });
+      return { value: sessionSearchAttemptLimitText(shot) };
+    }
     if (shot.reused) {
+      const failed = shot.reason === 'error';
       emitEvent('session_search.dedup', { query, count: shot.count });
       const semantics = sessionSearchSemanticsText({
         queried: false,
-        reason: 'reuse',
-        evidenceType: shot.evidenceType,
+        reason: failed ? 'error' : 'reuse',
+        evidenceType: failed ? 'none' : shot.evidenceType,
         query,
         count: shot.count,
         range,
@@ -2035,6 +2294,11 @@ export function createSessionSearchBudget({
         search: async () => {
           try {
             original = await next();
+            // A failed tool call is never a hit: return the failure shape, so `runSessionSearch`
+            // can project it as queried:false / reason:error / evidenceType:none.
+            if (original?.isError === true) {
+              return { failure: toolFailureInfo(original), hits: [], scanned: 0 };
+            }
             // The framework body returns formatted text, not rows. Use its exact empty sentinel to
             // decide the empty-scope hint; any other result counts as a hit, so a wording change can
             // only omit the hint and can never invent one.
@@ -2047,10 +2311,29 @@ export function createSessionSearchBudget({
         },
       });
       const evidenceType = outcome.evidenceType ?? 'none';
+      if (outcome.reason === 'error' && outcome.partial !== true) {
+        // A failure is returned as an annotated error, never as the original result (which could
+        // otherwise be read as a successful hit). Only the error text is cached.
+        const detail = String(outcome.error ?? '').trim();
+        const cached = withContexts(detail, original);
+        cacheLedger.complete(shot, cached, { evidenceType: 'none', reason: 'error' });
+        const annotated = sessionSearchFailureText({
+          errorName: outcome.errorName,
+          errorCode: outcome.errorCode,
+          error: detail,
+        });
+        return withContexts(annotated, original);
+      }
       if (outcome.partial !== true) {
         if (outcome.emptyScope === true && original?.isError === false) {
           const annotated = withContexts(`${String(original.value ?? '')}\n\n${outcome.notice}`, original);
-          cacheLedger.complete(shot, annotated, { evidenceType });
+          cacheLedger.complete(shot, annotated, { evidenceType, reason: 'empty' });
+          return annotated;
+        }
+        // A successful zero-hit run outside "today" still names the window it actually queried.
+        if (outcome.coverage === true && original?.isError === false) {
+          const annotated = withContexts(`${String(original.value ?? '')}\n\n${outcome.notice}`, original);
+          cacheLedger.complete(shot, annotated, { evidenceType, reason: 'empty' });
           return annotated;
         }
         // A present-tense hit is annotated: its rows describe now and cannot prove the past.
@@ -2065,16 +2348,16 @@ export function createSessionSearchBudget({
             })}`,
             original,
           );
-          cacheLedger.complete(shot, annotated, { evidenceType });
+          cacheLedger.complete(shot, annotated, { evidenceType, reason: outcome.reason ?? 'hit' });
           return annotated;
         }
-        cacheLedger.complete(shot, original, { evidenceType });
+        cacheLedger.complete(shot, original, { evidenceType, reason: outcome.reason ?? 'hit' });
         return original;
       }
       restoreNow = false;
       controller.abort();
       const degraded = { value: sessionSearchTimeoutText(outcome) };
-      cacheLedger.complete(shot, degraded, { evidenceType });
+      cacheLedger.complete(shot, degraded, { evidenceType, reason: 'timeout' });
       return degraded;
     } finally {
       if (restoreNow) exec.signal = upstream;

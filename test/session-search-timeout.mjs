@@ -267,3 +267,53 @@ test('8. a throwing or rejecting log never fails the search', async () => {
   console.log(`[8] timeoutPartial=${timeoutResult.partial} emptyScope=${empty.emptyScope} result unaffected`);
 });
 
+// ---------------------------------------------------------------------------
+// 9. A non-today empty result names its actual window instead of "no memory"
+// ---------------------------------------------------------------------------
+
+test('9. a non-today miss names the window and never claims "memory has nothing"', async () => {
+  const log = eventLog();
+  const range = { from: '2026-11-01', to: '2026-11-07' };
+  const result = await runSessionSearch({
+    budgetMs: 2_000,
+    log,
+    range,
+    search: async () => ({ hits: [], scanned: 2 }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.queried, true);
+  assert.equal(result.reason, 'empty');
+  assert.equal(result.evidenceType, 'none');
+  assert.equal(result.hits.length, 0);
+  assert.equal(result.coverage, true, 'a non-today miss carries the coverage marker');
+  assert.equal('emptyScope' in result, false, 'it is not called a today-only miss');
+  assert.deepEqual(result.range, range, 'the actual query window is returned');
+  assert.match(result.notice, /本轮只查了 2026-11-01–2026-11-07/u);
+  assert.match(result.notice, /不能据此断言没有发生/u);
+  assert.doesNotMatch(result.notice, /今天没有记录/u, 'a non-today window is not described as today');
+  assert.doesNotMatch(result.notice, /^记忆里没有/u);
+  assert.deepEqual(log.rows, [{ type: 'session_search.empty-coverage', payload: { range } }]);
+  console.log(`[9] reason=${result.reason} evidenceType=${result.evidenceType} range=${result.range.from}..${result.range.to} coverage=${result.coverage}`);
+});
+
+// ---------------------------------------------------------------------------
+// 10. An empty result without any time range is also bounded by what was scanned
+// ---------------------------------------------------------------------------
+
+test('10. an unbounded empty result states that no time range was set', async () => {
+  const log = eventLog();
+  const result = await runSessionSearch({
+    budgetMs: 2_000,
+    log,
+    search: async () => ({ hits: [], scanned: 7 }),
+  });
+  assert.equal(result.reason, 'empty');
+  assert.equal(result.evidenceType, 'none');
+  assert.equal(result.coverage, true);
+  assert.match(result.notice, /本轮查询没有限定时间范围/u);
+  assert.match(result.notice, /不能据此断言没有发生/u);
+  assert.match(result.notice, /不等于「记忆里没有」/u);
+  assert.deepEqual(log.rows, [{ type: 'session_search.empty-coverage', payload: { range: {} } }]);
+  console.log(`[10] reason=${result.reason} coverage=${result.coverage} notice=${result.notice.split('。')[0]}`);
+});
+
