@@ -567,8 +567,8 @@ test('15. 提交事件：commit 只在传输确认后出现，并进入宿主 de
   assert.deepEqual(
     Object.keys(commit).sort(),
     ['actionId', 'at', 'channels', 'commitCount', 'committed', 'event', 'firstAt', 'firstValue',
-      'lastAt', 'lastValue', 'peak', 'presetId', 'selectionId', 'skippedByTransport', 'spanMs',
-      'type'],
+      'lastAbs', 'lastAt', 'lastValue', 'peak', 'peakByChannel', 'presetId', 'selectionId',
+      'skippedByTransport', 'spanMs', 'type'],
   );
   assert.equal(commit.presetId, started.presetId);
   assert.deepEqual(commit.channels, started.channels);
@@ -665,10 +665,24 @@ test('16. commit 幅度证据：peak/firstValue/lastValue/spanMs 与最终发送
   runtime.takeEvents(); // the start/select of this trajectory is covered by test 17
 
   const sentByAt = new Map();
-  for (const at of [0, 250, 500, 750, 1000]) {
+  // Run the WHOLE trajectory so the early excursion and the tail (return to rest) are both
+  // acknowledged. The frame peak below is measured independently from the frames the transport
+  // really received, so `commit.peak` can be checked against the real trajectory, not its tail.
+  const observedPeak = new Map();
+  const tracked = new Set(started.channels);
+  for (let at = 0; at <= started.durationMs + 200; at += 33) {
     const frame = await tick(at);
     const sent = new Map();
-    for (const entry of frame?.entries ?? []) if (entry.channel) sent.set(entry.channel, entry.value);
+    for (const entry of frame?.entries ?? []) {
+      if (!entry.channel) continue;
+      sent.set(entry.channel, entry.value);
+      // `at >= durationMs` is the frame where the action is already retired: its rows are idle
+      // writes, not acknowledgements of this action.
+      if (at < started.durationMs && tracked.has(entry.channel) && Number.isFinite(entry.value)) {
+        const magnitude = Math.abs(entry.value);
+        observedPeak.set(entry.channel, Math.max(observedPeak.get(entry.channel) ?? 0, magnitude));
+      }
+    }
     sentByAt.set(at, sent);
   }
   // The 1 s commit throttle writes the first acknowledgement at once and flushes the newest one
@@ -680,6 +694,7 @@ test('16. commit 幅度证据：peak/firstValue/lastValue/spanMs 与最终发送
   const commit = commits.at(-1);
   assert.equal(commit.presetId, started.presetId);
   assert.equal(typeof commit.peak, 'number');
+  assert.equal(typeof commit.lastAbs, 'number');
   assert.equal(typeof commit.spanMs, 'number');
   assert.equal(commit.lastValue !== null && typeof commit.lastValue === 'object', true);
   assert.equal(commit.firstValue !== null && typeof commit.firstValue === 'object', true);
@@ -693,12 +708,54 @@ test('16. commit 幅度证据：peak/firstValue/lastValue/spanMs 与最终发送
       `lastValue equals the final sent value: ${channel}`);
     assert.ok(Number.isFinite(commit.firstValue[channel]), `firstValue is finite: ${channel}`);
   }
-  assert.equal(commit.peak, Math.max(...Object.values(commit.lastValue).map(Math.abs)));
+  // `lastAbs` keeps the OLD tail semantics; `peak` is the whole-action maximum, which here really
+  // is a visible head excursion (not a near-zero return-to-rest value).
+  assert.equal(commit.lastAbs, Math.max(...Object.values(commit.lastValue).map(Math.abs)));
+  assert.ok(commit.peak >= commit.lastAbs, `peak ${commit.peak} >= lastAbs ${commit.lastAbs}`);
+  assert.ok(commit.peak > 0.1, `normal head trajectory peak is visible: ${commit.peak}`);
+  assert.ok(commit.peak <= 0.95 + 1e-9, `peak stays inside the head clamp: ${commit.peak}`);
+  const observed = Math.max(0, ...observedPeak.values());
+  assert.equal(commit.peak, observed, 'peak equals the max |acknowledged value| of the whole action');
+  assert.deepEqual(commit.peakByChannel, Object.fromEntries(observedPeak));
   assert.equal(commit.spanMs, commit.lastAt - commits[0].lastAt, 'span = first ack -> last ack');
 
   // The same observability reaches the host log sink.
   assert.ok(logs.some((row) => row.message === 'avatar.preset.start'), 'start is logged too');
   assert.ok(logs.some((row) => row.message === 'avatar.preset.commit'), 'commit is logged');
+});
+
+test('16b. commit peak = 整段 maxAbs（先大后回位仍报早期大值）；lastAbs 保留尾值语义', () => {
+  const runtime = makeRuntime();
+  const selection = pick(runtime, { state: 'idle', event: 'idle', recipe: 'idle-tilt' });
+  assert.ok(selection !== null, 'idle-tilt must be selectable');
+  const started = runtime.startPreset(selection, { at: 0 });
+  assert.equal(started.started, true);
+  const live = presetSnapshot(runtime).active.find((item) => item.presetId === started.presetId);
+  assert.ok(live !== undefined, 'the action is live');
+  const owners = [{ seq: live.seq, generation: live.generation }];
+  runtime.takeEvents();
+
+  // The exact regression shape: a large early excursion, then a return to (almost) rest. Each
+  // acknowledgement is >1 s after the previous one, so the commit throttle writes all three and
+  // the last event is a real tail, not a suppressed middle frame.
+  const acknowledge = (at, value) => runtime.notePresetTransport({
+    phase: 'committed', owners, at, rows: [{ channel: 'headZ', value }],
+  });
+  acknowledge(0, 0.5);
+  acknowledge(1_100, 0.02);
+  acknowledge(2_200, 0.001);
+
+  const commits = runtime.takeEvents().filter((event) => event.type === 'avatar.preset.commit');
+  assert.equal(commits.length, 3, 'each spaced acknowledgement is written');
+  assert.equal(commits[0].peak, 0.5, 'the first acknowledgement is its own peak');
+  assert.equal(commits[0].lastAbs, 0.5);
+  const last = commits.at(-1);
+  assert.equal(last.peak, 0.5, 'peak is the whole-action maxAbs, not the tail value');
+  assert.equal(last.peakByChannel.headZ, 0.5, 'the per-channel maxAbs is kept too');
+  assert.equal(last.lastAbs, 0.001, 'lastAbs is the max |last acknowledged value|');
+  assert.equal(last.lastValue.headZ, 0.001, 'the tail value itself stays available');
+  assert.ok(last.peak > 0.1 && last.lastAbs < 0.01,
+    `early ${last.peak} vs tail ${last.lastAbs}`);
 });
 
 test('17. start 事件带幅度/时长/阶段，并已放开宿主白名单', () => {

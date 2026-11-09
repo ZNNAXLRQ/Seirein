@@ -639,7 +639,9 @@ const PRESET_GAZE_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
  * per second. A commit is throttled to one per second, but never silently dropped: the first and
  * the last acknowledgement of each action are always written (the middle ones are merged into the
  * last), because each commit payload already carries the action's cumulative merge window
- * (`firstAt`/`lastAt`/`firstValue`/`lastValue`).
+ * (`firstAt`/`lastAt`/`firstValue`/`lastValue`) plus two distinct amplitude metrics: `peak` is the
+ * whole-action maximum |acknowledged value| over every frame/channel, and `lastAbs` keeps the tail
+ * value (max |last acknowledged value per channel|) that the old `peak` field used to report.
  */
 const PRESET_DEBUG_THROTTLE_MS = 1000;
 const PRESET_COMMIT_THROTTLE_MS = 1000;
@@ -2993,6 +2995,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       written: new Set(),
       /** First acknowledged value per channel, for commit evidence only (`{at, values}`). */
       firstCommitted: null,
+      /**
+       * Whole-life maximum of every ACKNOWLEDGED |value|, not the last frame's value: `abs` is the
+       * overall peak, `byChannel` the per-channel peaks. `avatar.preset.commit.peak` reports `abs`
+       * so a trajectory that goes large early and returns to rest is still measured at its real
+       * excursion; the tail value is reported separately as `lastAbs`.
+       */
+      committedPeak: { abs: 0, byChannel: Object.create(null) },
       /** Acknowledgements merged by this action id; never a per-frame counter. */
       commitCount: 0,
       /** Takeover state: the channels fading OUT to a newer owner, and when that fade began. */
@@ -3284,6 +3293,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           if (!Number.isFinite(value)) continue;
           output.committed[channel] = value;
           output.committedAt[channel] = now;
+          // Whole-life evidence: keep the largest |value| this channel ever acknowledged, so the
+          // reported peak cannot collapse to the value of the last frame.
+          const magnitude = Math.abs(value);
+          if (magnitude > item.committedPeak.abs) item.committedPeak.abs = magnitude;
+          const channelPeak = item.committedPeak.byChannel[channel] ?? 0;
+          if (magnitude > channelPeak) item.committedPeak.byChannel[channel] = magnitude;
           committed += 1;
         }
       }
@@ -3305,7 +3320,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         for (const [channel, value] of Object.entries(lastValue)) {
           if (!Object.prototype.hasOwnProperty.call(firstValue, channel)) firstValue[channel] = value;
         }
-        const peak = Object.values(lastValue).reduce((max, value) => (
+        // The tail evidence: the last acknowledged value of each channel, as before.
+        const lastAbs = Object.values(lastValue).reduce((max, value) => (
           Number.isFinite(value) ? Math.max(max, Math.abs(value)) : max
         ), 0);
         committedItem.commitCount += 1;
@@ -3319,8 +3335,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           channels: [...committedItem.channels],
           committed: Object.keys(output.committed),
           skippedByTransport: { ...output.skippedByTransport },
-          /** All values below are the ACKNOWLEDGED values, never a new physical quantity. */
-          peak,
+          /**
+           * All values below are the ACKNOWLEDGED values, never a new physical quantity.
+           * `peak` is the whole-action maximum |value| over every frame and channel; `lastAbs` is
+           * the tail value (max |last acknowledged value per channel|), the old `peak` meaning.
+           */
+          peak: committedItem.committedPeak.abs,
+          peakByChannel: { ...committedItem.committedPeak.byChannel },
+          lastAbs,
           firstValue: { ...firstValue },
           lastValue,
           /** first acknowledgement of this action → this one: the merge window. */
