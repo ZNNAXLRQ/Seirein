@@ -46,7 +46,7 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 语音 | `speech/` | TTS（Edge / GPT-SoVITS）、翻译双流、口语版、候音、播放账本、分块与预取 | 「说」：回答、候音、工具播报、打字回合播报 |
 | 听觉 | `hearing/` | 麦克风 / 回环采集、ASR worker、VAD、端点、声纹影子、通话模式、环境音、音频保留 | 「听」：实时转写、连续对话缓冲、打断判定 |
 | 记忆 | `memory/` | 分域情节记忆（SQLite + FTS5）、固定记忆、自动记录、召回 / 纠正 / 归档 / 容量衰退 | 「记得」：相关记忆、固定约束、历史检索 |
-| 视觉 | `vision/` | 截图、故事板、桌面 / OBS 虚拟摄像头、隐私锁、OBS 连接、黑帧检查 | 「看见」：按需截屏、连续观看、场景查看 |
+| 视觉 | `vision/` | 截图、故事板、桌面 / OBS 虚拟摄像头、隐私锁、OBS 连接、黑帧检查、视听证据窗口、后台理解与主动回应 | 「看见」：按需截屏、连续观看、场景查看、按证据回看 |
 | 形象动作 | `avatar/` | VTS 连接 / 热键 / 表情 / 口型 / 参数、行为运行时、动作预设库、WPF 透明层、Spout 独立进程 | 「动」：说话口型、语义动作、待机生命感 |
 | 字幕 | `subtitle/` | WPF 叠加层、区域 / 气泡模式、字体枚举、对比色、分页 | 「显示」：语音字幕与原文对照 |
 | 平台 | `platform/` | 全局热键（`koffi`）、硬件探测、模型下载、Windows 窗口矩形 | 系统层适配 |
@@ -91,9 +91,11 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 压缩上下文 | 当天语音会话挂载只含压缩能力的 `seirein-voice` preset；接近窗口 80% 时置 `near-limit` 并写节流事件 | `voice.compaction.*` |
 | 动作预设 | 动作库按状态 / 事件 / 语义 / 已验证通道硬过滤，设置页可禁用、调优先级、恢复默认；不可用项跳过而不是降级成热键 | `motion.presets.*`、`avatar.*` |
 | 视觉观看 | 桌面用 ffmpeg ddagrab（gdigrab 兜底）；场景模式读 OBS 虚拟摄像头；`assistant_watch` 把 4–8 个变化帧拼成一张故事板；隐私模式下所有 agent 捕获被拒绝 | `assistant_see` / `assistant_watch` / `vision.*` 事件 |
+| 持续视听理解 | 陪伴会话开始后按画面变化在后台取故事板，进入 **30 秒 / 24 MiB** 的有界证据窗口；用户开口即锁住开口前后的画面，终稿后把评论对齐到关联帧；后台图片理解把场景摘要与经证据校验的事件接入下一轮，符合条件时主动说一句（默认开，可在设置页关；每小时最多 3 句、间隔 ≥60 秒） | `assistant:audiovisual` / `assistant:understanding`、`vision.evidence.*`、`vision.comment.*`、`vision.understanding.*`、`vision.proactive.*` |
+| 按证据回看 | `assistant_see` 传 `evidenceFrameIds`（最多 3 个）时，只回看证据窗口里的缓存副本，不重新截屏；隐私、来源与代次门禁和正常截图一致，过期/已淘汰的 id 直接拒绝 | `vision.evidence.added`、`vision.delivery.refused` |
 | 字幕 | 区域模式或气泡模式（跟随统一形象几何）；字幕语言与语音语言独立 | `subtitle.*` 事件 |
 | 记忆 | 相关记忆在 `agent/pre-step` 注入；固定记忆每轮注入（加密项只给索引）；普通记忆按容量衰退并归档 | `memory.recall`、`resource.inject.truncated`、`memory.*` |
-| 设置页 + 热键 | 插件页 / 设置分区里可切换组件、设备、语种、TTS、字幕、VTS、热键、记忆、人设；默认热键 `Ctrl+Alt+M`（麦克风）、`Ctrl+Alt+V`（视觉）、`Ctrl+Alt+E`（图层编辑）、`Ctrl+Alt+A`（环境音） | `client.js`、`assistant_hotkeys` |
+| 设置页 + 热键 | 插件页 / 设置分区里可切换组件、设备、语种、TTS、字幕、VTS、主动回应、热键、记忆、人设；默认热键 `Ctrl+Alt+M`（麦克风）、`Ctrl+Alt+V`（视觉）、`Ctrl+Alt+E`（图层编辑）、`Ctrl+Alt+A`（环境音） | `client.js`、`assistant_hotkeys` |
 
 ### 1.4 参考对象
 
@@ -473,7 +475,7 @@ tokens.txt
 所有设置都在 **Seirein 的设置页**：DSH 侧栏 **插件** → **Seirein** → 打开设置。设置页从上到下排列，下面按顺序走一遍即可。
 
 先记住一件事：**「组件开关」是总许可，打开不等于马上开始录音或截图。**
-听觉要你点「测试麦克风」或打开「开机自动监听」才会开始采集；视觉要你点「截图测试 / 启动持续观看」才会取景。
+听觉要你点「测试麦克风」或打开「开机自动监听」才会开始采集；视觉的按需取景要你点「截图测试 / 启动持续观看」，而陪伴会话开始后的后台证据采集是自动的（见 2.3.6），它只进证据窗口，不把图片塞进每轮请求。
 
 #### 2.3.1 存放位置（第一次必须做）
 
@@ -615,6 +617,10 @@ tokens.txt
 4. 看缩略图是否是该场景，而不是黑屏。
 
 **怎么算成功：** 缩略图出现且内容是你要看的画面。
+
+**持续视听理解（自动）：** 第一次陪伴对话开始后，视觉会在后台按画面变化持续取故事板，保留最近约 **30 秒** 的证据；你开口时会锁住开口前后的画面，用来把这句话对齐到「你刚才指的是哪一幕」。它不需要你额外点 **启动持续观看**；隐私模式、关闭视觉组件或切换来源都会停止。后台理解只在当前模型明确声明支持图片输入时运行；不支持时跳过并记一条 `vision.understanding.unavailable`（原因码），不会硬发图片。
+
+**主动回应（默认开）：** 设置页视觉分区里的 **主动回应** 开关控制它是否能在看到值得说的事时主动开口。关掉后只做被动理解，不会主动说话。为免打扰，你说话时、助手正在回答或播放时、上一轮回答还没结束时，都不会开口；默认每小时最多 **3 句**、两句至少间隔 **60 秒**。
 
 **没设置会怎样：** FFmpeg正常的时候只能看桌面；如果 FFmpeg 没放好，截图和观看都会失败。选了 OBS 但 OBS 没开/没虚拟摄像头，也会失败，不会偷偷用桌面顶替。
 
@@ -1245,7 +1251,7 @@ Seirein/
 │  └─ vision/                视觉
 ├─ test/                     node:test 回归
 ├─ scripts/                  test-batch.mjs / baseline-snapshot.mjs
-└─ tools/                    开发探针（不进发布包）
+└─ tools/                    开发探针与基线快照 CLI（不进发布包）
 ```
 
 入口只有 `src/host/index.js`：它只做装配（创建服务、注册工具 / 事件 / HTTP、跨域接线、生命周期），业务规则都在功能目录里；`test/module-layout.mjs` 断言 host 根目录只有这一个文件。
@@ -1295,7 +1301,7 @@ Seirein/
 
 并行的旁路：
 
-- **视觉**：只有视觉工具被调用、或本轮话里明确要求看时才取图；普通闲聊不会自动附图。回合内的预取见 3.3.2。
+- **视觉**：只有视觉工具被调用、或本轮话里明确要求看时才把图片附给模型；普通闲聊不会自动附图。陪伴会话开始后另有后台证据采集（见 3.3.2），它只把有界证据与对齐块接入上下文，不把图片塞进每轮请求。回合内的预取见 3.3.2。
 - **动作**：由播放、句间、回答起始等事件驱动，独立于文本与音频，只写当前模型验证过的通道。
 - **记忆**：消息边界自动记录（不占热路径）；召回只通过 `agent/pre-step` 注入。
 - **压缩**：由语音会话挂载的 preset 在宿主侧触发，不打断正在播放的句子；不可用是可见降级。
@@ -1337,6 +1343,12 @@ Seirein/
 短答（≤60 字且 ≤2 句）直接原样播；长答最多一次轻量改写；改写失败回落完整正文，不截断成摘要。
 
 **边界**：只改写一次，不会为了更短再跑一轮；模型不遵守时仍有输出形状的硬约束（一段口语、无标题与列表符号）。
+
+**句内流式：协议可行，当前不接入。**
+
+P-65C 复核确认：GPT-SoVITS 的 `streaming_mode=2/3` 在协议层是真正的增量音频输出（非 vocoder 模型逐块解码）；`streaming_mode=true` 在 Python 里等于 `1`，只是按文本片段返回完整音频，不是句内流式。Seirein 的 GPT-SoVITS 路径当前仍是整包合成后播放，没有发送 `streaming_mode`；克隆声线的实际上限是 B 档——在逗号 / 顿号处切文本、逐块合成并预取下一块。暂不接 C 不是因为后端不支持，而是主答复播放仍要求 `file + durationMs`，单合成槽会与 B 的预取冲突，且首块收益尚未实测；不做假流式。
+
+**边界**：C 未实现、未开启；B 的长句韵律与句间停顿 p95 仍未对照实测。
 
 **回声与误识别：只在高置信时丢。**
 
@@ -1404,6 +1416,18 @@ Seirein/
 
 **边界**：这是优化，失败 fail-open；关键词判定偏窄，漏判时退回工具采集，多一次工具往返。
 
+**持续视听理解：有界证据窗口、开口锁与后台理解。**
+
+陪伴会话的第一次真实回合后，视觉在后台按变化持续取故事板（约 2 秒一拍；长时间无变化放慢到 6 秒），把副本登记进一个按时间和字节双上限的窗口（30 秒 / 24 MiB，超出先淘汰最旧的未锁定帧）。用户开口的第一条非空 partial 就把「开口前约 8 秒到开口时刻」锁住，终稿到达后补上结束时间，并按文本线索把评论对齐到关联帧。
+
+主请求看到两个只读块：`assistant:audiovisual` 写开口 / 端点时间、窗口内帧数、关联帧数与把握，并明确「画面内容尚未经过后台理解」；后台图片理解成功后，`assistant:understanding` 再给场景摘要、事件与未解决项。事件在写入前必须引用本次真实帧 / 台词 id，但渲染块不输出这些 id。理解只读已经落盘的帧（最多 3 张、800 token、30 秒超时），且模型必须由 `inputModalities` 明确声明 `image`；缺省、抛错或未知都按不支持处理，不会先把图片发过去再说。
+
+带 `reaction` 的理解事件会进入主动候选，由仲裁器检查用户是否在说话、助手是否忙、是否有待回应的回答、离上次主动是否够远、每小时是否超限（默认 3 句、间隔 ≥60 秒）；只有通过才生成一句短句，走现有语音出口，不新建用户轮次、不写记忆或人设。
+
+`assistant_see` 还可以按证据 id 回看：传 `evidenceFrameIds`（最多 3 个）时只从窗口读缓存副本，不重新截屏；隐私、来源、代次和附件门禁与正常截图一致，过期 / 已淘汰的 id 直接拒绝。
+
+**边界**：首次陪伴轮之前没有后台连续采集的历史帧，不能倒查；后台理解依赖图片输入能力；主动回应的关键台词检测尚未接入；证据窗口只保留有界副本，不写记忆。
+
 **会话恢复：重装配再压缩。**
 
 `voice.session.recover` 是唯一能手动重建已存在语音会话的动作：保留同一个 session id，通过 `agentLoop.resume` 在 setup 里重新挂上压缩 preset，再调用一次 preset 自己的 `compactNow()` 后返回。
@@ -1466,9 +1490,14 @@ node scripts/test-batch.mjs --repeat=2 --only=tts
 node scripts/test-batch.mjs --list
 node scripts/test-batch.mjs --include-live
 
-# 基线快照
+# 基线快照（本地构建 / 模型 / 协议 / TTS，可对比）
 node scripts/baseline-snapshot.mjs
 node scripts/baseline-snapshot.mjs --compare <baseline.json>
+
+# 基线快照 CLI（读 /assistant/status → JSON；缺字段为 null，cacheStatsAvailable 未知按 false）
+node tools/baseline-snapshot.mjs
+node tools/baseline-snapshot.mjs --url http://127.0.0.1:<GUI端口>/assistant/status --out reports/baseline.json
+node tools/baseline-snapshot.mjs --commit <sha> --out reports/baseline.json
 
 # 发布文件清单
 npm pack --dry-run --json
@@ -1539,10 +1568,11 @@ npm pack --dry-run --json
 | --- | --- | --- |
 | P-46 逐轮时间线 | 已实现：每轮一条 `voice.turn.timeline`（模型轮次、工具区间并集、首字 / 首音边界、残差 `residualMs`），并作为附加字段并入 `voice.latency`；诊断探针 `turn.timeline` / `pipeline.timeline` 默认不返回阶段数组 | 时间线是单轮的，不跨轮串联 |
 | P-48 视觉准备复用请求前通道 | 已实现：`agent/pre-step` 开回合作用域，只有「要看」类请求预取一次；同回合复用受 30 s 与来源 / 场景约束，迟到结果丢弃；单帧与故事板分开 | 是否「要看」由关键词判定，漏判时退回工具采集（多一次工具往返） |
+| 持续视听理解 | 已实现：首次真实陪伴轮后按变化持续取故事板，30 秒 / 24 MiB 有界窗口，开口即锁，`assistant:audiovisual` 评论对齐块与 `assistant:understanding` 后台理解块接入下一轮；主动回应默认开、默认每小时最多 3 句且间隔 ≥60 秒 | 首次陪伴轮之前没有后台连续采集的历史帧，不能倒查；后台理解依赖模型声明图片输入；主动回应的关键台词检测尚未接入 |
 | P-50 关键等待路径 | 只做了观测底座（`a327a47` 等），**优化开发未开始** | 等待位置靠日志逐轮拼，缺统一时间链 |
 | P-59 分层上下文预算 | 已实现：`persona` / `fixed` 受保护，`memory` / `recent` / `ephemeral` 按 `voice` / `typed` / `fastpath` 三个入口各自配额裁剪，并报告每层丢弃量 | 默认配额宽松，只防病态长度，不是省 token 策略 |
 | P-89 宿主协议门槛 | 有实时正文增量，但**没有**「已进入最终答复阶段」的协议保证，也没有可等待的正文入口 | 不能宣称 token 级首句流式；A2 用「缓冲到 step 提交」实现 |
-| P-65 句内流式 | B 档（逗号切块）已实现、待审查；C 档（句内流式）未做，需先核实 GPT-SoVITS 能否增量输出 | 长句首音仍受整块合成影响 |
+| P-65 句内流式 | B 档（逗号切块 + 分块合成 + 预取）已实现、待审查；C 档（句内流式）协议层可行但**当前不接入**（`streaming_mode=2/3` 是真增量，`true/1` 不是） | B 是当前上限；长句首音仍受整块合成影响；首块收益未实测 |
 | 低证据门禁 | `lowEvidenceVerdict` 已有完整判定，但 `voice.lowEvidenceGate` **默认关**，只写影子 | 静音幻觉仍会投递；开启前需要更多真实设备证据 |
 | 声纹身份 | CAM++ 模型、影子打分，仅麦克风通道，阈值未按本机校准；不参与投递 | 不能用于「只认主人」；误匹配风险未量化 |
 | 上下文容量 | 压缩 preset 失败会降级；窗口默认 128k（无 token meter 时）；80% 只告警 | 长会话可能贴近上限，需重启或手动恢复 |
@@ -1556,7 +1586,7 @@ npm pack --dry-run --json
 
 | 入口 | 用法 | 说明 |
 | --- | --- | --- |
-| `GET /assistant/status` | `Invoke-RestMethod "http://127.0.0.1:<GUI端口>/assistant/status"` | 状态投影：版本、组件、设备、视觉、TTS、字幕、人设、记忆、热键、诊断 |
+| `GET /assistant/status` | `Invoke-RestMethod "http://127.0.0.1:<GUI端口>/assistant/status"` | 状态投影：版本、组件、设备、视觉、TTS、字幕、人设、记忆、热键、诊断；`vision.evidence` / `vision.evidenceCapture` / `vision.comment` / `vision.understanding` / `vision.proactive` / `vision.audiovisual` 主要给计数 / 速率 / 尺寸 / 时间 / 开关（少量定位 / 标签字段见下），不暴露路径或正文 |
 | `POST /assistant/action` | body `{ "action": "…", … }` | 设置动作统一入口；未知动作返回 `unknown action` |
 | `GET /assistant/shot?path=…` | 预览缓存图 | 只允许 `<root>/cache` 下且登记过的文件；隐私 / 切换中返回 403 |
 | `data/status.json` | 直接读文件 | 启动时写入的状态快照，便于外部工具检查 |
@@ -1566,6 +1596,9 @@ npm pack --dry-run --json
 | 音频保留 | `voice.audioRetention` + `audio.retention.list` | 只保留可疑语句的 16 kHz WAV，存 `<root>/cache/retention/`；默认关，隐私时不写 |
 | `tools/` 探针 | `node tools/api-smoke.mjs http://127.0.0.1:<GUI端口>`、`tools/memory-debug.mjs`、`tools/tts-probe.mjs`、`tools/vts-probe.mjs`、`tools/asr-probe.mjs`、`tools/obs-seed.mjs`、`tools/subtitle-probe.mjs` | 开发探针，不进发布包 |
 | `scripts/baseline-snapshot.mjs` | 见 §4.1 | 构建 / 模型 / 协议 / TTS 基线与对比 |
+| `tools/baseline-snapshot.mjs` | `node tools/baseline-snapshot.mjs --out reports/baseline.json` | 读 `/assistant/status` 输出稳定 JSON；缺字段为 `null`（`cacheStatsAvailable` 未知按 `false`），不猜；只读，不启动 VTS/OBS、不写事件 |
+
+`vision.evidence.recentIds` 是最近 5 个证据帧 id（供 `assistant_see` 回看定位）；`vision.proactive.lastTopic` 是截断后的主题标签，不是完整事件正文。
 
 示例：
 
