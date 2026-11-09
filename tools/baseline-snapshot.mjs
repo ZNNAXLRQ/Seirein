@@ -25,7 +25,7 @@ import { dirname, resolve } from 'node:path';
 import { release as osRelease, type as osType } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import { buildBaselineSnapshot } from '../src/host/runtime/baseline.js';
+import { buildBaselineSnapshot } from '../src/host/runtime/diagnostics/baseline.js';
 
 export const DEFAULT_STATUS_URL = 'http://127.0.0.1:52524/assistant/status';
 export const DEFAULT_TIMEOUT_MS = 5000;

@@ -14,7 +14,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildBaselineSnapshot } from '../src/host/runtime/baseline.js';
+import { buildBaselineSnapshot } from '../src/host/runtime/diagnostics/baseline.js';
 import {
   DEFAULT_STATUS_URL,
   DEFAULT_TIMEOUT_MS,

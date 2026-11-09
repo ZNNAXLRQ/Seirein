@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { apply } from '../src/host/index.js';
-import { buildBaselineSnapshot } from '../src/host/runtime/baseline.js';
+import { buildBaselineSnapshot } from '../src/host/runtime/diagnostics/baseline.js';
 import { voiceForLanguage } from '../src/host/speech/tts.js';
 import { cleanupRoot } from './helpers/cleanup.mjs';
 
