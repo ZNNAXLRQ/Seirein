@@ -369,20 +369,31 @@ test('a relevant memory is appended by C2 before the request and logged', async 
   assert.equal(joined.deliveryMessageId, 'm-hit', 'the delivery join key rides along');
 
   // Nothing matched: C2 appends a short status message, never a hit, and the user text is intact.
-  const missLog = log;
+  // A separate empty store keeps this a real miss: the hit store above seeds a weekly convention
+  // that the date window (UPCOMING_INJECT) legitimately retrieves on its matching days.
+  const missRoot = await mkdtemp(join(tmpdir(), 'dsh-memory-pipeline-miss-'));
+  const missMemory = new MemoryStore(missRoot);
+  t.after(async () => {
+    missMemory.close();
+    await rm(missRoot, { recursive: true, force: true }).catch(() => {});
+  });
+  const missLog = eventLog();
+  const missPrep = createMemoryPreStep({
+    memory: missMemory, log: missLog, inScope: () => true, featureEnabled: () => true,
+  });
   const missUtterance = '量子退相干的物理图像是什么';
   const missOriginal = userMessage(missUtterance);
   const missPayload = preStepPayload({ agent, turn: 2, messages: [missOriginal] });
-  const missResult = await prep.handle(missPayload, enterDecision(missPayload.messages));
+  const missResult = await missPrep.handle(missPayload, enterDecision(missPayload.messages));
   assert.equal(missResult.messages.length, 2, 'a miss still reports that a search happened');
   const status = missResult.messages.at(-1);
   assert.equal(status.source.kind, ASSISTANT_MEMORY_SOURCE);
-  assert.ok(status.content[0].text.startsWith('## 记忆检索状态'));
+  assert.ok(status.content[0].text.startsWith('## 记忆检索状态'), 'the appended block is the status line, not a hit');
   assert.equal(missOriginal.content[0].text, missUtterance, 'the miss leaves the user text unchanged');
   const missEvents = missLog.events.filter((event) => event.type === 'memory.recall');
-  assert.equal(missEvents.length, 2);
-  assert.equal(missEvents[1].payload.injected, false);
-  assert.equal(missEvents[1].payload.hits, 0);
+  assert.equal(missEvents.length, 1);
+  assert.equal(missEvents[0].payload.injected, false);
+  assert.equal(missEvents[0].payload.hits, 0);
 });
 
 test('out of scope or disabled: no retrieval, no injection, no memory write', async (t) => {

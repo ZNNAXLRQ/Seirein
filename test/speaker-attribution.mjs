@@ -257,7 +257,14 @@ async function mount(root) {
     },
     inject: (_deps, register) => register(scope),
     webServer: { register: () => () => {} },
-  }, { root, enabled: true, asrMergeWindowMs: 10 });
+  }, {
+    root,
+    enabled: true,
+    asrMergeWindowMs: 10,
+    // Candidate extraction is opt-in by default; this suite exercises attribution ON the
+    // automatic-lexicon candidate path, so it must opt in explicitly without touching the default.
+    lexicon: { autoCandidates: true },
+  });
 
   const listen = tools.get('assistant_listen');
   assert.ok(listen !== undefined, 'assistant_listen is registered');
