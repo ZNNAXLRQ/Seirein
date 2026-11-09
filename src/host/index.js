@@ -503,6 +503,11 @@ import {
 } from './speech/format.js';
 export { feedMarkdownSentences } from './speech/format.js';
 import { extractLexiconCandidates, parseExplicitCorrection } from './speech/lexicon-candidates.js';
+import {
+  applyLexiconPlan,
+  planLexiconCorrection,
+} from './speech/lexicon-correction.js';
+import { recallLexiconCandidates } from './speech/lexicon-recall.js';
 import { applyLexiconText, createLexiconStore } from './speech/lexicon-store.js';
 import {
   resolveVoicePrefetchDepth,
@@ -1479,6 +1484,171 @@ export async function publishVoiceInjected({ log, row = {}, turn = null, seen = 
   return payload;
 }
 
+/** One bounded debug form for a lexicon event; the whole transcript never rides an event. */
+function clipLexiconForm(value) {
+  const chars = [...(typeof value === 'string' ? value : String(value ?? ''))];
+  return chars.length <= 24 ? chars.join('') : `${chars.slice(0, 24).join('')}…`;
+}
+
+/** Lexicon events are diagnostics: a throwing/absent logger must never block delivery. */
+function emitLexiconEvent(log, type, payload) {
+  try {
+    void log?.emit?.(type, payload)?.catch?.(() => {});
+  } catch {
+    /* ignore a throwing logger */
+  }
+}
+
+/**
+ * The VOICE ASR post-processing point (never the typed/text lane).
+ *
+ * 1. The existing confirmed exact hints run first (`applyLexiconText`): whole-word
+ *    `wrongForms → canonical` and context-guarded correction rows, with their legacy
+ *    `lexicon.applied` rows.
+ * 2. Only then, recall + plan look for a high-confidence ASR near-miss/reading that the exact
+ *    hints cannot see. The plan is computed on the ALREADY-corrected text, so a word that the
+ *    exact pass just rewrote to its canonical form is reported as `already-canonical` and is
+ *    never replaced a second time.
+ *
+ * The stage is deliberately conservative: one clear recall candidate only (`ambiguous` or two
+ * matches means no replacement), and every plan rule still applies (low score, negation,
+ * factual forms, overlap). The raw ASR copy is not touched by this function; callers keep it as
+ * `rawText`. Any failure is fail-open to the exact-corrected text.
+ *
+ * @param {unknown} text the refined ASR text used for delivery/subtitles
+ * @param {{store?: {listConfirmed?: () => object[]}|null, log?: object|null,
+ *   utteranceId?: string}} [options]
+ * @returns {string}
+ */
+export function applyVoiceLexiconCorrection(text, { store = null, log = null, utteranceId = '' } = {}) {
+  const raw = typeof text === 'string' ? text : '';
+  if (raw.length === 0) return raw;
+  const id = typeof utteranceId === 'string' ? utteranceId : '';
+  const exact = applyLexiconText(raw, { store, log, utteranceId: id });
+  if (store === null || typeof store.listConfirmed !== 'function') return exact;
+  try {
+    const entries = store.listConfirmed();
+    if (!Array.isArray(entries) || entries.length === 0) return exact;
+    const recall = recallLexiconCandidates({ entries, text: exact, limit: 3 });
+    // Ambiguity or a second plausible match means "not unique": leave the ASR text alone.
+    if (recall.ambiguous === true || recall.entries.length !== 1) return exact;
+    // Recall reports its matches, but the locator needs the stored reading of the entry that
+    // produced them. Enrich only the reading/context: `wrongForms` are deliberately NOT injected
+    // here, because the exact pass above already owns their whole-word/context rules and the
+    // plan's literal locator must not re-open a form the exact pass refused (e.g. 小满 inside 小满子).
+    const entryById = new Map();
+    for (const entry of entries) {
+      if (entry !== null && typeof entry === 'object' && entry.id !== undefined) {
+        entryById.set(String(entry.id), entry);
+      }
+    }
+    const enriched = recall.entries
+      .map((candidate) => {
+        const stored = candidate.id === null || candidate.id === undefined
+          ? null
+          : entryById.get(String(candidate.id)) ?? null;
+        // A `correction` row is exact/context territory only; never let the near-form plan
+        // bypass the stored-context rule by re-locating it.
+        if (stored !== null && stored.kind === 'correction') return null;
+        if (stored === null) return candidate;
+        return {
+          ...candidate,
+          reading: typeof stored.reading === 'string' ? stored.reading : '',
+          context: stored.context ?? null,
+          kind: typeof stored.kind === 'string' ? stored.kind : '',
+        };
+      })
+      .filter((candidate) => candidate !== null);
+    if (enriched.length !== 1) return exact;
+    const plan = planLexiconCorrection(exact, { ...recall, entries: enriched });
+    if (plan === null || !Array.isArray(plan.replacements) || plan.replacements.length === 0) {
+      return exact;
+    }
+    const applied = applyLexiconPlan(exact, plan);
+    if (applied.applied.length === 0) return exact;
+    for (const item of applied.applied) {
+      const payload = {
+        utteranceId: id,
+        entryId: item.entryId ?? null,
+        from: clipLexiconForm(item.from),
+        to: clipLexiconForm(item.to),
+        reason: typeof item.reason === 'string' && item.reason.length > 0 ? item.reason : plan.reason,
+        source: 'asr-recall',
+      };
+      emitLexiconEvent(log, 'lexicon.replacement', payload);
+      emitLexiconEvent(log, 'lexicon.applied', payload);
+    }
+    return applied.text;
+  } catch {
+    // The lexicon is an enhancement; the exact-corrected delivery text stays valid.
+    return exact;
+  }
+}
+
+/** The event-log subset of one `onGptSovitsWarmupEvent` hook row. */
+const TTS_WARMUP_EVENT_TYPES = new Set([
+  'tts.warmup.queued',
+  'tts.warmup.started',
+  'tts.warmup.succeeded',
+  'tts.warmup.failed',
+  'tts.warmup.stale',
+]);
+
+/**
+ * Project a warm-up hook row onto the public event-log contract: identity/status and bounded
+ * numbers only. Paths, the reference text, provider error bodies and internal scheduling fields
+ * never enter the log.
+ *
+ * @param {unknown} payload
+ * @returns {{event: string, payload: {key: string|null, generation: number|null,
+ *   status: string, attempt: number|null, errorCode: string|null,
+ *   retryInMs: number|null, bytes: number|null}}|null}
+ */
+export function projectTtsWarmupEvent(payload) {
+  const event = payload?.event ?? payload?.type;
+  if (typeof event !== 'string' || !TTS_WARMUP_EVENT_TYPES.has(event)) return null;
+  const number = (value) => (Number.isFinite(value) ? Math.round(value) : null);
+  return {
+    event,
+    payload: {
+      key: typeof payload?.key === 'string' ? payload.key : null,
+      generation: Number.isInteger(payload?.generation) ? payload.generation : null,
+      status: typeof payload?.status === 'string' ? payload.status : 'unknown',
+      attempt: Number.isInteger(payload?.attempt) ? payload.attempt : null,
+      errorCode: typeof payload?.errorCode === 'string' ? payload.errorCode : null,
+      retryInMs: number(payload?.retryInMs),
+      bytes: number(payload?.bytes),
+    },
+  };
+}
+
+/**
+ * The `/assistant/status.tts.warmup` projection. A build whose TTS module has no warm-up state
+ * (or a mount without TTS) reports the same shape as `unknown`; it never throws.
+ */
+function ttsWarmupStatusView() {
+  const shape = (view = {}) => ({
+    status: typeof view.status === 'string' ? view.status : 'unknown',
+    key: typeof view.key === 'string' ? view.key : null,
+    generation: Number.isInteger(view.generation) ? view.generation : 0,
+    attempts: Number.isInteger(view.attempts) ? view.attempts : 0,
+    retryInMs: Number.isFinite(view.retryInMs) ? Math.max(0, Math.round(view.retryInMs)) : null,
+    lastErrorCode: typeof view.lastErrorCode === 'string' ? view.lastErrorCode : null,
+    retryable: view.retryable === true,
+    startedAt: Number.isFinite(view.startedAt) && view.startedAt > 0 ? view.startedAt : null,
+    finishedAt: Number.isFinite(view.finishedAt) && view.finishedAt > 0 ? view.finishedAt : null,
+  });
+  try {
+    if (typeof ttsModule.gptSovitsWarmupStatus === 'function') {
+      const view = ttsModule.gptSovitsWarmupStatus();
+      if (view !== null && typeof view === 'object') return shape(view);
+    }
+  } catch {
+    /* unconfigured/broken TTS must not break /assistant/status */
+  }
+  return shape();
+}
+
 /**
  * Register the v0 tool surface on the calling context.
  * @param ctx - registrant context carrying the tool registry.
@@ -2419,6 +2589,13 @@ export function apply(ctx, config) {
     onGptSovitsSkipped: (payload) => log.emit('tts.gptsovits.skipped', payload),
     onGptSovitsWarning: (payload) => log.emit('tts.gptsovits.warn', payload),
     onGptSovitsWarmupFailed: (payload) => log.emit('tts.gptsovits.warmup.failed', payload),
+    // Observation only: the warm-up state machine's identity/status rows. The projection keeps
+    // paths, prompt text, provider bodies and `reason` out of the event log.
+    onGptSovitsWarmupEvent: (payload) => {
+      const projected = projectTtsWarmupEvent(payload);
+      if (projected === null) return undefined;
+      return log.emit(projected.event, projected.payload);
+    },
     // Observation only: a synthesis that had to wait for a slot reports how long and behind how
     // many earlier jobs. A slot that started immediately is not emitted (the throttle).
     onSlotWait: (payload) => log.emit('tts.slot.wait', payload),
@@ -14398,8 +14575,9 @@ export function apply(ctx, config) {
       if (refined !== text) void log.emit('hearing.refined', { from: text.length, to: refined.length });
       // 个人语言库闭环：只有「已确认」词条改投递/字幕文本。`text`（原始 ASR）逐字保留在
       // `voice.transcript.rawText` 与上面的 `hearing.utterance` 存档行里；store/规则异常时
-      // fail-open 返回原文。
-      const corrected = applyLexiconText(refined, {
+      // fail-open 返回原文。这里只在语音 ASR 纠错阶段调用：精确 confirmed 规则先跑，再用
+      // recall+plan 处理高置信的唯一近音/读音候选（文字输入/字幕输出不经过这里）。
+      const corrected = applyVoiceLexiconCorrection(refined, {
         store: lexiconStore,
         log,
         utteranceId: meta.utteranceId,
@@ -18790,7 +18968,7 @@ export function apply(ctx, config) {
       protocol: baseline.protocol,
       reasoning: baseline.reasoning,
       input: baseline.input,
-      tts: { ...(status?.tts ?? {}), ...baseline.tts },
+      tts: { ...(status?.tts ?? {}), ...baseline.tts, warmup: ttsWarmupStatusView() },
       versions: { ...(status?.versions ?? {}), ...baseline.versions },
       live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
       vtsAuth,
