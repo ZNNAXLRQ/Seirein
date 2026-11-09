@@ -274,6 +274,15 @@ import {
   personaStyleVersion,
 } from './avatar/avatarRuntime.js';
 import {
+  TIRED_DEFAULTS,
+  createTiredDeadline,
+  resolveTiredTimeoutMs,
+  shouldEnterTired,
+  shouldExpireTired,
+  shouldRecoverFromTired,
+  tiredRecoveryEvidence,
+} from './avatar/idle-state.js';
+import {
   discoverCapabilities,
   resetCapabilities,
   sameDiscoveryIdentity,
@@ -2965,6 +2974,22 @@ export function apply(ctx, config) {
   // Shared by reference with createBehaviorRuntime, so discovery can narrow the pool in place.
   const avatarIdleActions = [...LIGHT_IDLE_ACTIONS];
   let avatarRuntime = null;
+  /**
+   * `tired` is a bounded trial, never a latch. The deadline is created only by a real
+   * waiting→tired transition and is never refreshed by status reads, repeated writes or the
+   * housekeeping poll. Any real exit (ASR / hearing.start / another status / dispose) clears it.
+   */
+  let avatarTiredSince = 0;
+  let avatarTiredReason = '';
+  let avatarTiredEvidenceAt = 0;
+  let avatarTiredExpiresAt = 0;
+  let avatarTiredTrialMs = 0;
+  /**
+   * Host-side floor for the runtime's idle clock. The runtime's `idleSince` is closure-owned and
+   * not writable from here; after tired ends, housekeeping compares against this floor instead, so
+   * the next tired entry needs a full NEW idleTimeout (a recovery cannot relapse on the next tick).
+   */
+  let avatarIdleSinceFloor = 0;
   let avatarActionTimer = null;
   let avatarActionDraining = false;
   /** First successful avatar connect already built the persona style (later reconnects use the tick). */
@@ -3353,6 +3378,9 @@ export function apply(ctx, config) {
 
   /** Idempotent teardown; the disposed instance stays readable from status. */
   const disposeAvatarRuntime = (reason = 'dispose') => {
+    // Teardown is an exit from tired: no trial, no idle floor and no later recovery event.
+    clearAvatarTiredState();
+    avatarIdleSinceFloor = 0;
     const current = avatarRuntime;
     if (current === null) return null;
     // A disposed generation must not leave a listening deadline behind.
@@ -3390,6 +3418,17 @@ export function apply(ctx, config) {
       /** Cached style + the current temporary state; no model/persona read happens here. */
       style: snap.style ?? null,
       status: snap.status ?? 'idle',
+      /**
+       * The bounded tired trial as recorded by the host (null outside tired). `reason` is the one
+       * label; the timestamps are numeric so a reader can verify that polling never extended it.
+       */
+      tired: avatarTiredSince > 0 ? {
+        since: avatarTiredSince,
+        reason: avatarTiredReason,
+        evidenceAt: avatarTiredEvidenceAt,
+        expiresAt: avatarTiredExpiresAt,
+        timeoutMs: avatarTiredTrialMs,
+      } : null,
       intents: snap.intents ?? null,
       mouth: {
         active: snap.speech?.active === true,
@@ -3710,12 +3749,70 @@ export function apply(ctx, config) {
     }
     avatarStatusIf(['idle', 'waiting', 'tired'], 'listening', reason);
   };
+  /**
+   * Trial validity: `config.avatar.tiredTimeoutMs` → legacy `config.avatarTiredTimeoutMs` →
+   * 30 min. `0`/negative/non-finite is NOT "disabled": use a huge value to effectively disable it.
+   */
+  const avatarTiredTimeoutMs = () => resolveTiredTimeoutMs(config);
+  /** Clear the trial and restart the idle clock. `at` is the real exit moment (0 = just clear). */
+  const clearAvatarTiredState = (at = 0) => {
+    avatarTiredSince = 0;
+    avatarTiredReason = '';
+    avatarTiredEvidenceAt = 0;
+    avatarTiredExpiresAt = 0;
+    avatarTiredTrialMs = 0;
+    if (Number.isFinite(at) && at > 0) avatarIdleSinceFloor = at;
+  };
+  /** Record ONE tired entry: reason, supporting evidence time and the fixed trial deadline. */
+  const beginAvatarTired = (reason, at, evidenceAt) => {
+    const enteredAt = Number.isFinite(at) && at > 0 ? at : Date.now();
+    const timeoutMs = avatarTiredTimeoutMs();
+    const deadline = createTiredDeadline({ reason, evidenceAt, now: enteredAt, timeoutMs });
+    avatarTiredSince = enteredAt;
+    avatarTiredReason = deadline?.reason
+      ?? (typeof reason === 'string' && reason.length > 0 ? reason : 'idle-timeout');
+    avatarTiredEvidenceAt = deadline?.evidenceAt ?? enteredAt;
+    avatarTiredExpiresAt = deadline?.expiresAt ?? (enteredAt + timeoutMs);
+    avatarTiredTrialMs = deadline?.timeoutMs ?? timeoutMs;
+  };
+  /**
+   * Defensive fallback for a tired snapshot without a recorded deadline (legacy/hand-written
+   * state). Keep an existing `tiredSince` so this does not restart the whole trial from the poll.
+   */
+  const seedAvatarTiredDeadline = (now) => {
+    const since = avatarTiredSince > 0 ? avatarTiredSince : now;
+    const timeoutMs = avatarTiredTimeoutMs();
+    avatarTiredSince = since;
+    avatarTiredReason = avatarTiredReason || 'tired-observed';
+    avatarTiredEvidenceAt = avatarTiredEvidenceAt > 0 ? avatarTiredEvidenceAt : since;
+    avatarTiredExpiresAt = since + timeoutMs;
+    avatarTiredTrialMs = timeoutMs;
+  };
+  /**
+   * The runtime's `idleSince` is closure-owned, so the host keeps a floor. After any tired exit,
+   * `max(runtimeIdleSince, floor)` behaves exactly like a reset `idleSince`: the next tired entry
+   * needs a full new idleTimeout instead of firing on the very next 60 s tick.
+   */
+  const avatarEffectiveIdleSince = (snap) => {
+    const idleSince = Number(snap?.idleSince);
+    if (!Number.isFinite(idleSince) || idleSince <= 0) return null;
+    return avatarIdleSinceFloor > idleSince ? avatarIdleSinceFloor : idleSince;
+  };
   /** Host event → temporary motion state; ignored while the runtime is absent/disposed. */
-  const avatarStatus = (status, reason = '') => {
+  const avatarStatus = (status, reason = '', timing = null) => {
     const current = avatarRuntime;
-    if (current === null || current.snapshot().disposed === true) return;
+    if (current === null || current.snapshot().disposed === true) return null;
+    const at = Number.isFinite(timing?.at) && timing.at > 0 ? timing.at : Date.now();
     const result = current.setStatus(status, { reason });
     if (result.changed === true) {
+      // A real waiting→tired transition is the ONLY new supporting evidence. A repeated injected
+      // `tired` while already tired reports changed:false and therefore never extends the trial.
+      if (status === 'tired') {
+        beginAvatarTired(reason, at, timing?.evidenceAt);
+      } else if (result.previous === 'tired') {
+        // ASR/hearing.start/speech/another state/dispose all leave here: clear the trial now.
+        clearAvatarTiredState(at);
+      }
       // `listening` is the only state with an expiry: entering starts the deadline, leaving clears it.
       if (status === 'listening') {
         avatarListeningActivityAt = Date.now();
@@ -3725,18 +3822,19 @@ export function apply(ctx, config) {
       }
       void log.emit('avatar.state', { status, previous: result.previous, reason }).catch(() => {});
     }
+    return result;
   };
   /**
    * Transition only when the runtime is still in one of `expected` states. End events are
    * asynchronous (a clip can finish after the mic reopened), so an unconditional waiting would
    * clobber a newer listening/speaking state.
    */
-  const avatarStatusIf = (expected, status, reason = '') => {
+  const avatarStatusIf = (expected, status, reason = '', timing = null) => {
     const current = avatarRuntime;
-    if (current === null) return;
+    if (current === null) return null;
     const snap = current.snapshot();
-    if (snap.disposed === true || !expected.includes(snap.status)) return;
-    avatarStatus(status, reason);
+    if (snap.disposed === true || !expected.includes(snap.status)) return null;
+    return avatarStatus(status, reason, timing);
   };
   // ---- P-54 / P-139: speech boundaries and communication phases -----------------------------
   /**
@@ -3917,20 +4015,61 @@ export function apply(ctx, config) {
       return null;
     }
   };
-  const AVATAR_STYLE_IDLE_TIRED_MS = 10 * 60 * 1000;
+  const AVATAR_STYLE_IDLE_TIRED_MS = TIRED_DEFAULTS.idleTimeoutMs;
   const avatarStyleHousekeeping = () => {
     void refreshAvatarStyle();
     const snap = avatarRuntime?.snapshot();
     if (snap === undefined) return;
+    const now = Date.now();
     // Belt and braces for the one-shot listening deadline: a suspended host may never run its
     // timer. This only re-runs the same check — it never fabricates an idle event.
-    if (snap.status === 'listening' && Date.now() - avatarListeningActivityAt >= avatarListeningIdleMs()) {
+    if (snap.status === 'listening' && now - avatarListeningActivityAt >= avatarListeningIdleMs()) {
       avatarListeningIdleCheck();
     }
+    // Tired recovery is a DEADLINE, not a heartbeat: this poll never extends it. Recovery runs
+    // before the connected guard so a dead socket cannot latch the status forever.
+    if (snap.status === 'tired') {
+      if (!(avatarTiredExpiresAt > 0)) {
+        // An observed tired state without a recorded deadline (legacy/foreign write): seed ONE
+        // observation-based deadline so a missing timestamp cannot recreate the permanent latch.
+        seedAvatarTiredDeadline(now);
+      }
+      const timeoutMs = avatarTiredTrialMs > 0 ? avatarTiredTrialMs : avatarTiredTimeoutMs();
+      const due = shouldExpireTired({ status: snap.status, expiresAt: avatarTiredExpiresAt, now })
+        || shouldRecoverFromTired({ status: snap.status, tiredSince: avatarTiredSince, now, timeoutMs });
+      if (due) {
+        const reason = avatarTiredReason || 'idle-timeout';
+        const evidence = tiredRecoveryEvidence({
+          tiredSince: avatarTiredSince,
+          evidenceAt: avatarTiredEvidenceAt,
+          expiresAt: avatarTiredExpiresAt,
+          now,
+        });
+        // Status first: the neutral `waiting` baseline is the recovery. `relax` then decays the
+        // posture over the runtime's 2–4 s plan, so the tired pose does not snap in one frame.
+        const result = avatarStatusIf(['tired'], 'waiting', 'tired-timeout', { at: now });
+        if (result?.changed === true) {
+          avatarCall('relax', (current) => current.relax({ at: now }));
+          // `reason` is the one label; every measurement in the payload is a number.
+          void log.emit('avatar.tired.recovered', {
+            reason,
+            evidenceAgeMs: evidence.evidenceAgeMs,
+            expiresInMs: evidence.expiresInMs,
+            afterMs: evidence.afterMs,
+            timeoutMs,
+          }).catch(() => {});
+        }
+      }
+      return;
+    }
     if (snap.connected !== true) return;
-    if (snap.status === 'waiting' && snap.idleSince !== null
-      && Date.now() - snap.idleSince > AVATAR_STYLE_IDLE_TIRED_MS) {
-      avatarStatus('tired', 'idle-timeout');
+    if (snap.status === 'waiting') {
+      const idleSince = avatarEffectiveIdleSince(snap);
+      if (shouldEnterTired({ status: snap.status, idleSince, now, timeoutMs: AVATAR_STYLE_IDLE_TIRED_MS })) {
+        // `avatarStatus` records the entry only on a changed transition, so a repeated write while
+        // already tired cannot refresh this deadline. The supporting evidence is the idle span.
+        avatarStatus('tired', 'idle-timeout', { at: now, evidenceAt: idleSince });
+      }
     }
   };
   const avatarStyleBoot = setTimeout(() => void refreshAvatarStyle(), 25_000);
