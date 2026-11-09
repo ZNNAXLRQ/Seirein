@@ -324,6 +324,55 @@ window.__ModuleLoader__.load({
     const ROLLOVER_LOCK_KEY = 'seirein.rollover.claim';
     const ROLLOVER_LOCK_MS = 10000;
 
+    // ---- P-111 P2: client-local diagnostics（默认关闭，受控，无正文） ----------------------
+    // 开关：`?seireinDiag=1` 或 `localStorage.seireinDiag === '1'`；两种都没有时本页不建 ring、
+    // 不暴露 window 全局、不产生事件。每条只允许 {t, code, generation}：绝不记录请求 body、
+    // rollover digest、error.message、用户文本或 URL 查询串；不新增定时器，也不发送到网络。
+    const DIAG_KEY = '__seireinDiag';
+    const DIAG_SWITCH_KEY = 'seireinDiag';
+    const DIAG_MAX_EVENTS = 200;
+    const DIAG_EVENT_CODES = Object.freeze([
+      'poll.start', 'poll.abort', 'send.cancel', 'action.unknown',
+      'session.start.failed', 'timeline.render',
+    ]);
+
+    const diagEnabled = (() => {
+      try {
+        const pageLocation = typeof window === 'undefined' ? undefined : window.location;
+        const search = typeof pageLocation?.search === 'string' ? pageLocation.search : '';
+        if (new URLSearchParams(search).get(DIAG_SWITCH_KEY) === '1') return true;
+        const storage = typeof window === 'undefined' ? undefined : window.localStorage;
+        if (storage?.getItem?.(DIAG_SWITCH_KEY) === '1') return true;
+        // Same key as a property, for storage objects that expose it that way.
+        return storage?.[DIAG_SWITCH_KEY] === '1';
+      } catch {
+        return false;
+      }
+    })();
+    const diagRing = diagEnabled ? [] : null;
+
+    /** Record one fixed event code; disabled pages return before touching the ring. */
+    function diag(code, generation) {
+      if (!diagEnabled || diagRing === null) return;
+      if (!DIAG_EVENT_CODES.includes(code)) return;
+      const numericGeneration = Number(generation);
+      diagRing.push({
+        t: Date.now(),
+        code,
+        generation: Number.isFinite(numericGeneration) ? numericGeneration : 0,
+      });
+      // Bounded: keep the newest 200 entries, never grow without limit.
+      if (diagRing.length > DIAG_MAX_EVENTS) diagRing.shift();
+    }
+
+    if (diagEnabled && typeof window !== 'undefined') {
+      window[DIAG_KEY] = {
+        enabled: true,
+        events: () => diagRing.map((event) => ({ ...event })),
+        clear: () => { diagRing.length = 0; },
+      };
+    }
+
     /** Stop whatever poller an earlier generation installed. Idempotent; safe when none runs. */
     function stopPolling() {
       if (typeof window === 'undefined') return;
@@ -333,6 +382,8 @@ window.__ModuleLoader__.load({
       // aborting the controller rejects the request that is already in flight.
       previous.cancelled = true;
       previous.controller?.abort();
+      // Observation only: the old generation's request was invalidated. No request data is kept.
+      diag('poll.abort', previous.generation);
       // A composer SEND this generation deferred must never click after the stop: drop its
       // pending timers now rather than letting them fire and discover the cancellation.
       previous.cancelSend?.();
@@ -368,6 +419,7 @@ window.__ModuleLoader__.load({
         cancelSend: null,
       };
       window[POLL_KEY] = handle;
+      diag('poll.start', handle.generation);
 
       /**
        * Type `text` into the chat composer and submit; false when no composer is mounted.
@@ -422,6 +474,10 @@ window.__ModuleLoader__.load({
             if (settled) return;
             settled = true;
             handle.cancelSend = null;
+            // Observation only: a deferred SEND had live timers and lost them to cancellation.
+            if (value === false && pending.size > 0 && typeof diag === 'function') {
+              diag('send.cancel', handle.generation);
+            }
             for (const timer of pending) clearTimeout(timer);
             pending.clear();
             resolve(value);
@@ -491,7 +547,13 @@ window.__ModuleLoader__.load({
             // Cancelled with the generation: a stopped poller must not keep talking to the host.
             signal: handle.controller.signal,
           });
-          return await response.json();
+          const reply = await response.json();
+          // Observation only: the host rejected this action as unknown. Do not record its body.
+          if (reply?.ok === false && typeof reply.error === 'string'
+            && reply.error.startsWith('unknown action')) {
+            diag('action.unknown', handle.generation);
+          }
+          return reply;
         } catch {
           return undefined;
         }
@@ -562,6 +624,7 @@ window.__ModuleLoader__.load({
               uiWorkspace.startSession(targetWorkspace || undefined);
             } catch (error) {
               // The host dropped the old diag action (b860f84); keep the diagnosis local.
+              diag('session.start.failed', handle.generation);
               console.warn('[seirein] rollover: startSession failed', error);
             }
           } else {
@@ -592,7 +655,12 @@ window.__ModuleLoader__.load({
         } catch (error) {
           // The host may be restarting; an AbortError means stopPolling() cancelled this very
           // generation's request, so neither may surface as a poller error.
-          if (error?.name === 'AbortError') return;
+          if (error?.name === 'AbortError') {
+            // stopPolling() already logged its own abort; only an abort while this generation
+            // still owns the page is a separate observation.
+            if (!handle.cancelled) diag('poll.abort', handle.generation);
+            return;
+          }
         } finally {
           inFlight = false;
         }
@@ -4127,6 +4195,8 @@ window.__ModuleLoader__.load({
      * 无数据 / 失败 / 缺字段都只降级成一行提示或「—」，绝不猜测数值。
      */
     function timelineSection(h, { data } = {}) {
+      // P-111 local diagnostics：只记一次渲染事件码，不记录任何时间线数据。
+      if (typeof diag === 'function') diag('timeline.render', 0);
       const timeline = diagnosticsObject(data);
       const loading = data === null || data === undefined || timeline?.loading === true;
       const rows = Array.isArray(timeline?.rows) ? timeline.rows : [];
