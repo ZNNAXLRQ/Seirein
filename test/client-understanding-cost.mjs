@@ -29,7 +29,7 @@ const proactiveAt = visionRegion.indexOf("'主动回应'", triggerAt);
 assert.ok(proactiveAt > triggerAt);
 const noteRegion = visionRegion.slice(costAt, proactiveAt);
 
-test('1. 成本概览是只读小字，文案包含最短间隔、理论上限与费用免责声明', () => {
+test('1. 成本概览是只读小字，文案包含最短间隔、理论上限与消耗免责声明', () => {
   assert.equal((visionRegion.match(/data-settings-note': 'understanding-cost'/gu) ?? []).length, 1,
     '成本概览只渲染一行');
   assert.equal((visionRegion.match(/data-settings-note': 'understanding-trigger'/gu) ?? []).length, 1,
@@ -37,7 +37,7 @@ test('1. 成本概览是只读小字，文案包含最短间隔、理论上限�
   assert.equal((visionRegion.match(/style: styles\.hint/gu) ?? []).length >= 2, true,
     '两行都用小字 hint 样式');
   assert.ok(visionRegion.includes(
-    '`后台理解：最短间隔约 ${understandingIntervalText}；持续触发理论上限约 ${understandingPerHour} 次/小时、最多 ${understandingImagesPerHour} 张输入图（实际费用取决于模型与图片处理方式）`',
+    '`后台理解：最短间隔约 ${understandingIntervalText}；持续触发理论上限约 ${understandingPerHour} 次/小时、最多 ${understandingImagesPerHour} 张输入图（实际消耗取决于模型与图片处理方式）`',
   ), '成本行文案与用户定稿一致');
   assert.ok(visionRegion.includes(
     '`限速、按变化触发，不是定时调用：每次分析最多 ${understandingMaxImages} 张输入图，静止或没有新证据时不会调用。`',

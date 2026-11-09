@@ -8529,14 +8529,15 @@ export function apply(ctx, config) {
         if (value.fixed + value.matched === 0) {
           return [{ type: 'text', text: `没有可注入的记忆。\n${memoryQueryLine(value)}` }];
         }
-        const header = `固定 ${value.fixed} 条 + 相关 ${value.matched} 条（关键词：${(value.terms ?? []).join('、') || '无'}）`;
-        const scope = memoryQueryLine(value);
+        // The scope belongs on the summary line whenever there are hits, so every record line
+        // below stays a single parseable line (the zero-hit branch still gives it its own line).
+        const header = `固定 ${value.fixed} 条 + 相关 ${value.matched} 条（关键词：${(value.terms ?? []).join('、') || '无'}） · ${memoryQueryLine(value)}`;
         // The model sees only this render. Correction needs the record id + version, so carry
         // them here instead of hoping the structured value is visible.
         const refs = [...(value.fixedRecords ?? []), ...(value.matchedRecords ?? [])]
           .filter((record) => typeof record.id === 'string' && record.id.length > 0)
           .map((record) => `${record.id}=v${record.version ?? 1}`);
-        const body = value.text.length > 0 ? `${header}\n${scope}\n${value.text}` : `${header}\n${scope}`;
+        const body = value.text.length > 0 ? `${header}\n${value.text}` : header;
         return [{ type: 'text', text: refs.length > 0 ? `${body}\n（定位：${refs.join('；')}）` : body }];
       },
     },
@@ -8619,7 +8620,8 @@ export function apply(ctx, config) {
         if (value.count === 0) {
           return [{ type: 'text', text: `归档里没有匹配「${value.query}」的记录。\n${memoryQueryLine(value)}` }];
         }
-        const lines = [`归档命中 ${value.count} 条（${value.query}）。`, memoryQueryLine(value)];
+        // Keep the range/relaxation on the summary line: one hit per following line, parseable.
+        const lines = [`归档命中 ${value.count} 条（${value.query}）。${memoryQueryLine(value)}`];
         for (const hit of value.hits) {
           const role = hit.role === 'user' || hit.role === 'assistant' ? hit.role : '提炼';
           lines.push(`- [${hit.domain}·${role}·${shortStamp(hit.ts)}] ${hit.text}${hit.turnUpdated === true ? '（该记录已于本轮更新）' : ''}`);

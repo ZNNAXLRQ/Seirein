@@ -5939,7 +5939,7 @@ window.__ModuleLoader__.load({
               h('div', {
                 style: styles.hint,
                 'data-settings-note': 'understanding-cost',
-              }, `后台理解：最短间隔约 ${understandingIntervalText}；持续触发理论上限约 ${understandingPerHour} 次/小时、最多 ${understandingImagesPerHour} 张输入图（实际费用取决于模型与图片处理方式）`),
+              }, `后台理解：最短间隔约 ${understandingIntervalText}；持续触发理论上限约 ${understandingPerHour} 次/小时、最多 ${understandingImagesPerHour} 张输入图（实际消耗取决于模型与图片处理方式）`),
               h('div', {
                 style: styles.hint,
                 'data-settings-note': 'understanding-trigger',

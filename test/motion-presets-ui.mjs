@@ -185,8 +185,14 @@ test('1. 列表返回 320 条、22 个家族，按家族分组且字段完整', 
   assert.equal(item.recipe, 'idle-side');
   assert.equal(item.variant, 'flow');
   assert.equal(item.name, '侧看后停留 · 连贯接续');
-  assert.deepEqual(item.states, ['idle', 'waiting']);
-  assert.deepEqual(item.stateLabels, ['待机', '等待']);
+  // Intentional recipe coverage (commit "tired 覆盖"): these actions now also apply while tired,
+  // so the settings row truthfully names the third state. The selector-only settle metadata
+  // (settle / offsetThreshold / settleChannels) is internal and must not leak into the row.
+  assert.deepEqual(item.states, ['idle', 'waiting', 'tired']);
+  assert.deepEqual(item.stateLabels, ['待机', '等待', '疲倦']);
+  for (const internal of ['settle', 'offsetThreshold', 'settleChannels']) {
+    assert.equal(Object.hasOwn(item, internal), false, `settings row must not expose ${internal}`);
+  }
   assert.deepEqual(item.events, ['idle']);
   assert.deepEqual(item.eventLabels, ['空闲']);
   assert.deepEqual(item.styles, ['reserved', 'composed', 'cool']);
