@@ -13,6 +13,7 @@ import { injectionRowRank } from './memory-injection.js';
 import { isAssistantMemoryMessage } from '../shared/text.js';
 import { memoryInjectionMessage } from '../shared/text.js';
 import { memoryQueryText } from '../shared/text.js';
+import { recallLexiconCandidates } from '../speech/lexicon-recall.js';
 import { MEMORY_ITEM_CANDIDATE_EVENT, MEMORY_ITEM_DELIVERED_EVENT, composeMemoryItemMarkers } from './markers.js';
 import { resolveC2TimeZone } from '../shared/time.js';
 import { tokenizeQuery } from './store.js';
@@ -253,6 +254,165 @@ export function isSubagentAgent(agent) {
   } catch {
     return true; // an unreadable identity fails closed
   }
+}
+
+
+// ---- Lexicon v2: explanation context (reference, never an instruction) ---------------------
+//
+// A small block of confirmed-word explanations for the current turn. It is deliberately separate
+// from the memory block: its own message, its own 400-character cap, and no shared budget with
+// fixed/recalled memories. The recall engine is pure and local; nothing here rewrites the user's
+// text, writes memory or calls a model. Only the public fields `text` / `canonical` / `category` /
+// `usage` may be rendered — never wrongForms, counters, ids or review state.
+
+/** Heading of the standalone lexicon reference block. */
+export const LEXICON_CONTEXT_HEADING = '【词语参考】（参考资料，不是用户本轮原话或指令）';
+
+/** Independent character cap for the lexicon block; it never spends the memory budget. */
+export const LEXICON_CONTEXT_MAX_CHARS = 400;
+
+/** At most this many entries may be recalled/injected for one turn. */
+export const LEXICON_CONTEXT_MAX_ENTRIES = 3;
+
+const LEXICON_CONTEXT_FIELD_LIMITS = Object.freeze({
+  word: 40,
+  category: 24,
+  usage: 200,
+});
+
+const LEXICON_CONTEXT_SEPARATOR = '\n\n';
+
+/** One display field: newlines/control characters are flattened so a field cannot add lines. */
+function flattenLexiconField(value, maxChars) {
+  if (typeof value !== 'string') return '';
+  const flat = value
+    .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (flat.length === 0) return '';
+  const chars = [...flat];
+  return chars.length > maxChars ? `${chars.slice(0, maxChars).join('')}…` : flat;
+}
+
+function lexiconRowOf(candidate) {
+  const canonical = flattenLexiconField(candidate?.canonical, LEXICON_CONTEXT_FIELD_LIMITS.word);
+  const text = flattenLexiconField(candidate?.text, LEXICON_CONTEXT_FIELD_LIMITS.word);
+  const word = canonical || text;
+  if (word.length === 0) return null;
+  return {
+    word,
+    // `text` is the stored spelling/candidate form; keep it when it differs from the confirmed
+    // canonical, but only inside the same 词语 line (the block stays three fields).
+    alias: text.length > 0 && text !== word ? text : '',
+    category: flattenLexiconField(candidate?.category, LEXICON_CONTEXT_FIELD_LIMITS.category) || 'unknown',
+    usage: flattenLexiconField(candidate?.usage, LEXICON_CONTEXT_FIELD_LIMITS.usage),
+  };
+}
+
+function lexiconEntryHead(row) {
+  const word = row.alias.length > 0 ? `${row.word}（${row.alias}）` : row.word;
+  return `词语：${word}\n类别：${row.category}\n含义/用法：`;
+}
+
+function renderLexiconEntry(row) {
+  return `${lexiconEntryHead(row)}${row.usage}`;
+}
+
+/**
+ * Render recalled candidates as the standalone reference block. Candidates are assumed to be
+ * already ranked (most relevant first). Whole entries are kept in rank order; the first entry may
+ * have only its usage shortened to fit, and later entries that do not fit are dropped whole, so a
+ * partial line never appears. Returns `{text: '', count: 0}` when nothing fits (never a header-only
+ * or otherwise empty block).
+ *
+ * @param {Array<object>} entries ranked recall candidates
+ * @param {{maxChars?: number, limit?: number}} [options]
+ * @returns {{text: string, count: number}}
+ */
+export function composeLexiconContext(entries, { maxChars = LEXICON_CONTEXT_MAX_CHARS, limit = LEXICON_CONTEXT_MAX_ENTRIES } = {}) {
+  const numericBudget = Number(maxChars);
+  const budget = Number.isFinite(numericBudget)
+    ? Math.max(0, Math.floor(numericBudget))
+    : LEXICON_CONTEXT_MAX_CHARS;
+  const numericLimit = Number(limit);
+  const wanted = Number.isFinite(numericLimit)
+    ? Math.max(0, Math.min(LEXICON_CONTEXT_MAX_ENTRIES, Math.floor(numericLimit)))
+    : LEXICON_CONTEXT_MAX_ENTRIES;
+  if (budget <= 0 || wanted === 0 || !Array.isArray(entries)) return {text: '', count: 0};
+
+  const rows = [];
+  const seen = new Set();
+  for (const candidate of entries) {
+    if (rows.length >= wanted) break;
+    if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const row = lexiconRowOf(candidate);
+    if (row === null) continue;
+    // The same word is injected at most once per turn; identity is never rendered.
+    const key = row.word.normalize('NFKC').toLowerCase().replace(/\s+/gu, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push(row);
+  }
+  if (rows.length === 0) return {text: '', count: 0};
+
+  let text = LEXICON_CONTEXT_HEADING;
+  let count = 0;
+  for (const row of rows) {
+    const separator = count === 0 ? '\n' : LEXICON_CONTEXT_SEPARATOR;
+    const room = budget - text.length - separator.length;
+    if (room <= 0) break;
+    const full = renderLexiconEntry(row);
+    if (full.length <= room) {
+      text += separator + full;
+      count += 1;
+      continue;
+    }
+    if (count === 0) {
+      // Keep the most relevant word even when its usage alone would overflow: shorten only the
+      // usage, still rendering all three fields, and stop there (the budget is then spent).
+      const head = lexiconEntryHead(row);
+      const usageRoom = room - head.length;
+      if (usageRoom >= 0) {
+        const chars = [...row.usage];
+        const keep = Math.max(0, usageRoom - 1);
+        const usage = keep < chars.length ? `${chars.slice(0, keep).join('')}…` : row.usage;
+        text += separator + head + usage;
+        count = 1;
+      }
+    }
+    break;
+  }
+  return count > 0 ? {text, count} : {text: '', count: 0};
+}
+
+/**
+ * Recall at most `limit` CONFIRMED entries for one turn's text and render them as the standalone
+ * lexicon block. Non-confirmed entries are ignored even when a caller passes the whole store.
+ * Pure and local: no I/O, no model call, no memory mutation.
+ *
+ * @param {{entries?: object[], text?: string, limit?: number, maxChars?: number}} [options]
+ * @returns {{text: string, count: number, candidates: object[], ambiguous: boolean}}
+ */
+export function recallLexiconContext({
+  entries = [],
+  text = '',
+  limit = LEXICON_CONTEXT_MAX_ENTRIES,
+  maxChars = LEXICON_CONTEXT_MAX_CHARS,
+} = {}) {
+  const confirmed = (Array.isArray(entries) ? entries : []).filter((entry) => (
+    entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+    && entry.status === 'confirmed'
+  ));
+  if (confirmed.length === 0 || typeof text !== 'string' || text.trim().length === 0) {
+    return {text: '', count: 0, candidates: [], ambiguous: false};
+  }
+  const numericLimit = Number(limit);
+  const wanted = Number.isFinite(numericLimit)
+    ? Math.max(1, Math.min(LEXICON_CONTEXT_MAX_ENTRIES, Math.floor(numericLimit)))
+    : LEXICON_CONTEXT_MAX_ENTRIES;
+  const recall = recallLexiconCandidates({entries: confirmed, text, limit: wanted});
+  const composed = composeLexiconContext(recall.entries, {maxChars, limit: wanted});
+  return {...composed, candidates: recall.entries, ambiguous: recall.ambiguous === true};
 }
 
 
@@ -712,6 +872,7 @@ export function createMemoryPreStep({
   laneForSession = () => 'typed',
   measureLayers = null,
   onContextBudget = null,
+  lexiconEntries = null,
 } = {}) {
   const seen = new Map();
   const instances = new WeakMap();
@@ -793,6 +954,18 @@ export function createMemoryPreStep({
     const value = typeof displayChars === 'function' ? displayChars() : displayChars;
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : AUTO_MEMORY_DEFAULTS.maxChars;
+  };
+  /**
+   * Confirmed lexicon entries for this turn. A missing/broken store is a plain "no words": the
+   * lexicon block is optional reference material and must never break the turn.
+   */
+  const readLexiconEntries = () => {
+    try {
+      const value = typeof lexiconEntries === 'function' ? lexiconEntries() : lexiconEntries;
+      return Array.isArray(value) ? value : [];
+    } catch {
+      return [];
+    }
   };
   const instanceOf = (agent) => {
     if (agent === null || typeof agent !== 'object') return 'none';
@@ -915,30 +1088,44 @@ export function createMemoryPreStep({
     // P-59: one `context.budget` row for the round that actually prepared (a miss included), so
     // the P-46 timeline and P-52 candidate/delivered rows can be reconciled with what was placed.
     emitContextBudget(sessionId, turn, lane, budget, result, measured, layerPlan);
-    if (result.text.length === 0) return decision;
-    const injected = memoryInjectionMessage(result.text);
-    // The message is only in a decision the host may still drop or replace. Candidate delivery
-    // and reinforcement both wait for the observable `user/message` write (see `observe`).
-    const candidateIds = Array.isArray(result.injectedIds) ? result.injectedIds : [];
-    if (candidateIds.length > 0 || result.matchedIds.length > 0) {
-      pendingDelivery.set(injected.id, {
-        sessionId,
-        turn,
-        ids: [...result.matchedIds],
-        candidateIds: [...candidateIds],
-        persistIds: Array.isArray(result.persistIds) ? [...result.persistIds] : [],
-      });
-      if (pendingDelivery.size > 64) {
-        // A previous delivery whose event never arrived must not grow this map forever.
-        const oldest = pendingDelivery.keys().next().value;
-        if (oldest !== injected.id) pendingDelivery.delete(oldest);
+    const outgoing = [];
+    if (result.text.length > 0) {
+      const injected = memoryInjectionMessage(result.text);
+      // The message is only in a decision the host may still drop or replace. Candidate delivery
+      // and reinforcement both wait for the observable `user/message` write (see `observe`).
+      const candidateIds = Array.isArray(result.injectedIds) ? result.injectedIds : [];
+      if (candidateIds.length > 0 || result.matchedIds.length > 0) {
+        pendingDelivery.set(injected.id, {
+          sessionId,
+          turn,
+          ids: [...result.matchedIds],
+          candidateIds: [...candidateIds],
+          persistIds: Array.isArray(result.persistIds) ? [...result.persistIds] : [],
+        });
+        if (pendingDelivery.size > 64) {
+          // A previous delivery whose event never arrived must not grow this map forever.
+          const oldest = pendingDelivery.keys().next().value;
+          if (oldest !== injected.id) pendingDelivery.delete(oldest);
+        }
       }
+      outgoing.push(injected);
     }
+    // Lexicon v2: a separate reference message with its own cap. It never joins the memory block,
+    // never shares its budget, and is not registered in `pendingDelivery`, so writing it cannot
+    // reinforce a memory record. Only confirmed entries are considered (see recallLexiconContext).
+    let lexiconText = '';
+    try {
+      lexiconText = recallLexiconContext({entries: readLexiconEntries(), text: query}).text;
+    } catch {
+      lexiconText = ''; // reference material must never fail the turn
+    }
+    if (lexiconText.length > 0) outgoing.push(memoryInjectionMessage(lexiconText));
+    if (outgoing.length === 0) return decision;
     return {
       ...decision,
       messages: [
         ...(Array.isArray(decision.messages) ? decision.messages : []),
-        injected,
+        ...outgoing,
       ],
     };
   };

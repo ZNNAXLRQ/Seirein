@@ -11,6 +11,8 @@
  *     object with its WebError code, never a stack or raw HTML;
  *  4. fetch accepts only http/https, returns non-2xx as a result, truncates the body to 12000
  *     characters, and keeps failures short;
+ *  4b. fetch render returns the whole retained body (not a 600-character preview), so an answer
+ *     past character 600 reaches the model; a 12000-character cut is named in the header;
  *  5. a missing `web` service answers 「当前没有联网搜索工具」 instead of falling back to curl;
  *  6. the event log records only input length, result count and code — never the query or URL body.
  *
@@ -412,6 +414,10 @@ test('8. fetch truncates the body to 12000 characters and marks truncated', asyn
   validate(tool.output.schema, value);
   const text = rendered(tool, args, value);
   assert.ok(text.length < body.length, 'render stays shorter than the full body');
+  assert.ok(text.includes(body.slice(0, 12_000)), 'the whole retained 12000-character body reaches the model');
+  assert.ok(text.includes('内容已截断'), 'render marks the cut body');
+  assert.ok(text.includes('仅前 12000 字'), 'render names the 12000-character cap');
+  assert.ok(text.length <= 12_000 + 200, 'render stays bounded by the same 12000-character budget');
 
   web.fetch = async (request) => ({
     url: request.url,
@@ -452,6 +458,11 @@ test('9. fetch failures keep only a short code/message and are skipped when not 
   assert.equal(failed.value.code, 'WEB_PROVIDER_UNAVAILABLE');
   assert.equal(JSON.stringify(failed.value).includes('secret'), false);
   assert.equal(rendered(failed.tool, { url: 'https://example.com/x' }, failed.value).includes('<html>'), false);
+  assert.equal(
+    rendered(failed.tool, { url: 'https://example.com/x' }, failed.value),
+    '联网抓取失败：bad gateway（WEB_PROVIDER_UNAVAILABLE）',
+    'the failure render is unchanged: short message plus code only',
+  );
   validate(failed.tool.output.schema, failed.value);
 
   web.fetchReady = async () => {
@@ -540,4 +551,34 @@ test('11. events carry only input length/result count/status/code, never query o
   } finally {
     EventLog.prototype.emit = originalEmit;
   }
+});
+
+test('12. fetch render shows the full body, including content past 600 characters', async (t) => {
+  const { web } = fakeWeb();
+  const { tools } = await mount(t, web);
+  const prefix = 'x'.repeat(700);
+  const answer = '答案在 600 字之后';
+  const body = `${prefix}${answer}${'y'.repeat(912 - prefix.length - answer.length)}`;
+  assert.equal(body.length, 912, 'the fake page is exactly 912 characters');
+  assert.ok(body.indexOf(answer) > 600, 'the answer starts after character 600');
+
+  web.fetch = async (request) => ({
+    url: request.url,
+    statusCode: 200,
+    body: { kind: 'text', content: body },
+    truncated: false,
+  });
+  const args = { url: 'https://example.com/912' };
+  const { tool, value } = await call(tools, 'assistant_web_fetch', args);
+  assert.equal(value.content, body);
+  assert.equal(value.content.length, 912);
+  assert.equal(value.truncated, false, 'a 912-character body is not truncated');
+  validate(tool.output.schema, value);
+
+  const text = rendered(tool, args, value);
+  assert.ok(text.includes(answer), 'the answer after character 600 reaches the model');
+  assert.ok(text.includes(body), 'the whole 912-character body is rendered, not a 600-character prefix');
+  assert.ok(text.includes('HTTP 200'));
+  assert.equal(text.includes('内容已截断'), false, 'an untruncated body has no cut marker');
+  console.log('12) 912-char page renders in full; an answer past character 600 is visible');
 });

@@ -539,6 +539,11 @@ export {
   isSubagentAgent,
   prepareMemoryInjection,
   createMemoryPreStep,
+  LEXICON_CONTEXT_HEADING,
+  LEXICON_CONTEXT_MAX_CHARS,
+  LEXICON_CONTEXT_MAX_ENTRIES,
+  composeLexiconContext,
+  recallLexiconContext,
 } from './memory/pre-step.js';
 export {
   assembleLayerPlan,
@@ -7301,6 +7306,10 @@ export function apply(ctx, config) {
     featureEnabled: () => features.enabled('memory'),
     displayChars: () => autoMemorySettings().maxChars,
     ledger: memoryTurnLedger,
+    // Lexicon v2 explanation context: confirmed shared-lexicon entries are recalled locally for
+    // this turn's text (voice and typed alike) and appended as their own reference block. It is
+    // read-only: no memory write, no reinforcement, no auto-replacement of the delivered text.
+    lexiconEntries: () => lexiconStore.listConfirmed(),
     // P-59: the voice session is the dated companion session; every other in-scope session is
     // the typed entry. Per-layer budgets are opt-in through `contextBudgets`, so a deployment
     // without them keeps the legacy single-block cap unchanged.
@@ -12554,9 +12563,18 @@ export function apply(ctx, config) {
             text: `联网抓取失败：${value.error}${value.code ? `（${value.code}）` : ''}`,
           }];
         }
-        const header = `联网抓取 ${value.url}：HTTP ${value.statusCode}，${value.contentType}${value.truncated ? '，内容已截断' : ''}`;
-        const preview = plainWebText(value.content);
-        return [{ type: 'text', text: preview.length > 0 ? `${header}\n${clipWebText(preview, 600)}` : header }];
+        // Render the whole retained body: execute already caps it at 12000 characters, so a
+        // smaller preview here hid everything past the prefix. The same 12000-character budget
+        // below only guards a hand-built value and keeps the truncation marker truthful.
+        const raw = typeof value.content === 'string' ? value.content : '';
+        const text = plainWebText(raw);
+        const clipped = text.length > WEB_FETCH_CONTENT_MAX_CHARS;
+        const body = clipped ? `${text.slice(0, WEB_FETCH_CONTENT_MAX_CHARS)}…` : text;
+        const truncated = value.truncated === true || clipped;
+        const cappedAtMax = clipped
+          || (value.truncated === true && raw.length >= WEB_FETCH_CONTENT_MAX_CHARS);
+        const header = `联网抓取 ${value.url}：HTTP ${value.statusCode}，${value.contentType}${truncated ? `，内容已截断${cappedAtMax ? `（仅前 ${WEB_FETCH_CONTENT_MAX_CHARS} 字）` : ''}` : ''}`;
+        return [{ type: 'text', text: body.length > 0 ? `${header}\n${body}` : header }];
       },
     },
     async execute(args, exec) {
