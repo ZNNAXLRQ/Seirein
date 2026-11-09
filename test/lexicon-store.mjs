@@ -158,6 +158,11 @@ test('1. 空文件 → 默认结构；首次 merge 写入并返回计数', (t) =
   assert.equal(entry.confirmedAt, '');
   assert.equal(entry.rejectedAt, '');
   assert.equal(entry.editedAt, '');
+  // v1 manual fields: automatic candidates default to unknown/public with empty text fields.
+  assert.equal(entry.category, 'unknown');
+  assert.equal(entry.usage, '');
+  assert.equal(entry.reading, '');
+  assert.equal(entry.library, 'public');
   assert.deepEqual(
     log.of('lexicon.store.changed').map((item) => ({ op: item.op, id: item.id })),
     [{ op: 'merge', id: 'lex-1' }],

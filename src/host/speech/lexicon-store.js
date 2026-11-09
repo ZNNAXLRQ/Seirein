@@ -23,6 +23,8 @@
  *     entries: [{
  *       id, key, text, canonical, wrongForms: [],
  *       kind: 'proper-noun'|'correction',
+ *       category: 'person'|'character'|'work'|'place'|'term'|'expression'|'meme'|'unknown',
+ *       usage: string, reading: string, library: 'public'|'voiceprint',
  *       status: 'candidate'|'confirmed'|'rejected',
  *       speakerId: null|string, assigned: boolean,
  *       context: {before, after}|null,
@@ -75,6 +77,30 @@ import {
 /** The path inside the caller-provided root. */
 export const LEXICON_STORE_PATH = join('data', 'lexicon.json');
 
+/** Manual shared-lexicon taxonomy. `unknown` is the safe default for old/automatic rows. */
+export const LEXICON_CATEGORIES = Object.freeze([
+  'person',
+  'character',
+  'work',
+  'place',
+  'term',
+  'expression',
+  'meme',
+  'unknown',
+]);
+
+/**
+ * Library slot of one entry. Only `public` is written today; `voiceprint` is reserved for a later
+ * per-voiceprint library and has no special logic in this stage.
+ */
+export const LEXICON_LIBRARIES = Object.freeze(['public', 'voiceprint']);
+export const LEXICON_DEFAULT_LIBRARY = 'public';
+
+/** User-facing field limits, measured in code points (an emoji counts once). */
+export const LEXICON_TEXT_MAX_CHARS = 40;
+export const LEXICON_USAGE_MAX_CHARS = 200;
+export const LEXICON_READING_MAX_CHARS = 80;
+
 /** One stored context side never carries more than this many characters. */
 const CONTEXT_MAX_CHARS = 16;
 
@@ -117,6 +143,49 @@ function cleanContext(value) {
   return { before, after };
 }
 
+/** Code-point length; invalid values count as empty. */
+function textLength(value) {
+  return typeof value === 'string' ? [...value].length : 0;
+}
+
+/**
+ * Repair the manual fields on one entry read from disk (or about to be written by `write`).
+ * Old lexicon files have none of these fields, so they must still read as usable public words.
+ * Mutators validate their input strictly; this tolerant pass only guarantees the persisted shape.
+ */
+function normalizeEntryExtras(entry) {
+  if (!LEXICON_CATEGORIES.includes(entry.category)) entry.category = 'unknown';
+  if (typeof entry.usage !== 'string') entry.usage = '';
+  if (typeof entry.reading !== 'string') entry.reading = '';
+  if (!LEXICON_LIBRARIES.includes(entry.library)) entry.library = LEXICON_DEFAULT_LIBRARY;
+}
+
+/** Validate a category/usage/reading/library argument; `null` means "invalid". */
+function cleanCategory(value) {
+  return typeof value === 'string' && LEXICON_CATEGORIES.includes(value) ? value : null;
+}
+
+function cleanUsage(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (textLength(text) > LEXICON_USAGE_MAX_CHARS) return null;
+  return text;
+}
+
+function cleanReading(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (textLength(text) > LEXICON_READING_MAX_CHARS) return null;
+  return text;
+}
+
+function cleanLibrary(value) {
+  if (value === undefined || value === null) return LEXICON_DEFAULT_LIBRARY;
+  return typeof value === 'string' && LEXICON_LIBRARIES.includes(value) ? value : null;
+}
+
 /** De-duplicated misrecognised forms; the same form in full/half width is one form. */
 function normalizeWrongForms(value) {
   if (!Array.isArray(value)) return null;
@@ -153,6 +222,22 @@ function clockInstant(clock) {
 }
 
 /**
+ * Allocate the next stable `lex-N` id for a manually added entry. This mirrors the model's own
+ * allocator (not exported by lexicon-candidates) and updates `state.nextId`, so ids stay unique
+ * across candidate merges and manual adds in either order.
+ */
+function allocateEntryId(state) {
+  let highest = 0;
+  for (const entry of state.entries) {
+    const match = /^lex-(\d+)$/u.exec(String(entry?.id ?? ''));
+    if (match !== null) highest = Math.max(highest, Number(match[1]));
+  }
+  const next = Math.max(Number.isSafeInteger(state.nextId) ? state.nextId : 1, highest + 1);
+  state.nextId = next + 1;
+  return `lex-${next}`;
+}
+
+/**
  * Create the file-backed lexicon store for one root.
  *
  * @param {object} options
@@ -165,6 +250,9 @@ function clockInstant(clock) {
  *   read: () => object,
  *   write: (state: object) => object,
  *   mergeCandidates: (candidates: object|object[]) => {added: number, merged: number, skipped: number},
+ *   addEntry: (options: object) => {ok: boolean, entry?: object, reason?: string},
+ *   updateEntry: (options: object) => {ok: boolean, entry?: object, reason?: string},
+ *   moveEntry: (options: object) => {ok: boolean, entry?: object, reason?: string},
  *   confirm: (options: object) => {ok: boolean, entry?: object, reason?: string},
  *   edit: (options: object) => {ok: boolean, entry?: object, reason?: string},
  *   reject: (options: object) => {ok: boolean, entry?: object, reason?: string},
@@ -219,7 +307,15 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     return views.map((view) => {
       const stored = byId.get(view.id);
       const editedAt = stored !== undefined && typeof stored.editedAt === 'string' ? stored.editedAt : '';
-      return { ...view, editedAt };
+      const extra = stored !== undefined && stored !== null && typeof stored === 'object'
+        ? {
+            category: LEXICON_CATEGORIES.includes(stored.category) ? stored.category : 'unknown',
+            usage: typeof stored.usage === 'string' ? stored.usage : '',
+            reading: typeof stored.reading === 'string' ? stored.reading : '',
+            library: LEXICON_LIBRARIES.includes(stored.library) ? stored.library : LEXICON_DEFAULT_LIBRARY,
+          }
+        : { category: 'unknown', usage: '', reading: '', library: LEXICON_DEFAULT_LIBRARY };
+      return { ...view, ...extra, editedAt };
     });
   };
 
@@ -249,6 +345,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       // Reuse the model's own entry normalizer instead of re-deriving field defaults here.
       const repaired = mergeStateCandidates(state, []);
       if (repaired.ok !== true) throw new TypeError(`无法修复 lexicon 状态: ${repaired.reason}`);
+      for (const entry of state.entries) normalizeEntryExtras(entry);
       lastCorruption = '';
       return state;
     } catch (error) {
@@ -267,6 +364,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     // creates fresh entries without `editedAt`, so it is filled at this boundary.
     for (const entry of normalized.entries) {
       if (typeof entry.editedAt !== 'string') entry.editedAt = '';
+      normalizeEntryExtras(entry);
     }
     mkdirSync(dirname(file), { recursive: true });
     // A unique temp name keeps two stores over one root from publishing each other's bytes.
@@ -315,6 +413,164 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     const firstAdded = state.entries.find((entry) => !beforeIds.has(entry?.id));
     emit('lexicon.store.changed', { op: 'merge', id: typeof firstAdded?.id === 'string' ? firstAdded.id : null });
     return counts;
+  };
+
+  /**
+   * Manually add one shared word. It is confirmed immediately (the user typed it, so there is no
+   * candidate to confirm) and carries no speaker identity. The category is required here because
+   * only the user can classify a manually added word; `usage`/`reading` may be empty.
+   *
+   * A duplicate key/canonical returns exactly `{ok:false, reason:'exists'}` and writes nothing.
+   *
+   * @param {{text?: string, canonical?: string, category?: string, usage?: string|null,
+   *   reading?: string|null, library?: string}} [options]
+   * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
+   */
+  const addEntry = ({
+    text = undefined,
+    canonical = undefined,
+    category = undefined,
+    usage = undefined,
+    reading = undefined,
+    library = undefined,
+  } = {}) => {
+    const raw = canonical !== undefined ? canonical : text;
+    const display = typeof raw === 'string' ? raw.trim() : '';
+    if (display.length === 0) return { ok: false, reason: 'text-required' };
+    if (textLength(display) > LEXICON_TEXT_MAX_CHARS) return { ok: false, reason: 'text-too-long' };
+    const categoryValue = cleanCategory(category);
+    if (categoryValue === null) return { ok: false, reason: 'invalid-category' };
+    const usageValue = cleanUsage(usage);
+    if (usageValue === null) return { ok: false, reason: 'invalid-usage' };
+    const readingValue = cleanReading(reading);
+    if (readingValue === null) return { ok: false, reason: 'invalid-reading' };
+    const libraryValue = cleanLibrary(library);
+    if (libraryValue === null) return { ok: false, reason: 'invalid-library' };
+    const key = lexiconKey(display);
+    const state = read();
+    const duplicate = state.entries.find((entry) => entry?.key === key
+      || (typeof entry?.canonical === 'string' && entry.canonical.length > 0 && lexiconKey(entry.canonical) === key));
+    if (duplicate !== undefined) return { ok: false, reason: 'exists' };
+    const at = clockInstant(clock);
+    const entry = {
+      id: allocateEntryId(state),
+      key,
+      text: display,
+      canonical: display,
+      kind: 'proper-noun',
+      category: categoryValue,
+      usage: usageValue,
+      reading: readingValue,
+      library: libraryValue,
+      status: LEXICON_STATUS.CONFIRMED,
+      wrongForms: [],
+      sourceIds: [],
+      context: null,
+      ambiguous: false,
+      speakerId: null,
+      assigned: true,
+      at,
+      confirmedAt: at,
+      rejectedAt: '',
+      editedAt: '',
+    };
+    state.entries.push(entry);
+    save(state);
+    emit('lexicon.store.changed', { op: 'add', id: entry.id });
+    return { ok: true, entry: viewOf(state, entry.id) };
+  };
+
+  /**
+   * Edit a manually managed entry's identity text / category / usage / reading. The entry's
+   * status, kind, wrongForms, context and identity (id) are never rewritten here; in particular an
+   * update cannot confirm, reject or un-reject an entry. Renaming to another entry's key is refused
+   * with `exists` so the store keeps one row per normalized form.
+   *
+   * `text` and `canonical` are two names for the same display form; when both are supplied
+   * `canonical` wins. Changing it updates `text`, `canonical` and the normalized `key` together.
+   *
+   * @param {{id?: string, text?: string, canonical?: string, category?: string,
+   *   usage?: string|null, reading?: string|null}} [options]
+   * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
+   */
+  const updateEntry = ({
+    id = undefined,
+    text = undefined,
+    canonical = undefined,
+    category = undefined,
+    usage = undefined,
+    reading = undefined,
+  } = {}) => {
+    if (id === undefined || id === null) return { ok: false, reason: 'id-required' };
+    if (text === undefined && canonical === undefined && category === undefined
+      && usage === undefined && reading === undefined) {
+      return { ok: false, reason: 'no-editable-field' };
+    }
+    let display;
+    if (text !== undefined || canonical !== undefined) {
+      const raw = canonical !== undefined ? canonical : text;
+      display = typeof raw === 'string' ? raw.trim() : '';
+      if (display.length === 0) return { ok: false, reason: 'text-required' };
+      if (textLength(display) > LEXICON_TEXT_MAX_CHARS) return { ok: false, reason: 'text-too-long' };
+    }
+    let categoryValue;
+    if (category !== undefined) {
+      categoryValue = cleanCategory(category);
+      if (categoryValue === null) return { ok: false, reason: 'invalid-category' };
+    }
+    let usageValue;
+    if (usage !== undefined) {
+      usageValue = cleanUsage(usage);
+      if (usageValue === null) return { ok: false, reason: 'invalid-usage' };
+    }
+    let readingValue;
+    if (reading !== undefined) {
+      readingValue = cleanReading(reading);
+      if (readingValue === null) return { ok: false, reason: 'invalid-reading' };
+    }
+    const state = read();
+    const entry = state.entries.find((item) => item?.id === String(id));
+    if (entry === undefined) return { ok: false, reason: 'not-found' };
+    if (entry.status === LEXICON_STATUS.REJECTED) return { ok: false, reason: 'rejected' };
+    if (display !== undefined) {
+      const key = lexiconKey(display);
+      const duplicate = state.entries.find((item) => item !== entry && (item?.key === key
+        || (typeof item?.canonical === 'string' && item.canonical.length > 0 && lexiconKey(item.canonical) === key)));
+      if (duplicate !== undefined) return { ok: false, reason: 'exists' };
+      entry.text = display;
+      entry.canonical = display;
+      entry.key = key;
+    }
+    if (categoryValue !== undefined) entry.category = categoryValue;
+    if (usageValue !== undefined) entry.usage = usageValue;
+    if (readingValue !== undefined) entry.reading = readingValue;
+    entry.editedAt = clockInstant(clock);
+    save(state);
+    emit('lexicon.store.changed', { op: 'update', id: entry.id });
+    return { ok: true, entry: viewOf(state, entry.id) };
+  };
+
+  /**
+   * Move one entry between the public library and the reserved voiceprint library. This changes
+   * only `library`; status/identity/content stay untouched. The voiceprint slot has no matching
+   * logic in this stage, but the value is accepted so a later version can read the same file.
+   *
+   * @param {{id?: string, library?: string}} [options]
+   * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
+   */
+  const moveEntry = ({ id = undefined, library = undefined } = {}) => {
+    if (id === undefined || id === null) return { ok: false, reason: 'id-required' };
+    if (library === undefined) return { ok: false, reason: 'invalid-library' };
+    const libraryValue = cleanLibrary(library);
+    if (libraryValue === null) return { ok: false, reason: 'invalid-library' };
+    const state = read();
+    const entry = state.entries.find((item) => item?.id === String(id));
+    if (entry === undefined) return { ok: false, reason: 'not-found' };
+    if (entry.status === LEXICON_STATUS.REJECTED) return { ok: false, reason: 'rejected' };
+    entry.library = libraryValue;
+    save(state);
+    emit('lexicon.store.changed', { op: 'move', id: entry.id });
+    return { ok: true, entry: viewOf(state, entry.id) };
   };
 
   /**
@@ -443,6 +699,9 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     read,
     write,
     mergeCandidates: merge,
+    addEntry,
+    updateEntry,
+    moveEntry,
     confirm,
     edit,
     reject,

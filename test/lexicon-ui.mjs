@@ -6,9 +6,9 @@
  * `lexiconSection`，用记录型 `h` 求值 —— 不需要 DOM、React 或宿主。
  *
  * 固定的是用户实际能看见/点到的东西：
- *   1. 两组列表（有数据/空数据）、加载中；
+ *   1. 两组列表（有数据/空数据）、加载中；手动新建表单三字段+读音、类别/库位展示；
  *   2. 确认候选的请求体（speakerId 只从宿主状态取，字符串参数逐项核对）；
- *   3. 编辑弹窗预填 + 删减误识别形式 + 保存请求体；
+ *   3. 编辑弹窗预填三字段/读音 + lexicon.update 保存请求体；
  *   4. 删除/忽略都是两步确认，第一次点击不写；
  *   5. 未接线/读取失败/坏数据只显示错误，不抛出（含宿主当前不带 ok 的 list 形状）；
  *   6. client.js 接线检查（回归套件 audio-retention-ui / motion-presets-ui / hearing-ui /
@@ -46,6 +46,7 @@ return {
   lexiconSpeakerId, lexiconListData, lexiconObservedForms, lexiconDialogOf, lexiconSaveBody, lexiconSection,
   lexiconFailureReason, lexiconPartialNotice, lexiconWrongFormsBody,
   lexiconSaveSteps, lexiconRetryStep, settleLexiconSave, closeLexiconDialogState,
+  lexiconEmptyDraft, lexiconAddBody, lexiconCategoryLabel, lexiconLibraryLabel,
 };`,
 )(styles, '#d8dce3', '#c92a2a');
 
@@ -116,6 +117,10 @@ const word = (overrides = {}) => ({
   canonical: '向晚',
   wrongForms: ['像晚', '想晚'],
   kind: 'proper-noun',
+  category: 'person',
+  usage: '角色名',
+  reading: '',
+  library: 'public',
   status: 'confirmed',
   speakerId: 'spk-1',
   assigned: true,
@@ -141,6 +146,9 @@ const mount = (overrides = {}) => {
     askRemove: [],
     remove: [],
     cancel: 0,
+    changeDraft: [],
+    add: [],
+    move: [],
   };
   const state = {
     data: { entries: [], unassigned: [], loading: false, error: '' },
@@ -148,6 +156,7 @@ const mount = (overrides = {}) => {
     dialog: null,
     pending: null,
     speakerId: 'spk-1',
+    draft: lexicon.lexiconEmptyDraft(),
     ...overrides,
   };
   const handlers = {
@@ -189,6 +198,12 @@ const mount = (overrides = {}) => {
     },
     remove: (id) => { calls.remove.push(id); state.pending = null; },
     cancelWrite: () => { calls.cancel += 1; state.pending = null; },
+    changeDraft: (patch) => {
+      calls.changeDraft.push(patch);
+      state.draft = { ...state.draft, ...patch, error: '' };
+    },
+    add: (draft) => { calls.add.push(draft); },
+    move: (id, library) => { calls.move.push([String(id), String(library)]); },
   };
   const render = () => lexicon.lexiconSection(h, {
     data: state.data,
@@ -196,6 +211,7 @@ const mount = (overrides = {}) => {
     dialog: state.dialog,
     pending: state.pending,
     speakerId: state.speakerId,
+    draft: state.draft,
   }, handlers);
   return { state, calls, render };
 };
@@ -253,7 +269,7 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   const tree = view.render();
   const texts = textsOf(tree);
 
-  assert.ok(texts.includes('未归属候选（3）'), 'the unassigned header carries its count');
+  assert.ok(texts.includes('待确认候选（3）'), 'the candidate header carries its count');
   assert.ok(texts.includes('共享词库（1）'), 'the confirmed header carries its count');
   assert.ok(texts.includes('向晚'), 'the candidate text is visible');
   assert.ok(texts.includes('林晚'), 'an assigned-but-unconfirmed candidate is visible too');
@@ -276,11 +292,30 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   assert.ok(nodeOf(tree, 'data-lexicon-entry', 'word-1') !== undefined, 'the confirmed word has its row');
   assert.equal(nodeOf(tree, 'data-lexicon-entry', 'draft-1'), undefined,
     'a non-confirmed entry never appears in the personal lexicon');
+  const wordRow = nodeOf(tree, 'data-lexicon-entry', 'word-1');
+  assert.equal(wordRow.props['data-lexicon-library'], 'public');
+  assert.ok(textsOf(wordRow).includes('人名'), 'the category is labelled in Chinese');
+  assert.ok(textsOf(wordRow).includes('公共库'), 'the library slot is visible');
+  assert.ok(textsOf(wordRow).includes('用法：角色名'), 'the usage is visible');
+  assert.equal(buttonOf(wordRow, '移到声纹库').props.disabled, true,
+    'move-to-voiceprint is disabled while the voiceprint library is not built');
+  assert.match(String(buttonOf(wordRow, '移到声纹库').props.title), /声纹库尚未建立/u);
+
+  const form = nodeOf(tree, 'data-lexicon-new-form', '1');
+  assert.ok(form !== undefined, 'the manual add form is mounted');
+  assert.equal(inputOf(form, (node) => node.props['data-lexicon-new-text'] === '1').props.value, '');
+  assert.ok(nodesOf(form).some((node) => node.type === 'select'
+    && node.props?.['data-lexicon-new-category'] === '1'), 'the category dropdown is present');
+  assert.ok(nodesOf(form).some((node) => node.type === 'input'
+    && node.props?.['data-lexicon-new-usage'] === '1'), 'the usage field is present');
+  assert.ok(nodesOf(form).some((node) => node.type === 'input'
+    && node.props?.['data-lexicon-new-reading'] === '1'), 'the optional reading field is present');
+  assert.equal(buttonOf(form, '添加词条').props.disabled, true, 'empty text cannot be added');
 
   const empty = mount().render();
   assert.ok(textsOf(empty).includes('没有待确认的候选'), 'empty unassigned has its own text');
   assert.ok(textsOf(empty).includes('共享词库还是空的'), 'empty lexicon has its own text');
-  assert.ok(textsOf(empty).includes('未归属候选（0）') && textsOf(empty).includes('共享词库（0）'));
+  assert.ok(textsOf(empty).includes('待确认候选（0）') && textsOf(empty).includes('共享词库（0）'));
 
   const loading = mount({ data: null }).render();
   assert.ok(textsOf(loading).includes('正在读取语言库…'), 'a null list renders the loading text');
@@ -409,8 +444,8 @@ test('2. 确认候选：speakerId 可选，有则带、无则不带；没有身�
 // ---------------------------------------------------------------------------------------------
 // 3. Edit dialog: prefill (spelling / wrong forms / context) and the save body
 // ---------------------------------------------------------------------------------------------
-test('3. 编辑弹窗：预填正确写法、误识别形式、上下文；删减后保存', async () => {
-  const entry = word();
+test('3. 编辑弹窗：预填三字段/读音；保存走 lexicon.update 且不碰 status/wrongForms', async () => {
+  const entry = word({ reading: 'xiàng wǎn' });
   const view = mount({ data: { unassigned: [], entries: [entry], error: '' } });
   const row = nodeOf(view.render(), 'data-lexicon-entry', 'word-1');
   assert.ok(row !== undefined);
@@ -419,28 +454,31 @@ test('3. 编辑弹窗：预填正确写法、误识别形式、上下文；删�
 
   let dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
   assert.ok(dialog !== undefined, 'the edit dialog is open');
-  assert.ok(textsOf(dialog).some((text) => text.includes('像晚')), 'existing wrong forms are prefilled');
-  assert.equal(inputOf(dialog, (node) => node.props.value === '向晚').props.value, '向晚',
+  assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-text'] === '1').props.value, '向晚',
     'the canonical spelling is prefilled');
-  assert.equal(inputOf(dialog, (node) => node.props.placeholder === '前文').props.value, '今天',
-    'the context before is prefilled');
-  assert.equal(inputOf(dialog, (node) => node.props.placeholder === '后文').props.value, '来了',
-    'the context after is prefilled');
+  const categorySelect = nodesOf(dialog).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-dialog-category'] === '1');
+  assert.ok(categorySelect !== undefined, 'the category dropdown is shown in edit');
+  assert.equal(categorySelect.props.value, 'person');
+  assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-usage'] === '1').props.value,
+    '角色名', 'the usage is prefilled');
+  assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1').props.value,
+    'xiàng wǎn', 'the optional reading is prefilled');
+  assert.ok(!nodesOf(dialog).some((node) => node.props?.['data-lexicon-remove-form'] !== undefined),
+    'the main edit form no longer edits internal wrongForms');
 
-  // Trim the first wrong form through the shipped × button.
-  const removeFirst = nodesOf(dialog).find((node) => node.type === 'button'
-    && node.props?.['data-lexicon-remove-form'] === '0');
-  assert.ok(removeFirst !== undefined, 'each wrong form has its own remove button');
-  await removeFirst.props.onClick();
-  assert.deepEqual(view.calls.removeForm, [0], 'removing a form is a state change, not a write');
-  dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
-  assert.ok(!textsOf(dialog).includes('像晚'), 'the removed form is gone from the dialog');
-  assert.ok(textsOf(dialog).includes('想晚'), 'the kept form stays');
-
-  // Edit the canonical spelling; the dialog must stay controlled.
-  const canonicalInput = inputOf(dialog, (node) => node.props.value === '向晚');
-  canonicalInput.props.onChange({ target: { value: '向晚晚' } });
+  // Edit each field; the dialog must stay controlled.
+  inputOf(dialog, (node) => node.props['data-lexicon-dialog-text'] === '1')
+    .props.onChange({ target: { value: '向晚晚' } });
   assert.deepEqual(view.calls.change.at(-1), { canonical: '向晚晚' }, 'typing updates the dialog state');
+  dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
+  nodesOf(dialog).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-dialog-category'] === '1')
+    .props.onChange({ target: { value: 'character' } });
+  inputOf(dialog, (node) => node.props['data-lexicon-dialog-usage'] === '1')
+    .props.onChange({ target: { value: '  角色别称  ' } });
+  inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1')
+    .props.onChange({ target: { value: 'xiàng wǎn wǎn' } });
   dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
 
   await buttonOf(dialog, '保存修改').props.onClick();
@@ -448,14 +486,16 @@ test('3. 编辑弹窗：预填正确写法、误识别形式、上下文；删�
   assert.equal(savedSpeakerId, 'spk-1', 'the section still passes the host identity');
   const body = lexicon.lexiconSaveBody(savedDialog, savedSpeakerId);
   assert.deepEqual(body, {
-    action: 'lexicon.edit',
+    action: 'lexicon.update',
     id: 'word-1',
     canonical: '向晚晚',
-    wrongForms: ['想晚'],
-    context: { before: '今天', after: '来了' },
-  }, 'the edit body matches lexicon.edit and carries only trimmed forms');
+    category: 'character',
+    usage: '角色别称',
+    reading: 'xiàng wǎn wǎn',
+  }, 'the edit body matches lexicon.update and carries no status/wrongForms');
+  assert.ok(!('status' in body) && !('wrongForms' in body), 'status is never sent by the main form');
 
-  console.log('[lexicon-ui 3] prefilled=向晚/像晚,想晚/今天,来了 body=', JSON.stringify(body));
+  console.log('[lexicon-ui 3] prefilled=向晚/person/角色名/xiàng wǎn body=', JSON.stringify(body));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -557,10 +597,12 @@ test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，�
 // ---------------------------------------------------------------------------------------------
 // 6. client.js wiring + regressions: the section is mounted in 记忆与人设 and uses lexicon actions
 // ---------------------------------------------------------------------------------------------
-test('6. 接线检查：设置页挂载、五个动作、speakerId 可选来源；确认无身份门槛', () => {
+test('6. 接线检查：设置页挂载、八个动作、手动添加/移动与可选身份；确认无身份门槛', () => {
   assert.match(clientSource, /const \[lexiconData, setLexiconData\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconDialog, setLexiconDialog\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconPending, setLexiconPending\] = useState\(null\);/u);
+  assert.match(clientSource, /const \[lexiconDraft, setLexiconDraft\] = useState\(\(\) => lexiconEmptyDraft\(\)\);/u,
+    'the manual new-entry draft is its own state');
   assert.match(clientSource, /speakerId: lexiconSpeakerId\(status\)/u, 'the panel resolves the optional identity from status');
   assert.match(clientSource, /setLexiconData\(lexiconListData\(result\)\);/u,
     'the list parser handles both the documented and the bare host shape');
@@ -572,7 +614,10 @@ test('6. 接线检查：设置页挂载、五个动作、speakerId 可选来源�
   assert.doesNotMatch(lexiconOnly, /selfId === ''/u,
     'no confirm button/dialog condition may gate on a missing selfId');
 
-  for (const action of ['lexicon.list', 'lexicon.confirm', 'lexicon.edit', 'lexicon.reject', 'lexicon.remove']) {
+  for (const action of [
+    'lexicon.list', 'lexicon.add', 'lexicon.update', 'lexicon.move',
+    'lexicon.confirm', 'lexicon.edit', 'lexicon.reject', 'lexicon.remove',
+  ]) {
     assert.ok(
       clientSource.includes(`'${action}'`),
       `client.js calls ${action}`,
@@ -594,14 +639,23 @@ test('6. 接线检查：设置页挂载、五个动作、speakerId 可选来源�
   assert.doesNotMatch(lexiconBlockSource.slice(sectionFrom), /\bact\(/u,
     'the rendering section has no host side effects; the save flow receives act by injection');
   assert.match(clientSource, /const body = lexiconSaveBody\(dialog, speakerId\);/u);
-  assert.match(clientSource, /await act\(body, body\.action === 'lexicon\.edit' \? 'lexicon-edit' : 'lexicon-confirm'\);/u,
-    'both dialog modes go through the one act() write path');
+  assert.match(clientSource, /const firstTag = body\.action === 'lexicon\.edit'/u,
+    'the edit/update/confirm modes pick their own act tag');
   assert.match(clientSource, /const result = await act\(body, tag\);/u,
     'ignore/remove share the same act() write path');
   assert.match(clientSource, /saveDialog: \(dialog, speakerId\) => void saveLexiconDialog\(dialog, speakerId\),/u,
     'the section passes the status-derived identity into the Panel save');
   assert.match(clientSource, /const second = await act\(lexiconWrongFormsBody\(dialog, entryId\), 'lexicon-edit'\);/u,
     'a trimmed confirm dialog is followed by one edit call');
+  assert.match(clientSource, /const body = lexiconAddBody\(draft\);/u,
+    'the new-entry form goes through the pure lexiconAddBody builder');
+  assert.match(clientSource, /add: \(draft\) => void addLexiconEntry\(draft\),/u,
+    'the section wires the manual add handler');
+  assert.match(clientSource, /move: \(id, library\) => void moveLexicon\(id, library\),/u,
+    'the section wires the library move handler');
+  assert.match(clientSource, /action: 'lexicon\.move', id: String\(id\), library: String\(library\)/u,
+    'the move handler sends the stable id and target library');
+  assert.match(clientSource, /newDraft\?\.error/u, 'a failed manual add keeps its reason in the form');
   assert.match(clientSource, /if \(second\?\.ok !== true\) \{\s+return \{ stage: 'partial', entryId, notice:/u,
     'the second step result is inspected instead of ignored');
   assert.match(clientSource, /retrySave: \(dialog\) => void retryLexiconSave\(dialog\),/u,
@@ -618,7 +672,7 @@ test('6. 接线检查：设置页挂载、五个动作、speakerId 可选来源�
   assert.doesNotMatch(clientSource.slice(retryFrom, retryTo), /saveLexiconDialog/u,
     'the retry never goes back through the two-step save');
 
-  console.log('[lexicon-ui 6] mounted=记忆与人设 actions=5 listParser=ok|bare speakerId=status retry=edit-only');
+  console.log('[lexicon-ui 6] mounted=记忆与人设 actions=8 add/move=wired speakerId=status retry=edit-only');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -777,7 +831,16 @@ test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重
   const done = await lexicon.lexiconSaveSteps({ dialog: editDialog, speakerId: 'spk-1', act: single.act });
   assert.equal(done.stage, 'done');
   assert.equal(single.calls.length, 1, 'an edit dialog writes exactly once');
-  assert.equal(single.calls[0].body.action, 'lexicon.edit');
+  assert.equal(single.calls[0].body.action, 'lexicon.update');
+  assert.deepEqual(single.calls[0].body, {
+    action: 'lexicon.update',
+    id: 'word-1',
+    canonical: '向晚',
+    category: 'person',
+    usage: '角色名',
+    reading: '',
+  }, 'the edit dialog updates the main fields only');
+  assert.equal(single.calls[0].tag, 'lexicon-update');
   await lexicon.settleLexiconSave({
     dialog: editDialog, outcome: done, setDialog: editUi.setDialog,
     loadLexicon: effects.loadLexicon, show: effects.show,
@@ -834,4 +897,69 @@ test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重
 
   console.log('[lexicon-ui 9] confirmFail=open(no-refresh) edit=one-write close=1',
     'partialCancel=refresh+hint plainCancel=silent');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 10. Manual add form + library move + candidate delete
+// ---------------------------------------------------------------------------------------------
+test('10. 手动新建：三字段+读音请求体；库位移动；候选删除保留', async () => {
+  const view = mount({
+    draft: {
+      text: '充电', category: 'expression',
+      usage: '指陪我聊一会，不是给设备充电', reading: 'chōng diàn', error: '',
+    },
+    data: { unassigned: [], entries: [], error: '' },
+  });
+  const form = nodeOf(view.render(), 'data-lexicon-new-form', '1');
+  assert.ok(form !== undefined);
+  assert.equal(buttonOf(form, '添加词条').props.disabled, false, 'a filled three-field form can add');
+  await buttonOf(form, '添加词条').props.onClick();
+  assert.equal(view.calls.add.length, 1);
+  const draft = view.calls.add[0];
+  assert.deepEqual(lexicon.lexiconAddBody(draft), {
+    action: 'lexicon.add',
+    text: '充电',
+    category: 'expression',
+    usage: '指陪我聊一会，不是给设备充电',
+    reading: 'chōng diàn',
+  }, 'the add body carries the three fields plus optional reading, no speakerId');
+  assert.equal(lexicon.lexiconCategoryLabel('expression'), '特殊表达');
+  assert.equal(lexicon.lexiconLibraryLabel('public'), '公共库');
+  assert.equal(lexicon.lexiconLibraryLabel('voiceprint'), '声纹库');
+
+  // The form is disabled while the word is blank; changing the draft goes through the handler.
+  const blank = mount({ data: { unassigned: [], entries: [], error: '' } });
+  const blankForm = nodeOf(blank.render(), 'data-lexicon-new-form', '1');
+  assert.equal(buttonOf(blankForm, '添加词条').props.disabled, true);
+  inputOf(blankForm, (node) => node.props['data-lexicon-new-text'] === '1')
+    .props.onChange({ target: { value: '充电' } });
+  assert.deepEqual(blank.calls.changeDraft.at(-1), { text: '充电' });
+  const select = nodesOf(blankForm).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-new-category'] === '1');
+  select.props.onChange({ target: { value: 'term' } });
+  assert.deepEqual(blank.calls.changeDraft.at(-1), { category: 'term' });
+
+  // Library move: public -> voiceprint is disabled until a voiceprint library exists; a stored
+  // voiceprint row can always be moved back to public.
+  const publicView = mount({ data: { unassigned: [], entries: [word()], error: '' } });
+  const publicRow = nodeOf(publicView.render(), 'data-lexicon-entry', 'word-1');
+  assert.equal(buttonOf(publicRow, '移到声纹库').props.disabled, true);
+  const voiceprintView = mount({
+    data: { unassigned: [], entries: [word({ library: 'voiceprint' })], error: '' },
+  });
+  const voiceprintRow = nodeOf(voiceprintView.render(), 'data-lexicon-entry', 'word-1');
+  await buttonOf(voiceprintRow, '移到公共库').props.onClick();
+  assert.deepEqual(voiceprintView.calls.move, [['word-1', 'public']]);
+
+  // Candidate delete is still available (in addition to the tombstone-producing ignore).
+  const candidateView = mount({ data: { unassigned: [candidate()], entries: [], error: '' } });
+  const candidateRow = () => nodeOf(candidateView.render(), 'data-lexicon-candidate', 'cand-1');
+  await buttonOf(candidateRow(), '删除').props.onClick();
+  assert.deepEqual(candidateView.calls.askRemove, ['cand-1']);
+  assert.deepEqual(candidateView.calls.remove, [], 'the first click only asks');
+  await buttonOf(candidateRow(), '确认删除').props.onClick();
+  assert.deepEqual(candidateView.calls.remove, ['cand-1']);
+
+  console.log('[lexicon-ui 10] addBody=', JSON.stringify(lexicon.lexiconAddBody(draft)),
+    'move=', JSON.stringify(voiceprintView.calls.move), 'candidateDelete=two-step');
 });

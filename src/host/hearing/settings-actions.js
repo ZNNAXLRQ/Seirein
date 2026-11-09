@@ -1,5 +1,12 @@
 /** Settings actions for microphone, ambient capture, speaker shadow and call mode. */
 
+import {
+  LEXICON_CATEGORIES,
+  LEXICON_READING_MAX_CHARS,
+  LEXICON_TEXT_MAX_CHARS,
+  LEXICON_USAGE_MAX_CHARS,
+} from '../speech/lexicon-store.js';
+import { lexiconKey } from '../speech/lexicon-candidates.js';
 
 export const ACTIONS = Object.freeze([
   'hearing.start',
@@ -14,6 +21,9 @@ export const ACTIONS = Object.freeze([
   'lexicon.list',
   'lexicon.candidates',
   'lexicon.confirm',
+  'lexicon.add',
+  'lexicon.update',
+  'lexicon.move',
   'lexicon.edit',
   'lexicon.reject',
   'lexicon.remove',
@@ -163,6 +173,60 @@ export function createHearingSettingsActions(services) {
             id: result.entry?.id ?? '',
             kind: result.entry?.kind ?? '',
             assigned: result.entry?.assigned === true,
+          });
+        }
+        return result;
+      }
+      case 'lexicon.add': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        // Manual add is confirmed immediately and always writes the public library unless the
+        // caller explicitly names a valid slot. No speakerId/voiceprint is involved.
+        const result = store.addEntry({
+          text: body.text,
+          canonical: body.canonical,
+          category: body.category,
+          usage: body.usage,
+          reading: body.reading,
+          library: body.library,
+        });
+        if (result.ok) {
+          await services.log.emit('lexicon.added', {
+            id: result.entry?.id ?? '',
+            category: result.entry?.category ?? 'unknown',
+            library: result.entry?.library ?? 'public',
+          });
+        }
+        return result;
+      }
+      case 'lexicon.update': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        const result = store.updateEntry({
+          id: body.id,
+          text: body.text,
+          canonical: body.canonical,
+          category: body.category,
+          usage: body.usage,
+          reading: body.reading,
+        });
+        if (result.ok) {
+          await services.log.emit('lexicon.updated', {
+            id: result.entry?.id ?? '',
+            category: result.entry?.category ?? 'unknown',
+            library: result.entry?.library ?? 'public',
+          });
+        }
+        return result;
+      }
+      case 'lexicon.move': {
+        const store = lexiconStore();
+        if (store === null) return LEXICON_UNAVAILABLE;
+        const result = store.moveEntry({ id: body.id, library: body.library });
+        if (result.ok) {
+          await services.log.emit('lexicon.moved', {
+            id: result.entry?.id ?? '',
+            library: result.entry?.library ?? '',
           });
         }
         return result;
@@ -320,6 +384,211 @@ export function createHearingSettingsActions(services) {
   }
 };
   return handler;
+}
+
+/**
+ * Chinese/English labels accepted by `/word` and shown by the form/listing. The canonical stored
+ * values are the English enum ids in `LEXICON_CATEGORIES`; labels are only an input/display alias.
+ */
+export const LEXICON_CATEGORY_LABELS = Object.freeze({
+  person: '人名',
+  character: '角色',
+  work: '作品',
+  place: '地点',
+  term: '术语',
+  expression: '特殊表达',
+  meme: '梗',
+  unknown: '未知',
+});
+
+const CATEGORY_ALIASES = new Map();
+for (const category of LEXICON_CATEGORIES) {
+  CATEGORY_ALIASES.set(category, category);
+  CATEGORY_ALIASES.set(LEXICON_CATEGORY_LABELS[category], category);
+}
+// Friendly synonyms beyond the canonical labels.
+for (const [alias, category] of [
+  ['人物', 'person'],
+  ['人名', 'person'],
+  ['角色', 'character'],
+  ['作品', 'work'],
+  ['地点', 'place'],
+  ['地方', 'place'],
+  ['术语', 'term'],
+  ['专有名词', 'term'],
+  ['表达', 'expression'],
+  ['特殊表达', 'expression'],
+  ['梗', 'meme'],
+  ['网络梗', 'meme'],
+  ['其他', 'unknown'],
+  ['未知', 'unknown'],
+]) {
+  if (!CATEGORY_ALIASES.has(alias)) CATEGORY_ALIASES.set(alias, category);
+}
+
+export const WORD_COMMAND_USAGE = '/word "词或短语" <类别> "用法" [读音]';
+const WORD_CATEGORY_HINT = LEXICON_CATEGORIES
+  .map((category) => `${LEXICON_CATEGORY_LABELS[category]}=${category}`)
+  .join('、');
+
+/**
+ * Split `/word` input on whitespace while honoring "double", 'single', “curly”, 「corner」 and
+ * 『corner』 quotes, so a usage phrase may contain spaces without becoming extra arguments.
+ *
+ * @param {unknown} rawInput everything after `/word`
+ * @returns {{ok: true, tokens: string[]}|{ok: false, error: string}}
+ */
+export function tokenizeWordCommand(rawInput) {
+  const source = typeof rawInput === 'string' ? rawInput : '';
+  const tokens = [];
+  let current = '';
+  let started = false;
+  let close = '';
+  const closingOf = (char) => ({
+    '"': '"', "'": "'", '“': '”', '‘': '’', '「': '」', '『': '』',
+  })[char] ?? '';
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (close !== '') {
+      if (char === close) {
+        close = '';
+        continue;
+      }
+      if (char === '\\' && (source[index + 1] === close || source[index + 1] === '\\')) {
+        current += source[index + 1];
+        index += 1;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+    const closing = closingOf(char);
+    if (closing !== '') {
+      close = closing;
+      started = true;
+      continue;
+    }
+    if (/\s/u.test(char)) {
+      if (started) {
+        tokens.push(current);
+        current = '';
+        started = false;
+      }
+      continue;
+    }
+    current += char;
+    started = true;
+  }
+  if (close !== '') return { ok: false, error: '引号没有闭合，请检查参数。' };
+  if (started) tokens.push(current);
+  return { ok: true, tokens };
+}
+
+/**
+ * Parse the `/word` arguments. Category and usage are REQUIRED and are never guessed: an
+ * incomplete call tells the user exactly what is missing. Reading is optional (auto-generation
+ * may leave it blank, and the user can add it later).
+ *
+ * @param {unknown} rawInput everything after `/word`
+ * @returns {{ok: true, value: {text: string, category: string, usage: string, reading: string}}
+ *   | {ok: false, error: string}}
+ */
+export function parseWordCommand(rawInput) {
+  const tokenized = tokenizeWordCommand(rawInput);
+  if (tokenized.ok !== true) return tokenized;
+  const tokens = tokenized.tokens;
+  if (tokens.length === 0) {
+    return { ok: false, error: `缺少词、类别和用法。用法：${WORD_COMMAND_USAGE}` };
+  }
+  if (tokens.length > 4) {
+    return { ok: false, error: `参数过多。用法：${WORD_COMMAND_USAGE}（含空格的用法请加引号）` };
+  }
+  const [text, categoryInput, usage, reading = ''] = tokens;
+  const display = String(text ?? '').trim();
+  if (display.length === 0) return { ok: false, error: '词或短语不能为空。' };
+  if ([...display].length > LEXICON_TEXT_MAX_CHARS) {
+    return { ok: false, error: `词或短语最多 ${LEXICON_TEXT_MAX_CHARS} 个字符。` };
+  }
+  if (categoryInput === undefined || categoryInput.trim() === '') {
+    return { ok: false, error: `缺少类别。可用类别：${WORD_CATEGORY_HINT}` };
+  }
+  const category = CATEGORY_ALIASES.get(categoryInput.trim())
+    ?? CATEGORY_ALIASES.get(categoryInput.trim().toLowerCase());
+  if (category === undefined) {
+    return { ok: false, error: `类别「${categoryInput}」无效。可用类别：${WORD_CATEGORY_HINT}` };
+  }
+  if (usage === undefined || String(usage).trim() === '') {
+    return { ok: false, error: `缺少用法说明。用法：${WORD_COMMAND_USAGE}` };
+  }
+  const usageText = String(usage).trim();
+  if ([...usageText].length > LEXICON_USAGE_MAX_CHARS) {
+    return { ok: false, error: `用法说明最多 ${LEXICON_USAGE_MAX_CHARS} 个字符。` };
+  }
+  const readingText = String(reading ?? '').trim();
+  if ([...readingText].length > LEXICON_READING_MAX_CHARS) {
+    return { ok: false, error: `读音最多 ${LEXICON_READING_MAX_CHARS} 个字符。` };
+  }
+  return {
+    ok: true,
+    value: { text: display, category, usage: usageText, reading: readingText },
+  };
+}
+
+/**
+ * Build the `/word` command definition for the DSH commands service. Only the public library is
+ * written; a successful result names the editable entry id. The caller registers it with
+ * `ctx.get('commands')?.register(definition)` (guarded because the service is optional).
+ *
+ * @param {{store?: object|null, log?: object|null}} [options]
+ * @returns {{name: string, description: string, input: {hint: string},
+ *   handler: (invocation: {rawInput?: string}) => Promise<object>}}
+ */
+export function createWordCommandDefinition({ store = null, log = null } = {}) {
+  return Object.freeze({
+    name: 'word',
+    description: '添加一条共享词库词条（公共库，可直接在设置页编辑）',
+    input: { hint: '词或短语 类别 "用法" [读音]' },
+    async handler(invocation) {
+      const parsed = parseWordCommand(invocation?.rawInput ?? '');
+      if (parsed.ok !== true) return { kind: 'error', text: parsed.error };
+      if (store === null || typeof store.addEntry !== 'function') {
+        return { kind: 'error', text: '共享词库尚未接线：宿主没有 lexicon 存储。' };
+      }
+      const added = store.addEntry({ ...parsed.value, library: 'public' });
+      if (added?.ok !== true) {
+        if (added?.reason === 'exists') {
+          let existingId = '';
+          try {
+            const key = lexiconKey(parsed.value.text);
+            const existing = store.list().find((entry) => entry?.key === key
+              || (typeof entry?.canonical === 'string' && entry.canonical.length > 0 && lexiconKey(entry.canonical) === key));
+            existingId = typeof existing?.id === 'string' ? existing.id : '';
+          } catch {
+            /* the duplicate message is still useful without an id */
+          }
+          return {
+            kind: 'error',
+            text: `词条已存在${existingId === '' ? '' : `（ID ${existingId}）`}；请到设置页编辑，而不是重复添加。`,
+          };
+        }
+        return { kind: 'error', text: `添加失败：${added?.reason ?? 'unknown'}` };
+      }
+      try {
+        void log?.emit?.('lexicon.command.word', {
+          id: added.entry?.id ?? '',
+          category: added.entry?.category ?? 'unknown',
+          library: 'public',
+        })?.catch?.(() => {});
+      } catch {
+        /* logging must never fail the command */
+      }
+      const label = LEXICON_CATEGORY_LABELS[added.entry?.category] ?? added.entry?.category ?? '未知';
+      return {
+        kind: 'success',
+        text: `已加入公共词库：「${added.entry?.canonical || added.entry?.text || parsed.value.text}」（${label}）· ID ${added.entry?.id ?? ''}。可在 设置 → 记忆与人设 → 共享词库 中编辑或移动。`,
+      };
+    },
+  });
 }
 
 /**

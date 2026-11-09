@@ -559,7 +559,7 @@ import {
 
 import { createStatusBuilder } from './runtime/http/status.js';
 import { createSettingsRoutes } from './runtime/http/routes.js';
-import { ACTIONS as hearingActions, createHearingSettingsActions, projectHearingStatus, resolveSelfSpeakerId } from './hearing/settings-actions.js';
+import { ACTIONS as hearingActions, createHearingSettingsActions, createWordCommandDefinition, projectHearingStatus, resolveSelfSpeakerId } from './hearing/settings-actions.js';
 import { ACTIONS as memoryActions, createMemorySettingsActions } from './memory/settings-actions.js';
 import { ACTIONS as speechActions, createSpeechSettingsActions } from './speech/settings-actions.js';
 import {
@@ -1605,6 +1605,23 @@ export function apply(ctx, config) {
   // 之后每次动作/合并都重新读盘。这里不确认任何词；只有用户的 lexicon.confirm 动作才算数。
   const lexiconStore = createLexiconStore({ root, log });
   lexiconStore.list();
+  // `/word` is a manual entry point into the public shared lexicon. The commands service is
+  // optional (older/embedded hosts may not compose it), so registration is best-effort and its
+  // disposer follows the plugin effect lifecycle.
+  const commandsService = getService('commands');
+  if (commandsService !== null && commandsService !== undefined
+    && typeof commandsService.register === 'function') {
+    try {
+      const disposeWordCommand = commandsService.register(
+        createWordCommandDefinition({ store: lexiconStore, log }),
+      );
+      if (typeof disposeWordCommand === 'function') ctx.effect(() => disposeWordCommand);
+    } catch (error) {
+      void log.emit('lexicon.command.register.failed', {
+        error: error?.message ?? String(error),
+      }).catch(() => {});
+    }
+  }
   // 声纹登记：`<root>/data/speaker-enrollment.json`。读取永不建文件，写入只由用户的
   // speaker.enroll.confirm / reject / remove 触发；这里不自动确认、不自动拒绝任何条目。
   const speakerEnrollmentStore = createSpeakerEnrollmentStore({ root, log });
@@ -13943,6 +13960,9 @@ export function apply(ctx, config) {
     return confirmedLexiconSpeaker(meta);
   };
   const noteLexiconTranscript = (text, meta = {}) => {
+    // v1 manual lexicon: automatic candidate extraction is opt-in. Existing candidates stay on
+    // disk and remain manageable; this guard only stops NEW candidates from being written.
+    if (config?.lexicon?.autoCandidates !== true) return;
     try {
       const at = new Date().toISOString();
       const id = `voice-${++lexiconSeq}`;

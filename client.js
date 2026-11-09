@@ -2528,6 +2528,44 @@ window.__ModuleLoader__.load({
       return LEXICON_KIND_LABEL[String(kind ?? '')] ?? '专有名词';
     }
 
+    /** 手动词条的类别：值写英文枚举，界面显示中文。 */
+    const LEXICON_CATEGORY_OPTIONS = Object.freeze([
+      ['person', '人名'],
+      ['character', '角色'],
+      ['work', '作品'],
+      ['place', '地点'],
+      ['term', '术语'],
+      ['expression', '特殊表达'],
+      ['meme', '梗'],
+      ['unknown', '未知'],
+    ]);
+    const LEXICON_CATEGORY_LABEL = Object.freeze(Object.fromEntries(LEXICON_CATEGORY_OPTIONS));
+
+    function lexiconCategoryLabel(category) {
+      return LEXICON_CATEGORY_LABEL[String(category ?? '')] ?? '未知';
+    }
+
+    const LEXICON_LIBRARY_LABEL = Object.freeze({ public: '公共库', voiceprint: '声纹库' });
+
+    function lexiconLibraryLabel(library) {
+      return LEXICON_LIBRARY_LABEL[String(library ?? '')] ?? '公共库';
+    }
+
+    function lexiconEmptyDraft() {
+      return { text: '', category: 'person', usage: '', reading: '', error: '' };
+    }
+
+    /** 新建词条请求体：只含主表单三字段 + 可选读音；公共库由宿主默认写死。 */
+    function lexiconAddBody(draft) {
+      return {
+        action: 'lexicon.add',
+        text: String(draft?.text ?? '').trim(),
+        category: String(draft?.category ?? ''),
+        usage: String(draft?.usage ?? '').trim(),
+        reading: String(draft?.reading ?? '').trim(),
+      };
+    }
+
     /** 行内确认时间；无法解析时给 `—`，绝不因坏值抛错。 */
     function lexiconTimeText(value) {
       const at = Date.parse(String(value ?? ''));
@@ -2552,15 +2590,25 @@ window.__ModuleLoader__.load({
       return forms;
     }
 
-    /** 弹窗状态：确认模式带上候选原文，编辑模式带出上下文；observed 保留自动带出的原始列表。 */
+    /**
+     * 弹窗状态：确认模式带候选原文与可删减的误识别形式；编辑模式带出手动词条的三字段、读音
+     * 和库位（库位只读，移动走列表按钮，避免编辑时误改 status/library）。
+     */
     function lexiconDialogOf(entry, mode) {
       const observed = lexiconObservedForms(entry);
       const editing = mode === 'edit';
+      const category = LEXICON_CATEGORY_LABEL[String(entry?.category ?? '')]
+        ? String(entry.category)
+        : 'unknown';
       return {
         mode: editing ? 'edit' : 'confirm',
         id: String(entry?.id ?? ''),
         text: String(entry?.text ?? ''),
         canonical: String(entry?.canonical ?? '') || String(entry?.text ?? ''),
+        category,
+        usage: String(entry?.usage ?? ''),
+        reading: String(entry?.reading ?? ''),
+        library: String(entry?.library ?? 'public'),
         wrongForms: observed,
         observed,
         context: editing
@@ -2582,15 +2630,14 @@ window.__ModuleLoader__.load({
         .map((form) => String(form ?? '').trim())
         .filter((form) => form !== '');
       if (current.mode === 'edit') {
+        // 主表单走 lexicon.update：只改词/类别/用法/读音，status/kind/wrongForms 不在这里改。
         return {
-          action: 'lexicon.edit',
+          action: 'lexicon.update',
           id: String(current.id ?? ''),
           canonical: String(current.canonical ?? '').trim(),
-          wrongForms: forms,
-          context: {
-            before: String(current.context?.before ?? ''),
-            after: String(current.context?.after ?? ''),
-          },
+          category: String(current.category ?? ''),
+          usage: String(current.usage ?? '').trim(),
+          reading: String(current.reading ?? '').trim(),
         };
       }
       const body = { action: 'lexicon.confirm' };
@@ -2637,7 +2684,10 @@ window.__ModuleLoader__.load({
     async function lexiconSaveSteps({ dialog, speakerId, act }) {
       if (dialog === null || dialog === undefined) return { stage: 'skipped' };
       const body = lexiconSaveBody(dialog, speakerId);
-      const first = await act(body, body.action === 'lexicon.edit' ? 'lexicon-edit' : 'lexicon-confirm');
+      const firstTag = body.action === 'lexicon.edit'
+        ? 'lexicon-edit'
+        : (body.action === 'lexicon.update' ? 'lexicon-update' : 'lexicon-confirm');
+      const first = await act(body, firstTag);
       if (first?.ok !== true) return { stage: 'failed', error: lexiconFailureReason(first) };
       const kept = Array.isArray(dialog.wrongForms) ? dialog.wrongForms.length : 0;
       const observed = Array.isArray(dialog.observed) ? dialog.observed.length : kept;
@@ -2696,7 +2746,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function lexiconSection(h, { data, busy, dialog, pending, speakerId }, handlers) {
+    function lexiconSection(h, { data, busy, dialog, pending, speakerId, draft }, handlers) {
       const loading = data === null || data === undefined || data.loading === true;
       // `entries` 是共享词库：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
       const entries = (Array.isArray(data?.entries) ? data.entries : [])
@@ -2706,6 +2756,14 @@ window.__ModuleLoader__.load({
       const stopped = busy !== '';
       // 身份只是可选来源：没有也不影响确认，只在请求体里「有则带」。
       const selfId = String(speakerId ?? '');
+      // 声纹库在本阶段只保留库位值，没有建立任何声纹分库，所以入口禁用并说明。
+      const voiceprintReady = data?.voiceprintReady === true || data?.voiceprintLibrary?.ready === true;
+      const newDraft = draft ?? lexiconEmptyDraft();
+      const draftText = String(newDraft?.text ?? '');
+      const draftCategory = String(newDraft?.category ?? '');
+      const addBlocked = stopped
+        || draftText.trim() === ''
+        || !LEXICON_CATEGORY_LABEL[draftCategory];
       const isPending = (kind, id) => pending?.kind === kind && String(pending?.id ?? '') === String(id);
       const evidenceText = (entry) => {
         const count = Number(entry?.count);
@@ -2749,26 +2807,7 @@ window.__ModuleLoader__.load({
                 style: { ...styles.btn, ...(stopped ? styles.off : {}) },
                 disabled: stopped,
                 onClick: () => handlers.askIgnore(entry?.id),
-              }, '忽略')));
-
-      const wordRow = (entry) => h('div', {
-        key: String(entry?.id ?? ''),
-        'data-lexicon-entry': String(entry?.id ?? ''),
-        style: { padding: '6px 0', borderTop: `1px dashed ${BORDER}` },
-      },
-        h('div', { style: styles.row },
-          h('span', { style: styles.label },
-            String(entry?.canonical ?? '') || String(entry?.text ?? '') || '（空）',
-            h('span', { style: styles.badge }, lexiconKindLabel(entry?.kind))),
-          h('span', { style: styles.mono }, `确认于 ${lexiconTimeText(entry?.confirmedAt ?? entry?.at)}`)),
-        h('div', { style: styles.hint },
-          `误识别形式：${(Array.isArray(entry?.wrongForms) ? entry.wrongForms : []).join(' / ') || '—'}`),
-        h('div', { style: styles.row },
-          h('button', {
-            style: { ...styles.btn, ...(stopped ? styles.off : {}) },
-            disabled: stopped,
-            onClick: () => handlers.openEdit(entry),
-          }, '编辑'),
+              }, '忽略'),
           isPending('remove', entry?.id)
             ? h('span', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
                 h('span', { style: styles.value }, '确认删除？'),
@@ -2788,10 +2827,73 @@ window.__ModuleLoader__.load({
                 onClick: () => handlers.askRemove(entry?.id),
               }, '删除')));
 
+      const wordRow = (entry) => {
+        const library = String(entry?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public';
+        const targetLibrary = library === 'public' ? 'voiceprint' : 'public';
+        const targetReady = targetLibrary === 'public' || voiceprintReady;
+        const forms = Array.isArray(entry?.wrongForms) ? entry.wrongForms : [];
+        return h('div', {
+          key: String(entry?.id ?? ''),
+          'data-lexicon-entry': String(entry?.id ?? ''),
+          'data-lexicon-library': library,
+          style: { padding: '6px 0', borderTop: `1px dashed ${BORDER}` },
+        },
+          h('div', { style: styles.row },
+            h('span', { style: styles.label },
+              String(entry?.canonical ?? '') || String(entry?.text ?? '') || '（空）',
+              h('span', { style: styles.badge }, lexiconCategoryLabel(entry?.category)),
+              h('span', { style: styles.badge }, lexiconLibraryLabel(library))),
+            h('span', { style: styles.mono }, `确认于 ${lexiconTimeText(entry?.confirmedAt ?? entry?.at)}`)),
+          h('div', { style: styles.hint },
+            `用法：${String(entry?.usage ?? '').trim() || '—'}`),
+          String(entry?.reading ?? '').trim() === ''
+            ? null
+            : h('div', { style: styles.hint }, `读音：${String(entry.reading).trim()}`),
+          forms.length === 0
+            ? null
+            : h('div', { style: styles.hint }, `误识别形式：${forms.join(' / ')}`),
+          h('div', { style: styles.row },
+            h('button', {
+              'data-lexicon-edit': String(entry?.id ?? ''),
+              style: { ...styles.btn, ...(stopped ? styles.off : {}) },
+              disabled: stopped,
+              onClick: () => handlers.openEdit(entry),
+            }, '编辑'),
+            h('button', {
+              'data-lexicon-move': targetLibrary,
+              style: { ...styles.btn, ...(stopped || !targetReady ? styles.off : {}) },
+              disabled: stopped || !targetReady,
+              title: targetReady ? '' : '声纹库尚未建立，暂时只能使用公共库',
+              onClick: () => void handlers.move(entry?.id, targetLibrary),
+            }, targetLibrary === 'voiceprint' ? '移到声纹库' : '移到公共库'),
+            isPending('remove', entry?.id)
+              ? h('span', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+                  h('span', { style: styles.value }, '确认删除？'),
+                  h('button', {
+                    style: { ...styles.btnDanger, ...(stopped ? styles.off : {}) },
+                    disabled: stopped,
+                    onClick: () => void handlers.remove(entry?.id),
+                  }, '确认删除'),
+                  h('button', {
+                    style: { ...styles.btn, ...(stopped ? styles.off : {}) },
+                    disabled: stopped,
+                    onClick: () => handlers.cancelWrite(),
+                  }, '取消'))
+              : h('button', {
+                  style: { ...styles.btnDanger, ...(stopped ? styles.off : {}) },
+                  disabled: stopped,
+                  onClick: () => handlers.askRemove(entry?.id),
+                }, '删除')));
+      };
+
       const editing = dialog?.mode === 'edit';
       const forms = Array.isArray(dialog?.wrongForms) ? dialog.wrongForms : [];
       const canonical = String(dialog?.canonical ?? '');
-      const context = dialog?.context ?? { before: '', after: '' };
+      const dialogCategory = LEXICON_CATEGORY_LABEL[String(dialog?.category ?? '')]
+        ? String(dialog.category)
+        : 'unknown';
+      const dialogUsage = String(dialog?.usage ?? '');
+      const dialogReading = String(dialog?.reading ?? '');
       // 第一步（confirm）已生效、第二步（补存误识别形式）失败：保留内容，换成重试入口。
       const notice = String(dialog?.notice ?? '');
       const retryId = String(dialog?.retryId ?? '');
@@ -2807,11 +2909,12 @@ window.__ModuleLoader__.load({
             ? `编辑「${canonical || String(dialog?.text ?? '')}」`
             : `确认候选「${String(dialog?.text ?? '')}」`),
           h('div', { style: styles.hint }, editing
-            ? '修改正确写法、误识别形式或上下文；只影响之后的识别与替换，不改写历史记录。'
+            ? '修改词、类别、用法或读音；不改状态、不改写历史记录，也不影响库位。'
             : '确认后这一条会进入共享词库，所有人说话时的识别与替换都可使用；声纹只是可选的来源标注，不是确认门槛。'),
           h('div', { style: styles.field },
-            h('span', { style: styles.value }, '正确写法'),
+            h('span', { style: styles.value }, editing ? '词或短语' : '正确写法'),
             h('input', {
+              'data-lexicon-dialog-text': '1',
               style: styles.input,
               value: canonical,
               placeholder: '例如：向晚',
@@ -2820,42 +2923,60 @@ window.__ModuleLoader__.load({
               title: partial ? '正确写法已随确认保存；重试只补存误识别形式' : '',
               onChange: (event) => handlers.changeDialog({ canonical: event.target.value }),
             })),
-          h('div', { style: styles.field },
-            h('span', { style: styles.value }, '当前出现过的误识别形式（可删减）'),
-            forms.length === 0
-              ? h('div', { style: styles.hint }, '没有已记录的误识别形式')
-              : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
-                  forms.map((form, index) => h('span', {
-                    key: `${index}:${String(form)}`,
-                    style: { ...styles.badge, marginLeft: 0, display: 'inline-flex', alignItems: 'center', gap: 4 },
-                  },
-                    String(form),
-                    h('button', {
-                      'data-lexicon-remove-form': String(index),
-                      style: { fontSize: 12, lineHeight: 1, padding: '0 3px', border: 'none', background: 'transparent', color: DANGER, cursor: 'pointer' },
-                      disabled: stopped,
-                      title: '删除该误识别形式',
-                      onClick: () => handlers.removeWrongForm(index),
-                    }, '×'))))),
           editing
             ? h('div', { style: styles.field },
-                h('span', { style: styles.value }, '上下文（前后文匹配时才替换，可留空）'),
-                h('div', { style: { display: 'flex', gap: 8 } },
-                  h('input', {
-                    style: styles.input,
-                    value: String(context.before ?? ''),
-                    placeholder: '前文',
-                    disabled: stopped,
-                    onChange: (event) => handlers.changeDialog({ context: { ...context, before: event.target.value } }),
-                  }),
-                  h('input', {
-                    style: styles.input,
-                    value: String(context.after ?? ''),
-                    placeholder: '后文',
-                    disabled: stopped,
-                    onChange: (event) => handlers.changeDialog({ context: { ...context, after: event.target.value } }),
-                  })))
+                h('span', { style: styles.value }, '类别'),
+                h('select', {
+                  'data-lexicon-dialog-category': '1',
+                  style: styles.input,
+                  value: dialogCategory,
+                  disabled: stopped,
+                  onChange: (event) => handlers.changeDialog({ category: event.target.value }),
+                }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label))))
             : null,
+          editing
+            ? h('div', { style: styles.field },
+                h('span', { style: styles.value }, '用法（可留空）'),
+                h('input', {
+                  'data-lexicon-dialog-usage': '1',
+                  style: styles.input,
+                  value: dialogUsage,
+                  placeholder: '例如：指陪我聊一会，不是给设备充电',
+                  disabled: stopped,
+                  onChange: (event) => handlers.changeDialog({ usage: event.target.value }),
+                }))
+            : null,
+          editing
+            ? h('div', { style: styles.field },
+                h('span', { style: styles.value }, '读音（可选，可留空）'),
+                h('input', {
+                  'data-lexicon-dialog-reading': '1',
+                  style: styles.input,
+                  value: dialogReading,
+                  placeholder: '例如：chōng diàn',
+                  disabled: stopped,
+                  onChange: (event) => handlers.changeDialog({ reading: event.target.value }),
+                }))
+            : null,
+          editing
+            ? null
+            : h('div', { style: styles.field },
+                h('span', { style: styles.value }, '当前出现过的误识别形式（可删减）'),
+                forms.length === 0
+                  ? h('div', { style: styles.hint }, '没有已记录的误识别形式')
+                  : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 } },
+                      forms.map((form, index) => h('span', {
+                        key: `${index}:${String(form)}`,
+                        style: { ...styles.badge, marginLeft: 0, display: 'inline-flex', alignItems: 'center', gap: 4 },
+                      },
+                        String(form),
+                        h('button', {
+                          'data-lexicon-remove-form': String(index),
+                          style: { fontSize: 12, lineHeight: 1, padding: '0 3px', border: 'none', background: 'transparent', color: DANGER, cursor: 'pointer' },
+                          disabled: stopped,
+                          title: '删除该误识别形式',
+                          onClick: () => handlers.removeWrongForm(index),
+                        }, '×'))))),
           String(dialog?.error ?? '') === ''
             ? null
             : h('div', { style: { ...styles.hint, color: DANGER } }, String(dialog?.error ?? '')),
@@ -2885,14 +3006,66 @@ window.__ModuleLoader__.load({
 
       return h('div', { 'data-settings-group': 'lexicon', style: styles.group },
         h('div', { style: styles.groupTitleRow },
-          h('span', { style: styles.groupTitle }, '共享语言库'),
+          h('span', { style: styles.groupTitle }, '共享词库'),
           h('button', { style: styles.btn, disabled: stopped, onClick: handlers.refresh }, '刷新')),
-        h('div', { style: styles.hint }, '普通转写先进「未归属候选」；确认后进入所有人共享的词库，只影响之后的识别与替换。声纹只是可选的来源标注，不是确认门槛。'),
+        h('div', { style: styles.hint }, '手动添加或从候选确认；词条进入所有人共享的词库，用于纠错与理解（v2 才接入召回/注入）。声纹不是添加或确认的门槛。'),
+        h('div', { style: styles.hint }, '自动提取候选默认关闭；已有候选仍可确认或删除。声纹库尚未建立：只能使用公共库，移到声纹库暂不可用。'),
         error === '' ? null : h('div', { style: { ...styles.hint, color: DANGER } }, `语言库不可用：${error}`),
         loading
           ? h('div', { style: styles.hint }, '正在读取语言库…')
           : h('div', {},
-              h('div', { style: { ...styles.label, marginTop: 8 } }, `未归属候选（${unassigned.length}）`),
+              h('div', { 'data-lexicon-new-form': '1', style: { marginTop: 8, padding: '8px 0', borderTop: `1px dashed ${BORDER}` } },
+                h('div', { style: styles.label }, '新建词条'),
+                h('div', { style: styles.field },
+                  h('span', { style: styles.value }, '词或短语'),
+                  h('input', {
+                    'data-lexicon-new-text': '1',
+                    style: styles.input,
+                    value: draftText,
+                    placeholder: '例如：充电',
+                    disabled: stopped,
+                    onChange: (event) => handlers.changeDraft({ text: event.target.value }),
+                  })),
+                h('div', { style: styles.field },
+                  h('span', { style: styles.value }, '类别'),
+                  h('select', {
+                    'data-lexicon-new-category': '1',
+                    style: styles.input,
+                    value: LEXICON_CATEGORY_LABEL[draftCategory] ? draftCategory : 'person',
+                    disabled: stopped,
+                    onChange: (event) => handlers.changeDraft({ category: event.target.value }),
+                  }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label)))),
+                h('div', { style: styles.field },
+                  h('span', { style: styles.value }, '用法（可留空）'),
+                  h('input', {
+                    'data-lexicon-new-usage': '1',
+                    style: styles.input,
+                    value: String(newDraft?.usage ?? ''),
+                    placeholder: '例如：指陪我聊一会，不是给设备充电',
+                    disabled: stopped,
+                    onChange: (event) => handlers.changeDraft({ usage: event.target.value }),
+                  })),
+                h('div', { style: styles.field },
+                  h('span', { style: styles.value }, '读音（可选，可留空）'),
+                  h('input', {
+                    'data-lexicon-new-reading': '1',
+                    style: styles.input,
+                    value: String(newDraft?.reading ?? ''),
+                    placeholder: '例如：chōng diàn',
+                    disabled: stopped,
+                    onChange: (event) => handlers.changeDraft({ reading: event.target.value }),
+                  })),
+                String(newDraft?.error ?? '') === ''
+                  ? null
+                  : h('div', { style: { ...styles.hint, color: DANGER } }, String(newDraft.error)),
+                h('div', { style: styles.row },
+                  h('button', {
+                    'data-lexicon-add': '1',
+                    style: { ...styles.btnPrimary, ...(addBlocked ? styles.off : {}) },
+                    disabled: addBlocked,
+                    onClick: () => void handlers.add(newDraft),
+                  }, '添加词条'))),
+              h('div', { style: { ...styles.label, marginTop: 8 } }, `待确认候选（${unassigned.length}）`),
               unassigned.length === 0
                 ? h('div', { style: styles.hint }, '没有待确认的候选')
                 : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, unassigned.map(candidateRow)),
@@ -4764,6 +4937,7 @@ window.__ModuleLoader__.load({
       const [lexiconData, setLexiconData] = useState(null);
       const [lexiconDialog, setLexiconDialog] = useState(null);
       const [lexiconPending, setLexiconPending] = useState(null);
+      const [lexiconDraft, setLexiconDraft] = useState(() => lexiconEmptyDraft());
       // 客户端诊断：打开设置页时读一次 /assistant/status；之后只由「刷新」再读，不新增轮询。
       const [diagnostics, setDiagnostics] = useState(null);
       // 最近一轮时间线：与诊断同一次打开/刷新读取（每个 probe 一次），不额外轮询。
@@ -5181,6 +5355,35 @@ window.__ModuleLoader__.load({
           });
         }
       }, []);
+
+      const changeLexiconDraft = useCallback((patch) => {
+        setLexiconDraft((current) => ({ ...current, ...patch, error: '' }));
+      }, []);
+
+      /** 手动添加：不走候选、不需要声纹；成功后只清空表单并刷新列表。 */
+      const addLexiconEntry = useCallback(async (draft) => {
+        const body = lexiconAddBody(draft);
+        if (body.text === '') {
+          setLexiconDraft((current) => ({ ...current, error: '词或短语不能为空' }));
+          return;
+        }
+        const result = await act(body, 'lexicon-add');
+        if (result?.ok !== true) {
+          setLexiconDraft((current) => ({ ...current, error: lexiconFailureReason(result) }));
+          return;
+        }
+        setLexiconDraft(lexiconEmptyDraft());
+        await loadLexicon();
+        show(`已添加「${body.text}」`);
+      }, [act, loadLexicon, show]);
+
+      /** 库位移动只改 library；声纹库尚无实现，入口在 UI 里禁用。 */
+      const moveLexicon = useCallback(async (id, library) => {
+        const result = await act({ action: 'lexicon.move', id: String(id), library: String(library) }, 'lexicon-move');
+        if (result?.ok !== true) return;
+        await loadLexicon();
+        show(library === 'voiceprint' ? '已移到声纹库' : '已移到公共库');
+      }, [act, loadLexicon, show]);
 
       const openLexiconConfirm = useCallback((entry) => {
         setLexiconPending(null);
@@ -7007,8 +7210,12 @@ window.__ModuleLoader__.load({
             dialog: lexiconDialog,
             pending: lexiconPending,
             speakerId: lexiconSpeakerId(status),
+            draft: lexiconDraft,
           }, {
             refresh: () => void loadLexicon(),
+            changeDraft: changeLexiconDraft,
+            add: (draft) => void addLexiconEntry(draft),
+            move: (id, library) => void moveLexicon(id, library),
             openConfirm: openLexiconConfirm,
             openEdit: openLexiconEdit,
             closeDialog: (dialog) => void closeLexiconDialog(dialog),

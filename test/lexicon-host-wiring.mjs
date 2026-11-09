@@ -1,8 +1,10 @@
 /**
  * 共享语言库（stage B3）宿主接线。
  *
- * The host owns one `createLexiconStore({ root })` (`data/lexicon.json`) and exposes six settings
- * actions. Voice delivery feeds a rolling window of delivered transcripts into
+ * The host owns one `createLexiconStore({ root })` (`data/lexicon.json`) and exposes nine settings
+ * actions (candidate management + manual add/update/move), plus the `/word` command. Automatic
+ * candidate extraction is opt-in (`config.lexicon.autoCandidates`), so the candidate tests mount
+ * with it explicitly enabled. Voice delivery feeds a rolling window of delivered transcripts into
  * `extractLexiconCandidates`, but the transcript itself is never rewritten and nothing is
  * auto-confirmed:
  *
@@ -17,7 +19,9 @@
  *   5. `/assistant/status` exposes `lexicon.speakerId` from `voice.selfSpeakerId`, falling back to
  *      a speaker-shadow match and then to null, with the source labelled;
  *   6. regression: the candidate/correction semantics and the confirmed `wrongForms→canonical`
- *      hints are unchanged, and the six action names are registered.
+ *      hints are unchanged, and the action names are registered;
+ *   7. manual add/update/move actions and the `/word` command are mounted by default (no automatic
+ *      extraction needed), and a manual add carries no speakerId.
  *
  * A synthetic microphone (registerHooks stub) feeds `onUpdate` exactly like the real capture loop;
  * no sound, TTS, model or GUI is used.
@@ -119,13 +123,20 @@ async function newRoot() {
   return root;
 }
 
-async function mount(root) {
+async function mount(root, options = {}) {
   state.onUpdate = null;
   state.onEvent = null;
   const cleanups = [];
   const tools = new Map();
   const routes = new Map();
+  const commands = new Map();
   const services = new Map([
+    ['commands', {
+      register(definition) {
+        commands.set(definition.name, definition);
+        return () => commands.delete(definition.name);
+      },
+    }],
     ['agentDefaultModel', { currentSelection: () => ({ provider: 'fake-provider', model: 'fake-model' }) }],
     ['sessionTitle', { get: () => undefined, rename: (_session, title) => ({ title, source: { kind: 'user' } }) }],
     ['workspaceRegistry', {
@@ -164,7 +175,12 @@ async function mount(root) {
     },
     inject: (_deps, register) => register(scope),
     webServer: { register: () => () => {} },
-  }, { root, enabled: true, asrMergeWindowMs: 10 });
+  }, {
+    root,
+    enabled: true,
+    asrMergeWindowMs: 10,
+    ...(options.autoCandidates === true ? { lexicon: { autoCandidates: true } } : {}),
+  });
 
   const listen = tools.get('assistant_listen');
   assert.ok(listen !== undefined, 'assistant_listen is registered');
@@ -214,6 +230,7 @@ async function mount(root) {
     action,
     events,
     status,
+    commands,
     waitFor,
     /** Feed one delivered transcript through the real merge/flush path. */
     say: (text, meta = {}) => state.onUpdate({ final: text, durationMs: 100, ...meta }),
@@ -238,7 +255,7 @@ const readLexicon = async (root) => JSON.parse(await readFile(join(root, 'data',
 
 test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘', async (t) => {
   const root = await newRoot();
-  const host = await mount(root);
+  const host = await mount(root, { autoCandidates: true });
   t.after(async () => { await host.close(); await cleanupRoot(root); });
 
   const initial = await host.list();
@@ -330,7 +347,7 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
 
 test('2. 语音转写 → 候选；assigned 取决于已确认说话人；普通转写仍进未归属区', async (t) => {
   const root = await newRoot();
-  const host = await mount(root);
+  const host = await mount(root, { autoCandidates: true });
   t.after(async () => { await host.close(); await cleanupRoot(root); });
 
   // A form correction from a CONFIRMED speaker: attributed, but still only a candidate.
@@ -435,7 +452,7 @@ test('3. 事实纠正（不是周五是周六）不入库，也不创建 lexicon
 
 test('4. 重启（同一 root 的第二个 Host 挂载）后条目仍在', async (t) => {
   const root = await newRoot();
-  const first = await mount(root);
+  const first = await mount(root, { autoCandidates: true });
   first.say('向晚来了，向晚走了。');
   const candidate = await first.waitFor(
     async () => (await first.latestCandidates()).find((entry) => entry.text === '向晚'),
@@ -524,6 +541,7 @@ test('5. status.lexicon：voice.selfSpeakerId 权威优先，其次声纹影子 
 test('6. 回归：候选/纠正语义、confirmed 提示形状、六个动作已注册', async () => {
   for (const action of [
     'lexicon.list', 'lexicon.candidates', 'lexicon.confirm',
+    'lexicon.add', 'lexicon.update', 'lexicon.move',
     'lexicon.edit', 'lexicon.reject', 'lexicon.remove',
   ]) {
     assert.ok(ACTIONS.includes(action), `action registered: ${action}`);
@@ -555,4 +573,67 @@ test('6. 回归：候选/纠正语义、confirmed 提示形状、六个动作已
   assert.equal(applyCorrection('GPT4 是模型', hints[1]).reason, 'context-required');
 
   console.log('[6] actions=', 6, 'fact-candidate=', 0, 'form=', JSON.stringify([formCandidate.text, formCandidate.assigned, formCandidate.wrongForms]), 'hints=', JSON.stringify(hints.map((hint) => [hint.kind, hint.replaceable])));
+});
+
+// 7 ---------------------------------------------------------------------------
+
+test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提取关闭）', async (t) => {
+  const root = await newRoot();
+  // Deliberately no `lexicon.autoCandidates`: manual management must not depend on it.
+  const host = await mount(root);
+  t.after(async () => { await host.close(); await cleanupRoot(root); });
+
+  const wordCommand = host.commands.get('word');
+  assert.ok(wordCommand !== undefined, 'ctx.get("commands").register mounted /word');
+  assert.equal(wordCommand.name, 'word');
+  assert.equal(typeof wordCommand.handler, 'function');
+
+  const added = await host.action({
+    action: 'lexicon.add',
+    text: '充电',
+    category: 'expression',
+    usage: '指陪我聊一会，不是给设备充电',
+    reading: 'chōng diàn',
+  });
+  assert.equal(added.ok, true);
+  assert.equal(added.entry.status, 'confirmed');
+  assert.equal(added.entry.assigned, true);
+  assert.equal(added.entry.speakerId, null, 'manual add needs no speaker identity');
+  assert.equal(added.entry.category, 'expression');
+  assert.equal(added.entry.usage, '指陪我聊一会，不是给设备充电');
+  assert.equal(added.entry.reading, 'chōng diàn');
+  assert.equal(added.entry.library, 'public');
+
+  const updated = await host.action({
+    action: 'lexicon.update', id: added.entry.id, category: 'term', usage: '便携电源',
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.entry.status, 'confirmed');
+  assert.equal(updated.entry.category, 'term');
+
+  const moved = await host.action({ action: 'lexicon.move', id: added.entry.id, library: 'voiceprint' });
+  assert.equal(moved.ok, true);
+  assert.equal(moved.entry.library, 'voiceprint');
+  assert.equal(moved.entry.status, 'confirmed');
+  assert.deepEqual(await host.action({ action: 'lexicon.move', id: added.entry.id, library: 'private' }),
+    { ok: false, reason: 'invalid-library' });
+
+  const commandResult = await wordCommand.handler({
+    rawInput: '"麦克风" 术语 "输入设备"',
+  });
+  assert.equal(commandResult.kind, 'success');
+  assert.match(commandResult.text, /ID lex-2/u);
+  const listed = await host.list();
+  assert.deepEqual(listed.entries.map((entry) => [entry.canonical, entry.category, entry.library]).sort(),
+    [['充电', 'term', 'voiceprint'], ['麦克风', 'term', 'public']].sort());
+
+  // The default-OFF extractor did not create anything from the spoken text in the same mount.
+  host.say('向晚来了，向晚走了。');
+  await tick(120);
+  assert.equal((await host.latestCandidates()).length, 0, 'no automatic candidate without opt-in');
+  assert.deepEqual(listed.entries.length, 2);
+
+  console.log('[7] command=word added=', JSON.stringify(added.entry.id),
+    'updated-category=', updated.entry.category, 'moved=', moved.entry.library,
+    'command-text=', JSON.stringify(commandResult.text));
 });
