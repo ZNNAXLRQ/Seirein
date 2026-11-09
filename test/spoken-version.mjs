@@ -129,7 +129,7 @@ const hooks = registerHooks({
     return next(url, context);
   },
 });
-const { apply, splitSentences, voiceSessionTarget } = await import('../src/host/index.js');
+const { apply, normalizeSpokenVersion, splitSentences, voiceSessionTarget } = await import('../src/host/index.js');
 hooks.deregister();
 after(() => { delete globalThis.__spokenVersion; });
 
@@ -556,8 +556,9 @@ test('7. a failed spoken version falls back to the full body and records the rea
   assert.ok(!app.texts().includes(LONG_SPOKEN), 'no condensed text was played');
   t.diagnostic(`fallbackReason=${fallback.reason} source=${version.source} clips=${app.texts().length}`);
 
-  // Validation failure (the model returned something that is not shorter) takes the same path.
-  const invalid = await mountRound(t, { replyText: LONG_BODY, spoken: () => LONG_BODY });
+  // Validation failure (the model returned something longer than the body) takes the same path.
+  // Equal length is allowed since turn 11; only an actually longer candidate is not-shorter.
+  const invalid = await mountRound(t, { replyText: LONG_BODY, spoken: () => `${LONG_BODY}再补一句。` });
   invalid.say('明天出门要注意什么');
   await playText(invalid, LONG_BODY);
   const rejected = await invalid.waitForEvent('voice.spoken.fallback');
@@ -896,5 +897,69 @@ test('19. voice.spoken.version / voice.spoken.text keep their existing fields', 
   assert.equal(textRow.spokenText, LONG_SPOKEN, 'the logged text is the expression that was played');
   assert.equal(textRow.source, version.source);
   t.diagnostic(`versionFields=${Object.keys(version).length} textFields=${Object.keys(textRow).length} source=${version.source}`);
+});
+
+// ---------------------------------------------------------------------------
+// 21. Equal length is allowed (turn 11: a 166-char body and a 166-char spoken version)
+// ---------------------------------------------------------------------------
+test('21. 口语版与正文等长时被采纳，不再因 not-shorter 回退正文', async (t) => {
+  const equalBody = '说明'.repeat(83);
+  const equalSpoken = '口播'.repeat(83);
+  assert.equal([...equalBody].length, 166, 'fixture: the body is 166 characters');
+  assert.equal([...equalSpoken].length, 166, 'fixture: the candidate is 166 characters');
+  const app = await mountRound(t, { replyText: equalBody, spoken: () => equalSpoken });
+  app.say('展开说说');
+  await waitUntil(() => app.players().length >= 1, 'the equal-length version reached the player');
+  await playText(app, equalSpoken);
+  const version = await app.waitForEvent('voice.spoken.version');
+  assert.equal(version.source, 'condensed', 'equal length is adopted, not rejected');
+  assert.equal(version.refused, false);
+  assert.equal(version.chars, 166);
+  assert.equal(app.texts().join(''), equalSpoken, 'the 166-char spoken version is played');
+  const fallbacks = (await app.events()).filter((event) => event.type === 'voice.spoken.fallback');
+  assert.deepEqual(fallbacks, [], 'no fallback row for an equal-length candidate');
+  t.diagnostic(`source=${version.source} chars=${version.chars}/${[...equalBody].length} fallbacks=0`);
+});
+
+// ---------------------------------------------------------------------------
+// 22. Read-aloud cleanup: formatting is dropped, content words are kept
+// ---------------------------------------------------------------------------
+test('22. 朗读清理去掉强调/引号/书名号/破折号/emoji，并保留正文实词', async (t) => {
+  const source = '本来就很长的一段正文，足够用来做长度基准。';
+  const marked = normalizeSpokenVersion(source, '**结论**：“明天——有雨☔️。”');
+  assert.equal(marked.ok, true);
+  assert.equal(marked.text, '结论：明天，有雨。');
+  assert.ok(marked.text.includes('结论') && marked.text.includes('有雨'), 'the content words are kept');
+  assert.ok(!marked.text.includes('**') && !marked.text.includes('——'), 'no emphasis/em dash is spoken');
+
+  const quoted = normalizeSpokenVersion(source, '读`三体`，别读《活着》。');
+  assert.equal(quoted.text, '读三体，别读活着。', 'backticks and book-title marks are dropped, content kept');
+
+  const paired = normalizeSpokenVersion(source, '「明天有雨」，记得带伞。');
+  assert.equal(paired.text, '明天有雨，记得带伞。', 'paired quotation marks are dropped, content kept');
+  t.diagnostic(`marked="${marked.text}" quoted="${quoted.text}" paired="${paired.text}"`);
+});
+
+// ---------------------------------------------------------------------------
+// 23. The length ceiling and the original refusal reasons still hold after cleanup
+// ---------------------------------------------------------------------------
+test('23. 清理后仍不得长于正文；空串/过短/前言仍按原 reason 拒绝', async (t) => {
+  const source = '拿一段足够长的正文，用来做长度上限的基准。';
+  const equal = normalizeSpokenVersion(source, source);
+  assert.equal(equal.ok, true, 'equality is accepted');
+  assert.equal(equal.chars, [...source].length);
+
+  const longer = normalizeSpokenVersion(source, `${source}再补一句。`);
+  assert.equal(longer.ok, false);
+  assert.equal(longer.reason, 'not-shorter', 'a longer candidate is still refused');
+
+  const preambleSource = '这是正文内容。'.repeat(10);
+  const preamble = normalizeSpokenVersion(preambleSource, `好的，${preambleSource.slice(0, 62)}`);
+  assert.equal(preamble.ok, false);
+  assert.equal(preamble.reason, 'preamble', 'a near-full-length model preamble is still refused');
+
+  assert.equal(normalizeSpokenVersion(source, '😀😀').reason, 'empty', 'emoji-only text cleans to empty');
+  assert.equal(normalizeSpokenVersion(source, '好的。').reason, 'too-short', 'a candidate under 4 chars is still too short');
+  t.diagnostic(`equal=${equal.chars} longer=${longer.reason} preamble=${preamble.reason} empty/too-short=refused`);
 });
 

@@ -170,22 +170,65 @@ export function requestsFullRead(utterance) {
 }
 
 /**
- * Validate a model-produced spoken version. Similarity is never used to delete anything: only the
- * shape is checked (non-empty, shorter than the source, no model preamble/quoting), and every
- * failure is reported with a reason so the caller can fall back to the full body.
+ * Read-aloud cleanup for a model-produced spoken version. Every rule only removes presentation
+ * (Markdown emphasis/backticks) or punctuation that is not spoken (paired quotation/book-title
+ * wrappers keep their content, em dashes become a comma pause, emoji/decorative symbols and
+ * redundant whitespace disappear). No content word is ever deleted.
+ * @param {string} value
+ * @returns {string}
+ */
+function cleanSpokenText(value) {
+  let text = String(value ?? '');
+  // Fenced code lines and inline-code backticks: keep the code text itself, drop the markers.
+  text = text.replace(/```[^\n]*\n?/gu, '');
+  text = text.replace(/`([^`\n]+)`/gu, '$1').replace(/`/gu, '');
+  // Markdown emphasis pairs. `_` is only treated as emphasis in a pair, so `foo_bar` survives.
+  text = text.replace(/\*\*([^*\n]+)\*\*/gu, '$1');
+  text = text.replace(/__([^_\n]+)__/gu, '$1');
+  text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/gu, '$1$2');
+  text = text.replace(/(^|[^_\w])_([^_\n]+)_(?=[^_\w]|$)/gu, '$1$2');
+  // Paired quotation / book-title wrappers: the marks are not spoken, their content is kept.
+  text = text.replace(/“([^“”]*)”/gu, '$1');
+  text = text.replace(/‘([^‘’]*)’/gu, '$1');
+  text = text.replace(/「([^「」]*)」/gu, '$1');
+  text = text.replace(/『([^『』]*)』/gu, '$1');
+  text = text.replace(/《([^《》]*)》/gu, '$1');
+  text = text.replace(/〈([^〈〉]*)〉/gu, '$1');
+  text = text.replace(/"([^"\n]*)"/gu, '$1');
+  // A lone wrapper at either end is the same shape; strip it rather than speaking it.
+  text = text.replace(/^["「『“'"‘《〈]+/u, '').replace(/["」』”'"’》〉]+$/u, '');
+  // An em dash is a pause, not a word.
+  text = text.replace(/——/gu, '，').replace(/—/gu, '，');
+  // Emoji, variation selectors, joiners and decorative symbol characters are never spoken.
+  text = text.replace(
+    /[\p{Extended_Pictographic}\uFE0F\u200D\u20E3\u{1F1E6}-\u{1F3FF}]/gu,
+    '',
+  );
+  text = text.replace(/\p{So}/gu, '');
+  // Only presentation whitespace is removed; words, numbers and sentence punctuation stay.
+  text = text.replace(/\s*\n+\s*/gu, ' ').replace(/[ \t]+/gu, ' ').trim();
+  return text;
+}
+
+/**
+ * Validate a model-produced spoken version. The candidate is first cleaned for reading (see
+ * `cleanSpokenText`); similarity is never used to delete anything. Only the shape is checked
+ * (non-empty, not longer than the source, no model preamble/quoting), and every failure is
+ * reported with a reason so the caller can fall back to the full body. Length equality is
+ * allowed: turn 11 produced a 166-character spoken version for a 166-character body and the old
+ * `>=` check rejected a usable answer.
  * @returns {{ok: boolean, text: string, chars: number, reason: string}}
  */
 export function normalizeSpokenVersion(source, candidate) {
   const original = String(source ?? '').trim();
   let text = String(candidate ?? '').trim();
   text = text.replace(/^(?:口语版|口播版|语音版|spoken\s*version|speech)\s*[:：]\s*/iu, '');
-  text = text.replace(/^["「『“]+/u, '').replace(/["」』”]+$/u, '').trim();
-  text = text.replace(/[ \t]+/gu, ' ').trim();
+  text = cleanSpokenText(text);
   const chars = speechCharCount(text);
   const sourceChars = speechCharCount(original);
   if (chars === 0) return { ok: false, text: '', chars: 0, reason: 'empty' };
   if (chars < 4) return { ok: false, text, chars, reason: 'too-short' };
-  if (chars >= sourceChars) return { ok: false, text, chars, reason: 'not-shorter' };
+  if (chars > sourceChars) return { ok: false, text, chars, reason: 'not-shorter' };
   if (/^(?:好的|当然|以下是|这是)/u.test(text) && chars > sourceChars * 0.9) {
     return { ok: false, text, chars, reason: 'preamble' };
   }
