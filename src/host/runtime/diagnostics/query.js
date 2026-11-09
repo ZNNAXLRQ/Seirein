@@ -128,7 +128,11 @@ export const DIAGNOSTICS_TIMELINE_PHASE_FIELDS = Object.freeze([
 /** The `voice.latency` stages `pipeline.timeline` joins onto its own row. */
 const PIPELINE_LATENCY_FIELDS = Object.freeze(['totalMs', 'asrMs', 'injectToAckMs', 'ackToFirstTextMs']);
 
-/** `pipeline.timeline` projection: the five pipeline stages plus the four joined latency stages. */
+/**
+ * `pipeline.timeline` projection: the five pipeline stages, the first-chunk TTS queue wait written
+ * beside them, and the four joined latency stages. The queue wait is an existing measured field of
+ * the event (first `answer` chunk's slot wait); it is projected only, never derived.
+ */
 export const DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS = Object.freeze([
   'at',
   'turn',
@@ -139,6 +143,7 @@ export const DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS = Object.freeze([
   'translatedFirstMs',
   'firstChunkSynthMs',
   'firstAudioMs',
+  'firstChunkQueueWaitMs',
   ...PIPELINE_LATENCY_FIELDS,
 ]);
 
@@ -511,7 +516,7 @@ function latencyFor(index, { turn, sessionId, deliveryMessageId }) {
   return index.byTurn.get(turn) ?? NO_LATENCY;
 }
 
-/** `pipeline.timeline`: the five pipeline stages plus the latency stages of the same round. */
+/** `pipeline.timeline`: the five pipeline stages, the first-chunk queue wait and the latency stages. */
 function projectPipelineTimelineRow(row, index) {
   const payload = isPlainObject(row?.payload) ? row.payload : {};
   const turn = intOrNull(payload.turn);
@@ -528,6 +533,8 @@ function projectPipelineTimelineRow(row, index) {
     translatedFirstMs: msOrNull(payload.translatedFirstMs),
     firstChunkSynthMs: msOrNull(payload.firstChunkSynthMs),
     firstAudioMs: msOrNull(payload.firstAudioMs),
+    // An unobserved queue wait stays null; a measured 0 is preserved (never filled with 0).
+    firstChunkQueueWaitMs: msOrNull(payload.firstChunkQueueWaitMs),
     totalMs: joined.totalMs,
     asrMs: joined.asrMs,
     injectToAckMs: joined.injectToAckMs,

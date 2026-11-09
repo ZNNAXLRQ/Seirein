@@ -703,3 +703,57 @@ test('12. both timeline probes project the event time and order by it, not by tu
     f.cleanup();
   }
 });
+
+test('13. pipeline.timeline projects firstChunkQueueWaitMs: measured 0, value, null, absent', async () => {
+  const pipeline = (turn, offsetMs, queueWait) => event('voice.pipeline.timeline', {
+    sessionId: 'session-q',
+    deliveryMessageId: `msg-q${turn}`,
+    turn,
+    bodyReadyMs: 800 + turn,
+    ...(queueWait === undefined ? {} : { firstChunkQueueWaitMs: queueWait }),
+  }, offsetMs);
+  const f = fixture([
+    pipeline(13, 200, 0), // a measured zero is information, not an unknown
+    // A real measured wait plus fields the whitelist must drop, including the undefined ttsQueueMs.
+    event('voice.pipeline.timeline', {
+      sessionId: 'session-q',
+      deliveryMessageId: 'msg-q12',
+      turn: 12,
+      bodyReadyMs: 812,
+      firstChunkQueueWaitMs: 7.6,
+      ttsQueueMs: 987654,
+      firstChunkQueueWaitMsRaw: 'PRIVATE QUEUE RAW',
+    }, 300),
+    pipeline(11, 400, null), // explicitly recorded as unobserved
+    pipeline(10, 500), // key absent entirely
+  ]);
+  const diagnostics = createDiagnostics({ root: f.root, isEnabled: true });
+  try {
+    assert.ok(DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS.includes('firstChunkQueueWaitMs'));
+    assert.equal(DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS.includes('ttsQueueMs'), false,
+      'P-46 does not add an undefined ttsQueueMs field');
+    const result = await diagnostics.query({ probe: 'pipeline.timeline', limit: 10 });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.rows.map((row) => row.turn), [13, 12, 11, 10], 'newest first');
+    for (const row of result.rows) {
+      assertFields(row, DIAGNOSTICS_PIPELINE_TIMELINE_FIELDS, 'pipeline.timeline row');
+      assert.ok(Object.hasOwn(row, 'firstChunkQueueWaitMs'), 'the field is always projected');
+    }
+    const [measuredZero, measured, explicitNull, absent] = result.rows;
+    assert.equal(measuredZero.firstChunkQueueWaitMs, 0, 'a measured zero is preserved');
+    assert.equal(measured.firstChunkQueueWaitMs, 8, 'a measured wait is rounded, not dropped');
+    assert.equal(explicitNull.firstChunkQueueWaitMs, null, 'an explicit null stays null');
+    assert.equal(absent.firstChunkQueueWaitMs, null, 'a missing field stays null, never 0');
+    assert.equal(absent.bodyReadyMs, 810, 'the sibling pipeline stages are unaffected');
+
+    const serialized = JSON.stringify(result.rows);
+    for (const forbidden of ['ttsQueueMs', '987654', 'firstChunkQueueWaitMsRaw', 'PRIVATE QUEUE RAW']) {
+      assert.equal(serialized.includes(forbidden), false, `leaked ${forbidden}`);
+    }
+    console.log(`[13] queueWait measuredZero=${measuredZero.firstChunkQueueWaitMs} `
+      + `measured=${measured.firstChunkQueueWaitMs} explicitNull=${JSON.stringify(explicitNull.firstChunkQueueWaitMs)} `
+      + `absent=${JSON.stringify(absent.firstChunkQueueWaitMs)} (ttsQueueMs/unknown fields dropped)`);
+  } finally {
+    f.cleanup();
+  }
+});
