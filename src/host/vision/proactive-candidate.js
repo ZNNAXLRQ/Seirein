@@ -1,9 +1,10 @@
 /**
  * P-187 阶段 5 —— 主动回应仲裁（纯决策层）。
  *
- * 设计文档第十节只把“作品事件 -> 主动候选”作为输入，真正开口前还要过一遍时机与频率：
- * 候选未过期、证据仍在、用户没在说话、助手没有待完成回应、不在关键台词上、离上次主动
- * 够远、每小时没超限。第十一节又要求这些观察是短期、有界、可过期的，不能自动写进记忆。
+ * 设计文档第十节只把“作品事件 -> 主动候选”作为输入，真正开口前还要过一遍时机与内容概率：
+ * 候选未过期、证据仍在、用户没在说话、助手没有待完成回应、不在关键台词上；时机通过后，
+ * 再按用户设置的“主动回应通过率”给每个独立候选一次抽签。不再有“每小时几句 / 间隔多少秒”
+ * 的固定配额（仍可选覆盖）。第十一节又要求这些观察是短期、有界、可过期的，不能自动写进记忆。
  *
  * 因此本模块只做一件事：判断“现在这一步适不适合开口，如果要开口说哪一条”。
  *   - 不截图、不读文件、不调用模型、不建定时器、不写记忆、不创建对话、不改人设；
@@ -12,24 +13,27 @@
  *
  * 取舍：
  *   - evaluate() 只读输入、不消费候选；真正开口后必须再调用 spoken() 记账。
- *   - spoken() 会移除同 id 候选，并在 maxAgeMs 窗口内记住该 id，避免同一事件被重复说出。
+ *   - spoken() 会移除同一事件的候选，并在 maxAgeMs 窗口内记住该事件，避免重复说出。
  *   - 候选过期就丢弃，不排队；淘汰/拒绝都只计数，不回报正文。
+ *   - 通过率按候选身份只抽一次：抽中/未抽中都持久记录（有界），换措辞不重抽。
  *   - cancelAll() 只清待选池（可再次登记）；cancelFor() 才写取消集；reset() 是隐私/切源的
- *     代次边界，连取消集、最近主题与时机窗口一起清空，但保留累计计数。
+ *     代次边界，连取消集、抽签记录、最近主题与时机窗口一起清空，但保留累计计数。
  */
 
-/** 第一版试验参数；不是冻结值，按本机实测再调。 */
+/** 默认值：不再有固定配额，只保留有效期、静默期与同时候选数；计时/频率仍可显式覆盖。 */
 export const PROACTIVE_DEFAULTS = Object.freeze({
   /** 候选有效期（事件发生到可开口）。 */
   maxAgeMs: 8_000,
-  /** 两次主动之间的最小间隔。 */
-  minGapMs: 45_000,
-  /** 每小时上限。 */
-  maxPerHour: 6,
+  /** 两次主动之间的最小间隔；0 = 不限制（可选覆盖）。 */
+  minGapMs: 0,
+  /** 每小时上限；null = 不限制（可选覆盖）。 */
+  maxPerHour: null,
   /** 连续未被回应时进入的静默期。 */
   quietAfterIgnoredMs: 120_000,
   /** 同时保留的候选上限。 */
   maxCandidates: 4,
+  /** 每个独立候选的通过概率（0–100，默认 100 = 必过）。 */
+  rate: 100,
 });
 
 /** 每小时按滚动窗口计算，避免整点前后出现两次突发。 */
@@ -40,6 +44,9 @@ const TOPIC_LABEL_MAX = 48;
 
 /** 已取消事件 id 只保留近期一段；候选本身寿命很短，无需无限增长。 */
 const CANCELED_ID_LIMIT = 256;
+
+/** 通过率抽签结果按候选身份持久保存；有界，防止长会话无限增长。 */
+const DRAW_ID_LIMIT = 256;
 
 /** 发言时间只用于滚动一小时计数；硬上限防止异常时钟/重复记账把数组撑大。 */
 const SPEAK_TIMES_LIMIT = 2_048;
@@ -67,10 +74,30 @@ function timestamp(value) {
   return number === null || number < 0 ? null : number;
 }
 
-/** 配置里的时长/频率：有限且非负；非法时回退默认值。 */
+/** 配置里的时长：有限且非负；非法时回退默认值。 */
 function nonNegative(value, fallback) {
   const number = finiteNumber(value);
   return number === null || number < 0 ? fallback : number;
+}
+
+/** 可选的每小时上限：null/Infinity = 不限制；其它有限非负数取整；非法时回退。 */
+function optionalLimit(value, fallback) {
+  if (value === null || value === Infinity) return null;
+  const number = finiteNumber(value);
+  if (number === null || number < 0) return fallback;
+  return Math.floor(number);
+}
+
+/** 通过率：只接受有限数字，夹到 0–100；非法时回退默认值。 */
+function rateValue(value, fallback) {
+  const number = finiteNumber(value);
+  if (number === null) return fallback;
+  return Math.min(100, Math.max(0, number));
+}
+
+/** 候选身份：显式 eventId 优先；否则回到 id。描述文本永远不参与身份。 */
+function candidateIdentity(candidate) {
+  return candidate.eventId.length > 0 ? candidate.eventId : candidate.id;
 }
 
 /** 候选 id / 证据 id / 取消事件 id 统一成去掉首尾空白的非空字符串。 */
@@ -114,6 +141,10 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
   const id = normalizeId(input.id);
   if (id.length === 0) return { ok: false, reason: 'malformed' };
 
+  // 身份优先用显式 eventId；没有 eventId 时用 id。描述文本不参与身份。
+  const eventId = normalizeId(input.eventId);
+  const identity = eventId.length > 0 ? eventId : id;
+
   if (typeof input.description !== 'string') return { ok: false, reason: 'malformed' };
   const description = input.description.trim();
   if (description.length === 0) return { ok: false, reason: 'malformed' };
@@ -149,10 +180,10 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
   if (at - to > config.maxAgeMs) return { ok: false, reason: 'expired' };
 
   // 用户先评论了同一事件：取消后即使再次送来也不恢复主动。
-  if (canceled.has(id)) return { ok: false, reason: 'canceled' };
+  if (canceled.has(id) || canceled.has(identity)) return { ok: false, reason: 'canceled' };
 
   // 重复抑制：同一事件刚说过的 maxAgeMs 内不再接受，避免后台重复理解带来重复开口。
-  const spokenAtTime = spokenAt.get(id);
+  const spokenAtTime = spokenAt.get(identity);
   if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) {
     return { ok: false, reason: 'duplicate' };
   }
@@ -164,6 +195,7 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
     ok: true,
     candidate: Object.freeze({
       id,
+      eventId,
       from,
       to,
       description,
@@ -225,6 +257,7 @@ export function revalidateProactiveCandidate(input = {}) {
  *
  * @param {object} [options]
  * @param {Function|number} [options.now] 时钟：默认 Date.now；测试可注入固定值。
+ * @param {Function} [options.draw] 通过率随机源：默认 Math.random；测试可注入固定值。
  * @param {object} [options.defaults] 覆盖 PROACTIVE_DEFAULTS 中的部分或全部参数。
  */
 export function createProactiveArbiter(options = {}) {
@@ -239,14 +272,18 @@ export function createProactiveArbiter(options = {}) {
   const config = {
     maxAgeMs: nonNegative(source.maxAgeMs, base.maxAgeMs),
     minGapMs: nonNegative(source.minGapMs, base.minGapMs),
-    maxPerHour: Math.floor(nonNegative(source.maxPerHour, base.maxPerHour)),
+    maxPerHour: optionalLimit(source.maxPerHour, base.maxPerHour),
     quietAfterIgnoredMs: nonNegative(source.quietAfterIgnoredMs, base.quietAfterIgnoredMs),
     maxCandidates: Math.max(1, Math.floor(nonNegative(source.maxCandidates, base.maxCandidates))),
+    rate: rateValue(source.rate, base.rate),
   };
 
   const clock = typeof opts.now === 'function'
     ? opts.now
     : (timestamp(opts.now) !== null ? () => opts.now : Date.now);
+
+  // 通过率抽签的随机源：默认 Math.random；测试可注入固定序列。
+  const draw = typeof opts.draw === 'function' ? opts.draw : Math.random;
 
   function currentTime() {
     try {
@@ -259,12 +296,23 @@ export function createProactiveArbiter(options = {}) {
     }
   }
 
+  /** 抽一次随机数；坏值/抛错按 0 处理，绝不让随机源拖垮仲裁器。 */
+  function drawOnce() {
+    try {
+      const value = Number(draw());
+      if (!Number.isFinite(value)) return 0;
+      return Math.min(1, Math.max(0, value));
+    } catch {
+      return 0;
+    }
+  }
+
   /** 候选本身的有效性：未过期、未被取消、不在“刚说过”的重复窗口里。 */
   function isUsable(candidate, at) {
     if (candidate.expiresAt !== null && at >= candidate.expiresAt) return false;
     if (at - candidate.to > config.maxAgeMs) return false;
-    if (canceled.has(candidate.id)) return false;
-    const spokenAtTime = spokenAt.get(candidate.id);
+    if (canceled.has(candidate.id) || canceled.has(candidateIdentity(candidate))) return false;
+    const spokenAtTime = spokenAt.get(candidateIdentity(candidate));
     if (spokenAtTime !== undefined && at - spokenAtTime <= config.maxAgeMs) return false;
     return true;
   }
@@ -302,28 +350,71 @@ export function createProactiveArbiter(options = {}) {
     }
   }
 
-  /** 读每轮 settings：只认明确的 false / 合法非负数字，畸形字段逐个忽略。 */
+  /** 读每轮 settings：只认明确的 false / 合法数值；畸形字段逐个忽略。 */
   function resolveSettings(settings) {
     const resolved = {
       enabled: true,
       maxPerHour: config.maxPerHour,
       minGapMs: config.minGapMs,
+      rate: config.rate,
     };
     if (settings === null || typeof settings !== 'object' || Array.isArray(settings)) {
       return resolved;
     }
     if (settings.enabled === false) resolved.enabled = false;
-    const maxPerHour = finiteNumber(settings.maxPerHour);
-    if (maxPerHour !== null && maxPerHour >= 0) resolved.maxPerHour = Math.floor(maxPerHour);
+    // null / Infinity 是“显式不限制”，不能被当成非法值回退成默认上限。
+    if (settings.maxPerHour === null || settings.maxPerHour === Infinity) {
+      resolved.maxPerHour = null;
+    } else {
+      const maxPerHour = finiteNumber(settings.maxPerHour);
+      if (maxPerHour !== null && maxPerHour >= 0) resolved.maxPerHour = Math.floor(maxPerHour);
+    }
     const minGapMs = finiteNumber(settings.minGapMs);
     if (minGapMs !== null && minGapMs >= 0) resolved.minGapMs = minGapMs;
+    const rate = finiteNumber(settings.rate);
+    if (rate !== null) resolved.rate = Math.min(100, Math.max(0, rate));
     return resolved;
+  }
+
+  /** 记录一次抽签结果；超过上限先丢最旧的身份。 */
+  function rememberDraw(identity, passed) {
+    draws.delete(identity);
+    draws.set(identity, passed);
+    while (draws.size > DRAW_ID_LIMIT) {
+      const oldest = draws.keys().next().value;
+      draws.delete(oldest);
+    }
+  }
+
+  /**
+   * 通过率判定：每个独立候选身份只判定一次，结果持久记录。
+   * 0 = 直接不开口；100 = 直接必过；中间值才调用一次注入的随机源。
+   * 已记录的身份不重抽——即使同一事件换了措辞、id 或描述。
+   */
+  function decideRate(candidate, rate) {
+    const identity = candidateIdentity(candidate);
+    if (rate <= 0) {
+      if (!draws.has(identity)) {
+        rememberDraw(identity, false);
+        drawn += 1;
+      }
+      return { pass: false, reason: 'rate-zero' };
+    }
+    const recorded = draws.get(identity);
+    if (recorded !== undefined) return { pass: recorded, reason: recorded ? 'rate-hit' : 'rate-miss' };
+
+    const pass = rate >= 100 ? true : drawOnce() * 100 < rate;
+    rememberDraw(identity, pass);
+    drawn += 1;
+    if (pass) passed += 1;
+    return { pass, reason: pass ? 'rate-hit' : 'rate-miss' };
   }
 
   // ---- 内部状态 -----------------------------------------------------------
   const candidates = [];
   const canceled = new Map();
   const spokenAt = new Map();
+  const draws = new Map();
   const speakTimes = [];
   let proposed = 0;
   let rejected = 0;
@@ -333,9 +424,12 @@ export function createProactiveArbiter(options = {}) {
   let canceledCandidates = 0;
   let spokenCount = 0;
   let ignoredCount = 0;
+  let drawn = 0;
+  let passed = 0;
   let consecutiveIgnored = 0;
   let lastSpokenAt = null;
   let quietUntil = null;
+  let lastRate = config.rate;
   let lastTopic = null;
   let lastReason = null;
 
@@ -357,8 +451,10 @@ export function createProactiveArbiter(options = {}) {
       }
 
       const candidate = result.candidate;
-      // 同 id 去重：后到的版本替换旧版本，并视为最新登记。
-      const existing = candidates.findIndex((entry) => entry.id === candidate.id);
+      // 同身份（eventId 优先，否则 id）去重：后到的版本替换旧版本，并视为最新登记；
+      // 同一事件换措辞不会变成两条候选，也不会多一次抽签。
+      const identity = candidateIdentity(candidate);
+      const existing = candidates.findIndex((entry) => candidateIdentity(entry) === identity);
       if (existing >= 0) candidates.splice(existing, 1);
       candidates.push(candidate);
       proposed += 1;
@@ -372,13 +468,18 @@ export function createProactiveArbiter(options = {}) {
     },
 
     /**
-     * 判断现在是否适合开口；不修改参数、不消费候选。
-     * 成功时 reason 为 'ok'，candidate 为本次应说的那一条；被抑制时 candidate 为 null。
+     * 判断现在是否适合开口；不消费候选，但会按候选身份记录一次通过率抽签。
+     *
+     * 顺序固定：先看开关与时机（用户说话/助手忙/待回复/关键台词/too-soon/可选小时上限）；
+     * 任何时机抑制都直接返回，不选候选、不抽签。时机通过后才做候选有效性选择与通过率判定。
+     * 成功时 reason 为 'rate-hit'，candidate 为本次应说的那一条；概率未过为 'rate-miss'，
+     * 通过率为 0 时为 'rate-zero'，被时机抑制时 candidate 为 null。
      */
     evaluate(input = {}) {
       const at = currentTime();
       const state = input !== null && typeof input === 'object' && !Array.isArray(input) ? input : {};
       const settings = resolveSettings(state.settings);
+      lastRate = settings.rate;
       lastReason = null;
 
       if (!settings.enabled) {
@@ -393,25 +494,46 @@ export function createProactiveArbiter(options = {}) {
       if (state.keyDialogue) suppressed.push('key-dialogue');
 
       // quiet 期还没结束，或距上次开口不足（连续 ignored 时按倍数放大），都算 too-soon。
+      // minGapMs 默认 0：只有显式覆盖成非零值时，这个间隔才生效。
       const quiet = quietUntil !== null && at < quietUntil;
       const lastGap = lastSpokenAt === null ? null : at - lastSpokenAt;
-      const tooSoon = quiet || (lastGap !== null && lastGap < settings.minGapMs
-        * (consecutiveIgnored > 0 ? consecutiveIgnored + 1 : 1));
+      const tooSoon = quiet || (lastGap !== null && settings.minGapMs > 0
+        && lastGap < settings.minGapMs * (consecutiveIgnored > 0 ? consecutiveIgnored + 1 : 1));
       if (tooSoon) suppressed.push('too-soon');
 
-      if (recentSpeakCount(at) >= settings.maxPerHour) suppressed.push('hourly-limit');
+      // maxPerHour 默认 null：不限制；只有显式设置数字时才检查滚动窗口。
+      if (settings.maxPerHour !== null && recentSpeakCount(at) >= settings.maxPerHour) {
+        suppressed.push('hourly-limit');
+      }
+
+      // 时机失败不抽签：先返回，不选候选、不消耗任何随机性/身份记录。
+      if (suppressed.length > 0) {
+        const reason = suppressed[0];
+        lastReason = reason;
+        return { speak: false, candidate: null, reason, suppressed };
+      }
 
       const candidate = selectCandidate(at);
-      if (candidate === null) suppressed.push('no-candidate');
+      if (candidate === null) {
+        lastReason = 'no-candidate';
+        return { speak: false, candidate: null, reason: 'no-candidate', suppressed: ['no-candidate'] };
+      }
 
-      const speak = suppressed.length === 0;
-      const reason = speak ? 'ok' : suppressed[0];
-      lastReason = reason;
+      const decision = decideRate(candidate, settings.rate);
+      lastReason = decision.reason;
+      if (!decision.pass) {
+        return {
+          speak: false,
+          candidate: null,
+          reason: decision.reason,
+          suppressed: [decision.reason],
+        };
+      }
       return {
-        speak,
-        candidate: speak ? candidate : null,
-        reason,
-        suppressed,
+        speak: true,
+        candidate,
+        reason: decision.reason,
+        suppressed: [],
       };
     },
 
@@ -427,6 +549,9 @@ export function createProactiveArbiter(options = {}) {
       }
       const id = normalizeId(candidate.id);
       if (id.length === 0) return false;
+      // 重复抑制按身份记账：同一事件换 id/描述后仍然算“说过”。
+      const eventId = normalizeId(candidate.eventId);
+      const identity = eventId.length > 0 ? eventId : id;
 
       const at = timestamp(options !== null && typeof options === 'object' ? options.now : null)
         ?? currentTime();
@@ -446,12 +571,12 @@ export function createProactiveArbiter(options = {}) {
         ? candidate.description.trim()
         : '';
       lastTopic = { id, label: summarizeTopic(id, description) };
-      spokenAt.set(id, at);
+      spokenAt.set(identity, at);
       spokenCount += 1;
 
       // 同一事件已经说过：从待选池移除，防止紧接着再次被选中。
       for (let i = candidates.length - 1; i >= 0; i -= 1) {
-        if (candidates[i].id === id) candidates.splice(i, 1);
+        if (candidateIdentity(candidates[i]) === identity) candidates.splice(i, 1);
       }
 
       consecutiveIgnored = 0;
@@ -462,25 +587,31 @@ export function createProactiveArbiter(options = {}) {
 
     /**
      * 用户先评论了同一事件：取消这些主动候选，转入被动讨论。
-     * 取消是持久的（有界保留），之后同 id 再送来也不会恢复。
+     * 取消是持久的（有界保留），之后同 id / 同 eventId 再送来也不会恢复。
      * @returns {number} 本次移除的候选数
      */
     cancelFor(eventIds) {
       const values = Array.isArray(eventIds) ? eventIds : [eventIds];
       const at = currentTime();
       let removed = 0;
-      values.forEach((value) => {
-        const id = normalizeId(value);
-        if (id.length === 0) return;
+      const rememberCanceled = (cancelId) => {
         // 重新取消时刷新顺序，超过上限先丢掉最旧的取消记录。
-        canceled.delete(id);
-        canceled.set(id, at);
+        canceled.delete(cancelId);
+        canceled.set(cancelId, at);
         while (canceled.size > CANCELED_ID_LIMIT) {
           const oldest = canceled.keys().next().value;
           canceled.delete(oldest);
         }
+      };
+      values.forEach((value) => {
+        const id = normalizeId(value);
+        if (id.length === 0) return;
+        rememberCanceled(id);
         for (let i = candidates.length - 1; i >= 0; i -= 1) {
-          if (candidates[i].id !== id) continue;
+          const identity = candidateIdentity(candidates[i]);
+          if (candidates[i].id !== id && identity !== id) continue;
+          // 按任意一个 id 取消时，把事件身份也记进取消集，换 id 的同一事件不会复活。
+          if (identity !== id) rememberCanceled(identity);
           candidates.splice(i, 1);
           removed += 1;
         }
@@ -507,7 +638,7 @@ export function createProactiveArbiter(options = {}) {
     },
 
     /**
-     * 代次边界（隐私/切源/卸载）：清空候选、取消集、最近主题与所有时机窗口。
+     * 代次边界（隐私/切源/卸载）：清空候选、取消集、抽签记录、最近主题与所有时机窗口。
      *
      * 取舍：累计计数（proposed/rejected/expired/evicted/duplicate/canceled/spoken/ignored）
      * **保留**，因为它们描述的是这个仲裁器实例的整个生命周期，清理窗口不应让诊断数字归零；
@@ -523,6 +654,7 @@ export function createProactiveArbiter(options = {}) {
       candidates.length = 0;
       canceled.clear();
       spokenAt.clear();
+      draws.clear();
       speakTimes.length = 0;
       lastSpokenAt = null;
       consecutiveIgnored = 0;
@@ -558,6 +690,11 @@ export function createProactiveArbiter(options = {}) {
       return {
         pending: candidates.length,
         valid,
+        // 只读诊断：最近一次 evaluate 的通过率，以及按身份记录的抽签计数。
+        // drawn = 已记录结果的候选身份数（含 0/100 的确定性结果）；passed = 其中通过数。
+        rate: lastRate,
+        drawn,
+        passed,
         counts: {
           proposed,
           rejected,

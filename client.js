@@ -4705,8 +4705,9 @@ window.__ModuleLoader__.load({
       const [lastRestart, setLastRestart] = useState(null);
       // 「最近听到」只看 1 条还是最近 3 条；只是展示状态，不写 settings。
       const [expandedAmbient, setExpandedAmbient] = useState(false);
-      // 「主动回应」开关：null = 跟随 status 里的已保存值；点击先乐观写本地，失败再回滚。
+      // 「主动回应」开关与通过率：null = 跟随 status 里的已保存值；改动先乐观写本地，失败再回滚。
       const [proactiveDraft, setProactiveDraft] = useState(null);
+      const [proactiveRateDraft, setProactiveRateDraft] = useState(null);
       const [proactiveError, setProactiveError] = useState('');
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
       const [profileMaintain, setProfileMaintain] = useState(null);
@@ -5842,10 +5843,40 @@ window.__ModuleLoader__.load({
             const scenes = vm.scenes ?? [];
             const capturing = vm.capturing === true;
             const busyNow = busy !== '';
-            // 初值来自 /assistant/status 的 vision.proactive.enabled；未知（非布尔）时按开启展示，
-            // 但不强行写回设置。proactiveDraft 只承载本次点击的乐观值，失败时清掉即回滚。
+            // 初值来自 /assistant/status 的 vision.proactive.{enabled,rate}；未知时按开启 / 100%
+            // 展示，但不强行写回设置。draft 只承载本次动作的乐观值，失败时清掉即回滚。
+            const clampProactiveRate = (value) => {
+              const number = Number(value);
+              if (!Number.isFinite(number)) return null;
+              return Math.min(100, Math.max(0, Math.round(number)));
+            };
             const proactiveSaved = typeof vm.proactive?.enabled === 'boolean' ? vm.proactive.enabled : true;
             const proactiveOn = typeof proactiveDraft === 'boolean' ? proactiveDraft : proactiveSaved;
+            const proactiveRateSaved = clampProactiveRate(vm.proactive?.rate) ?? 100;
+            const proactiveRate = typeof proactiveRateDraft === 'number'
+              ? proactiveRateDraft
+              : proactiveRateSaved;
+            // 通过率提交：先乐观写本地，成功以宿主返回的 0–100 值为准，失败清掉乐观值回滚。
+            const commitProactiveRate = async () => {
+              const next = clampProactiveRate(proactiveRate);
+              if (next === null || next === proactiveRateSaved) {
+                setProactiveRateDraft(null);
+                return;
+              }
+              setProactiveRateDraft(next);
+              setProactiveError('');
+              const result = await act(
+                { action: 'vision.proactive', enabled: proactiveOn, rate: next },
+                'vision-proactive-rate',
+              );
+              if (result?.ok === true) {
+                setProactiveRateDraft(clampProactiveRate(result.rate) ?? next);
+                if (typeof result.enabled === 'boolean') setProactiveDraft(result.enabled);
+                return;
+              }
+              setProactiveRateDraft(null);
+              setProactiveError(String(result?.error ?? '保存失败'));
+            };
             const visionHotkey = (status.hotkeys ?? []).find((entry) => entry.action === 'vision')?.combo ?? 'Ctrl+Alt+V';
             const lastCaptureAt = Number(vm.lastCaptureAt) || 0;
             const lastCaptureText = lastCaptureAt > 0 ? new Date(lastCaptureAt).toLocaleTimeString() : '—';
@@ -5896,10 +5927,16 @@ window.__ModuleLoader__.load({
                     const next = !proactiveOn;
                     setProactiveDraft(next);
                     setProactiveError('');
-                    const result = await act({ action: 'vision.proactive', enabled: next }, 'vision-proactive');
+                    // 契约扩展：开关动作也带上当前通过率，宿主一次保存两个字段。
+                    const result = await act(
+                      { action: 'vision.proactive', enabled: next, rate: proactiveRate },
+                      'vision-proactive',
+                    );
                     if (result?.ok === true) {
                       // 成功以宿主返回的有效值为准；没带布尔值时保留乐观值，等 status 刷新校正。
                       setProactiveDraft(typeof result.enabled === 'boolean' ? result.enabled : next);
+                      const savedRate = clampProactiveRate(result.rate);
+                      if (savedRate !== null) setProactiveRateDraft(savedRate);
                       return;
                     }
                     // 失败回滚：清掉乐观值，界面回到 status.vision.proactive.enabled。
@@ -5907,6 +5944,36 @@ window.__ModuleLoader__.load({
                     setProactiveError(String(result?.error ?? '保存失败'));
                   },
                 }, proactiveOn ? '已开启' : '已关闭')),
+              h('div', { style: styles.row },
+                h('span', { style: styles.label },
+                  '主动回应通过率',
+                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（每个候选只抽一次，100% 必过）')),
+                h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                  h('input', {
+                    type: 'number',
+                    min: 0,
+                    max: 100,
+                    step: 5,
+                    value: proactiveRate,
+                    'data-settings-input': 'vision-proactive-rate',
+                    'aria-label': '主动回应通过率',
+                    style: { ...styles.input, width: 76 },
+                    // 关闭主动回应时通过率没有意义：禁用，但保留已保存的数字。
+                    disabled: busyNow || !proactiveOn,
+                    onChange: (event) => {
+                      const next = clampProactiveRate(event.target.value);
+                      if (next !== null) setProactiveRateDraft(next);
+                    },
+                    onBlur: () => {
+                      void commitProactiveRate();
+                    },
+                    onKeyDown: (event) => {
+                      if (event.key === 'Enter') event.currentTarget.blur();
+                    },
+                  }),
+                  h('span', { style: styles.value }, '%'),
+                ),
+              ),
               proactiveError !== ''
                 ? h('div', { style: { ...styles.hint, color: DANGER } }, `主动回应保存失败：${proactiveError}`)
                 : null,
