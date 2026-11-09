@@ -139,7 +139,7 @@ test('4. 同句两个纠正 / 代词指向不明 → ambiguous，落候选但不
   console.log('[4] parsed=', JSON.stringify(parsed), 'candidate=', JSON.stringify(candidates[0]), 'confirm=', JSON.stringify(refused));
 });
 
-test('5. speakerId 为空 → 不 assigned，只留候选', () => {
+test('5. speakerId 为空 → 候选不 assigned，但确认不再要求 speakerId', () => {
   const parsed = parseExplicitCorrection('不是小满，是向晚');
   assert.equal(parsed.ambiguous, false);
 
@@ -162,11 +162,16 @@ test('5. speakerId 为空 → 不 assigned，只留候选', () => {
   assert.equal(listUnassigned(state).length, 1);
   assert.deepEqual(listEntries(state), []);
 
-  const refused = confirmCandidate(state, { text: '向晚', canonical: '向晚', now: T2 });
-  assert.equal(refused.ok, false);
-  assert.equal(refused.reason, 'speaker-required');
+  // The shared lexicon does not require a voiceprint identity: confirmation succeeds with
+  // speakerId null and the entry becomes effective.
+  const confirmed = confirmCandidate(state, { text: '向晚', canonical: '向晚', now: T2 });
+  assert.equal(confirmed.ok, true);
+  assert.equal(confirmed.entry.assigned, true);
+  assert.equal(confirmed.entry.speakerId, null);
+  assert.equal(listUnassigned(state).length, 0);
+  assert.equal(listEntries(state).length, 1);
 
-  console.log('[5] candidate=', JSON.stringify(candidates[0]), 'confirm=', JSON.stringify(refused));
+  console.log('[5] candidate=', JSON.stringify(candidates[0]), 'confirm=', JSON.stringify(confirmed.entry));
 });
 
 test('6. applyCorrection：上下文匹配才替换，不匹配/无上下文不替换', () => {

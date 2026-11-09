@@ -11,7 +11,8 @@
  *   5. confirm sets canonical + assigned + confirmedAt and makes the entry visible; a second
  *      confirm can edit the canonical spelling;
  *   6. reject/remove work and the whole state survives a JSON round-trip;
- *   7. confirming without a speakerId is refused with ok:false and writes nothing.
+ *   7. confirming without a speakerId succeeds (shared lexicon); a blank speakerId normalises to
+ *      null, while an unknown / rejected entry is still refused.
  *
  * Run: node --test test/lexicon-candidates.mjs
  */
@@ -307,35 +308,49 @@ test('6. reject/remove 生效，状态可 JSON 序列化往返', () => {
   console.log('[6] rejected=', JSON.stringify(rejected.entry), 'again=', JSON.stringify(again), 'bytes=', serialised.length, 'readded=', JSON.stringify(readded));
 });
 
-test('7. 无 speakerId 时确认被拒绝（ok:false，不写）', () => {
+test('7. 无 speakerId 时确认成功（共享词库）；空白归一为 null；unknown/rejected 仍拒绝', () => {
   const state = createLexiconState();
   extractAndMerge(state, {
     utterances: [utterance('u1', 'TTS 是语音。', T1), utterance('u2', 'TTS 很好。', T2)],
     now: T3,
   });
-  const before = JSON.stringify(state);
 
+  // The user's confirmation is the only gate; no speakerId is needed for a shared entry.
   const missing = confirmCandidate(state, { text: 'TTS', canonical: 'TTS', now: T3 });
-  assert.equal(missing.ok, false);
-  assert.equal(missing.reason, 'speaker-required');
-  assert.equal(JSON.stringify(state), before, 'a refused confirmation writes nothing');
-  assert.equal(listEntries(state).length, 0);
-  assert.equal(listUnassigned(state)[0].canonical, '');
+  assert.equal(missing.ok, true);
+  assert.equal(missing.entry.assigned, true);
+  assert.equal(missing.entry.speakerId, null);
+  assert.equal(missing.entry.status, 'confirmed');
+  assert.equal(missing.entry.canonical, 'TTS');
+  assert.equal(listEntries(state).length, 1);
+  assert.deepEqual(listUnassigned(state), []);
 
-  const blank = confirmCandidate(state, { text: 'TTS', speakerId: '   ', canonical: 'TTS', now: T3 });
-  assert.equal(blank.ok, false);
-  assert.equal(blank.reason, 'speaker-required');
-  assert.equal(JSON.stringify(state), before);
+  // A blank speakerId is optional provenance too: confirm and normalise it to null.
+  const blankState = createLexiconState();
+  extractAndMerge(blankState, {
+    utterances: [utterance('v1', 'TTS 是语音。', T1), utterance('v2', 'TTS 很好。', T2)],
+    now: T3,
+  });
+  const blank = confirmCandidate(blankState, { text: 'TTS', speakerId: '   ', canonical: 'TTS', now: T3 });
+  assert.equal(blank.ok, true);
+  assert.equal(blank.entry.assigned, true);
+  assert.equal(blank.entry.speakerId, null);
+  assert.equal(listEntries(blankState).length, 1);
 
   const unknown = confirmCandidate(state, { text: '不存在', speakerId: 'spk-1', now: T3 });
   assert.equal(unknown.ok, false);
   assert.equal(unknown.reason, 'not-found');
 
-  assert.equal(rejectCandidate(state, { text: 'TTS', now: T3 }).ok, true);
-  const cannotConfirmRejected = confirmCandidate(state, { text: 'TTS', speakerId: 'spk-1', now: T3 });
+  const rejectedState = createLexiconState();
+  extractAndMerge(rejectedState, {
+    utterances: [utterance('w1', 'TTS 是语音。', T1), utterance('w2', 'TTS 很好。', T2)],
+    now: T3,
+  });
+  assert.equal(rejectCandidate(rejectedState, { text: 'TTS', now: T3 }).ok, true);
+  const cannotConfirmRejected = confirmCandidate(rejectedState, { text: 'TTS', speakerId: 'spk-1', now: T3 });
   assert.equal(cannotConfirmRejected.ok, false);
   assert.equal(cannotConfirmRejected.reason, 'rejected');
 
-  console.log('[7] missing=', JSON.stringify(missing), 'blank=', JSON.stringify(blank), 'unknown=', JSON.stringify(unknown), 'rejected=', JSON.stringify(cannotConfirmRejected));
+  console.log('[7] missing=', JSON.stringify(missing.entry), 'blank=', JSON.stringify(blank.entry), 'unknown=', JSON.stringify(unknown), 'rejected=', JSON.stringify(cannotConfirmRejected));
   console.log('[constants]', JSON.stringify(LEXICON_DEFAULTS));
 });

@@ -10,7 +10,7 @@ export const ACTIONS = Object.freeze([
   'audio.retention.list',
   'audio.retention.delete',
   'audio.retention.export',
-  /** Personal lexicon: candidates come from conversation, only an explicit confirm makes a word. */
+  /** Shared lexicon: candidates come from conversation, only an explicit confirm makes a word. */
   'lexicon.list',
   'lexicon.candidates',
   'lexicon.confirm',
@@ -42,15 +42,16 @@ export function createHearingSettingsActions(services) {
     error: '音频诊断保留尚未接线：需要 Host 提供 retention 存储',
   });
   /**
-   * The personal lexicon store the Host owns (one per plugin root). Every action here is a thin
-   * pass-through: the store decides speaker-required/ambiguous/tombstone rules, and nothing is
-   * auto-confirmed by listing or by a candidate arriving from a transcript.
+   * The shared lexicon store the Host owns (one per plugin root). Every action here is a thin
+   * pass-through: the store decides the ambiguous/tombstone rules, and nothing is auto-confirmed
+   * by listing or by a candidate arriving from a transcript. A speakerId is optional provenance;
+   * it is never required to confirm.
    */
   const lexiconStore = () => services.lexiconStore ?? null;
   const LEXICON_UNAVAILABLE = Object.freeze({
     ok: false,
     code: 'LEXICON_UNAVAILABLE',
-    error: '个人语言库尚未接线：需要 Host 提供 lexicon 存储',
+    error: '共享语言库尚未接线：需要 Host 提供 lexicon 存储',
   });
   const handler = async (body) => {
     switch (body.action) {
@@ -144,10 +145,16 @@ export function createHearingSettingsActions(services) {
       case 'lexicon.confirm': {
         const store = lexiconStore();
         if (store === null) return LEXICON_UNAVAILABLE;
+        // speakerId is optional provenance: normalise a supplied identity (string or finite number)
+        // and forward null when absent/blank, so an empty string never reaches the stored entry.
+        const rawSpeakerId = body.speakerId;
+        const speakerId = typeof rawSpeakerId === 'string'
+          ? (rawSpeakerId.trim() === '' ? null : rawSpeakerId.trim())
+          : (rawSpeakerId ?? null);
         const result = store.confirm({
           text: body.text ?? '',
           id: body.id,
-          speakerId: body.speakerId,
+          speakerId,
           canonical: body.canonical,
           context: body.context,
         });
@@ -316,10 +323,11 @@ export function createHearingSettingsActions(services) {
 }
 
 /**
- * The authoritative "本人" speaker id for the language library: `voice.selfSpeakerId` from
- * settings.json (written by the user or a later voiceprint registration) wins; otherwise a
- * speaker-shadow `match` supplies it; otherwise there is no identity. Pure, so the Host can
- * project it from a settings snapshot and the live shadow verdict without extra state.
+ * The optional "本人" speaker id used as provenance for the shared lexicon: `voice.selfSpeakerId`
+ * from settings.json (written by the user or a later voiceprint registration) wins; otherwise a
+ * speaker-shadow `match` supplies it; otherwise there is no identity. This is never a confirmation
+ * gate — the lexicon is shared, and an entry may be confirmed with no speaker id at all. Pure, so
+ * the Host can project it from a settings snapshot and the live shadow verdict without extra state.
  *
  * @param {{settings?: object, shadow?: object|null}} [evidence]
  * @returns {{speakerId: string|null, source: 'setting'|'shadow'|null}}

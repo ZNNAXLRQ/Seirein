@@ -1,11 +1,11 @@
 /**
- * Personal lexicon — stage B3: candidate persistence + the unassigned area (pure module).
+ * Shared lexicon — stage B3: candidate persistence + the pending area (pure module).
  *
- * The user's fixed rules (2026-11-08):
+ * The user's fixed rules (2026-11-10):
  *   - an ordinary transcript only ever produces a CANDIDATE; nothing is auto-confirmed;
  *   - only the user's confirm action turns a candidate into an effective word;
- *   - a candidate whose speaker identity is not confirmed stays in the unassigned area and is
- *     NOT part of the personal lexicon;
+ *   - the lexicon is SHARED: a candidate is never partitioned by speaker, and a missing voiceprint
+ *     identity is not a confirmation gate; speakerId is optional provenance when it is known;
  *   - a confirmed word can be listed, modified and deleted;
  *   - import/export is a v2 feature and is deliberately absent here.
  *
@@ -318,12 +318,12 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
   };
 
   /**
-   * The user's explicit confirm action. A candidate becomes an effective word only here, and only
-   * with a speaker identity: no speakerId → `{ok:false, reason:'speaker-required'}` and the entry
-   * keeps `assigned:false, speakerId:null`. `canonical` edits the correct spelling and `context`
-   * (optional) its replacement window.
+   * The user's explicit confirm action. A candidate becomes an effective shared word only here.
+   * `speakerId` is optional provenance: a supplied value is recorded, an absent/blank one leaves
+   * the entry `speakerId:null`; either way the confirmation succeeds with `assigned:true`.
+   * `canonical` edits the correct spelling and `context` (optional) its replacement window.
    *
-   * @param {{text?: string, id?: string, speakerId?: string, canonical?: string,
+   * @param {{text?: string, id?: string, speakerId?: string|null, canonical?: string,
    *   context?: {before?: string, after?: string}|null}} [options]
    * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
    */
@@ -426,7 +426,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
 
   /**
    * Every stored entry (candidate, confirmed and rejected tombstones), sorted by `at`.
-   * `listConfirmed()` is the personal lexicon; `listUnassigned()` is the unassigned area.
+   * `listConfirmed()` is the shared lexicon; `listUnassigned()` is the pending candidate view.
    */
   const list = () => {
     const state = read();
@@ -679,7 +679,7 @@ function emitApplyEvent(log, event, payload) {
 }
 
 /**
- * The recognition post-processing point: apply the CONFIRMED personal lexicon to the text used
+ * The recognition post-processing point: apply the CONFIRMED shared lexicon to the text used
  * for delivery and subtitles, and report each hit as a debug `lexicon.applied` row.
  *
  * Fail-open: a missing/throwing store, a corrupt entry or a hint-building error returns the input

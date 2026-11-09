@@ -97,7 +97,7 @@ window.__ModuleLoader__.load({
       {
         id: 'memory',
         title: '6 记忆与人设',
-        hint: '人设、画像、固定记忆、记忆容量与个人语言库。',
+        hint: '人设、画像、固定记忆、记忆容量与共享语言库。',
       },
       {
         id: 'speaker',
@@ -2481,9 +2481,10 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 「听觉 → 个人语言库」：未归属候选 → 确认 → 个人词库，卡片式两段列表 + 确认/编辑弹窗。
-     * 身份只从宿主状态取（`lexiconSpeakerId`）：候选确认必须带 speakerId，拿不到就禁用确认，
-     * 绝不把本地猜的身份写进词库。渲染是纯函数，所有写入都交给 handlers（Panel 里统一走 act）。
+     * 「记忆与人设 → 共享语言库」：待确认候选 → 确认 → 共享词库，卡片式两段列表 + 确认/编辑弹窗。
+     * 词库是所有人共享的，确认只要求用户点确认；身份只作为可选来源从宿主状态取
+     * （`lexiconSpeakerId`），拿不到就不带 speakerId，绝不因此禁用确认或猜一个身份。
+     * 渲染是纯函数，所有写入都交给 handlers（Panel 里统一走 act）。
      */
     function lexiconSpeakerId(status) {
       const explicit = [
@@ -2494,7 +2495,7 @@ window.__ModuleLoader__.load({
       ].find((value) => typeof value === 'string' && value.trim() !== '');
       if (explicit !== undefined) return explicit.trim();
       // 宿主还没有专门的「本人」speakerId 字段时，退回声纹影子的最近一次判定：
-      // 只认可 match（unsure / no-speakers 不当作身份），否则确认按钮保持禁用。
+      // 只认可 match（unsure / no-speakers 不当作身份）；拿不到就返回空，确认照常可用。
       const shadow = status?.speaker?.lastShadow;
       if (shadow?.decision === 'match' && typeof shadow?.speakerId === 'string') {
         return shadow.speakerId.trim();
@@ -2571,7 +2572,8 @@ window.__ModuleLoader__.load({
 
     /**
      * 弹窗 → 写入请求体（契约固定）：
-     *   确认：{action:'lexicon.confirm', id|text, speakerId, canonical?}（speakerId 必填）
+     *   确认：{action:'lexicon.confirm', id|text, canonical?, speakerId?}（speakerId 可选：
+     *   有才带，空字符串绝不进入请求体）
      *   编辑：{action:'lexicon.edit', id, canonical, wrongForms, context}
      */
     function lexiconSaveBody(dialog, speakerId) {
@@ -2591,7 +2593,9 @@ window.__ModuleLoader__.load({
           },
         };
       }
-      const body = { action: 'lexicon.confirm', speakerId: String(speakerId ?? '').trim() };
+      const body = { action: 'lexicon.confirm' };
+      const speaker = String(speakerId ?? '').trim();
+      if (speaker !== '') body.speakerId = speaker;
       if (String(current.id ?? '') !== '') body.id = String(current.id);
       else if (String(current.text ?? '') !== '') body.text = String(current.text);
       const canonical = String(current.canonical ?? '').trim();
@@ -2694,12 +2698,13 @@ window.__ModuleLoader__.load({
 
     function lexiconSection(h, { data, busy, dialog, pending, speakerId }, handlers) {
       const loading = data === null || data === undefined || data.loading === true;
-      // `entries` 是个人词库：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
+      // `entries` 是共享词库：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
       const entries = (Array.isArray(data?.entries) ? data.entries : [])
         .filter((entry) => entry?.status === undefined || entry.status === 'confirmed');
       const unassigned = Array.isArray(data?.unassigned) ? data.unassigned : [];
       const error = String(data?.error ?? '');
       const stopped = busy !== '';
+      // 身份只是可选来源：没有也不影响确认，只在请求体里「有则带」。
       const selfId = String(speakerId ?? '');
       const isPending = (kind, id) => pending?.kind === kind && String(pending?.id ?? '') === String(id);
       const evidenceText = (entry) => {
@@ -2723,9 +2728,8 @@ window.__ModuleLoader__.load({
           h('span', { style: styles.mono }, metaText(entry))),
         h('div', { style: styles.row },
           h('button', {
-            style: { ...styles.btnPrimary, ...(stopped || selfId === '' ? styles.off : {}) },
-            disabled: stopped || selfId === '',
-            title: selfId === '' ? '需要宿主的本人声纹身份（speakerId）才能确认' : '',
+            style: { ...styles.btnPrimary, ...(stopped ? styles.off : {}) },
+            disabled: stopped,
             onClick: () => handlers.openConfirm(entry),
           }, '确认'),
           isPending('ignore', entry?.id)
@@ -2792,7 +2796,7 @@ window.__ModuleLoader__.load({
       const notice = String(dialog?.notice ?? '');
       const retryId = String(dialog?.retryId ?? '');
       const partial = notice !== '' && !editing;
-      const saveBlocked = stopped || canonical.trim() === '' || (!editing && selfId === '');
+      const saveBlocked = stopped || canonical.trim() === '';
       const dialogNode = h('div', {
         'data-lexicon-dialog': editing ? 'edit' : 'confirm',
         'data-lexicon-partial': partial ? '1' : undefined,
@@ -2804,7 +2808,7 @@ window.__ModuleLoader__.load({
             : `确认候选「${String(dialog?.text ?? '')}」`),
           h('div', { style: styles.hint }, editing
             ? '修改正确写法、误识别形式或上下文；只影响之后的识别与替换，不改写历史记录。'
-            : '确认后这一条会归入个人词库，只作用于本人说话时的识别与替换。'),
+            : '确认后这一条会进入共享词库，所有人说话时的识别与替换都可使用；声纹只是可选的来源标注，不是确认门槛。'),
           h('div', { style: styles.field },
             h('span', { style: styles.value }, '正确写法'),
             h('input', {
@@ -2881,12 +2885,9 @@ window.__ModuleLoader__.load({
 
       return h('div', { 'data-settings-group': 'lexicon', style: styles.group },
         h('div', { style: styles.groupTitleRow },
-          h('span', { style: styles.groupTitle }, '个人语言库'),
+          h('span', { style: styles.groupTitle }, '共享语言库'),
           h('button', { style: styles.btn, disabled: stopped, onClick: handlers.refresh }, '刷新')),
-        h('div', { style: styles.hint }, '普通转写先进「未归属候选」；确认并绑定本人声纹后才算个人词库，只影响之后的识别与替换。'),
-        selfId === ''
-          ? h('div', { style: { ...styles.hint, color: DANGER } }, '宿主还没有提供已登记的说话人身份（speakerId），确认按钮暂不可用。')
-          : null,
+        h('div', { style: styles.hint }, '普通转写先进「未归属候选」；确认后进入所有人共享的词库，只影响之后的识别与替换。声纹只是可选的来源标注，不是确认门槛。'),
         error === '' ? null : h('div', { style: { ...styles.hint, color: DANGER } }, `语言库不可用：${error}`),
         loading
           ? h('div', { style: styles.hint }, '正在读取语言库…')
@@ -2895,9 +2896,9 @@ window.__ModuleLoader__.load({
               unassigned.length === 0
                 ? h('div', { style: styles.hint }, '没有待确认的候选')
                 : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, unassigned.map(candidateRow)),
-              h('div', { style: { ...styles.label, marginTop: 10 } }, `个人词库（${entries.length}）`),
+              h('div', { style: { ...styles.label, marginTop: 10 } }, `共享词库（${entries.length}）`),
               entries.length === 0
-                ? h('div', { style: styles.hint }, '个人词库还是空的')
+                ? h('div', { style: styles.hint }, '共享词库还是空的')
                 : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, entries.map(wordRow))),
         dialog === null || dialog === undefined ? null : dialogNode,
       );
@@ -4759,7 +4760,7 @@ window.__ModuleLoader__.load({
       const [retentionData, setRetentionData] = useState(null);
       const [retentionPreview, setRetentionPreview] = useState(null);
       const [retentionConfirm, setRetentionConfirm] = useState('');
-      // 「个人语言库」：列表（未归属候选 + 个人词库）、确认/编辑弹窗与忽略/删除的两步确认。
+      // 「共享语言库」：列表（待确认候选 + 共享词库）、确认/编辑弹窗与忽略/删除的两步确认。
       const [lexiconData, setLexiconData] = useState(null);
       const [lexiconDialog, setLexiconDialog] = useState(null);
       const [lexiconPending, setLexiconPending] = useState(null);
@@ -5209,7 +5210,7 @@ window.__ModuleLoader__.load({
       }, []);
 
       /**
-       * 弹窗保存：确认走 lexicon.confirm（speakerId 由宿主状态传入），编辑走 lexicon.edit。
+       * 弹窗保存：确认走 lexicon.confirm（speakerId 可选，仅作为来源标注），编辑走 lexicon.edit。
        * confirm 契约不带 wrongForms，弹窗里删减过的形式在确认成功后补一次 edit；两步的结果都
        * 落到界面上：只有都成功才关闭，第二步失败时保留弹窗并给出重试，绝不吞掉。
        */
@@ -5243,7 +5244,7 @@ window.__ModuleLoader__.load({
 
       const removeLexicon = useCallback(async (id) => {
         const result = await writeLexiconEntry({ action: 'lexicon.remove', id: String(id) }, 'lexicon-remove');
-        if (result?.ok === true) show('已从个人词库删除');
+        if (result?.ok === true) show('已从共享词库删除');
       }, [show, writeLexiconEntry]);
 
       // ---- P-116 问卷弹窗 handlers -----------------------------------------------------------

@@ -1,5 +1,5 @@
 /**
- * 个人语言库（stage B3）宿主接线。
+ * 共享语言库（stage B3）宿主接线。
  *
  * The host owns one `createLexiconStore({ root })` (`data/lexicon.json`) and exposes six settings
  * actions. Voice delivery feeds a rolling window of delivered transcripts into
@@ -8,7 +8,7 @@
  *
  *   1. `lexicon.list` answers the documented `{ok:true, entries, unassigned, candidates}` contract;
  *      confirm/edit/reject/remove pass through the store and the persisted `data/lexicon.json`
- *      reflects every step;
+ *      reflects every step; confirm succeeds without a speakerId (optional provenance only);
  *   2. a delivered transcript produces CANDIDATES: an explicit form correction from a confirmed
  *      speaker is `assigned` and STILL visible in `unassigned` (with `assigned:true`), the same
  *      correction without a confirmed identity and every ordinary transcript stays unassigned;
@@ -264,19 +264,20 @@ test('1. lexicon.list 初始为空；confirm/edit/reject/remove 生效并落盘'
   assert.deepEqual(pending.candidates.map((entry) => [entry.text, entry.assigned]), [['向晚', false]]);
 
   const confirmed = await host.action({
-    action: 'lexicon.confirm', text: '向晚', speakerId: 'spk-1', canonical: '向晚',
+    action: 'lexicon.confirm', text: '向晚', canonical: '向晚',
   });
   assert.equal(confirmed.ok, true);
   assert.equal(confirmed.entry.id, candidate.id);
   assert.equal(confirmed.entry.status, 'confirmed');
   assert.equal(confirmed.entry.assigned, true);
+  assert.equal(confirmed.entry.speakerId, null, 'confirmation does not require a speakerId');
   assert.deepEqual((await host.list()).entries.map((entry) => entry.text), ['向晚']);
   assert.deepEqual((await host.list()).unassigned, []);
   let saved = await readLexicon(root);
   assert.equal(saved.entries.length, 1);
   assert.equal(saved.entries[0].status, 'confirmed');
   assert.equal(saved.entries[0].canonical, '向晚');
-  assert.equal(saved.entries[0].speakerId, 'spk-1');
+  assert.equal(saved.entries[0].speakerId, null);
 
   const edited = await host.action({
     action: 'lexicon.edit',

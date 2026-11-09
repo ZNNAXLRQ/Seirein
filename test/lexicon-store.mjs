@@ -1,5 +1,5 @@
 /**
- * Personal lexicon stage B3 — candidate persistence + the unassigned area (pure module).
+ * Shared lexicon stage B3 — candidate persistence + the pending area (pure module).
  *
  * The list mirrors the acceptance items:
  *   1. missing file → default state (reading creates nothing); the first merge writes and returns
@@ -8,11 +8,12 @@
  *      never leaves a temp file behind;
  *   3. bad JSON / version / top-level structure → default state + one `lexicon.store.corrupt`
  *      (identical consecutive content is reported once);
- *   4. confirm requires speakerId, sets assigned/speakerId/confirmedAt and is the only thing that
- *      makes a word visible in listConfirmed();
+ *   4. confirm succeeds without speakerId (the user's confirmation is the only gate), sets
+ *      assigned/confirmedAt and is the only thing that makes a word visible in listConfirmed();
+ *      a supplied speakerId is optional provenance;
  *   5. edit sets canonical/wrongForms/context and editedAt, and cannot change id/kind/status;
  *   6. reject leaves a tombstone that re-extraction cannot resurrect; remove really deletes;
- *   7. assigned:false candidates appear only in the unassigned area — not in the personal lexicon;
+ *   7. assigned:false candidates appear only in the pending area — never auto-added to the lexicon;
  *   8. a new store instance over the same root sees the same state (restart) and keeps allocating
  *      fresh ids;
  *   9. an ordinary-transcript candidate is never auto-confirmed;
@@ -251,7 +252,7 @@ test('3. 坏 JSON/版本/结构 → 回退默认并记 corrupt 仅一次', (t) =
   console.log('[3] corrupt-events=', JSON.stringify(log.of('lexicon.store.corrupt').map((item) => item.error)));
 });
 
-test('4. confirm 后 assigned/speakerId/confirmedAt 正确；listConfirmed 可见', (t) => {
+test('4. confirm 无需 speakerId；assigned/confirmedAt 正确，listConfirmed 可见，speakerId 可选', (t) => {
   const root = tempRoot(t);
   const clock = makeClock(T1);
   const log = collectingLog();
@@ -259,37 +260,42 @@ test('4. confirm 后 assigned/speakerId/confirmedAt 正确；listConfirmed 可�
   const file = join(root, 'data', 'lexicon.json');
   store.mergeCandidates(properNounCandidates());
 
-  // no speakerId → refused, and the candidate stays unassigned and unconfirmed
-  assert.deepEqual(store.confirm({ text: '向晚' }), { ok: false, reason: 'speaker-required' });
-  const stillCandidate = store.read().entries[0];
-  assert.equal(stillCandidate.status, 'candidate');
-  assert.equal(stillCandidate.assigned, false);
-  assert.equal(stillCandidate.speakerId, null);
-  assert.deepEqual(store.listConfirmed(), []);
-
+  // No speakerId at all: confirmation still succeeds; the entry is shared and speakerId is null.
   clock.set(T2);
-  const confirmed = store.confirm({ text: '向晚', speakerId: 'spk-1', canonical: '向晚' });
+  const confirmed = store.confirm({ text: '向晚', canonical: '向晚' });
   assert.equal(confirmed.ok, true);
   assert.equal(confirmed.entry.id, 'lex-1');
   assert.equal(confirmed.entry.status, 'confirmed');
   assert.equal(confirmed.entry.assigned, true);
-  assert.equal(confirmed.entry.speakerId, 'spk-1');
+  assert.equal(confirmed.entry.speakerId, null);
   assert.equal(confirmed.entry.canonical, '向晚');
   assert.equal(confirmed.entry.confirmedAt, iso(T2));
 
-  const persisted = readJson(file).entries[0];
+  let persisted = readJson(file).entries[0];
   assert.equal(persisted.status, 'confirmed');
   assert.equal(persisted.assigned, true);
-  assert.equal(persisted.speakerId, 'spk-1');
+  assert.equal(persisted.speakerId, null);
   assert.equal(persisted.confirmedAt, iso(T2));
 
   assert.deepEqual(store.listConfirmed().map((entry) => entry.text), ['向晚']);
-  assert.deepEqual(store.listUnassigned(), [], 'a confirmed word left the unassigned area');
-  assert.equal(log.of('lexicon.store.changed').filter((item) => item.op === 'confirm').length, 1);
+  assert.deepEqual(store.listUnassigned(), [], 'a confirmed word left the pending area');
+
+  // A speakerId is optional provenance: when supplied later it is recorded on the same entry.
+  clock.set(T3);
+  const attributed = store.confirm({ text: '向晚', speakerId: 'spk-1', canonical: '向晚' });
+  assert.equal(attributed.ok, true);
+  assert.equal(attributed.entry.id, 'lex-1');
+  assert.equal(attributed.entry.status, 'confirmed');
+  assert.equal(attributed.entry.assigned, true);
+  assert.equal(attributed.entry.speakerId, 'spk-1');
+  assert.equal(attributed.entry.confirmedAt, iso(T3));
+  persisted = readJson(file).entries[0];
+  assert.equal(persisted.speakerId, 'spk-1');
+  assert.equal(log.of('lexicon.store.changed').filter((item) => item.op === 'confirm').length, 2);
 
   assert.deepEqual(store.confirm({ text: '不存在', speakerId: 'spk-1' }), { ok: false, reason: 'not-found' });
 
-  console.log('[4] refused=speaker-required', 'confirmed=', JSON.stringify(confirmed.entry), 'listConfirmed=', JSON.stringify(store.listConfirmed()));
+  console.log('[4] no-speaker-confirm=', JSON.stringify(confirmed.entry), 'attributed=', JSON.stringify(attributed.entry), 'listConfirmed=', JSON.stringify(store.listConfirmed()));
 });
 
 test('5. edit canonical/wrongForms/context 生效且 editedAt 更新；不可改 id/kind/status', (t) => {

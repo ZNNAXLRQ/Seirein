@@ -1,5 +1,5 @@
 /**
- * 「记忆与人设 → 个人语言库」设置页回归。
+ * 「记忆与人设 → 共享语言库」设置页回归。
  *
  * 与 test/audio-retention-ui.mjs 同一套做法：从 client.js 抽出真正发货的
  * `lexiconSpeakerId` / `lexiconObservedForms` / `lexiconSaveBody` / `lexiconDialogOf` /
@@ -238,8 +238,8 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
       unassigned: [
         candidate(),
         candidate({ id: 'cand-2', text: '阿晚', kind: 'correction', count: 5, sourceIds: [] }),
-        // The backend now keeps assigned-but-unconfirmed corrections in the visible list, marked
-        // `assigned:true`; the card must render that row (and allow confirming it with an identity).
+        // The backend keeps assigned-but-unconfirmed corrections in the visible list, marked
+        // `assigned:true`; the card must render that row (and allow confirming it, no identity gate).
         candidate({
           id: 'cand-3', text: '林晚', kind: 'correction', assigned: true, speakerId: 'spk-1',
           wrongForms: ['林晚'], sourceIds: ['u3'],
@@ -254,7 +254,7 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   const texts = textsOf(tree);
 
   assert.ok(texts.includes('未归属候选（3）'), 'the unassigned header carries its count');
-  assert.ok(texts.includes('个人词库（1）'), 'the confirmed header carries its count');
+  assert.ok(texts.includes('共享词库（1）'), 'the confirmed header carries its count');
   assert.ok(texts.includes('向晚'), 'the candidate text is visible');
   assert.ok(texts.includes('林晚'), 'an assigned-but-unconfirmed candidate is visible too');
   assert.ok(texts.includes('专有名词'), 'the kind is labelled in Chinese');
@@ -279,8 +279,8 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
 
   const empty = mount().render();
   assert.ok(textsOf(empty).includes('没有待确认的候选'), 'empty unassigned has its own text');
-  assert.ok(textsOf(empty).includes('个人词库还是空的'), 'empty lexicon has its own text');
-  assert.ok(textsOf(empty).includes('未归属候选（0）') && textsOf(empty).includes('个人词库（0）'));
+  assert.ok(textsOf(empty).includes('共享词库还是空的'), 'empty lexicon has its own text');
+  assert.ok(textsOf(empty).includes('未归属候选（0）') && textsOf(empty).includes('共享词库（0）'));
 
   const loading = mount({ data: null }).render();
   assert.ok(textsOf(loading).includes('正在读取语言库…'), 'a null list renders the loading text');
@@ -293,7 +293,7 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
 // ---------------------------------------------------------------------------------------------
 // 2. Confirm: speakerId comes from host status; body matches lexicon.confirm
 // ---------------------------------------------------------------------------------------------
-test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时按钮禁用', async () => {
+test('2. 确认候选：speakerId 可选，有则带、无则不带；没有身份按钮仍可用', async () => {
   assert.equal(lexicon.lexiconSpeakerId({ lexicon: { speakerId: 'spk-9', source: 'setting' } }), 'spk-9',
     'the authoritative status.lexicon.speakerId is the primary source');
   assert.equal(lexicon.lexiconSpeakerId({ lexicon: { speakerId: 'spk-9' } }), 'spk-9',
@@ -358,8 +358,16 @@ test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时�
     speakerId: 'spk-9',
     id: 'cand-1',
     canonical: '向晚',
-  }, 'the confirm body matches the documented contract exactly');
+  }, 'a supplied speakerId is optional provenance and stays in the body');
   assert.ok(!('wrongForms' in body) && !('context' in body), 'confirm never sends edit-only fields');
+
+  // Without an identity the request body must not carry speakerId at all (not an empty string).
+  const anonymousBody = lexicon.lexiconSaveBody(savedDialog, '');
+  assert.deepEqual(anonymousBody, {
+    action: 'lexicon.confirm',
+    id: 'cand-1',
+    canonical: '向晚',
+  }, 'no speakerId means the key is absent, not an empty string');
 
   const textOnly = lexicon.lexiconSaveBody({
     mode: 'confirm', id: '', text: '阿晚', canonical: '阿晚',
@@ -388,14 +396,14 @@ test('2. 确认候选：请求体带宿主状态里的 speakerId，缺身份时�
 
   const anonymous = mount({ speakerId: '', data: { unassigned: [candidate()], entries: [], error: '' } });
   assert.equal(buttonOf(nodeOf(anonymous.render(), 'data-lexicon-candidate', 'cand-1'), '确认').props.disabled,
-    true, 'without a host identity the confirm button is disabled');
+    false, 'without a host identity the confirm button is still enabled');
   anonymous.state.dialog = lexicon.lexiconDialogOf(candidate(), 'confirm');
   const anonymousDialog = nodeOf(anonymous.render(), 'data-lexicon-dialog', 'confirm');
-  assert.equal(buttonOf(anonymousDialog, '确认').props.disabled, true,
-    'the dialog cannot be saved without a host identity');
+  assert.equal(buttonOf(anonymousDialog, '确认').props.disabled, false,
+    'the dialog can be saved without a host identity');
 
   console.log('[lexicon-ui 2] speakerId=spk-9 body=', JSON.stringify(body),
-    'status-speakerId=spk-self confirmEnabled=true');
+    'anonymousBody=', JSON.stringify(anonymousBody), 'no-identity-confirmEnabled=true');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -541,7 +549,7 @@ test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，�
     true, 'an empty spelling cannot be saved');
 
   const noData = mount({ data: { entries: [], unassigned: [], error: undefined } }).render();
-  assert.ok(textsOf(noData).includes('个人词库还是空的'), 'an undefined error is not printed');
+  assert.ok(textsOf(noData).includes('共享词库还是空的'), 'an undefined error is not printed');
 
   console.log('[lexicon-ui 5] error=语言库不可用：LEXICON_UNAVAILABLE crash=no');
 });
@@ -549,13 +557,20 @@ test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，�
 // ---------------------------------------------------------------------------------------------
 // 6. client.js wiring + regressions: the section is mounted in 记忆与人设 and uses lexicon actions
 // ---------------------------------------------------------------------------------------------
-test('6. 接线检查：设置页挂载、五个动作、speakerId 来自宿主状态', () => {
+test('6. 接线检查：设置页挂载、五个动作、speakerId 可选来源；确认无身份门槛', () => {
   assert.match(clientSource, /const \[lexiconData, setLexiconData\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconDialog, setLexiconDialog\] = useState\(null\);/u);
   assert.match(clientSource, /const \[lexiconPending, setLexiconPending\] = useState\(null\);/u);
-  assert.match(clientSource, /speakerId: lexiconSpeakerId\(status\)/u, 'the panel resolves the identity from status');
+  assert.match(clientSource, /speakerId: lexiconSpeakerId\(status\)/u, 'the panel resolves the optional identity from status');
   assert.match(clientSource, /setLexiconData\(lexiconListData\(result\)\);/u,
     'the list parser handles both the documented and the bare host shape');
+  assert.doesNotMatch(lexiconBlockSource, /speaker-required/u, 'the card no longer expects a speaker-required gate');
+  const lexiconOnly = lexiconBlockSource.slice(
+    lexiconBlockSource.indexOf('    function lexiconSection('),
+    lexiconBlockSource.indexOf('    // ---- 声纹登记'),
+  );
+  assert.doesNotMatch(lexiconOnly, /selfId === ''/u,
+    'no confirm button/dialog condition may gate on a missing selfId');
 
   for (const action of ['lexicon.list', 'lexicon.confirm', 'lexicon.edit', 'lexicon.reject', 'lexicon.remove']) {
     assert.ok(
@@ -568,7 +583,7 @@ test('6. 接线检查：设置页挂载、五个动作、speakerId 来自宿主�
   const retentionMount = /(\n\s+)retentionSection\(h, \{/u.exec(clientSource);
   assert.ok(mount !== null && retentionMount !== null, 'both sections are mounted in the settings page');
   assert.ok(mount.index < retentionMount.index,
-    '个人语言库 stays in 6、记忆与人设, above 音频保留 in 11、诊断与维护');
+    '共享语言库 stays in 6、记忆与人设, above 音频保留 in 11、诊断与维护');
   assert.ok(clientSource.indexOf('    function lexiconSection(') > clientSource.indexOf('    function retentionSection('));
 
   assert.doesNotMatch(lexiconBlockSource, /fetch\(/u, 'the lexicon block never fetches by itself');
@@ -734,11 +749,12 @@ test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重
   const trimmed = { ...base, wrongForms: ['想晚'] };
 
   // confirm failed: the error stays in the dialog; nothing refreshes and nothing toasts.
-  const denied = makeAct([{ ok: false, reason: 'speaker-required' }]);
+  const denied = makeAct([{ ok: false, reason: 'write-failed' }]);
   const ui = makeDialogState(trimmed);
   const failed = await lexicon.lexiconSaveSteps({ dialog: trimmed, speakerId: '', act: denied.act });
   assert.equal(failed.stage, 'failed');
   assert.equal(denied.calls.length, 1, 'a failed confirm never reaches the second step');
+  assert.ok(!('speakerId' in denied.calls[0].body), 'no identity means no speakerId field in the request');
   await lexicon.settleLexiconSave({
     dialog: trimmed,
     outcome: failed,
@@ -747,11 +763,11 @@ test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重
     show: () => { throw new Error('a failed confirm must not toast'); },
   });
   assert.ok(ui.get() !== null, 'the dialog stays open');
-  assert.equal(ui.get().error, 'speaker-required');
+  assert.equal(ui.get().error, 'write-failed');
   const failNode = nodeOf(mount({
     dialog: ui.get(), data: { unassigned: [], entries: [word()], error: '' },
   }).render(), 'data-lexicon-dialog', 'confirm');
-  assert.ok(textsOf(failNode).includes('speaker-required'), 'the host reason is visible');
+  assert.ok(textsOf(failNode).includes('write-failed'), 'the host reason is visible');
 
   // edit mode: one write, one close, one refresh.
   const editDialog = lexicon.lexiconDialogOf(word(), 'edit');

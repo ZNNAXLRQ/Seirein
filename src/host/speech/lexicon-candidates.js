@@ -1,13 +1,13 @@
 /**
- * Personal lexicon — stage 1: candidate extraction and the confirmation data model (pure module).
+ * Shared lexicon — stage 1: candidate extraction and the confirmation data model (pure module).
  *
- * The user's fixed rules (2026-11-08):
+ * The user's fixed rules (2026-11-10):
  *   candidate → confirm → effective
- *   sources: the user's own utterances + explicit corrections ("不是甲，是乙");
+ *   sources: any speaker's utterances + explicit corrections ("不是甲，是乙");
  *   an ordinary transcript only ever produces a CANDIDATE — never a trusted answer;
  *   a confirmed entry stores the correct spelling + the misrecognised forms + sources;
- *   when the speaker is not confirmed the word belongs to the unassigned area and is not a
- *   personal lexicon entry; confirmed words can be listed, modified and deleted.
+ *   the lexicon is SHARED: candidates and entries are never partitioned by speaker, and a
+ *   confirmed word can be listed, modified and deleted by anyone using this host.
  *
  * This file is the data model for that pipeline. It is deliberately NOT wired to the host:
  *   - no file, database, network or event access; the state is a plain JSON object the caller owns;
@@ -16,15 +16,16 @@
  *
  * Trust rules:
  *   - an explicit correction (`explicit === true`) becomes kind `correction`; its `wrong` is a
- *     misrecognised form and it is assigned only when the correction names a confirmed speaker;
+ *     misrecognised form. When the correction carries speaker attribution it is stored as optional
+ *     provenance, but the entry is shared either way;
  *   - an ordinary transcript becomes kind `proper-noun`, always `assigned:false` and
  *     `speakerId:null`, even when the utterance carries a speakerId: a transcript cannot prove
  *     who the word belongs to. It needs `threshold` (default 2) observed occurrences;
- *   - both kinds are still CANDIDATES. Only `confirmCandidate()` with a speakerId makes an entry
- *     effective, and only `listEntries()` returns effective entries.
+ *   - both kinds are still CANDIDATES. Only `confirmCandidate()` makes an entry effective, and only
+ *     `listEntries()` returns effective entries. A speakerId is optional provenance, never a gate.
  *
  * Correction tightening: only a word-form/reading correction ("不是小满，是向晚" with 写法/读作/…
- * or two short name-shaped sides), a unique target and a confirmed speaker may take effect. A
+ * or two short name-shaped sides) and a unique target may take effect. A
  * fact correction ("不是周五，是周六", "不是3个，是4个") is returned as kind `fact-correction`
  * with `ignored:true` and a reason; it never enters the lexicon. Every correction entry carries a
  * replacement `context` ({before, after}), and `applyCorrection()` refuses to replace anything
@@ -53,9 +54,9 @@
  *
  *   const state = createLexiconState();
  *   mergeCandidates(state, extractLexiconCandidates({ utterances, corrections }));
- *   confirmCandidate(state, { text: '向晚', speakerId: 'spk-1', canonical: '向晚' });
- *   listEntries(state);    // effective words
- *   listUnassigned(state); // reviewed but not yet a personal word
+ *   confirmCandidate(state, { text: '向晚', canonical: '向晚' }); // speakerId optional
+ *   listEntries(state);    // effective shared words
+ *   listUnassigned(state); // pending candidates, not yet confirmed
  */
 
 export const LEXICON_STATE_VERSION = 1;
@@ -605,9 +606,9 @@ export function extractLexiconCandidates({
 
   const candidates = new Map();
   for (const [key, record] of correctionRecords) {
-    // A correction is trusted evidence, but a word attributed to two different speakers is not
-    // one person's personal word: it stays unassigned rather than silently pick a side. An
-    // ambiguous target is not attributed at all, even when the correction carries a speakerId.
+    // A correction is trusted evidence. Speaker attribution is optional provenance: a word seen
+    // from two different speakers keeps its shared candidate row but drops the ambiguous source.
+    // An ambiguous target is not attributed at all, even when the correction carries a speakerId.
     const speakers = [...record.speakers];
     const assigned = !record.ambiguous && speakers.length === 1;
     candidates.set(key, {
@@ -1128,7 +1129,8 @@ export function mergeCandidates(state, candidates) {
           existing.kind = KIND_CORRECTION;
           if (incoming.text.length > 0) existing.text = incoming.text;
         }
-        // Two different confirmed speakers make this not one person's word; stay unassigned.
+        // Two different speakers are optional provenance, not an ownership split: keep the shared
+        // candidate but drop the ambiguous speaker attribution.
         const speakers = new Set();
         if (existing.speakerId !== null) speakers.add(existing.speakerId);
         if (incoming.speakerId !== null) speakers.add(incoming.speakerId);
@@ -1156,11 +1158,13 @@ export function mergeCandidates(state, candidates) {
 }
 
 /**
- * Confirm a candidate: it becomes an effective entry, attributed to `speakerId`.
+ * Confirm a candidate: it becomes an effective entry in the shared lexicon.
  *
- * A missing/blank speakerId is refused without touching the state. The canonical spelling
- * defaults to the candidate's text; confirming again edits it (the only "modify" operation
- * stage 1 needs) while keeping the stable id.
+ * The user's explicit confirmation is the only gate. `speakerId` is optional provenance: when it
+ * is supplied it is recorded as-is (normalised, blank → null), otherwise the entry stays
+ * `speakerId:null`; either way `assigned` becomes true and the entry is shared. The canonical
+ * spelling defaults to the candidate's text; confirming again edits it (the only "modify"
+ * operation stage 1 needs) while keeping the stable id.
  *
  * @param {object} state
  * @param {{text?: string, id?: string, speakerId?: string|null, canonical?: string,
@@ -1176,11 +1180,11 @@ export function confirmCandidate(state, { text = '', id = undefined, speakerId =
   // "不是甲，是乙" with two possible targets is not confirmable, even manually.
   if (entry.ambiguous === true) return { ok: false, reason: 'ambiguous-target' };
   const speaker = normalizeSpeaker(speakerId);
-  if (speaker === null) return { ok: false, reason: 'speaker-required' };
   const display = cleanForm(canonical) || entry.text;
   if (display.length === 0) return { ok: false, reason: 'canonical-empty' };
   if (entry.text.length === 0) entry.text = display;
   entry.canonical = display;
+  // Shared entry: confirmation always assigns it; the speaker is optional provenance, not a gate.
   entry.assigned = true;
   entry.speakerId = speaker;
   entry.status = STATUS_CONFIRMED;
@@ -1251,7 +1255,7 @@ export function listCandidates(state, { status = STATUS_CANDIDATE } = {}) {
 }
 
 /**
- * The effective personal lexicon: confirmed entries only.
+ * The effective shared lexicon: confirmed entries only.
  * @param {object} state
  * @returns {object[]}
  */
@@ -1265,8 +1269,8 @@ export function listEntries(state) {
 }
 
 /**
- * The unassigned area: pending candidates whose speaker identity is not confirmed. Nothing here
- * is a personal word yet; ordinary transcripts always land here.
+ * The pending area: candidates whose speaker identity is not confirmed. This is a view over the
+ * same shared state, not a per-speaker library; confirmation never depends on membership here.
  * @param {object} state
  * @returns {object[]}
  */
