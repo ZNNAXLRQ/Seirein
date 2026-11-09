@@ -12612,11 +12612,18 @@ export function apply(ctx, config) {
   ].join('\n');
 
   // Tool choice only: the assistant session is already in full access, so this section must not
-  // describe a sandbox policy or suggest that permissions need widening.
+  // describe a sandbox policy or suggest that permissions need widening. The web-retrieval block
+  // exists because a live session used `curl` in a terminal against Moegirl/Bing/DuckDuckGo, got
+  // empty or anti-bot responses, and stopped without trying the web tools it already had.
   const TOOL_SELECTION = [
     '## 执行工具选择',
     '- 执行普通命令时，优先使用一次性命令工具 `pwsh`。',
     '- 仅在需要持续交互（等待提示符、多步交互、REPL）时使用 `terminal_open`；若其启动失败，不要反复重试、不要试图扩大权限，改用 `pwsh`，或如实说明当前限制。',
+    '### 联网检索',
+    '- 查外部资料时优先使用 `web_search`；需要读某个具体页面的完整内容时用 `web_fetch`。',
+    '- 不要用 `pwsh` 或 `terminal_open` 里的 `curl` / `Invoke-WebRequest` 去抓搜索引擎结果页（Bing、DuckDuckGo、Google 等）或百科 API，这类抓取通常会被反爬拦截、返回空响应或超时。',
+    '- 被限流、空响应或反爬时如实说明查不到，不要连续更换搜索引擎反复尝试；可以先派子任务去查，但子任务同样优先使用 `web_search` / `web_fetch`。',
+    '- 如果当前会话的工具集中没有 `web_search` / `web_fetch`，直接说明「当前没有联网搜索工具」，不要改用 curl 假装在搜索。',
   ].join('\n');
 
   const TASK_DISPATCH = [
