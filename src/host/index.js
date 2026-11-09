@@ -320,7 +320,10 @@ import { ALIGNMENT_DEFAULTS, alignComment } from './vision/comment-alignment.js'
 import { createCommentEvidence } from './vision/comment-evidence.js';
 // P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
 import { createImageAnalyzer } from './vision/image-analyzer.js';
-import { createUnderstandingRuntime } from './vision/understanding-runtime.js';
+import {
+  UNDERSTANDING_RUNTIME_DEFAULTS,
+  createUnderstandingRuntime,
+} from './vision/understanding-runtime.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
 import {
   createProactiveArbiter,
@@ -655,6 +658,75 @@ const AUDIOVISUAL_INJECTION_ORDER = DIALOGUE_INJECTION_ORDER + 1;
 
 /** P-187 阶段 3：画面理解块紧接视听证据，仍是 ephemeral runtime context。 */
 const UNDERSTANDING_INJECTION_ORDER = AUDIOVISUAL_INJECTION_ORDER + 1;
+
+/** 后台理解每次分析最多交给模型的图片数；与运行时默认值同源，供设置页成本概览使用。 */
+export const UNDERSTANDING_MAX_IMAGES = UNDERSTANDING_RUNTIME_DEFAULTS.maxFrames;
+
+/** 材料签名的上限：只用来判断“是不是同一份材料”，不携带正文、不读像素。 */
+const MATERIAL_SIGNATURE_MAX_CHARS = 240;
+const MATERIAL_FILE_MAX_CHARS = 80;
+
+/** 只保留文件名并限长：完整路径不进入签名，也不进入任何 status。 */
+function materialFilePart(value) {
+  if (typeof value !== 'string' || value.length === 0) return '';
+  const name = basename(value);
+  return name.length <= MATERIAL_FILE_MAX_CHARS ? name : name.slice(-MATERIAL_FILE_MAX_CHARS);
+}
+
+/**
+ * 一次故事板材料的签名：`capturedAt + 文件名 + 字节数 + 帧数` 的有界组合。
+ *
+ * 它只回答“这张 sheet 与上次触发理解的是不是同一份材料”。不读文件内容、不比较像素；
+ * 持续采集在无变化时本来就不会产出 sheet（`take({force:false})` 返回 null），这里再挡掉
+ * 同一份材料被重复投递的情况。输出最多 `MATERIAL_SIGNATURE_MAX_CHARS` 个字符。
+ *
+ * @param {object|null} sheet 采集会话返回的 sheet 元数据
+ * @param {object|null} entry 证据窗口登记后的 entry（带 file/bytes/capturedAt）
+ * @returns {string}
+ */
+export function understandingMaterialSignature(sheet, entry = null) {
+  const shot = sheet !== null && typeof sheet === 'object' ? sheet : {};
+  const added = entry !== null && typeof entry === 'object' ? entry : {};
+  const capturedAt = Number(shot.capturedAt ?? shot.at ?? added.capturedAt);
+  const bytes = Number(added.bytes ?? shot.bytes);
+  const frameCount = Number(shot.frames ?? added.frames);
+  const at = Number.isFinite(capturedAt) && capturedAt > 0 ? Math.floor(capturedAt) : 0;
+  const size = Number.isFinite(bytes) && bytes >= 0 ? Math.floor(bytes) : 0;
+  const frames = Number.isFinite(frameCount) && frameCount >= 0 ? Math.floor(frameCount) : 0;
+  return `at=${at}|bytes=${size}|frames=${frames}|file=${materialFilePart(added.file ?? shot.file)}`
+    .slice(0, MATERIAL_SIGNATURE_MAX_CHARS);
+}
+
+/**
+ * 后台理解的材料去重门：同一签名只放行一次，`reset()` 后重新放行。
+ *
+ * 签名比较和 `lastMaterialSignature/lastMaterialAt` 的记录都发生在宿主
+ * `noteUnderstandingChange` 内；没有签名（用户评论的 priority 路径）永远放行，不受静态画面
+ * 签名限制。`at` 非法时退回当前时间，保证记录值始终有界、可读。
+ */
+export function createUnderstandingMaterialGate() {
+  let lastMaterialSignature = '';
+  let lastMaterialAt = 0;
+  return {
+    /** @param {string} signature @param {number} [at] @returns {boolean} 是否应触发理解 */
+    accept(signature, at = Date.now()) {
+      const value = typeof signature === 'string' ? signature : '';
+      if (value.length === 0) return true;
+      if (value === lastMaterialSignature) return false;
+      lastMaterialSignature = value;
+      const stamp = Number(at);
+      lastMaterialAt = Number.isFinite(stamp) && stamp >= 0 ? stamp : Date.now();
+      return true;
+    },
+    reset() {
+      lastMaterialSignature = '';
+      lastMaterialAt = 0;
+    },
+    status() {
+      return { lastMaterialSignature, lastMaterialAt };
+    },
+  };
+}
 
 /** Only the tool registry is required; everything else stays optional. */
 export const inject = ['tools'];
@@ -9117,10 +9189,25 @@ export function apply(ctx, config) {
     return understandingCapabilityProbe;
   };
   /**
-   * 所有触发都走这里：先确认能力，再交给运行时排程。探测与排程都不向调用方抛错 ——
-   * 触发方（持续采集的 sheet、麦克风终稿）只是旁路，不能因此改变证据登记或投递。
+   * 材料去重门：只有“同一份材料被重复投递”才被挡住。静态画面在采集层就不会产出 sheet，
+   * 所以这里的签名不是定时器，也不会让理解变成每 20 秒一次的轮询。
+   */
+  const understandingMaterial = createUnderstandingMaterialGate();
+  /** 切源/隐私/停止时清掉签名，让新来源的第一张 sheet 重新有机会触发。 */
+  const resetUnderstandingMaterial = () => {
+    understandingMaterial.reset();
+  };
+  /**
+   * 所有触发都走这里：先做材料签名比较，再确认能力，最后交给运行时排程。探测与排程都不向
+   * 调用方抛错 —— 触发方（持续采集的 sheet、麦克风终稿）只是旁路，不能因此改变证据登记或投递。
+   *
+   * 有 `materialSignature` 的请求（故事板 sheet）受“同签名只触发一次”约束；用户评论的
+   * priority 路径不带签名，直接放行，仍受运行时最短间隔与单在途约束（定向补看另有 5 秒去重）。
    */
   const noteUnderstandingChange = (request) => {
+    const source = request !== null && typeof request === 'object' ? request : {};
+    const signature = typeof source.materialSignature === 'string' ? source.materialSignature : '';
+    if (!understandingMaterial.accept(signature, source.materialAt)) return;
     void understandingCapabilityReady()
       .then((usable) => { if (usable) understanding.noteChange(request); })
       .catch(() => {});
@@ -9399,6 +9486,15 @@ export function apply(ctx, config) {
     stopProactive();
   });
 
+  /**
+   * 20 秒是“最短间隔”的下限，不是定时器：只有出现新材料/用户评论时才登记一次，调度器保证
+   * 两次真正开始的分析至少相隔这么久。设置页的成本概览直接读这个值与运行时上限。
+   */
+  const configuredUnderstandingInterval = Number(config?.understandingMinIntervalMs);
+  const understandingMinIntervalMs = Number.isFinite(configuredUnderstandingInterval)
+    && configuredUnderstandingInterval > 0
+    ? Math.max(1, Math.floor(configuredUnderstandingInterval))
+    : 20_000;
   const understanding = createUnderstandingRuntime({
     analyze: typeof config?.understandingAnalyzer === 'function'
       ? (options) => config.understandingAnalyzer(options)
@@ -9410,10 +9506,7 @@ export function apply(ctx, config) {
     audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
     isBlocked: () => companionSessionSeen !== true || visionDisposed || visionChanging
       || shutdown.closing || vision.mode === 'privacy' || features.enabled('vision') !== true,
-    minIntervalMs: (() => {
-      const configured = Number(config?.understandingMinIntervalMs);
-      return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 20_000;
-    })(),
+    minIntervalMs: understandingMinIntervalMs,
     // 运行时以单对象 `{type, ok, reason, ...}` 回调 emit；展开成宿主事件名，避免 type 变成对象。
     emit: (event, payload) => {
       if (event !== null && typeof event === 'object') {
@@ -9427,15 +9520,30 @@ export function apply(ctx, config) {
     onAdvance: (update) => proposeProactive(update),
   });
   /**
+   * 设置页成本概览的只读数值：最短间隔是限速下限，`theoretical*` 只是“持续有变化可触发”时
+   * 的算术上限，不代表定时调用，也不代表实际费用。实际费用取决于模型与图片处理方式。
+   */
+  const understandingCostView = () => {
+    const perHour = Math.floor(3_600_000 / understandingMinIntervalMs);
+    return {
+      intervalMs: understandingMinIntervalMs,
+      maxImages: UNDERSTANDING_MAX_IMAGES,
+      theoreticalPerHour: perHour,
+      theoreticalImagesPerHour: perHour * UNDERSTANDING_MAX_IMAGES,
+    };
+  };
+  /**
    * `/assistant/status` 的只读投影：调度计数 + 有界状态的“有没有内容/多大”。绝不暴露场景正文、
    * 事件描述、帧 id 或文件路径。无状态（含隐私清空后）固定给三个 0。
    */
   const understandingStatusView = () => {
     const emptyState = { sceneChars: 0, events: 0, unresolvedChars: 0 };
+    const cost = understandingCostView();
     try {
       const current = understanding.current();
       return {
         ...understanding.status(),
+        ...cost,
         state: current === null ? emptyState : {
           sceneChars: typeof current.sceneSummary === 'string' ? current.sceneSummary.length : 0,
           events: Array.isArray(current.events) ? current.events.length : 0,
@@ -9453,6 +9561,7 @@ export function apply(ctx, config) {
         droppedEvents: 0,
         stopped: false,
         hasState: false,
+        ...cost,
         state: emptyState,
       };
     }
@@ -9742,8 +9851,18 @@ export function apply(ctx, config) {
       const added = await rememberEvidence(sheet, { kind: 'storyboard', token });
       // 只有真正登记进本代次窗口的画面才值得理解；窗口可以给同一时刻（非优先）。
       if (added === null) return;
-      const capturedAt = Number(sheet?.capturedAt ?? added.capturedAt ?? Date.now());
-      noteUnderstandingChange({ reason: 'sheet', from: capturedAt, to: capturedAt });
+      const sheetCapturedAt = Number(sheet?.capturedAt ?? added.capturedAt);
+      const capturedAt = Number.isFinite(sheetCapturedAt) && sheetCapturedAt > 0
+        ? sheetCapturedAt
+        : Date.now();
+      // 材料签名只做去重：同一份 sheet 被重复投递时不再排一次理解（不读像素）。
+      noteUnderstandingChange({
+        reason: 'sheet',
+        from: capturedAt,
+        to: capturedAt,
+        materialSignature: understandingMaterialSignature(sheet, added),
+        materialAt: capturedAt,
+      });
     },
     isBlocked: () => evidenceCaptureHolding !== true || visionDisposed || visionChanging
       || shutdown.closing || vision.mode === 'privacy',
@@ -9786,6 +9905,8 @@ export function apply(ctx, config) {
   /** 停止持续证据采集；代次一停，旧会话迟到的 sheet/错误由模块丢弃。 */
   const stopEvidenceCapture = async (reason = 'stop') => {
     clearEvidenceRetry();
+    // 采集停止是材料代次的边界：下一次启动的第一张 sheet 必须能重新触发理解。
+    resetUnderstandingMaterial();
     evidenceCaptureHolding = false;
     const stopping = evidenceCapture.stop(reason);
     try { evidenceCaptureAbort?.abort(new Error(`证据采集已停止：${reason}`)); } catch { /* already aborted */ }
@@ -9907,6 +10028,7 @@ export function apply(ctx, config) {
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
+    resetUnderstandingMaterial();
     // P-187 阶段 5：主动候选同样属于旧代次；连未回应计时一起清掉，但保留累计计数。
     resetProactive('vision-invalidated');
     visionGeneration += 1;
@@ -17663,6 +17785,7 @@ export function apply(ctx, config) {
           await stopEvidenceCapture('dispose');
           // P-187 阶段 3：停止后台理解的定时器/队列，在途结果因代次检查不会写回。
           understanding.stop();
+          resetUnderstandingMaterial();
           // P-187 阶段 5：先停主动评估定时器并作废在途结果，再让 invalidateVision 清一次窗口。
           stopProactive();
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));

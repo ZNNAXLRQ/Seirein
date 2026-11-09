@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { registerHooks } from 'node:module';
 import { Readable } from 'node:stream';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,8 +57,14 @@ const hooks = registerHooks({
     return next(url, context);
   },
 });
-const { apply, voiceSessionTarget } = await import('../src/host/index.js');
+const {
+  apply,
+  voiceSessionTarget,
+  createUnderstandingMaterialGate,
+  understandingMaterialSignature,
+} = await import('../src/host/index.js');
 hooks.deregister();
+const hostSource = readFileSync(new URL('../src/host/index.js', import.meta.url), 'utf8');
 
 async function fixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-understanding-host-'));
@@ -170,6 +177,11 @@ test('裸挂载：assistant:understanding 已注册且渲染空，status 只给�
   assert.equal(view.stopped, false);
   assert.equal(view.hasState, false);
   assert.deepEqual(view.state, { sceneChars: 0, events: 0, unresolvedChars: 0 });
+  // 设置页成本概览的只读数值：20 秒是限速下限，不是定时器；上限只是算术值。
+  assert.equal(view.intervalMs, 20_000, '默认最短间隔 20 秒');
+  assert.equal(view.maxImages, 3, '单次最多 3 张输入图');
+  assert.equal(view.theoreticalPerHour, 180, '3600/20 = 180 次/小时');
+  assert.equal(view.theoreticalImagesPerHour, 540, '180 × 3 = 540 张/小时');
   assert.equal(JSON.stringify(view).includes('cache'), false, '状态里不含证据路径');
   assert.equal(JSON.stringify(view).includes('frame'), false, '状态里不含帧 id');
 
@@ -226,4 +238,70 @@ test('测试缝：注入 understandingAnalyzer 时连续渲染两次都不探测
   const snapshot = await app.status();
   assert.equal(snapshot.vision.understanding.runs, 0);
   assert.deepEqual(snapshot.vision.understanding.state, { sceneChars: 0, events: 0, unresolvedChars: 0 });
+});
+
+test('相同材料签名第二次不触发；onSheet 只在登记成功后带签名触发', async () => {
+  const gate = createUnderstandingMaterialGate();
+  const sheet = {
+    file: join('cache', 'screens', 'sheet-a.png'),
+    capturedAt: 1_700_000_000_000,
+    bytes: 4096,
+    frames: 6,
+  };
+  const added = {
+    file: join('cache', 'evidence', 'ev-1.png'),
+    capturedAt: 1_700_000_000_000,
+    bytes: 4096,
+  };
+  const signature = understandingMaterialSignature(sheet, added);
+  assert.ok(signature.length <= 240, '签名有界');
+  assert.equal(signature.includes('cache'), false, '签名只保留文件名，不含完整路径');
+  assert.equal(gate.accept(signature, sheet.capturedAt), true, '第一次新材料放行');
+  assert.equal(gate.accept(signature, sheet.capturedAt), false, '同一签名第二次不触发');
+  assert.equal(gate.status().lastMaterialAt, sheet.capturedAt, '记录 lastMaterialAt');
+  assert.equal(gate.accept(`${signature}-next`, sheet.capturedAt + 1), true, '不同材料仍放行');
+
+  // 无法从裸挂载驱动真实采集，因此用源码断言核对接线：先判断新 entry，再带签名 note。
+  const onSheetAt = hostSource.indexOf('onSheet: async (sheet) =>');
+  assert.ok(onSheetAt > 0, 'index.js 有 onSheet 接线');
+  const onSheetRegion = hostSource.slice(onSheetAt, hostSource.indexOf('isBlocked:', onSheetAt));
+  assert.match(onSheetRegion, /if \(added === null\) return;/, '无新增证据不触发');
+  assert.match(onSheetRegion,
+    /materialSignature: understandingMaterialSignature\(sheet, added\)/,
+    'onSheet 用登记后的 entry + sheet 元数据生成签名');
+  const noteAt = hostSource.indexOf('const noteUnderstandingChange = (request) =>');
+  assert.ok(noteAt > 0);
+  const noteRegion = hostSource.slice(noteAt, noteAt + 1200);
+  assert.match(noteRegion, /understandingMaterial\.accept\(signature, source\.materialAt\)/,
+    'noteUnderstandingChange 内做签名比较并记录');
+  assert.match(noteRegion, /if \(!understandingMaterial\.accept\(signature, source\.materialAt\)\) return;/,
+    '同签名在能力探测/排程之前就被挡住');
+});
+
+test('隐私、切源或停止后材料签名重置；评论 priority 路径不受静态签名限制', () => {
+  const gate = createUnderstandingMaterialGate();
+  assert.equal(gate.accept('same-material', 1), true);
+  gate.reset();
+  assert.equal(gate.accept('same-material', 2), true, 'reset 后同一材料重新放行');
+  assert.equal(gate.status().lastMaterialSignature, 'same-material');
+  assert.equal(gate.status().lastMaterialAt, 2);
+  // 评论路径没有签名：总是放行，也不覆盖故事板签名。
+  assert.equal(gate.accept('', 3), true);
+  assert.equal(gate.status().lastMaterialSignature, 'same-material', '无签名请求不写材料签名');
+
+  const invalidateAt = hostSource.indexOf('const invalidateVision = () =>');
+  assert.ok(invalidateAt > 0);
+  const invalidateRegion = hostSource.slice(invalidateAt, invalidateAt + 2500);
+  assert.match(invalidateRegion, /resetUnderstandingMaterial\(\)/,
+    '隐私/切源/换代（invalidateVision）重置签名');
+
+  const stopAt = hostSource.indexOf('const stopEvidenceCapture = async');
+  assert.ok(stopAt > 0);
+  const stopRegion = hostSource.slice(stopAt, stopAt + 900);
+  assert.match(stopRegion, /resetUnderstandingMaterial\(\)/, '停止采集时重置签名');
+
+  const disposeAt = hostSource.indexOf('understanding.stop();');
+  assert.ok(disposeAt > 0);
+  assert.match(hostSource.slice(disposeAt, disposeAt + 200), /resetUnderstandingMaterial\(\)/,
+    '卸载停止理解时也重置签名');
 });

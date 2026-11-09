@@ -5888,6 +5888,27 @@ window.__ModuleLoader__.load({
                 : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
             // No local state: the select value is the source the Host actually has.
             const sourceValue = source === 'obs' ? (vm.scene || '__obs__') : '__desktop__';
+            // 后台理解成本概览：只读 status.vision.understanding，优先用宿主给的限速/上限；
+            // 缺失或畸形时退回 20 秒 / 3 张 / 180 次 / 540 张。只展示，不新增开关或轮询。
+            const understandingView = vm.understanding ?? {};
+            const boundedCount = (value, fallback, allowZero = false) => {
+              const number = Number(value);
+              if (!Number.isFinite(number) || number < 0) return fallback;
+              if (!allowZero && number === 0) return fallback;
+              return Math.floor(number);
+            };
+            const understandingIntervalMs = boundedCount(understandingView.intervalMs, 20_000);
+            const understandingMaxImages = boundedCount(understandingView.maxImages, 3);
+            const understandingPerHour = boundedCount(understandingView.theoreticalPerHour, 180, true);
+            const understandingImagesFallback = understandingPerHour * understandingMaxImages || 540;
+            const understandingImagesPerHour = boundedCount(
+              understandingView.theoreticalImagesPerHour,
+              understandingImagesFallback,
+              true,
+            );
+            const understandingIntervalText = understandingIntervalMs % 1000 === 0
+              ? `${understandingIntervalMs / 1000} 秒`
+              : `${(understandingIntervalMs / 1000).toFixed(1)} 秒`;
             return settingsGroup(h, 'vision', '观看来源与隐私',
               h('div', { style: styles.row },
                 h('span', { style: styles.label }, '当前视觉来源'),
@@ -5915,6 +5936,14 @@ window.__ModuleLoader__.load({
                 : '已停止（取景时按需启动；用户自启的不会关闭）'),
               line('OBS 进程', vm.obsRunning ? '运行中' : '未运行 / 未连接'),
               line('OBS 场景', status.obsScene || '未连接 / 未知'),
+              h('div', {
+                style: styles.hint,
+                'data-settings-note': 'understanding-cost',
+              }, `后台理解：最短间隔约 ${understandingIntervalText}；持续触发理论上限约 ${understandingPerHour} 次/小时、最多 ${understandingImagesPerHour} 张输入图（实际费用取决于模型与图片处理方式）`),
+              h('div', {
+                style: styles.hint,
+                'data-settings-note': 'understanding-trigger',
+              }, `限速、按变化触发，不是定时调用：每次分析最多 ${understandingMaxImages} 张输入图，静止或没有新证据时不会调用。`),
               h('div', { style: styles.row },
                 h('span', { style: styles.label },
                   '主动回应',
