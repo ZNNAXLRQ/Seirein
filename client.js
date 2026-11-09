@@ -6327,6 +6327,9 @@ window.__ModuleLoader__.load({
       if (error.length > 0) return card('Seirein', h('div', { style: styles.value }, `无法读取状态：${error}`));
       if (status === null) return card('Seirein', h('div', { style: styles.value }, '读取中…'));
 
+      // 用户输入时是否立即打断当前播报：缺省 true（历史行为），只有明确存过 false 才关闭。
+      const inputInterrupts = status.voiceInputInterruptsReply !== false;
+
       const hearingOn = status.hearing.running;
       const resources = status.resources ?? [];
       const scope = status.workspaceScope ?? { enabled: true, path: status.workspace?.path ?? '' };
@@ -7678,8 +7681,6 @@ window.__ModuleLoader__.load({
           (() => {
             // 语种：语音与字幕分开配置，来源是 /assistant/status 的 langs。
             const langOptions = [['zh', '中文'], ['ja', '日语'], ['en', '英语'], ['ko', '韩语'], ['yue', '粤语']];
-            // 用户输入时是否立即打断当前播报：缺省 true（历史行为），只有明确存过 false 才关闭。
-            const inputInterrupts = status.voiceInputInterruptsReply !== false;
             const langRow = (label, key) => settingsField(h, label,
               h('select', {
                 style: { ...styles.input, width: 140 },
@@ -8252,6 +8253,7 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots'],
+      __panel: Panel,
       apply(ctx) {
         // Expose the client context so the background voice/rollover poller can use client
         // services (uiWorkspace) without a React scope.
