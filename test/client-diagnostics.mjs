@@ -48,6 +48,9 @@ return {
   copyDiagnosticsReport,
   loadDiagnosticsStatus,
   diagnosticsSection,
+  timelineSection,
+  readDiagnosticsTimelines,
+  diagnosticsPipelineTimelineOf,
   sanitizeDiagnosticText,
   reportField,
 };`,
@@ -625,6 +628,110 @@ test('6. 回归：单次读取、手动刷新、无新增轮询；lexicon-ui / a
   }
   const summary = results.map(({ args, code }) => `${args.join(' ')} => exit ${code}`).join('; ');
   console.log(`[client-diagnostics 6] ${summary}`);
+});
+
+test('7. P-46：首块队列等待进入客户端时间线；0 保留，null/缺失显示「—」，不引入 ttsQueueMs', async () => {
+  const api = loadDiagnostics();
+
+  // 1) 投影白名单：宿主字段被保留，0 不被当成「没有」；探针之外的原字段一律丢弃。
+  const projected = api.diagnosticsPipelineTimelineOf({
+    turn: 3,
+    sessionId: 'session-a',
+    deliveryMessageId: 'msg-3',
+    firstChunkQueueWaitMs: 0,
+    ttsQueueMs: 987654,
+    firstChunkQueueWaitMsRaw: 'PRIVATE QUEUE RAW',
+  });
+  assert.equal(projected.firstChunkQueueWaitMs, 0, 'the projection keeps a measured 0');
+  assert.equal(Object.hasOwn(projected, 'ttsQueueMs'), false, 'ttsQueueMs is not added to the whitelist');
+  assert.equal(Object.hasOwn(projected, 'firstChunkQueueWaitMsRaw'), false,
+    'unknown raw fields stay out of the projection');
+
+  // 2) 经过 readDiagnosticsTimelines 后，字段仍在合并行上（含只有 pipeline 的轮次）。
+  const read = (pipelineRows, turnRows = []) => api.readDiagnosticsTimelines(async (body) => ({
+    ok: true,
+    probe: body.probe,
+    rows: body.probe === 'turn.timeline' ? turnRows : pipelineRows,
+  }));
+  const data = await read([
+    { turn: 3, sessionId: 'session-a', deliveryMessageId: 'msg-3', firstChunkQueueWaitMs: 7 },
+    { turn: 2, sessionId: 'session-a', deliveryMessageId: 'msg-2', firstChunkQueueWaitMs: 0 },
+    { turn: 1, sessionId: 'session-a', deliveryMessageId: 'msg-1', firstChunkQueueWaitMs: null },
+    { turn: 0, sessionId: 'session-a', deliveryMessageId: 'msg-0' },
+  ]);
+  assert.deepEqual(
+    data.pipeline.map((row) => row.firstChunkQueueWaitMs),
+    [7, 0, null, null],
+    'value / 0 / explicit null / missing are projected distinctly',
+  );
+  assert.deepEqual(
+    data.rows.map((row) => row.firstChunkQueueWaitMs),
+    [7, 0, null, null],
+    'the merged timeline rows carry the queue wait',
+  );
+  assert.equal(JSON.stringify(data.rows).includes('ttsQueueMs'), false,
+    'ttsQueueMs never reaches the merged rows');
+
+  const merged = await read(
+    [{ turn: 4, sessionId: 'session-a', deliveryMessageId: 'msg-4', totalMs: 900, firstChunkQueueWaitMs: 12 }],
+    [{
+      turn: 4,
+      sessionId: 'session-a',
+      deliveryMessageId: 'msg-4',
+      status: 'ok',
+      counts: { modelRounds: 1 },
+      toolKinds: null,
+      overlaps: {},
+      residualMs: 1,
+    }],
+  );
+  assert.equal(merged.rows.length, 1, 'the two probes still merge into one row');
+  assert.equal(merged.rows[0].firstChunkQueueWaitMs, 12, 'the merged row gets the pipeline value');
+
+  // 3) 时间线行：短标签追加在既有「耗时」行末尾，不新增列/行，也不打乱既有顺序。
+  const rowText = (row) => textsOf(api.timelineSection(h, {
+    data: { loading: false, error: '', rows: [row], at: 1 },
+  })).join(' | ');
+  const full = {
+    turn: 4,
+    status: 'ok',
+    modelRounds: 1,
+    toolKinds: { 'self-speech': 0, 'self-wait': 0, perception: 0, work: 0 },
+    toolWallMs: 400,
+    totalMs: 900,
+    firstAudioMs: 1200,
+    residualMs: -12,
+    firstChunkQueueWaitMs: 7,
+  };
+  const fullText = rowText(full);
+  assert.ok(fullText.includes('首块队列等待 7ms'), 'the row renders the short label and value');
+  assert.ok(fullText.includes('toolWallMs 400ms · 总时长 900ms · 首音 1200ms · 残差 -12ms · 首块队列等待 7ms'),
+    'the label is appended after the existing fields, so the existing order is unchanged');
+  assert.ok(fullText.includes('首块队列等待 0ms') === false, 'a measured value is not rendered as 0');
+
+  assert.ok(rowText({ ...full, firstChunkQueueWaitMs: 0 }).includes('首块队列等待 0ms'),
+    'a measured 0 is shown as 0ms, not hidden');
+  assert.ok(rowText({ ...full, firstChunkQueueWaitMs: null }).includes('首块队列等待 —'),
+    'an explicit null shows —');
+  assert.ok(rowText({ ...full, firstChunkQueueWaitMs: undefined }).includes('首块队列等待 —'),
+    'a missing field shows —');
+  const missingRow = {};
+  assert.ok(rowText(missingRow).includes('首块队列等待 —'), 'a degraded row shows — instead of 0');
+
+  // 4) 既有报告摘要的白名单不因本字段放宽：可复制报告仍不含该字段和 ttsQueueMs。
+  const report = JSON.parse(api.diagnosticsReportOf({ version: '0.99.0' }, {
+    clientVersion: '0.99.0',
+    timeline: data,
+  }));
+  assert.deepEqual(Object.keys(report.timeline.rows[0]).sort(), [
+    'firstAudioMs', 'modelRounds', 'residualMs', 'status', 'toolKinds', 'toolWallMs', 'totalMs', 'turn',
+  ], 'the copyable timeline summary keeps its existing field set');
+  for (const forbidden of ['firstChunkQueueWaitMs', 'ttsQueueMs', '987654', 'PRIVATE QUEUE RAW']) {
+    assert.equal(JSON.stringify(report).includes(forbidden), false, `the report leaked ${forbidden}`);
+  }
+
+  console.log('[7] projected=0/7/null/missing merged=7/0/null/null '
+    + 'render=首块队列等待 7ms|0ms|— reportWhitelistUnchanged=true ttsQueueMs=false');
 });
 
 /** Run one child suite and report its tail when it fails. */

@@ -3580,7 +3580,10 @@ window.__ModuleLoader__.load({
       };
     };
 
-    /** pipeline.timeline 行 -> 投影；只保留合并展示需要的计时字段与会话/交付标识。 */
+    /**
+     * pipeline.timeline 行 -> 投影；只保留合并展示需要的计时字段与会话/交付标识。
+     * 首块 TTS 队列等待是宿主已有的事件字段（P-46），只透传、不派生；0 是真实观测，保留。
+     */
     const diagnosticsPipelineTimelineOf = (value) => {
       const object = diagnosticsObject(value);
       if (object === null) return null;
@@ -3595,6 +3598,7 @@ window.__ModuleLoader__.load({
         ackToFirstTextMs: diagnosticsNumber(object.ackToFirstTextMs),
         bodyReadyMs: diagnosticsNumber(object.bodyReadyMs),
         firstAudioMs: diagnosticsNumber(object.firstAudioMs),
+        firstChunkQueueWaitMs: diagnosticsNumber(object.firstChunkQueueWaitMs),
       };
     };
 
@@ -3661,6 +3665,7 @@ window.__ModuleLoader__.load({
           residualMs: entry.residualMs,
           totalMs: null,
           firstAudioMs: null,
+          firstChunkQueueWaitMs: null,
           hasTurn: true,
           hasPipeline: false,
         };
@@ -3673,6 +3678,7 @@ window.__ModuleLoader__.load({
         if (target !== undefined && target.hasPipeline === false) {
           target.totalMs = entry.totalMs;
           target.firstAudioMs = entry.firstAudioMs;
+          target.firstChunkQueueWaitMs = entry.firstChunkQueueWaitMs;
           target.hasPipeline = true;
           continue;
         }
@@ -3689,6 +3695,7 @@ window.__ModuleLoader__.load({
           residualMs: null,
           totalMs: entry.totalMs,
           firstAudioMs: entry.firstAudioMs,
+          firstChunkQueueWaitMs: entry.firstChunkQueueWaitMs,
           hasTurn: false,
           hasPipeline: true,
         });
@@ -4150,7 +4157,8 @@ window.__ModuleLoader__.load({
               `toolWallMs ${show(entry.toolWallMs, 'ms')}`
               + ` · 总时长 ${show(entry.totalMs, 'ms')}`
               + ` · 首音 ${show(entry.firstAudioMs, 'ms')}`
-              + ` · 残差 ${show(entry.residualMs, 'ms')}`)));
+              + ` · 残差 ${show(entry.residualMs, 'ms')}`
+              + ` · 首块队列等待 ${show(entry.firstChunkQueueWaitMs, 'ms')}`)));
       };
       return h('div', { style: styles.group, 'data-settings-group': 'timeline', 'data-seirein-timeline': 'turn' },
         h('div', { style: styles.groupTitle }, '最近一轮时间线'),
