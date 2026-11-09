@@ -352,6 +352,32 @@ export function createEvidenceWindow({
       .map((entry) => ({ ...entry }));
   }
 
+  /**
+   * 按 id 回看当前窗口内仍存在的记录。只读：不触发淘汰、不发事件、不碰磁盘。
+   * 入参可以是单个 id 或 id 数组；非法/空/重复 id 跳过，最多返回 32 条，顺序与传入一致。
+   * 返回的是记录副本，调用方改不到窗口内部状态。
+   * @param {string[]|string} ids
+   * @returns {object[]}
+   */
+  function byId(ids) {
+    const requested = typeof ids === 'string' ? [ids] : (Array.isArray(ids) ? ids : []);
+    if (requested.length === 0) return [];
+    const index = new Map(frames.map((entry) => [entry.id, entry]));
+    const seen = new Set();
+    const found = [];
+    for (const raw of requested) {
+      if (typeof raw !== 'string') continue;
+      const id = raw.trim();
+      if (id.length === 0 || seen.has(id)) continue;
+      seen.add(id);
+      const entry = index.get(id);
+      if (entry === undefined) continue;
+      found.push({ ...entry });
+      if (found.length >= 32) break;
+    }
+    return found;
+  }
+
   /** 满足条件的最新一帧（`current state` 用）。 */
   function latest({ source = null, sourceEpoch = null } = {}) {
     for (let i = frames.length - 1; i >= 0; i -= 1) {
@@ -376,10 +402,12 @@ export function createEvidenceWindow({
       pinnedBytes: pinned.reduce((sum, entry) => sum + entry.bytes, 0),
       oldestAt: frames.length === 0 ? null : frames[0].capturedAt,
       newestAt: frames.length === 0 ? null : frames[frames.length - 1].capturedAt,
+      // 只给 id，不含副本路径：设置页/诊断脚本可以据此发起回看，但拿不到文件位置。
+      recentIds: frames.slice(-5).map((entry) => entry.id),
       locks: activeLocks.map((lock) => ({ ...lock })),
       stats: { ...stats },
     };
   }
 
-  return { add, lock, extendLock, releaseLock, clear, between, latest, state };
+  return { add, lock, extendLock, releaseLock, clear, between, latest, byId, state };
 }

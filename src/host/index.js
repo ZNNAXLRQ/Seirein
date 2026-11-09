@@ -7631,12 +7631,18 @@ export function apply(ctx, config) {
   register({
     name: 'assistant_see',
     description:
-      'Take one look and attach the PNG to the result, so you can look at it directly. With the desktop source it uses ffmpeg ddagrab on the screen; with the OBS source it reads the selected scene through the virtual camera. In privacy mode it refuses. When the call fails, do not describe the screen from memory.',
+      'Take one look and attach the PNG to the result, so you can look at it directly. With the desktop source it uses ffmpeg ddagrab on the screen; with the OBS source it reads the selected scene through the virtual camera. In privacy mode it refuses. To replay recently cached evidence frames by id without taking a new screenshot (at most 3), pass evidenceFrameIds. When the call fails, do not describe the screen from memory.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
         reason: { type: 'string', description: 'Why the view is needed, in one short sentence.' },
+        evidenceFrameIds: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 3,
+          description: 'Replay up to 3 recently cached evidence frames by id; this does not take a new screenshot.',
+        },
       },
     },
     output: {
@@ -7646,6 +7652,10 @@ export function apply(ctx, config) {
         properties: {
           ok: { type: 'boolean' },
           reason: { type: 'string' },
+          error: { type: 'string' },
+          evidence: { type: 'boolean' },
+          frameIds: { type: 'array', items: { type: 'string' } },
+          frames: { type: 'array', items: { type: 'object' } },
           file: { type: 'string' },
           bytes: { type: 'integer' },
           width: { type: 'integer' },
@@ -7670,6 +7680,34 @@ export function apply(ctx, config) {
         ],
       },
       render: (_args, value) => {
+        if (value.evidence === true) {
+          const frames = Array.isArray(value.frames) ? value.frames : [];
+          if (value.ok !== true) {
+            const blocks = [{
+              type: 'text',
+              text: `Evidence replay failed: ${value.error ?? value.reason ?? '证据帧已过期或不可用'}`,
+            }];
+            for (const frame of frames) {
+              if (frame?.attachment !== null && frame?.attachment !== undefined) {
+                blocks.push({ type: 'image', attachment: frame.attachment });
+              }
+            }
+            return blocks;
+          }
+          const blocks = [{
+            type: 'text',
+            text: `Evidence replay (${(value.frameIds ?? []).join(', ') || 'none'}): cached frames, not a new screenshot.`,
+          }];
+          for (const frame of frames) {
+            if (frame?.attachment === null || frame?.attachment === undefined) continue;
+            const label = typeof frame.frameId === 'string' && frame.frameId.length > 0
+              ? `Evidence frame ${frame.frameId}: `
+              : '';
+            blocks.push({ type: 'text', text: `${label}${sightSummary(frame)}` });
+            blocks.push({ type: 'image', attachment: frame.attachment });
+          }
+          return blocks;
+        }
         if (value.ok !== true) return [{ type: 'text', text: `Capture failed: ${value.reason}` }];
         const blocks = [{ type: 'text', text: sightSummary(value) }];
         // DSH shows the model only what render returns: without this block it sees no pixels.
@@ -7680,7 +7718,8 @@ export function apply(ctx, config) {
       },
     },
     // The execute body lives in runtime/tools.js, so the turn owner travels as its third argument.
-    execute: (args, exec) => tools.executeSee(args, exec, preRequestOwner(exec)),
+    // The evidence replay branch is host-local: it reads the evidence window instead of capturing.
+    execute: (args, exec) => executeAssistantSee(args, exec),
   });
 
   register({
@@ -10160,6 +10199,120 @@ export function apply(ctx, config) {
       current: observation.stale !== true,
     };
   };
+
+  /**
+   * `assistant_see` 的宿主侧分流：带 `evidenceFrameIds` 时只回看证据窗口里的副本，绝不采新帧。
+   * 普通调用完全走 `runtime/tools.js` 的原路径；回看分支只复用交付门禁与 `deliverSight`，
+   * 因此隐私/模式/卸载/代次/来源/附件大小语义与正常交付一致，但不会写 `preRequestVision`、
+   * 不会触发 `captureForAgent`，也不会改变 `lastVision`（回看不是“现在”）。
+   */
+  async function executeAssistantSee(args, exec) {
+    const requestedIds = Array.isArray(args?.evidenceFrameIds) ? args.evidenceFrameIds : [];
+    if (requestedIds.length === 0) return tools.executeSee(args, exec, preRequestOwner(exec));
+
+    const evidenceFailure = (reason) => ({
+      ...sightFailure(reason),
+      error: reason,
+      evidence: true,
+      frameIds: [],
+      frames: [],
+    });
+    const refuse = async (reason, stage, { unknown = false, capability = null } = {}) => {
+      perceptionStat('rejected');
+      perceptionEvent('perception.rejected', { reason, stage });
+      const eventType = unknown === true ? 'vision.capability.unknown-rejected' : 'vision.delivery.refused';
+      await log.emit(eventType, {
+        reason,
+        stage,
+        provider: capability?.provider ?? '',
+        model: capability?.model ?? '',
+      });
+      // Same legacy outcome event as the capture path: an attempted see that never delivered.
+      if (unknown === true) await log.emit('vision.failed', { reason, phase: 'capability' });
+      return evidenceFailure(reason);
+    };
+
+    if (!features.enabled('vision')) return refuse('视觉组件已关闭', 'preflight');
+    const callSignal = exec?.signal;
+    if (callSignal?.aborted === true) {
+      return refuse('工具调用已取消：未采集截图', 'preflight');
+    }
+    // Capability/privacy gate first; it never touches the screen, only decides whether a frame
+    // could be handed to this model. Privacy is refused here and again by assertVisionToken.
+    const ready = await sightDeliveryCheck(exec, callSignal);
+    if (!ready.ok) {
+      return refuse(ready.reason, 'preflight', {
+        unknown: ready.unknown === true,
+        capability: ready.capability,
+      });
+    }
+    let token;
+    try {
+      token = visionToken();
+      assertVisionToken(token);
+    } catch (error) {
+      return refuse(error?.message ?? String(error), 'preflight');
+    }
+
+    const source = vision.mode === 'scene' ? 'obs' : 'desktop';
+    const generation = visionGeneration;
+    const candidates = evidenceWindow.byId(requestedIds)
+      .filter((entry) => entry.sourceEpoch === generation && entry.source === source)
+      .slice(0, 3);
+    if (candidates.length === 0) {
+      // 已淘汰/不存在/旧代次/别来源：不捕获新帧，也不把回看伪装成“现在”。
+      await log.emit('vision.delivery.refused', {
+        reason: '证据帧已过期或不可用', stage: 'evidence',
+      }).catch(() => {});
+      return evidenceFailure('证据帧已过期或不可用');
+    }
+
+    const frames = [];
+    const frameIds = [];
+    const deliveryDir = join(root, 'cache', 'screens');
+    let lastFailure = '';
+    for (const entry of candidates) {
+      try {
+        // 每张图交付前重新核对代次/来源/隐私：循环中的 await 也是边界。
+        assertVisionToken(token);
+      } catch (error) {
+        lastFailure = error?.message ?? String(error);
+        break;
+      }
+      // 关键：绝不把证据副本直接交给 deliverSight。它的拒绝/取消路径会删除 shot.file；
+      // 这里每帧复制一个临时交付文件，交付结束（成功/拒绝/取消/异常）后只在 finally 里删临时文件。
+      let tempFile = '';
+      try {
+        await mkdir(deliveryDir, { recursive: true });
+        tempFile = join(deliveryDir, `deliver-${randomUUID()}.png`);
+        await copyFile(entry.file, tempFile);
+        const shot = {
+          file: tempFile,
+          bytes: entry.bytes,
+          width: entry.width,
+          height: entry.height,
+          capturedAt: entry.capturedAt,
+          at: entry.at ?? entry.capturedAt,
+        };
+        const delivered = await deliverSight(shot, token, exec, ready.capability);
+        if (delivered.ok !== true) {
+          lastFailure = delivered.reason;
+          break;
+        }
+        frameIds.push(entry.id);
+        frames.push({ ...delivered, frameId: entry.id });
+      } catch (error) {
+        lastFailure = error?.message ?? String(error);
+        break;
+      } finally {
+        // 临时副本绝不跨越交付边界；删除失败只影响缓存卫生，不改变交付结果。
+        if (tempFile.length > 0) await rm(tempFile, { force: true }).catch(() => {});
+      }
+    }
+    if (frames.length === 0) return evidenceFailure(lastFailure || '证据帧已过期或不可用');
+    // 整体结果沿用最后一张的既有字段，另附 evidence/frameIds/frames 供 render 逐张输出图片块。
+    return { ...frames[frames.length - 1], evidence: true, frameIds, frames };
+  }
 
   // Privacy persists as a plugin-side capture lock only: booting into privacy touches no OBS
   // scene and starts no capture. The persisted return source/scene is restored when the user
@@ -15837,7 +15990,7 @@ export function apply(ctx, config) {
       // The 听觉 card's 音频保留 switch follows the persisted setting (default off), not a local
       // toggle; the clips themselves are read through `audio.retention.list`.
       retention: { enabled: audioRetention.isEnabled(), limits: { ...audioRetention.limits } },
-      // P-186/P-187 阶段 1 的只读证据状态：只给数量、时间、代次和计数，绝不暴露副本文件路径。
+      // P-186/P-187 阶段 1 的只读证据状态：只给数量、时间、代次、最近 id 和计数，绝不暴露副本文件路径。
       // 放在各自既有块里，不改原有字段语义，设置页/诊断脚本一次 status 就能看出窗口是否在工作。
       vision: {
         ...(status?.vision ?? {}),

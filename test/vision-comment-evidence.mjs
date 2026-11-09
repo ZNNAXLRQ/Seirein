@@ -71,6 +71,10 @@ test('attach 后 render：评论关联窗口/当前最新画面/把握齐全，�
   assert.ok(text.includes('晚于开口'), '最新画面晚于开口时必须明确不能倒过来解释评论');
   assert.ok(text.includes('关联把握：高（原因：window）'));
   assert.ok(text.includes('不要声称已经看见画面内容'), '图片内容尚未交付的边界必须写清楚');
+  assert.ok(
+    text.includes('如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）'),
+    '说明行指向按 id 回看的工具入口',
+  );
   assert.equal(text.includes('C:\\'), false, '渲染不含 Windows 路径');
   assert.equal(text.includes('cache'), false, '渲染不含缓存目录');
   assert.equal(text.includes('u-1'), false, '渲染不含台词/语句 id 正文');

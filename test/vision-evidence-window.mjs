@@ -76,6 +76,76 @@ test('登记与查询：按采集时间排序、来源/代次可过滤、同一�
   assert.deepEqual(added, [], '还在窗口内，没有淘汰');
 });
 
+test('byId：按传入顺序返回副本、去重、缺失/非法跳过，最多 32 条', () => {
+  let clock = NOW;
+  const window = createEvidenceWindow({
+    now: () => clock,
+    maxFrames: 400,
+    maxAgeMs: 60_000,
+    minGapMs: 0,
+  });
+  const ids = [];
+  for (let i = 0; i < 40; i += 1) {
+    clock = NOW + i;
+    const added = window.add(frame({ file: `frame-${i}.png`, capturedAt: clock }));
+    assert.ok(added !== null);
+    ids.push(added.id);
+  }
+
+  const reversed = window.byId(ids.slice().reverse());
+  assert.equal(reversed.length, 32, '最多返回 32 条');
+  assert.deepEqual(reversed.map((entry) => entry.id), ids.slice().reverse().slice(0, 32),
+    '返回顺序与传入顺序一致');
+
+  assert.deepEqual(window.byId([ids[0], ids[0], ids[1]]).map((entry) => entry.id), [ids[0], ids[1]],
+    '重复 id 去重');
+  assert.deepEqual(window.byId(ids[1]).map((entry) => entry.id), [ids[1]], '单个字符串也接受');
+  assert.deepEqual(window.byId([ids[0], 'ev-missing', 42, null, {}, [], '', '   ']).map((entry) => entry.id),
+    [ids[0]], '缺失/非法/空 id 跳过');
+  assert.deepEqual(window.byId(''), [], '空字符串返回空数组');
+  assert.deepEqual(window.byId(null), []);
+  assert.deepEqual(window.byId(undefined), []);
+  assert.deepEqual(window.byId([null, {}, [], 3]), []);
+
+  const copy = window.byId([ids[0]])[0];
+  copy.file = 'tampered.png';
+  assert.equal(window.byId([ids[0]])[0].file, 'frame-0.png', '返回的是记录副本');
+  assert.equal(copy.id, ids[0]);
+  assert.equal(typeof copy.capturedAt, 'number');
+  assert.equal(copy.source, 'desktop');
+  assert.equal(copy.kind, 'shot');
+  // byId 只读：窗口容量/代次/计数都不因查询改变。
+  assert.equal(window.state().frames, 40);
+  assert.equal(window.state().generation, 0);
+  assert.deepEqual(window.state().recentIds, ids.slice(-5), 'status 只暴露最近 5 个 id');
+});
+
+test('byId：淘汰后查不到；查询本身不触发淘汰或事件', () => {
+  let clock = NOW;
+  const evicted = [];
+  const events = [];
+  const window = createEvidenceWindow({
+    now: () => clock,
+    maxFrames: 1,
+    maxBytes: 10_000_000,
+    maxAgeMs: 60_000,
+    onEvict: (entry, reason) => evicted.push({ id: entry.id, reason }),
+    emit: (type, payload) => events.push({ type, payload }),
+  });
+  const first = window.add(frame({ file: 'a.png', capturedAt: NOW }));
+  clock = NOW + 1_000;
+  const second = window.add(frame({ file: 'b.png', capturedAt: clock }));
+  assert.deepEqual(evicted.map((entry) => entry.id), [first.id], '最旧的帧被容量淘汰');
+
+  const evictedBefore = evicted.length;
+  const eventsBefore = events.length;
+  assert.deepEqual(window.byId([first.id]), [], '已淘汰的 id 返回空数组');
+  assert.deepEqual(window.byId([first.id, second.id]).map((entry) => entry.id), [second.id],
+    '同一查询里缺失 id 跳过，存在的仍返回');
+  assert.equal(evicted.length, evictedBefore, 'byId 不触发淘汰');
+  assert.equal(events.length, eventsBefore, 'byId 不发事件');
+});
+
 test('去重：同源同代次且落在最小间隔内的帧算同一次变化', () => {
   const window = createEvidenceWindow({ now: () => NOW, minGapMs: 300 });
   assert.ok(window.add(frame({ file: 'a.png', capturedAt: NOW })));

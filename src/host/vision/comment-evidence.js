@@ -310,7 +310,7 @@ export function createCommentEvidence({
       `- 评论关联窗口：${clockText(windowFrom)}–${clockText(windowTo)}（窗口内 ${frameCount} 帧，关联 ${relatedCount} 帧）`,
       latestLine,
       `- 关联把握：${confidence}（原因：${reason}）`,
-      '- 说明：画面内容尚未经过后台理解；这里只有采集时间与帧数，不要声称已经看见画面内容。',
+      '- 说明：画面内容尚未经过后台理解；这里只有采集时间与帧数，不要声称已经看见画面内容。如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）。',
     ];
     return lines.join('\n').slice(0, charLimit());
   }
