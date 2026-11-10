@@ -326,7 +326,12 @@ import { createEvidenceWindow } from './vision/evidence-window.js';
 import { createEvidenceCapture } from './vision/evidence-capture.js';
 import { createMediaTimeline } from './hearing/media-timeline.js';
 // P-186/P-187 阶段 2：评论对齐（纯计算）与主请求里的“评论证据块”（纯状态/文本）。
-import { ALIGNMENT_DEFAULTS, alignComment } from './vision/comment-alignment.js';
+import {
+  ALIGNMENT_DEFAULTS,
+  TYPED_TURN_DEFAULTS,
+  alignComment,
+  alignTypedTurn,
+} from './vision/comment-alignment.js';
 import { createCommentEvidence, COMMENT_EVIDENCE_DEFAULTS } from './vision/comment-evidence.js';
 // P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
 import { createImageAnalyzer } from './vision/image-analyzer.js';
@@ -2925,8 +2930,9 @@ export function apply(ctx, config) {
     return null;
   };
   /**
-   * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁与 runtime context 完全一致：
-   * workspace + 陪伴 agent + voice lane + 视觉组件开启。
+   * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁：workspace + 陪伴 agent + 视觉组件开启；
+   * 语音轮按 voice lane，文字轮按本轮 pre-step 记录的 kind。取用时只认本轮绑定：
+   * typed 轮绝不回退到上一条麦克风记录（`commentEvidence.render` 的 turnId 查询）。
    *
    * `commentEvidence` 在本函数之后才初始化（挂载时的证据窗口之后）：这里只能在函数体内引用，
    * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
@@ -2935,16 +2941,42 @@ export function apply(ctx, config) {
     try {
       if (!inWorkspaceScope(context)) return '';
       if (!isCompanionAgent(context?.agent)) return '';
-      if (contextLaneOf(context) !== 'voice') return '';
       if (features.enabled('vision') !== true) return '';
       const agent = context?.agent;
       const id = typeof agent?.id === 'string' && agent.id.length > 0
         ? agent.id
         : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
       if (id.length === 0) return '';
-      const block = commentEvidence.render(id);
+      const trackedTurn = preRequestTurnBySession.get(id);
+      const turn = Number.isSafeInteger(trackedTurn) ? trackedTurn : null;
+      const kind = turn === null ? null : visionTurnKindOf(id, turn);
+      const typedTurn = kind?.kind === 'typed';
+      const lane = contextLaneOf(context);
+      if (lane === 'fastpath') return '';
+      // 没有本轮 kind 的旧渲染路径保持原 voice lane 门禁；typed 轮由 pre-step 的 kind 放行。
+      if (!typedTurn && lane !== 'voice') return '';
+      let block = '';
+      if (typedTurn) {
+        block = commentEvidence.render(id, { turnId: turn });
+      } else if (turn !== null) {
+        // 语音记录在 pre-step 被补上 turnId；极旧注入实例没有 bindTurn 时退回最近一条，
+        // 但绝不把 typed 块回退到语音轮。
+        block = commentEvidence.render(id, { turnId: turn });
+        if (block.length === 0) {
+          let latest = null;
+          try {
+            latest = typeof commentEvidence.take === 'function' ? commentEvidence.take(id) : null;
+          } catch {
+            latest = null;
+          }
+          if (latest === null || latest.timeSource !== 'typed-sent') block = commentEvidence.render(id);
+        }
+      } else {
+        block = commentEvidence.render(id);
+      }
       if (block.length === 0) return '';
       // 旧 hearing 没有 audioStartAt 时必须诚实标出时间来源；只补一行固定说明，不含正文。
+      if (typedTurn) return block;
       const time = commentEvidenceTime.get(id);
       if (time !== undefined && time.timeSource === 'fallback'
         && Date.now() - time.at <= UNDERSTANDING_FOCUS_TTL_MS) {
@@ -2978,8 +3010,18 @@ export function apply(ctx, config) {
       if (!understandingBlockAllowed({
         inScope: true, companion: true, subagent: false, visionEnabled, privacy, hasState: true,
       })) return '';
+      const agent = context?.agent;
+      const id = typeof agent?.id === 'string' && agent.id.length > 0
+        ? agent.id
+        : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
+      const trackedTurn = id.length > 0 ? preRequestTurnBySession.get(id) : undefined;
+      const turn = Number.isSafeInteger(trackedTurn) ? trackedTurn : null;
+      // 焦点只服务产生它的那一轮：typed 的 sentAt 窗口、语音的 audioStart/End 窗口都不能
+      // 永久套到后续轮次上。直接调用（没有 turn 的测试/旧路径）仍允许无 turn 的焦点。
       const focus = understandingFocus !== null
         && Date.now() - understandingFocus.at <= UNDERSTANDING_FOCUS_TTL_MS
+        && (understandingFocus.sessionId === undefined || understandingFocus.sessionId === id)
+        && (understandingFocus.turnId === undefined || turn === null || understandingFocus.turnId === turn)
         ? understandingFocus
         : null;
       return understanding.render(focus);
@@ -3005,7 +3047,9 @@ export function apply(ctx, config) {
       const understandingLane = voiceLane || lane === 'typed';
       return {
         recent: voiceLane && features.enabled('hearing') ? dialogueSummary.render() : '',
-        audiovisual: voiceLane ? commentEvidenceForContext(context) : '',
+        // 语音轮与 typed 轮都由 commentEvidenceForContext 自己按本轮 kind/turn 门禁；
+        // 普通非陪伴 typed 会话仍在这里被 companion 门挡住。
+        audiovisual: commentEvidenceForContext(context),
         understanding: understandingLane ? understandingForContext(context) : '',
       };
     } catch {
@@ -3061,7 +3105,11 @@ export function apply(ctx, config) {
     const ephemeralBlocks = [];
     if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
-    if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'audiovisual', text: audiovisualText, separator: '\n', keep: 'head' });
+    // 视听证据：语音轮由 lane 放行；文字轮由 pre-step 的 kind 放行（内部还会按 turn 取记录）。
+    // 空文本不产生块，因此普通 typed 会话不会多出一条空 observation。
+    if (inScope && companion && (lane === 'voice' || audiovisualText.length > 0)) {
+      ephemeralBlocks.push({ name: 'audiovisual', text: audiovisualText, separator: '\n', keep: 'head' });
+    }
     // P-187 阶段 3：画面理解排在视听证据之后；语音轮与文字陪伴轮都注入，但仍然只属于陪伴
     // 上下文（视觉开启、非隐私、有状态、非 subagent）。空文本返回 null，不占可见文本。
     let understandingVisionEnabled = false;
@@ -11195,11 +11243,13 @@ export function apply(ctx, config) {
     return evidenceShot.id;
   };
   /**
-   * P-186/P-187 阶段 2：本轮评论证据。只保留“一次终稿到达后的对齐结果”，按陪伴会话短暂存放；
-   * 主请求通过 runtime context 读取渲染文本（只有采集时间/帧数，没有图片、路径或台词正文）。
+   * P-186/P-187 阶段 2：本轮评论证据。只保留“一次终稿/一条文字发送后的对齐结果”，按陪伴
+   * 会话短暂存放；主请求通过 runtime context 按当前 turn 读取渲染文本（只有采集时间/帧数，
+   * 没有图片、路径或台词正文）。默认 TTL 用本轮范围（30s），不再是 120s 的全局便车。
    * `config.commentEvidence` 是测试注入缝（和 `dialogueContext` 一样）：生产 config 来自 JSON。
    */
-  const commentEvidence = config?.commentEvidence ?? createCommentEvidence();
+  const commentEvidence = config?.commentEvidence
+    ?? createCommentEvidence({ ttlMs: COMMENT_EVIDENCE_DEFAULTS.turnTtlMs });
   /**
    * P0：评论证据的语音时间来源。comment-evidence 为了“不写正文”只保留时间/帧数，这里
    * 单独记一个极小的 per-session 标记，渲染时只用它补一行“回退”说明；不含台词/路径。
@@ -11916,6 +11966,9 @@ export function apply(ctx, config) {
       commentEvidence.attach({
         sessionId: target.sessionId,
         utteranceId,
+        // 语音轮记录真实开口/端点时间；turnId 在紧随其后的 pre-step 补上（finish 时还没有 turn）。
+        sentAt: start,
+        timeSource: speech.timeSource,
         startedAt: start,
         endedAt: end,
         alignment,
@@ -11948,11 +12001,13 @@ export function apply(ctx, config) {
         : evidenceFrom;
       const focusTo = Number.isFinite(alignment.window?.to) ? alignment.window.to : end;
       understandingFocus = {
+        sessionId: target.sessionId,
         from: focusFrom,
         to: focusTo,
         ...(focusShot === null ? {} : { shotId: focusShot }),
         retrospective: alignment.cues?.retrospective === true,
         current: alignment.cues?.current === true,
+        timeSource: speech.timeSource,
         at,
       };
       // P-187 阶段 3：用户评论优先触发一次画面理解（仍受调度器的最短间隔约束）。
@@ -12396,6 +12451,30 @@ export function apply(ctx, config) {
    * written exactly where `beginTurn` is, so both always name the same turn.
    */
   const preRequestTurnBySession = new Map();
+  /**
+   * Session -> this turn's input kind (`typed` / `voice`) and the Host-recorded send time.
+   * The pre-step is the one place that knows both the turn and its delivered user message, so it
+   * writes this before any prompt context renders. Bounded LRU: an old session cannot grow it.
+   */
+  const turnVisionKind = new Map();
+  const rememberTurnVisionKind = (sessionId, turn, kind, sentAt = null) => {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return;
+    if (!Number.isSafeInteger(turn) || turn < 0) return;
+    if (kind !== 'typed' && kind !== 'voice') return;
+    turnVisionKind.delete(sessionId);
+    turnVisionKind.set(sessionId, { turn, kind, sentAt: Number.isFinite(sentAt) ? sentAt : null });
+    while (turnVisionKind.size > 32) {
+      const oldest = turnVisionKind.keys().next().value;
+      if (oldest === undefined) break;
+      turnVisionKind.delete(oldest);
+    }
+  };
+  const visionTurnKindOf = (sessionId, turn) => {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return null;
+    if (!Number.isSafeInteger(turn)) return null;
+    const entry = turnVisionKind.get(sessionId);
+    return entry !== undefined && entry.turn === turn ? entry : null;
+  };
   /** The owner of the turn a tool call belongs to; `null` when no turn was opened for it. */
   const preRequestOwner = (exec) => {
     const sessionId = typeof exec?.agent?.session?.id === 'string' ? exec.agent.session.id : '';
@@ -13241,6 +13320,147 @@ export function apply(ctx, config) {
       return false;
     }
   };
+  /**
+   * The genuine user message of this pre-step: runtime context, the daily digest and the
+   * plugin's own injected block are not the turn's words. Mirrors `memoryQueryText`.
+   */
+  const visionTurnMessage = (payload) => {
+    const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message === null || typeof message !== 'object' || message.role !== 'user') continue;
+      if (message.source?.kind !== 'user') continue;
+      const text = messageTextBlocks(message).trim();
+      if (text.length === 0) continue;
+      return {
+        id: typeof message.id === 'string' && message.id.length > 0 ? message.id : '',
+        text,
+      };
+    }
+    return null;
+  };
+  /**
+   * voice 投递在 `noteDelivery` 时用 request.id 登记：pre-step 看到的同一条 user/message
+   * 若命中该映射就是语音轮；没有登记的就是 typed 轮（不靠 lane 猜，陪伴会话里的打字也算 typed）。
+   * `speakerUtteranceByMessage` 在本函数之后才初始化，闭包只在真实 pre-step 时读取。
+   */
+  const visionTurnInputKind = (message) => {
+    if (message === null || message.id.length === 0) return '';
+    try {
+      if (speakerUtteranceByMessage.has(message.id)) return 'voice';
+    } catch {
+      /* unreadable cache falls through to typed */
+    }
+    return 'typed';
+  };
+  /**
+   * P1：typed 轮没有音频端点。用 Host 在 pre-step 记录的发送时刻（sentAt）建立本轮窗口，
+   * 从证据窗口按区间取画面、按当前镜头建理解焦点；绝不读取上一条麦克风终稿时间。
+   *
+   * 窗口：`[sentAt - 8s, sentAt + 2s]`（回溯词仍由 alignComment 扩到 16s）；证据实际按
+   * 最远回溯范围取，避免“刚才那个”因只取了 8s 而缺帧。
+   */
+  const rememberTypedVisionTurn = ({ sessionId, turn, text, source }) => {
+    const sentAt = Date.now();
+    rememberTurnVisionKind(sessionId, turn, 'typed', sentAt);
+    // 与画面无关的闲聊不强行 attach：本轮不产生评论块，也不留下可被下一轮借用的焦点。
+    if (speechReferenceOf(text) === 'unrelated') {
+      understandingFocus = null;
+      void log.emit('vision.comment.skipped', {
+        reason: 'unrelated', turnId: turn, timeSource: 'typed-sent',
+      }).catch(() => {});
+      return;
+    }
+    const lookback = Number(ALIGNMENT_DEFAULTS.lookbackMs) || 8_000;
+    const factor = Number(ALIGNMENT_DEFAULTS.retrospectiveFactor) || 2;
+    const after = Number(TYPED_TURN_DEFAULTS.afterMs) || 2_000;
+    const evidenceFrom = Math.max(0, sentAt - lookback * factor);
+    const evidenceTo = sentAt + after;
+    const evidence = evidenceWindow.between(evidenceFrom, evidenceTo, {
+      source,
+      sourceEpoch: visionGeneration,
+    });
+    const latest = evidenceWindow.latest({ source, sourceEpoch: visionGeneration });
+    const latestId = latest === null ? null : latest.id;
+    const latestAt = latest === null ? null : (latest.endedAt ?? latest.capturedAt);
+    // 与语音轮一致：跨发送时刻的故事板用它在发送时仍可见的最后一刻做代表点，
+    // 完全在发送后的故事板保留真实 capturedAt，只进 afterSpeech。
+    const alignmentEvidence = evidence.map((entry) => {
+      const entryStart = Number(entry.startedAt ?? entry.capturedAt);
+      const entryEnd = Number(entry.endedAt ?? entry.capturedAt);
+      const capturedAt = entryStart <= sentAt
+        ? Math.max(entryStart, Math.min(entryEnd, sentAt))
+        : entry.capturedAt;
+      return { ...entry, capturedAt };
+    });
+    const alignment = alignTypedTurn({
+      text,
+      sentAt,
+      evidence: alignmentEvidence,
+      latestId,
+      now: () => sentAt,
+    });
+    alignment.relevance = 'related';
+    const shotById = new Map(evidence.map((entry) => [entry.id, entry.shotId ?? null]));
+    const relatedShot = (Array.isArray(alignment.relatedFrameIds) ? alignment.relatedFrameIds : [])
+      .map((id) => shotById.get(id))
+      .find((shotId) => typeof shotId === 'string' && shotId.length > 0);
+    // 回溯词优先“上一镜头”；否则用当前最新镜头；都拿不到就只按时间窗口选事件。
+    const focusShot = alignment.cues?.retrospective === true && relatedShot !== undefined
+      ? relatedShot
+      : (latest?.shotId ?? relatedShot ?? null);
+    const focusFrom = Number.isFinite(alignment.window?.from) ? alignment.window.from : evidenceFrom;
+    const focusTo = Number.isFinite(alignment.window?.to) ? alignment.window.to : evidenceTo;
+    // 评论块写“窗口内 N 帧”时必须只数最终窗口内的证据；16s 回溯取样不等于 8s 窗口。
+    const frameCount = evidence.filter((entry) => {
+      const entryStart = Number(entry.startedAt ?? entry.capturedAt);
+      const entryEnd = Number(entry.endedAt ?? entry.capturedAt);
+      return Number.isFinite(entryStart) && Number.isFinite(entryEnd)
+        && entryEnd >= focusFrom && entryStart <= focusTo;
+    }).length;
+    // 先把本轮记录写进评论证据；理解块与它共用同一窗口/镜头，不再各说各的。
+    commentEvidence.attach({
+      sessionId,
+      turnId: turn,
+      sentAt,
+      timeSource: 'typed-sent',
+      startedAt: sentAt,
+      endedAt: sentAt,
+      alignment,
+      latestId,
+      latestAt,
+      frameCount,
+    });
+    understandingFocus = {
+      sessionId,
+      turnId: turn,
+      from: focusFrom,
+      to: focusTo,
+      ...(focusShot === null ? {} : { shotId: focusShot }),
+      retrospective: alignment.cues?.retrospective === true,
+      current: alignment.cues?.current === true,
+      timeSource: 'typed-sent',
+      at: sentAt,
+    };
+    // 没有本窗口证据时不排队一次空分析；评论块仍会诚实写“无已登记画面”。
+    if (evidence.length > 0) {
+      noteUnderstandingChange({
+        reason: 'typed',
+        from: focusFrom,
+        to: focusTo,
+        priority: true,
+      });
+    }
+    void log.emit('vision.comment.typed', {
+      turnId: turn,
+      from: focusFrom,
+      to: focusTo,
+      frames: evidence.length,
+      related: alignment.relatedFrameIds.length,
+      confidence: alignment.confidence,
+      timeSource: 'typed-sent',
+    }).catch(() => {});
+  };
   const prepareVisionForTurn = async (payload, decision) => {
     if (Number(payload?.step) !== 1) return;
     if (decision === null || typeof decision !== 'object' || decision.kind === 'reject') return;
@@ -13271,6 +13491,39 @@ export function apply(ctx, config) {
       enabled = false;
     }
     if (!enabled) return;
+    // P1：先定性本轮输入（voice / typed），再记录本轮窗口。typed 轮只用自己的 sentAt，
+    // 绝不复用上一条麦克风终稿时间；语音轮保持既有 audioStartAt/audioEndAt 语义。
+    const inputMessage = visionTurnMessage(payload);
+    if (inputMessage !== null) {
+      const inputKind = visionTurnInputKind(inputMessage);
+      if (inputKind === 'voice') {
+        rememberTurnVisionKind(sessionId, turn, 'voice');
+        // 语音终稿先于 pre-step 到达；这里把记录补绑到本 turn，渲染只认本轮。
+        try {
+          if (typeof commentEvidence.bindTurn === 'function') {
+            commentEvidence.bindTurn(sessionId, turn, { maxAgeMs: 10_000 });
+          }
+        } catch {
+          /* 旧注入实例没有 bindTurn：渲染侧仍会退回最近一条语音记录 */
+        }
+        if (understandingFocus !== null
+          && understandingFocus.sessionId === sessionId
+          && understandingFocus.turnId === undefined) {
+          understandingFocus = { ...understandingFocus, turnId: turn };
+        }
+      } else if (inputKind === 'typed') {
+        if (companionTurn) {
+          rememberTypedVisionTurn({ sessionId, turn, text: inputMessage.text, source });
+        } else {
+          // 普通 GUI/编码 typed 会话不是当天陪伴会话：如实记录“没有注入”，不伪造评论证据。
+          rememberTurnVisionKind(sessionId, turn, 'typed', Date.now());
+          understandingFocus = null;
+          void log.emit('vision.comment.skipped', {
+            reason: 'not-companion', turnId: turn, timeSource: 'typed-sent',
+          }).catch(() => {});
+        }
+      }
+    }
     // 独立开关关闭时，首轮也不得启动持续采集；evidenceCaptureAllowed 还会再核一次。
     if (firstCompanionTurn && continuousViewEnabled()) void startEvidenceCapture('first-turn');
     if (!visionLookRequested(payload?.messages)) return;
@@ -15099,7 +15352,8 @@ export function apply(ctx, config) {
     const recentText = lane === 'voice' && features.enabled('hearing') ? dialogueContext.render() : '';
     const ephemeralText = [
       lane === 'voice' ? nonverbalCue.render() : '',
-      lane === 'voice' ? commentEvidenceForContext(context) : '',
+      // 内部按本轮 kind/turn 门禁；typed 陪伴轮有本轮记录时才产生文本。
+      commentEvidenceForContext(context),
       lane === 'voice' || lane === 'typed' ? understandingForContext(context) : '',
       renderEnvironment(),
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');

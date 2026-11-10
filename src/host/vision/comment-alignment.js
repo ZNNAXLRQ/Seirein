@@ -27,6 +27,14 @@ export const ALIGNMENT_DEFAULTS = Object.freeze({
 });
 
 /**
+ * 文字轮（typed）没有音频端点，只有 Host 在 pre-step 记录的发送时刻。
+ * 窗口向前覆盖发送前 8 秒，向后留 2 秒给“发送后立刻发生”的画面；不是语音端点语义。
+ */
+export const TYPED_TURN_DEFAULTS = Object.freeze({
+  afterMs: 2_000,
+});
+
+/**
  * 回溯词：用户明确在说“已经发生过的画面”。
  * 用包含匹配而不是分词：中文口语里的“刚才那个”“刚刚那下”都包含这些词根。
  */
@@ -142,7 +150,7 @@ function detectCues(text) {
  * @param {object} [options]
  * @param {string} [options.text] 用户评论文本
  * @param {number|null} [options.startedAt] 用户开口时刻（必填才可对齐）
- * @param {number|null} [options.endedAt] 识别完成时刻；缺省或早于开口时用 now
+ * @param {number|null} [options.endedAt] 本轮窗口结束（语音轮是 hearing 的 audioEndAt 端点，不是识别完成时刻）
  * @param {Array<{id: string, capturedAt: number}>} [options.evidence] 证据窗口元数据
  * @param {string|number|null} [options.latestId] 已知的当前最新画面 id
  * @param {() => number} [options.now] 当前时刻函数
@@ -232,5 +240,99 @@ export function alignComment({
     confidence,
     reason,
     cues,
+  };
+}
+
+/**
+ * 文字轮的时间窗口：`[sentAt - lookbackMs, sentAt + afterMs]`。
+ * 没有发送时刻返回 null；绝不拿“上一条麦克风终稿”或转写完成时间替代。
+ *
+ * @param {object} [options]
+ * @param {number|null} [options.sentAt] Host 在 typed pre-step 记录的发送时刻
+ * @param {number} [options.lookbackMs] 发送前的搜索范围
+ * @param {number} [options.afterMs] 发送后的宽限
+ * @returns {{from:number,to:number,sentAt:number,timeSource:'typed-sent'}|null}
+ */
+export function typedTurnWindow({ sentAt = null, lookbackMs, afterMs } = {}) {
+  const start = finiteNumber(sentAt);
+  if (start === null || start < 0) return null;
+  const lookbackValue = finiteNumber(lookbackMs);
+  const lookback = lookbackValue !== null && lookbackValue > 0
+    ? lookbackValue
+    : ALIGNMENT_DEFAULTS.lookbackMs;
+  const afterValue = finiteNumber(afterMs);
+  const after = afterValue !== null && afterValue >= 0
+    ? afterValue
+    : TYPED_TURN_DEFAULTS.afterMs;
+  return {
+    from: Math.max(0, start - lookback),
+    to: start + after,
+    sentAt: start,
+    timeSource: 'typed-sent',
+  };
+}
+
+/**
+ * 把一条 typed 消息对齐到它自己的发送窗口。
+ *
+ * 与语音轮共用 `alignComment` 的线索/相关帧规则，但 `startedAt` 一定是 `sentAt`，
+ * `endedAt` 是发送后的宽限点；没有音频、没有 partial、也没有识别完成时间参与。
+ * 返回的 `window` 是最终（可能因“刚才”扩到 16 秒）的可检索窗口，宿主据此选理解事件。
+ *
+ * @param {object} [options]
+ * @param {string} [options.text] 用户这条文字消息
+ * @param {number|null} [options.sentAt] Host 记录的发送时刻
+ * @param {Array<{id:string,capturedAt:number}>} [options.evidence] 证据窗口元数据
+ * @param {string|number|null} [options.latestId] 已知当前最新画面 id
+ * @param {() => number} [options.now] 当前时刻函数
+ * @param {number} [options.lookbackMs]
+ * @param {number} [options.afterMs]
+ * @param {number} [options.maxFrames]
+ */
+export function alignTypedTurn({
+  text = '',
+  sentAt = null,
+  evidence = [],
+  latestId = null,
+  now = Date.now,
+  lookbackMs,
+  afterMs,
+  maxFrames,
+} = {}) {
+  const cues = detectCues(text);
+  const typed = typedTurnWindow({ sentAt, lookbackMs, afterMs });
+  if (typed === null) {
+    const frames = collectFrames(evidence);
+    const requestedLatest = explicitId(latestId);
+    return {
+      ok: false,
+      window: { from: null, to: null },
+      relatedFrameIds: [],
+      latestFrameId: requestedLatest.length > 0
+        ? requestedLatest
+        : (frames.length === 0 ? null : frames[frames.length - 1].id),
+      afterSpeechFrameIds: [],
+      confidence: 'low',
+      reason: 'no-sent',
+      cues,
+      timeSource: 'typed-sent',
+      sentAt: null,
+    };
+  }
+  const aligned = alignComment({
+    text,
+    startedAt: typed.sentAt,
+    endedAt: typed.to,
+    evidence,
+    latestId,
+    now,
+    lookbackMs,
+    maxFrames,
+  });
+  return {
+    ...aligned,
+    timeSource: 'typed-sent',
+    sentAt: typed.sentAt,
+    sentAtWindow: { ...typed },
   };
 }

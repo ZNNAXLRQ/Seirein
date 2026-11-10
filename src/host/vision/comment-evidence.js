@@ -16,10 +16,17 @@
 
 /** 第一版试验参数；不是冻结值，按本机实测再调。 */
 export const COMMENT_EVIDENCE_DEFAULTS = Object.freeze({
-  /** 一条对齐结果只服务“紧接着的这一轮”；超时后主请求不再看到旧评论证据。 */
+  /**
+   * 旧接口的兼容常量。新建实例默认使用 `turnTtlMs`（30s）；只有调用方显式传 `ttlMs`
+   * 时才按旧的长保留时间工作。一条对齐结果只服务“紧接着的这一轮”。
+   */
   ttlMs: 120_000,
+  /** 本轮记录的实际 TTL：30 秒足以覆盖一次投递/排队，又不会活到下一轮。 */
+  turnTtlMs: 30_000,
   /** 同时保留的会话数：语音通常只有一个陪伴会话，留几个余量给跨日/重连。 */
   maxSessions: 8,
+  /** 每个会话最多保留的按轮记录数；旧式 attach（无 turn）仍只留最近一条。 */
+  maxPerSession: 4,
   /** 主请求里的文本上限：只放时间/帧数，超长直接截断，不把整段对齐结果塞进提示词。 */
   maxChars: 400,
 });
@@ -63,6 +70,20 @@ function idText(value) {
   }
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return null;
+}
+
+/**
+ * 时间来源只接受本模块认识的机器码：
+ *   - `audio`   真实 hearing 采集区间；
+ *   - `fallback` 旧 hearing 缺 audioStartAt，退回首个非空 partial；
+ *   - `typed-sent` 文字轮，没有音频，按 Host 记录的发送时刻。
+ * 其他值一律为空，渲染时回退到旧文案，绝不把第三方字符串带进提示词。
+ */
+const KNOWN_TIME_SOURCES = new Set(['audio', 'fallback', 'typed-sent']);
+function timeSourceOf(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim().toLowerCase();
+  return KNOWN_TIME_SOURCES.has(text) ? text : '';
 }
 
 /** 一组帧 id：只复制字符串/数字，跳过坏项；有界，避免调用方塞入超长数组。 */
@@ -121,6 +142,8 @@ function copyAlignment(input) {
     relatedFrameIds: idList(input.relatedFrameIds),
     afterSpeechFrameIds: idList(input.afterSpeechFrameIds),
     latestFrameId: idText(input.latestFrameId),
+    timeSource: timeSourceOf(input.timeSource),
+    relevance: typeof input.relevance === 'string' ? input.relevance.trim().slice(0, 32) : '',
   };
 }
 
@@ -133,13 +156,18 @@ function cloneAlignment(alignment) {
     relatedFrameIds: alignment.relatedFrameIds.slice(),
     afterSpeechFrameIds: alignment.afterSpeechFrameIds.slice(),
     latestFrameId: alignment.latestFrameId,
+    timeSource: alignment.timeSource,
+    relevance: alignment.relevance,
   };
 }
 
 function snapshotRecord(record) {
   return {
     sessionId: record.sessionId,
+    turnId: record.turnId,
     utteranceId: record.utteranceId,
+    sentAt: record.sentAt,
+    timeSource: record.timeSource,
     startedAt: record.startedAt,
     endedAt: record.endedAt,
     alignment: cloneAlignment(record.alignment),
@@ -195,12 +223,14 @@ function reviewFrameIds(alignment) {
  * @param {() => number} [options.now]
  * @param {number} [options.ttlMs]
  * @param {number} [options.maxSessions]
+ * @param {number} [options.maxPerSession]
  * @param {number} [options.maxChars]
  */
 export function createCommentEvidence({
   now = Date.now,
-  ttlMs = COMMENT_EVIDENCE_DEFAULTS.ttlMs,
+  ttlMs = COMMENT_EVIDENCE_DEFAULTS.turnTtlMs,
   maxSessions = COMMENT_EVIDENCE_DEFAULTS.maxSessions,
+  maxPerSession = COMMENT_EVIDENCE_DEFAULTS.maxPerSession,
   maxChars = COMMENT_EVIDENCE_DEFAULTS.maxChars,
 } = {}) {
   const clock = () => {
@@ -211,31 +241,95 @@ export function createCommentEvidence({
       return Date.now();
     }
   };
-  const ttl = () => (Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : COMMENT_EVIDENCE_DEFAULTS.ttlMs);
+  const ttl = () => (Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : COMMENT_EVIDENCE_DEFAULTS.turnTtlMs);
   const sessionLimit = () => (Number.isFinite(maxSessions) && maxSessions > 0
     ? Math.max(1, Math.floor(maxSessions))
     : COMMENT_EVIDENCE_DEFAULTS.maxSessions);
+  const perSessionLimit = () => (Number.isFinite(maxPerSession) && maxPerSession > 0
+    ? Math.max(1, Math.floor(maxPerSession))
+    : COMMENT_EVIDENCE_DEFAULTS.maxPerSession);
   const charLimit = () => (Number.isFinite(maxChars) && maxChars > 0
     ? Math.floor(maxChars)
     : COMMENT_EVIDENCE_DEFAULTS.maxChars);
 
-  /** 按 attach 顺序保存；重新 attach 同一会话会移到队尾（最近使用）。 */
+  /**
+   * `sessionId -> 最近记录数组`。不带轮次绑定的旧式 attach 仍只替换最近一条；
+   * 带 `turnId`（typed 轮）或 `timeSource:'typed-sent'` 的记录按轮追加，每会话有界。
+   * 会话本身仍按最近使用排序，供 `maxSessions` 淘汰。
+   */
   const records = new Map();
   /** 只做计数，不含任何正文；status 只读这个投影。 */
   const stats = { attached: 0, expired: 0, evicted: 0 };
 
-  /** TTL 读时清理：take/render/state/attach 都会先走这里。 */
+  /** 一次查询只接受 turnId/utteranceId/sentAt 或时间窗口；全空视为“没有查询”。 */
+  function queryOf(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+    const turnId = idText(value.turnId);
+    const utteranceId = idText(value.utteranceId);
+    const sentAt = timestamp(value.sentAt);
+    const from = timestamp(value.from);
+    const to = timestamp(value.to);
+    const timeSource = timeSourceOf(value.timeSource);
+    if (turnId === null && utteranceId === null && sentAt === null
+      && from === null && to === null) return null;
+    return { turnId, utteranceId, sentAt, from, to, timeSource };
+  }
+
+  /** 记录的有效窗口：优先对齐窗口，旧记录退回开口/发送时间。 */
+  function recordWindow(record) {
+    const from = record.alignment.window.from ?? record.startedAt ?? record.sentAt;
+    const to = record.alignment.window.to ?? record.endedAt ?? record.sentAt;
+    if (from === null || to === null) return null;
+    return { from, to };
+  }
+
+  /**
+   * 只返回与本轮查询相关的记录。turnId 是强绑定：查 t7 时绝不再回退到“最近一条”
+   * （上一条麦克风记录），这样 typed 轮不会搭上一轮语音的便车。
+   */
+  function matchesQuery(record, query) {
+    if (query.timeSource.length > 0 && record.timeSource !== query.timeSource) return false;
+    if (query.turnId !== null) return record.turnId !== null && record.turnId === query.turnId;
+    if (query.utteranceId !== null) {
+      return record.utteranceId.length > 0 && record.utteranceId === query.utteranceId;
+    }
+    if (query.sentAt !== null && query.from === null && query.to === null) {
+      if (record.sentAt !== null && record.sentAt === query.sentAt) return true;
+      const window = recordWindow(record);
+      return window !== null && query.sentAt >= window.from && query.sentAt <= window.to;
+    }
+    const window = recordWindow(record);
+    if (window === null) return false;
+    const from = query.from ?? query.to;
+    const to = query.to ?? query.from;
+    if (from === null || to === null) return false;
+    return window.to >= from && window.from <= to;
+  }
+
+  function latestRecord(key) {
+    const list = records.get(key);
+    return list === undefined || list.length === 0 ? null : list[list.length - 1];
+  }
+
+  /** TTL 读时清理：take/render/state/attach/bindTurn 都会先走这里。 */
   function sweep(current) {
-    for (const [key, record] of records) {
-      if (current - record.at >= ttl()) {
-        records.delete(key);
-        stats.expired += 1;
+    for (const [key, list] of records) {
+      let kept = 0;
+      for (const record of list) {
+        if (current - record.at >= ttl()) {
+          stats.expired += 1;
+          continue;
+        }
+        list[kept] = record;
+        kept += 1;
       }
+      list.length = kept;
+      if (list.length === 0) records.delete(key);
     }
   }
 
   /**
-   * 覆盖该 session 的最近一条。入参（包括 alignment 里的对象/数组）全部复制；空 session 不落库。
+   * 追加/替换一条记录，入参（包括 alignment 里的对象/数组）全部复制；空 session 不落库。
    * 畸形 alignment 不抛错，只按“低/未知”渲染。
    * @returns {object|null} 归一化后的快照；session 非法时 null。
    */
@@ -248,9 +342,14 @@ export function createCommentEvidence({
     const alignment = copyAlignment(input.alignment);
     const relatedCount = alignment.relatedFrameIds.length;
     const declaredFrames = nonNegativeInteger(input.frameCount);
+    const turnId = idText(input.turnId);
+    const timeSource = timeSourceOf(input.timeSource) || alignment.timeSource;
     const record = {
       sessionId,
+      turnId,
       utteranceId: idText(input.utteranceId) ?? '',
+      sentAt: timestamp(input.sentAt) ?? timestamp(input.startedAt),
+      timeSource,
       startedAt: timestamp(input.startedAt),
       endedAt: timestamp(input.endedAt),
       alignment,
@@ -260,9 +359,36 @@ export function createCommentEvidence({
       frameCount: declaredFrames ?? relatedCount,
       at: current,
     };
-    // 覆盖同一会话并移到队尾，让 maxSessions 淘汰的总是“最久没更新的会话”。
+    const list = records.get(sessionId) ?? [];
+    // 只有按轮记录（typed）或显式 turnId 才追加；旧式语音 attach 仍覆盖最近一条。
+    const separated = turnId !== null || timeSource === 'typed-sent';
+    let replaced = false;
+    if (separated && turnId !== null) {
+      const index = list.findIndex((entry) => entry.turnId === turnId);
+      if (index >= 0) {
+        list[index] = record;
+        replaced = true;
+      }
+    } else if (separated) {
+      for (let index = list.length - 1; index >= 0; index -= 1) {
+        if (list[index].timeSource === 'typed-sent' && list[index].turnId === null) {
+          list[index] = record;
+          replaced = true;
+          break;
+        }
+      }
+    } else if (list.length > 0) {
+      list[list.length - 1] = record;
+      replaced = true;
+    }
+    if (!replaced) list.push(record);
+    while (list.length > perSessionLimit()) {
+      list.shift();
+      stats.evicted += 1;
+    }
+    // 会话移到队尾，让 maxSessions 淘汰的总是“最久没更新的会话”。
     records.delete(sessionId);
-    records.set(sessionId, record);
+    records.set(sessionId, list);
     stats.attached += 1;
     while (records.size > sessionLimit()) {
       const oldest = records.keys().next().value;
@@ -273,31 +399,58 @@ export function createCommentEvidence({
     return snapshotRecord(record);
   }
 
-  /** 当前有效记录；过期/未知返回 null。返回副本，调用方改不到内部状态。 */
-  function take(sessionId) {
+  /**
+   * 把最近一条尚未绑定轮次的语音记录绑定到本轮。语音终稿先于 pre-step 到达，
+   * 因此由 pre-step 在拿到 turn 后补上；typed 记录在 attach 时已带 turnId。
+   * `maxAgeMs` 可选：只绑定足够新的记录，避免把上一轮遗漏的旧记录补绑到新 turn。
+   * @returns {object|null} 绑定后的快照；没有可绑定记录时 null。
+   */
+  function bindTurn(sessionId, turnId, { maxAgeMs } = {}) {
     const key = sessionKey(sessionId);
-    if (key.length === 0) return null;
+    const turn = idText(turnId);
+    if (key.length === 0 || turn === null) return null;
     const current = clock();
     sweep(current);
-    const record = records.get(key);
-    return record === undefined ? null : snapshotRecord(record);
+    const limit = Number.isFinite(maxAgeMs) && maxAgeMs >= 0 ? maxAgeMs : null;
+    const list = records.get(key);
+    if (list === undefined) return null;
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const record = list[index];
+      if (record.turnId === turn) return snapshotRecord(record);
+      if (record.turnId === null && record.timeSource !== 'typed-sent') {
+        if (limit !== null && current - record.at > limit) return null;
+        record.turnId = turn;
+        return snapshotRecord(record);
+      }
+    }
+    return null;
   }
 
   /**
-   * 主请求用的中文块：只含时间、帧数、把握、可回看帧 id 与“尚无画面理解”的边界说明。
-   * 无记录/过期返回 ''，宿主注册的 context 因此不会产生空块。
+   * 当前有效记录；过期/未知返回 null。返回副本，调用方改不到内部状态。
+   * 传 `query` 时只返回本轮相关记录（turnId/utteranceId/窗口），不匹配就返回 null。
    */
-  function render(sessionId) {
+  function take(sessionId, query = null) {
     const key = sessionKey(sessionId);
-    if (key.length === 0) return '';
-    const current = clock();
-    sweep(current);
-    const record = records.get(key);
-    if (record === undefined) return '';
+    if (key.length === 0) return null;
+    sweep(clock());
+    const parsed = queryOf(query);
+    if (parsed === null) {
+      const record = latestRecord(key);
+      return record === null ? null : snapshotRecord(record);
+    }
+    const list = records.get(key) ?? [];
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      if (matchesQuery(list[index], parsed)) return snapshotRecord(list[index]);
+    }
+    return null;
+  }
 
+  /** 语音轮沿用原文案（开口/端点/评论窗口）；typed 轮没有音频，必须换一套诚实的文案。 */
+  function renderRecord(record) {
     const alignment = record.alignment;
-    const windowFrom = alignment.window.from ?? record.startedAt;
-    const windowTo = alignment.window.to ?? record.endedAt;
+    const windowFrom = alignment.window.from ?? record.startedAt ?? record.sentAt;
+    const windowTo = alignment.window.to ?? record.endedAt ?? record.sentAt;
     const confidence = alignment.confidence === 'high' ? '高' : '低';
     const reason = reasonText(alignment.reason);
     const frameCount = Number.isInteger(record.frameCount) && record.frameCount > 0
@@ -311,20 +464,37 @@ export function createCommentEvidence({
     const reviewLine = reviewIds.length > 0
       ? `- 可回看帧：${reviewIds.join(', ')}（最多 3 个，调用 assistant_see 的 evidenceFrameIds）`
       : '- 可回看帧：本次没有可回看的关联帧';
+    const typed = record.timeSource === 'typed-sent';
+    const anchorLabel = typed ? '发送' : '开口';
+    const anchorAt = typed ? (record.sentAt ?? record.startedAt) : record.startedAt;
 
     let latestLine;
     if (record.latestAt !== null) {
-      // 没有开口时间就不假装比较先后；有开口时间才说“晚于/不晚于”。
-      const relation = record.startedAt === null
+      // 没有基准时间就不假装比较先后；有基准时间才说“晚于/不晚于”。
+      const relation = anchorAt === null
         ? '只能回答“现在”，不能倒过来解释评论'
-        : (record.latestAt > record.startedAt
-          ? '晚于开口，只能回答“现在”，不能倒过来解释评论'
-          : '不晚于开口，仍不能替代评论关联窗口');
+        : (record.latestAt > anchorAt
+          ? `晚于${anchorLabel}，只能回答“现在”，不能倒过来解释评论`
+          : `不晚于${anchorLabel}，仍不能替代评论关联窗口`);
       latestLine = `- 当前最新画面：${clockText(record.latestAt)} 采集（${relation}）`;
     } else if (record.latestId !== null) {
       latestLine = '- 当前最新画面：最新帧已登记，采集时间未知（只能回答“现在”，不能倒过来解释评论）';
     } else {
       latestLine = '- 当前最新画面：无已登记画面（不能声称已经看见画面内容）';
+    }
+
+    if (typed) {
+      const lines = [
+        '【视听证据｜本轮文字发送】',
+        `- 文字发送：${clockText(anchorAt)}（Host 时钟；本轮无音频）`,
+        `- 关联窗口：${clockText(windowFrom)}–${clockText(windowTo)}（窗口内 ${frameCount} 帧，关联 ${relatedCount} 帧）`,
+        latestLine,
+        `- 关联把握：${confidence}（原因：${reason}）`,
+        '- 时间来源：typed-sent（无音频，按发送时刻选择画面）',
+        reviewLine,
+        '- 说明：文字轮没有音频区间；画面内容尚未经过后台理解；这里只有采集时间与帧数，不要声称已经看见画面内容。如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）。',
+      ];
+      return lines.join('\n').slice(0, charLimit());
     }
 
     const lines = [
@@ -338,6 +508,19 @@ export function createCommentEvidence({
       '- 说明：画面内容尚未经过后台理解；这里只有采集时间与帧数，不要声称已经看见画面内容。如需回看关联帧，可调用 assistant_see 并传入 evidenceFrameIds（最多 3 个）。',
     ];
     return lines.join('\n').slice(0, charLimit());
+  }
+
+  /**
+   * 主请求用的中文块：只含时间、帧数、把握、可回看帧 id 与“尚无画面理解”的边界说明。
+   * 无记录/过期返回 ''，宿主注册的 context 因此不会产生空块。
+   * 传 `query` 时只渲染本轮绑定记录；本轮没有绑定就返回 ''（typed 轮不套上一条麦克风评论）。
+   */
+  function render(sessionId, query = null) {
+    const key = sessionKey(sessionId);
+    if (key.length === 0) return '';
+    const record = take(key, query);
+    if (record === null) return '';
+    return renderRecord(record);
   }
 
   /** 会话边界：只清这一条，不碰其他会话。 */
@@ -357,8 +540,10 @@ export function createCommentEvidence({
     const current = clock();
     sweep(current);
     let latestAt = null;
-    for (const record of records.values()) {
-      if (latestAt === null || record.at > latestAt) latestAt = record.at;
+    for (const list of records.values()) {
+      for (const record of list) {
+        if (latestAt === null || record.at > latestAt) latestAt = record.at;
+      }
     }
     return {
       sessions: records.size,
@@ -369,5 +554,5 @@ export function createCommentEvidence({
     };
   }
 
-  return { attach, take, render, clear, clearAll, state };
+  return { attach, bindTurn, take, render, clear, clearAll, state };
 }
