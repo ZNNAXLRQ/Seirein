@@ -256,6 +256,7 @@ import {
   waitForSpeechQuiet,
 } from './runtime/shutdown.js';
 import { createShutdownDiagnostics } from './runtime/diagnostics/shutdown-resources.js';
+import { installStartupDiagnostics } from './runtime/startup-diagnostics.js';
 import { createDiagnostics, resolveDiagnosticsEnabled } from './runtime/diagnostics/query.js';
 import {
   ACK_BODY_PHASES, ACK_DELAY_MAX_MS, ACK_DELAY_MIN_MS, ACK_DELAY_MS, ACK_SYNTH_PRIORITY,
@@ -1825,6 +1826,15 @@ export function apply(ctx, config) {
   })();
   const root = resolveInstanceRoot(config);
   const log = new EventLog(root);
+  // Startup fail-loud: record the FIRST rejection/exception before DSH disposes the root context.
+  // The later "inactive context" error is secondary; this listener only records and leaves every
+  // other listener (including DSH's fail-loud handler) untouched. Its cleanup removes exactly the
+  // two handlers it installed.
+  const uninstallStartupDiagnostics = installStartupDiagnostics({
+    onRejection: (summary) => { void log.emit('startup.unhandled.rejection', summary).catch(() => {}); },
+    onException: (summary) => { void log.emit('startup.uncaught.exception', summary).catch(() => {}); },
+  });
+  ctx.effect(() => uninstallStartupDiagnostics);
   // The speech-text residual buffer is drained by every `formatSpeech`/`formatCaption`; this is
   // the only event-log outlet. A fresh mount starts a fresh throttle bucket.
   const residualSink = (type, payload) => { void log.emit(type, payload).catch(() => {}); };
