@@ -455,11 +455,19 @@ import {
   buildPipelineTimeline,
   collectModelStream,
   createSpokenUnitStream,
+  createSpokenVersionLedger,
   createUnitSizer,
+  evaluateSpokenVersion,
   hasSpeakableText,
   joinSpokenUnits,
+  requestsDetailedSpoken,
   shouldSkipSpokenVersion,
+  spokenVersionMetrics,
+  spokenVersionTargetChars,
   splitSemanticUnits,
+  SPOKEN_TOO_LONG_MIN_BODY,
+  SPOKEN_VERSION_MAX_ATTEMPTS,
+  SPOKEN_VERSION_RECENT_LIMIT,
 } from './speech/spokenPipeline.js';
 import {
   DEFAULT_ADJACENT_THRESHOLD,
@@ -1156,9 +1164,10 @@ const VOICE_BUSY_LINE = '上一条还在处理，等处理完请再说一次。'
  *
  * A spoken version is not "the whole body, compressed": it is a short, clear spoken response
  * organized around what THIS turn needs. The five steps happen inside the SAME request as the
- * rewrite (no separate analysis call). Length is a result, never a target: the character count is
- * only a soft anti-padding cue and no fixed compression ratio exists. The hard contract stays the
- * output shape (one readable passage, no headings/list markers) enforced by
+ * rewrite (no separate analysis call). Length is a result, never a hard target: for a long body
+ * (over 120 characters, the short-answer hard cap) the SOFT target is about 40–65% of the body,
+ * while an explicit detail/complete-enumeration request keeps the body's completeness. The hard
+ * contract stays the output shape (one readable passage, no headings/list markers) enforced by
  * `normalizeSpokenVersion`; the persona is rendered above this block by every caller.
  */
 const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不加标题、编号或列表符号）。在这一次请求里按下面五步组织，直接给结果，不要输出分析过程：
@@ -1168,7 +1177,8 @@ const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不�
 4. 按人设重新组织口头表达：保留语气、称呼、措辞与互动方式；人设只作用于表达，不改变既有优先级，不得覆盖事实保真、限制条件与用户明确要求；不照搬正文结构，也不靠额外铺垫、撒娇或结尾总结来机械体现人设。
 5. 检查清晰度与冗余：同一观点通常只说一次，后面只补充新信息；保留必要的递进与自然强调；不要为了变短而删句或直接截断，篇幅靠取舍而不是靠砍字。
 验收口径：答中需求、重点与条件完整、表达自然、人设保留；不是符号越少或句子越短越好。
-长度是结果不是目标：字数只作软性的防铺陈约束，没有固定压缩比，也不要求压到某个比例。用户本轮明确要求详细、完整列举或全部朗读时，按正文本身的完整度表达，不要为了简短而省略。
+长度是结果不是目标：字数只作软性的防铺陈约束，没有固定压缩比；正文超过 120 字且用户没有要求详细、完整列举或全部朗读时，口语版的软目标约为正文的 40%–65%，这是取舍后的参考区间，不是硬截断。用户本轮明确要求详细、完整列举或全部朗读时，按正文本身的完整度表达，不要为了简短而省略。
+为了接近软目标，也只能省略铺陈、重复和无决策价值的细节；否定、条件、数字、时间、风险、用户明确要求一个都不能删。宁可略长，也不要丢事实。句子必须在自然收口处结束，不在句子中间截断；不为了凑比例硬拆或硬砍。
 只使用已确认的正文，不新增事实，不补充尚未出现的结论，不解释。
 提炼核心回应，不逐段复述正文；不要重复正文里已经说过的铺陈与例子；
 输出一段连贯口语，一句话说清一个意思。
@@ -1199,6 +1209,26 @@ const SPOKEN_VERSION_GUIDE = `只输出一段可直接朗读的口语版（不�
 function spokenQuestionContext(question) {
   const text = String(question ?? '').trim();
   return text.length === 0 ? '' : `\n\n【当前用户问题】${text}`;
+}
+
+/**
+ * One stronger shortening instruction for the single retry after a too-long candidate. It only
+ * sharpens the EXISTING selection rules: it never authorizes dropping a negation, condition,
+ * number, time, risk or an explicit user request, and it never cuts a sentence in the middle.
+ */
+const SPOKEN_SHORTENING_RETRY = `\n\n【更强缩短重试】上一版口语版太长，几乎是正文的复述。请重新组织并明显缩短到上面的软目标区间附近：只保留直接回答、最有决策价值的信息和会改变结论的条件，删掉铺陈、重复、举例与论证过程；但否定、条件、数字、时间、风险、用户明确要求一个都不能删。宁可略长，也不丢事实；句子必须在自然收口处结束，不在句子中间截断。`;
+
+/**
+ * The per-request length hint. It is deliberately computed from THIS body (a soft target, not a
+ * cap) and omitted for a short body or an explicit detail/full-enumeration request. The persona,
+ * facts and tool results are unchanged; only the spoken rewrite sees this suffix.
+ */
+function spokenPromptSuffix(bodyChars, { stronger = false, explicitDetail = false } = {}) {
+  const target = explicitDetail === true ? null : spokenVersionTargetChars(bodyChars);
+  const hint = target === null
+    ? ''
+    : `\n\n【本次长度参考】正文约 ${target.bodyChars} 字，口语版软目标约 ${target.min}–${target.max} 字（正文的 40%–65%）；先保证关键事实，宁可略长，不要截断。`;
+  return `${hint}${stronger === true ? SPOKEN_SHORTENING_RETRY : ''}`;
 }
 
 /**
@@ -12454,6 +12484,60 @@ export function apply(ctx, config) {
   let continuousViewRetryAt = null;
   let continuousViewRetryAttempt = 0;
   /**
+   * 持续分镜/证据采集的采集分辨率。800×450 看不清桌面文字；1920×1200 是试验默认（2560×1600
+   * 原生屏的 75%，拼图不会过大）。`visionWidth` / `visionHeight` 可覆盖，但必须 clamp，
+   * 避免配置把逐帧 rgb24 缓冲和拼图一起放大到不可控。sight.startStoryboard 有同样的兜底
+   * clamp；这里先解析，既让状态在启动阶段就有分辨率可显示，也让测试替身看到真实入参。
+   */
+  const VISION_CAPTURE_DEFAULT = Object.freeze({ width: 1920, height: 1200 });
+  const VISION_CAPTURE_BOUNDS = Object.freeze({
+    minWidth: 1280,
+    minHeight: 720,
+    maxWidth: 2560,
+    maxHeight: 1600,
+  });
+  const clampVisionDimension = (value, fallback, min, max) => {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return fallback;
+    return Math.min(max, Math.max(min, Math.round(number)));
+  };
+  const fallbackVisionCaptureSize = () => ({
+    width: clampVisionDimension(
+      config?.visionWidth,
+      VISION_CAPTURE_DEFAULT.width,
+      VISION_CAPTURE_BOUNDS.minWidth,
+      VISION_CAPTURE_BOUNDS.maxWidth,
+    ),
+    height: clampVisionDimension(
+      config?.visionHeight,
+      VISION_CAPTURE_DEFAULT.height,
+      VISION_CAPTURE_BOUNDS.minHeight,
+      VISION_CAPTURE_BOUNDS.maxHeight,
+    ),
+  });
+  /** 优先复用 sight.js 的解析（生产只有一份口径）；旧替身没有该导出时走本地兜底。 */
+  const visionCaptureSize = () => {
+    const shared = sightRuntime.resolveStoryboardSize;
+    if (typeof shared === 'function') {
+      try {
+        const size = shared({ width: config?.visionWidth, height: config?.visionHeight });
+        const width = Number(size?.width);
+        const height = Number(size?.height);
+        if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+          return { width: Math.round(width), height: Math.round(height) };
+        }
+      } catch {
+        /* fall through to the local bounds */
+      }
+    }
+    return fallbackVisionCaptureSize();
+  };
+  /**
+   * 本次证据采集真正生效的分辨率；只在有采集会话（或正在启动）时给出，停止后清空。
+   * 只读数字，不含路径/正文，可以直接放进 `/assistant/status`。
+   */
+  let continuousViewCaptureSize = { width: null, height: null };
+  /**
    * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到工作区内的真实 pre-step（当天陪伴会话，
    * 或普通主 GUI typed 会话；子代理/编码/后台/压缩/摘要等排除）时才置位。
    * 它只门禁后台理解/主动回应，不再门禁持续采集；工具挂载、设置页、裸宿主 mount 都不会让它
@@ -12501,19 +12585,32 @@ export function apply(ctx, config) {
     assertVisionToken(token);
     const ffmpegPath = resolveFfmpeg(root, config);
     if (ffmpegPath === null) throw new Error('未找到 ffmpeg；持续证据采集需要 ffmpeg');
+    const captureSize = visionCaptureSize();
+    // 启动 await 期间状态就已经能报出计划分辨率；会话建好后用 stats() 的真实值再核一次。
+    continuousViewCaptureSize = { width: captureSize.width, height: captureSize.height };
     let session = null;
     try {
       session = await startStoryboard({
         ffmpegPath,
         dir: join(root, 'cache', 'screens'),
-        width: Number(config?.visionWidth ?? 800),
-        height: Number(config?.visionHeight ?? 450),
+        width: captureSize.width,
+        height: captureSize.height,
         fps: Number(config?.visionFps ?? 12),
         signal: token.signal,
         source: wantedSource === 'obs'
           ? { kind: 'obs', device: virtualCamDevice() }
           : { kind: 'screen' },
       });
+      const stats = typeof session?.stats === 'function' ? session.stats() : null;
+      const actualWidth = Number(stats?.width);
+      const actualHeight = Number(stats?.height);
+      if (Number.isFinite(actualWidth) && actualWidth > 0
+        && Number.isFinite(actualHeight) && actualHeight > 0) {
+        continuousViewCaptureSize = {
+          width: Math.round(actualWidth),
+          height: Math.round(actualHeight),
+        };
+      }
       assertVisionToken(token);
       return session;
     } catch (error) {
@@ -12522,6 +12619,7 @@ export function apply(ctx, config) {
         try { session.stop(); } catch { /* session teardown is best effort */ }
         await Promise.resolve(session.done).catch(() => {});
       }
+      continuousViewCaptureSize = { width: null, height: null };
       throw error;
     }
   };
@@ -12569,6 +12667,15 @@ export function apply(ctx, config) {
     ...(Number.isFinite(Number(config?.evidenceCaptureTickMs)) && Number(config.evidenceCaptureTickMs) > 0
       ? { tickMs: Math.max(1, Math.floor(Number(config.evidenceCaptureTickMs))) }
       : {}),
+  });
+  /**
+   * `/assistant/status.vision.evidenceCapture` 的只读投影：在原计数/来源之上附加采集分辨率。
+   * 分辨率只来自会话 stats()（或启动时的计划值），不含任何文件路径或画面正文。
+   */
+  const evidenceCaptureStatusView = () => ({
+    ...evidenceCapture.status(),
+    width: continuousViewCaptureSize.width,
+    height: continuousViewCaptureSize.height,
   });
   /**
    * 确定性错误：再等 60 秒也只会得到同一个结果（缺 ffmpeg、场景未配置、组件被关闭、
@@ -12652,6 +12759,7 @@ export function apply(ctx, config) {
     // 关闭/切源/隐私都是新的代次：迟到回来的 start 结果不得再改状态。
     continuousViewAttempt += 1;
     continuousViewStarting = false;
+    continuousViewCaptureSize = { width: null, height: null };
     clearEvidenceRetry();
     // 采集停止是材料代次的边界：下一次启动的第一张 sheet 必须能重新触发理解。
     resetUnderstandingMaterial();
@@ -12665,7 +12773,7 @@ export function apply(ctx, config) {
       void log.emit('vision.evidence.capture.stop-failed', {
         reason, error: error?.message ?? String(error),
       }).catch(() => {});
-      return evidenceCapture.status();
+      return evidenceCaptureStatusView();
     }
   };
   /**
@@ -12692,6 +12800,9 @@ export function apply(ctx, config) {
       understandingEnabled: understandingEnabled(),
       proactiveEnabled: proactiveAllowed(),
       source: mode === 'scene' ? 'obs' : 'desktop',
+      // 采集分辨率：启动阶段是计划值，运行中是会话 stats() 的真实值；停止后为 null。
+      width: continuousViewCaptureSize.width,
+      height: continuousViewCaptureSize.height,
       lastFrameAt: continuousViewLastFrameAt,
       lastUnderstandingAt: continuousViewLastUnderstandingAt,
       error: continuousViewLastError,
@@ -14294,9 +14405,10 @@ export function apply(ctx, config) {
         assertVisionToken(token);
         if (token.mode === 'scene') await ensureSceneCamera(token);
         assertVisionToken(token);
+        const captureSize = visionCaptureSize();
         session = await startStoryboard({
           ffmpegPath, dir: join(root, 'cache', 'screens'),
-          width: Number(config?.visionWidth ?? 800), height: Number(config?.visionHeight ?? 450),
+          width: captureSize.width, height: captureSize.height,
           fps: Number(config?.visionFps ?? 12), signal: token.signal,
           source: token.mode === 'scene' ? { kind: 'obs', device: virtualCamDevice() } : { kind: 'screen' },
         });
@@ -17098,6 +17210,107 @@ export function apply(ctx, config) {
       /* observation only: a lint failure must never affect what is spoken */
     }
   };
+  // ---- spoken-version length gate (text-free ledger) ----------------------
+  // The decision used to be "validated + adopted", with no execution of the guide's length rule.
+  // Every decision now records bodyChars/spokenChars/ratio/savedChars/truncated/tooLong/reason,
+  // and the last few decisions are readable from `voice.spoken.summary` for a direct comparison.
+  // Only counts/reasons enter the ledger: the body and the spoken text are never stored here.
+  const spokenVersionLedger = createSpokenVersionLedger({ limit: SPOKEN_VERSION_RECENT_LIMIT });
+  /**
+   * Record one spoken-version decision (original, condensed, or full fallback) in one place.
+   * @returns {Promise<object>} the emitted `voice.spoken.version` payload
+   */
+  const noteSpokenVersion = async ({
+    turn = null, purpose = 'answer', replyVersion = null, decision = '', source = 'original',
+    bodyText = '', text = '', ms = 0, failure = '', truncated = false, explicitDetail = false,
+    retried = false,
+  } = {}) => {
+    const metrics = spokenVersionMetrics({
+      bodyText, spokenText: text, source, explicitDetail, truncated,
+    });
+    const failureText = String(failure ?? '');
+    const payload = {
+      turn: Number.isSafeInteger(turn) ? turn : null,
+      purpose,
+      replyVersion,
+      chars: speechCharCount(text),
+      source,
+      ms,
+      adopted: source === 'condensed',
+      refused: source === 'full-fallback',
+      decision,
+      bodyChars: metrics.bodyChars,
+      spokenChars: metrics.spokenChars,
+      ratio: metrics.ratio,
+      savedChars: metrics.savedChars,
+      truncated: metrics.truncated === true,
+      tooLong: metrics.tooLong === true,
+      reason: failureText.length > 0 ? failureText : metrics.reason,
+      retried: retried === true,
+      verdict: source === 'condensed'
+        ? (metrics.reason === 'explicit-detail'
+          ? 'explicit-detail'
+          : (metrics.tooLong ? 'adopted-too-long' : 'adopted'))
+        : (source === 'full-fallback' ? 'fallback' : 'original'),
+    };
+    await log.emit('voice.spoken.version', payload);
+    spokenVersionLedger.record({
+      turn: payload.turn,
+      purpose: payload.purpose,
+      replyVersion: payload.replyVersion,
+      source: payload.source,
+      bodyChars: payload.bodyChars,
+      spokenChars: payload.spokenChars,
+      ratio: payload.ratio,
+      savedChars: payload.savedChars,
+      truncated: payload.truncated,
+      tooLong: payload.tooLong,
+      reason: payload.reason,
+      retried: payload.retried,
+      verdict: payload.verdict,
+      ms: payload.ms,
+      at: Date.now(),
+    });
+    // Readable recent-N comparison for the status/log reader; counts only, never the text.
+    void log.emit('voice.spoken.summary', {
+      turn: payload.turn,
+      purpose: payload.purpose,
+      ...spokenVersionLedger.snapshot(),
+    }).catch(() => {});
+    if (payload.tooLong) {
+      // The streamed lane may have already spoken units before the whole length was known; retrying
+      // there would repeat them. The adoption is therefore reported, never silent.
+      void log.emit('voice.spoken.too-long', {
+        turn: payload.turn,
+        purpose: payload.purpose,
+        replyVersion: payload.replyVersion,
+        source: payload.source,
+        bodyChars: payload.bodyChars,
+        spokenChars: payload.spokenChars,
+        ratio: payload.ratio,
+        savedChars: payload.savedChars,
+        reason: 'too-long',
+        retried: payload.retried,
+      }).catch(() => {});
+    }
+    return payload;
+  };
+  /** One rejected-too-long attempt that is about to be retried with the stronger instruction. */
+  const noteSpokenRetry = async ({ turn = null, purpose = 'answer', replyVersion = null, bodyText = '', text = '', attempt = 1, maxAttempts = 2 } = {}) => {
+    const metrics = spokenVersionMetrics({ bodyText, spokenText: text, source: 'condensed' });
+    void log.emit('voice.spoken.retry', {
+      turn: Number.isSafeInteger(turn) ? turn : null,
+      purpose,
+      replyVersion,
+      attempt,
+      maxAttempts,
+      reason: 'too-long',
+      bodyChars: metrics.bodyChars,
+      spokenChars: metrics.spokenChars,
+      ratio: metrics.ratio,
+      savedChars: metrics.savedChars,
+    }).catch(() => {});
+  };
   /**
    * The typed round gets the same speech treatment as a voice round: the session keeps the full
    * body, the voice outlet says a short, need-organized spoken version (`source:'condensed'`).
@@ -17132,33 +17345,77 @@ export function apply(ctx, config) {
       profileText = '';
     }
     const profileBlock = profileText.length > 0 ? `\n\n【用户画像】\n${profileText}` : '';
-    try {
-      const result = await lightweight.ask({
-        task: 'spoken',
-        context: 'none',
-        // The channel's default spoken task instruction is the old "compress the whole body" line;
-        // `SPOKEN_VERSION_GUIDE` replaces it. Passing the existing `instruction` option as '' keeps
-        // that prompt from being appended a second time (it does not change the channel itself).
-        instruction: '',
-        system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenQuestionContext(utterance)}`,
-        user: `<完整答复>\n${full}\n</完整答复>`,
-        maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
-        timeoutMs: SPOKEN_VERSION_TIMEOUT_MS,
-        signal,
-      });
-      const checked = normalizeSpokenVersion(full, result?.text ?? '');
-      if (checked.ok === true) {
-        void log.emit('voice.spoken.version', {
-          turn: null, purpose: 'typed', replyVersion: 0, chars: checked.chars,
-          source: 'condensed', ms: Number(result?.doneMs) || 0, adopted: true, refused: false,
+    const bodyChars = speechCharCount(full);
+    // A detail/complete-enumeration request keeps the body's completeness (no target, no retry).
+    const explicitDetail = requestsDetailedSpoken(utterance);
+    const maxAttempts = explicitDetail || bodyChars <= SPOKEN_TOO_LONG_MIN_BODY
+      ? 1
+      : SPOKEN_VERSION_MAX_ATTEMPTS;
+    let lastFailure = '';
+    let retried = false;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const result = await lightweight.ask({
+          task: 'spoken',
+          context: 'none',
+          // The channel's default spoken task instruction is the old "compress the whole body" line;
+          // `SPOKEN_VERSION_GUIDE` replaces it. Passing the existing `instruction` option as '' keeps
+          // that prompt from being appended a second time (it does not change the channel itself).
+          instruction: '',
+          system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenPromptSuffix(bodyChars, { stronger: attempt > 1, explicitDetail })}${spokenQuestionContext(utterance)}`,
+          user: `<完整答复>\n${full}\n</完整答复>`,
+          maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
+          timeoutMs: SPOKEN_VERSION_TIMEOUT_MS,
+          signal,
+        });
+        const checked = normalizeSpokenVersion(full, result?.text ?? '');
+        if (checked.ok !== true) {
+          lastFailure = checked.reason;
+          break;
+        }
+        const evaluation = evaluateSpokenVersion({
+          bodyText: full,
+          spokenText: checked.text,
+          source: 'condensed',
+          explicitDetail,
+          attempt,
+          maxAttempts,
+        });
+        if (evaluation.retry) {
+          // Near-copy is not adopted silently: one stronger shortening request runs first.
+          retried = true;
+          await noteSpokenRetry({
+            turn: boundTurn,
+            purpose: 'typed',
+            replyVersion: 0,
+            bodyText: full,
+            text: checked.text,
+            attempt,
+            maxAttempts,
+          });
+          continue;
+        }
+        await noteSpokenVersion({
+          turn: boundTurn,
+          purpose: 'typed',
+          replyVersion: 0,
+          source: 'condensed',
+          bodyText: full,
+          text: checked.text,
+          ms: Number(result?.doneMs) || 0,
+          explicitDetail,
+          retried,
         }).catch(() => {});
-        emitSpokenLint({ turn: boundTurn, text: checked.text, bodyChars: speechCharCount(full) });
+        emitSpokenLint({ turn: boundTurn, text: checked.text, bodyChars });
         return finish({ text: checked.text, caption: checked.text, source: 'condensed' });
+      } catch (error) {
+        lastFailure = error?.message ?? String(error);
+        break;
       }
-      void log.emit('voice.spoken.fallback', { turn: null, purpose: 'typed', reason: checked.reason }).catch(() => {});
-    } catch (error) {
-      void log.emit('voice.spoken.fallback', { turn: null, purpose: 'typed', reason: error?.message ?? String(error) }).catch(() => {});
     }
+    void log.emit('voice.spoken.fallback', {
+      turn: boundTurn, purpose: 'typed', reason: lastFailure || 'too-long',
+    }).catch(() => {});
     return finish({ text: full, caption: full, source: 'full-fallback' });
   };
 
@@ -18039,7 +18296,9 @@ export function apply(ctx, config) {
         firstBodyAt = Date.now();
       };
       /** One model call for a long answer; persona + the confirmed body only (no recall, no tools). */
-      const requestSpokenVersion = async (source, { carryText = '' } = {}) => {
+      const requestSpokenVersion = async (source, {
+        carryText = '', stronger = false, explicitDetail = false,
+      } = {}) => {
         const controller = new AbortController();
         const lane = turnOwnership?.signal ?? null;
         const forward = () => controller.abort(lane?.reason ?? new DOMException('Spoken version cancelled', 'AbortError'));
@@ -18069,7 +18328,7 @@ export function apply(ctx, config) {
             // Same as the typed path: the guide is the whole prompt, so the channel's old
             // compression instruction is explicitly suppressed instead of being appended.
             instruction: '',
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${carryBlock}${spokenQuestionContext(spoken)}`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenPromptSuffix(speechCharCount(source), { stronger, explicitDetail })}${carryBlock}${spokenQuestionContext(spoken)}`,
             user: carryText.length > 0
               ? composeCarryConveyUser(carryText, source)
               : `<完整答复>\n${source}\n</完整答复>`,
@@ -18090,17 +18349,22 @@ export function apply(ctx, config) {
       };
       /** One `voice.spoken.version` row: which expression of the answer was chosen and why. */
       const emitSpokenVersion = async (plan, source, chars, ms, failure = '') => {
-        await log.emit('voice.spoken.version', {
+        // The shared recorder writes the length metrics (`bodyChars/spokenChars/ratio/savedChars/
+        // truncated/tooLong/reason`) and the text-free recent-N summary; `chars` stays the spoken
+        // character count of the expression that was actually adopted.
+        await noteSpokenVersion({
           turn: plan.turn,
           purpose: 'answer',
           replyVersion: plan.replyVersion,
-          chars,
-          source,
-          ms,
-          adopted: source === 'condensed',
-          refused: source === 'full-fallback',
           decision: plan.reason,
-          ...failure.length > 0 ? { reason: failure } : {},
+          source,
+          bodyText: plan.bodyText ?? plan.text,
+          text: plan.text,
+          ms,
+          failure,
+          truncated: plan.truncated === true,
+          explicitDetail: plan.explicitDetail === true,
+          retried: plan.retried === true,
         });
       };
       const decideSpokenVersion = (reason = 'end') => {
@@ -18180,33 +18444,72 @@ export function apply(ctx, config) {
             await emitSpokenVersion(plan, 'full-fallback', plan.chars, 0, 'duplicate-task');
             return plan;
           }
+          // Length gate: `normalizeSpokenVersion` only proves the candidate is not LONGER than the
+          // body, so a near-copy used to pass as "condensed". A long body (>120 chars, above the
+          // short-answer hard cap) whose candidate keeps >85% is retried once with the stronger
+          // shortening instruction; a retry that is still long is adopted with `tooLong:true`
+          // (reported, never silent). Explicit detail / complete-enumeration requests are exempt.
+          const bodyChars = speechCharCount(full);
+          const explicitDetail = requestsDetailedSpoken(spoken);
+          const maxAttempts = explicitDetail || bodyChars <= SPOKEN_TOO_LONG_MIN_BODY
+            ? 1
+            : SPOKEN_VERSION_MAX_ATTEMPTS;
           let failure = '';
-          let candidate = '';
-          try {
-            const result = await requestSpokenVersion(full, { carryText });
-            candidate = String(result?.text ?? '');
-          } catch (error) {
-            // A provider code is the actionable reason; a DOMException only has a name.
-            const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : '';
-            failure = code || String(error?.name || error?.message || error) || 'generation-failed';
+          let retried = false;
+          for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            let candidate = '';
+            try {
+              const result = await requestSpokenVersion(full, {
+                carryText, stronger: attempt > 1, explicitDetail,
+              });
+              candidate = String(result?.text ?? '');
+            } catch (error) {
+              // A provider code is the actionable reason; a DOMException only has a name.
+              const code = typeof error?.code === 'string' && error.code.length > 0 ? error.code : '';
+              failure = code || String(error?.name || error?.message || error) || 'generation-failed';
+              break;
+            }
+            const checked = normalizeSpokenVersion(speechSource, candidate);
+            if (checked.ok !== true) {
+              failure = checked.reason;
+              break;
+            }
+            const evaluation = evaluateSpokenVersion({
+              bodyText: full,
+              spokenText: checked.text,
+              source: 'condensed',
+              explicitDetail,
+              attempt,
+              maxAttempts,
+            });
+            if (evaluation.retry) {
+              retried = true;
+              await noteSpokenRetry({
+                turn: turnId,
+                purpose: 'answer',
+                replyVersion,
+                bodyText: full,
+                text: checked.text,
+                attempt,
+                maxAttempts,
+              });
+              continue;
+            }
+            plan.text = checked.text;
+            plan.chars = checked.chars;
+            plan.source = 'condensed';
+            plan.feedText = checked.text;
+            plan.ms = Date.now() - startedAt;
+            plan.explicitDetail = explicitDetail;
+            plan.retried = retried;
+            plan.tooLong = evaluation.tooLong;
+            await emitSpokenVersion(plan, 'condensed', plan.chars, plan.ms);
+            emitSpokenLint({
+              turn: plan.turn, text: checked.text, bodyChars: speechCharCount(speechSource),
+            });
+            return plan;
           }
           const ms = Date.now() - startedAt;
-          if (failure.length === 0) {
-            const checked = normalizeSpokenVersion(speechSource, candidate);
-            if (checked.ok === true) {
-              plan.text = checked.text;
-              plan.chars = checked.chars;
-              plan.source = 'condensed';
-              plan.feedText = checked.text;
-              plan.ms = ms;
-              await emitSpokenVersion(plan, 'condensed', plan.chars, ms);
-              emitSpokenLint({
-                turn: plan.turn, text: checked.text, bodyChars: speechCharCount(speechSource),
-              });
-              return plan;
-            }
-            failure = checked.reason;
-          }
           // Fallback is the FULL current body, never a truncated summary. Carried points that do not
           // fit (or that the new answer corrects) stay pending instead of eating the new answer.
           plan.text = fallbackText;
@@ -18218,6 +18521,8 @@ export function apply(ctx, config) {
           plan.carrySupersededReason = carrySupersededReason;
           plan.ms = ms;
           plan.fallback = failure;
+          plan.explicitDetail = explicitDetail;
+          plan.retried = retried;
           await log.emit('voice.spoken.fallback', {
             turn: turnId, purpose: 'answer', replyVersion, reason: failure,
           });
@@ -18337,6 +18642,9 @@ export function apply(ctx, config) {
         const turnId = Number.isSafeInteger(stage.turn) ? stage.turn : null;
         const replyVersion = replyVersionOf(sessionId, turnId);
         const startedAt = Date.now();
+        const bodyChars = speechCharCount(full);
+        // The same exemption as the blocking/typed lanes: an explicit detail request keeps length.
+        const explicitDetail = requestsDetailedSpoken(spoken);
         const plan = {
           text: full,
           feedText: raw,
@@ -18350,6 +18658,10 @@ export function apply(ctx, config) {
           answerVersion: voiceGroupVersion,
           // Same observation seam as the whole-text decision: the body beside the spoken text.
           bodyText: full,
+          explicitDetail,
+          retried: false,
+          tooLong: false,
+          truncated: false,
         };
         const speaker = ensureSentenceVoice();
         if (speaker === null) return null;
@@ -18431,7 +18743,7 @@ export function apply(ctx, config) {
           })();
           const profileBlock = profileText.length > 0 ? `\n\n【用户画像】\n${profileText}` : '';
           const stream = await requestTaskStream({
-            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenQuestionContext(spoken)}`,
+            system: `【人设】\n${persona.render()}${profileBlock}\n\n${SPOKEN_VERSION_GUIDE}${spokenPromptSuffix(bodyChars, { explicitDetail })}${spokenQuestionContext(spoken)}`,
             user: `<完整答复>\n${full}\n</完整答复>`,
             maxTokens: Math.min(1024, Math.max(120, Math.ceil(full.length * 1.5))),
             signal: controller.signal,
@@ -18477,6 +18789,19 @@ export function apply(ctx, config) {
           plan.feedText = checked.text;
           plan.chars = checked.chars;
           plan.source = 'condensed';
+          // Streaming has already spoken units by the time the whole length is known, so an
+          // over-long candidate cannot be retried without repeating audio. It is still evaluated
+          // and reported (`tooLong:true`, `verdict:'adopted-too-long'`, `voice.spoken.too-long`);
+          // the retry lane exists on the blocking/typed paths, which decide before speaking.
+          const evaluation = evaluateSpokenVersion({
+            bodyText: full,
+            spokenText: checked.text,
+            source: 'condensed',
+            explicitDetail,
+            attempt: 1,
+            maxAttempts: 1,
+          });
+          plan.tooLong = evaluation.tooLong;
         } else {
           failure = checked.reason || failure;
           plan.fallback = failure;
@@ -18492,6 +18817,9 @@ export function apply(ctx, config) {
             spokenUnits: emitted, spokenChars: units.stats().chars,
           });
         }
+        // A truncated finish/rewrite is recorded as-is; it is never repaired by speaking the tail
+        // of the body, because the user already heard the complete units.
+        plan.truncated = outcome?.truncated === true;
         // The decision point is the FIRST unit: that is when translation + synthesis started, not
         // when the whole rewrite finished.
         plan.ms = spokenMarks.firstUnitAt > 0
@@ -21016,8 +21344,8 @@ export function apply(ctx, config) {
       vision: {
         ...(status?.vision ?? {}),
         evidence: evidenceWindow.state(),
-        // 持续证据采集的只读状态：计数/时间/来源，不含文件路径；不启动或停止任何东西。
-        evidenceCapture: evidenceCapture.status(),
+        // 持续证据采集的只读状态：计数/时间/来源/采集分辨率，不含文件路径；不启动或停止任何东西。
+        evidenceCapture: evidenceCaptureStatusView(),
         // 持续观看的独立设置 + 状态机：关闭后任何路径都不得自动恢复；`running` 不能代表有画面。
         continuous: continuousViewStatus(),
         // P-186/P-187 阶段 2 的只读评论证据计数：sessions/latestAt/attached，绝不含对齐正文。

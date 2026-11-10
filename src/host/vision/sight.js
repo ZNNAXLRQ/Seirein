@@ -17,6 +17,57 @@ import { dirname, join } from 'node:path';
 /** Default freshness window for a perception result: anything older is no longer "now". */
 export const OBSERVATION_TTL_MS = 30_000;
 
+/**
+ * Storyboard capture resolution.
+ *
+ * 800×450 was too small to read desktop text in a packed sheet. 1920×1200 is the trial default:
+ * it is 75% of a 2560×1600 screen on each axis (16:10, so text stays sharp) while the packed sheet
+ * and the per-frame rgb24 buffers stay well below native 2560×1600.
+ */
+export const STORYBOARD_DEFAULT_SIZE = Object.freeze({ width: 1920, height: 1200 });
+
+/**
+ * Bounds for caller/config supplied sizes. Below the minimum text turns to mush; above the
+ * maximum every buffered frame and the composed sheet grow past what the analyzer can use.
+ */
+export const STORYBOARD_SIZE_BOUNDS = Object.freeze({
+  minWidth: 1280,
+  minHeight: 720,
+  maxWidth: 2560,
+  maxHeight: 1600,
+});
+
+/** Clamp one axis: unusable values fall back to the default, valid ones stay inside the bounds. */
+function captureDimension(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.round(number)));
+}
+
+/**
+ * Resolve a storyboard capture size. Both axes are clamped independently so an extreme config
+ * can never make the raw frame buffers (or the packed sheet) unbounded; an override inside the
+ * bounds is kept exactly as given.
+ * @param {{width?: number|string, height?: number|string}} [size]
+ * @returns {{width: number, height: number}}
+ */
+export function resolveStoryboardSize({ width, height } = {}) {
+  return {
+    width: captureDimension(
+      width,
+      STORYBOARD_DEFAULT_SIZE.width,
+      STORYBOARD_SIZE_BOUNDS.minWidth,
+      STORYBOARD_SIZE_BOUNDS.maxWidth,
+    ),
+    height: captureDimension(
+      height,
+      STORYBOARD_DEFAULT_SIZE.height,
+      STORYBOARD_SIZE_BOUNDS.minHeight,
+      STORYBOARD_SIZE_BOUNDS.maxHeight,
+    ),
+  };
+}
+
 /** Normalize a caller-supplied TTL; an unusable value falls back to the default window. */
 function observationTtl(ttlMs) {
   const value = Number(ttlMs);
@@ -291,6 +342,8 @@ export async function shrinkShot(shot, { dir, ffmpegPath, maxBytes, signal, atte
 /**
  * Continuous capture with change-gated frame packing, delegated to dsh-see-now.
  * `source` selects the input: the desktop, or OBS's virtual camera for scene mode.
+ * `width`/`height` default to the trial storyboard size (1920×1200) and are clamped by
+ * `resolveStoryboardSize`; the actual values are reported through `stats()`.
  * @param {{ffmpegPath: string, dir: string, width?: number, height?: number, fps?: number, source?: object, signal?: AbortSignal}} options
  */
 let cancellableScreenEngine = null;
@@ -298,8 +351,9 @@ let cancellableScreenEngine = null;
 /** How long one frame's arrival stamp is kept: comfortably longer than a sheet can sit queued. */
 const CAPTURED_AT_RETENTION_MS = 180_000;
 
-export async function startStoryboard({ ffmpegPath, dir, width = 800, height = 450, fps = 12, source = { kind: 'screen' }, signal }) {
+export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12, source = { kind: 'screen' }, signal }) {
   signal?.throwIfAborted();
+  const size = resolveStoryboardSize({ width, height });
   const [{ spawnFrames, pickScreenEngine, captureArgs }, { createPipeline }] = await Promise.all([
     import('dsh-see-now/capture'),
     import('dsh-see-now/pipeline'),
@@ -336,7 +390,7 @@ export async function startStoryboard({ ffmpegPath, dir, width = 800, height = 4
   signal?.throwIfAborted();
   // Report the source as the engine for device captures, so callers see "obs" not "auto".
   const label = source.kind === 'screen' ? captureEngine : source.kind;
-  let pipeline = createPipeline({ width, height, fps });
+  let pipeline = createPipeline({ width: size.width, height: size.height, fps });
   let stopped = false;
 
   const startedAt = Date.now();
@@ -360,8 +414,8 @@ export async function startStoryboard({ ffmpegPath, dir, width = 800, height = 4
 
   const run = spawnFrames({
     source,
-    width,
-    height,
+    width: size.width,
+    height: size.height,
     fps,
     engine: captureEngine,
     ffmpegPath,
@@ -412,7 +466,17 @@ export async function startStoryboard({ ffmpegPath, dir, width = 800, height = 4
     engine: label,
     sourceKind: source.kind ?? 'screen',
     get running() { return !stopped; },
-    stats: () => ({ engine: label, sourceKind: source.kind ?? 'screen', frames, sheets, firstFrameMs, uptimeMs: Date.now() - startedAt }),
+    stats: () => ({
+      engine: label,
+      sourceKind: source.kind ?? 'screen',
+      // 采集分辨率是本次会话真实生效的值（config 覆盖后再 clamp），不是调用方传入的原始值。
+      width: size.width,
+      height: size.height,
+      frames,
+      sheets,
+      firstFrameMs,
+      uptimeMs: Date.now() - startedAt,
+    }),
     /** Take the current storyboard, write it to disk, and return its metadata. */
     async take({ force = true } = {}) {
       signal?.throwIfAborted();

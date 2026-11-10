@@ -887,7 +887,9 @@ test('19. voice.spoken.version / voice.spoken.text keep their existing fields', 
   await playText(app, LONG_SPOKEN);
   const version = await app.waitForEvent('voice.spoken.version');
   assert.deepEqual(Object.keys(version).sort(), [
-    'adopted', 'chars', 'decision', 'ms', 'purpose', 'refused', 'replyVersion', 'source', 'turn',
+    'adopted', 'bodyChars', 'chars', 'decision', 'ms', 'purpose', 'ratio', 'reason', 'refused',
+    'replyVersion', 'retried', 'savedChars', 'source', 'spokenChars', 'tooLong', 'truncated',
+    'turn', 'verdict',
   ]);
   const textRow = await app.waitForEvent('voice.spoken.text', (payload) => payload.purpose === 'answer');
   assert.deepEqual(Object.keys(textRow).sort(), [
@@ -902,7 +904,7 @@ test('19. voice.spoken.version / voice.spoken.text keep their existing fields', 
 // ---------------------------------------------------------------------------
 // 21. Equal length is allowed (turn 11: a 166-char body and a 166-char spoken version)
 // ---------------------------------------------------------------------------
-test('21. 口语版与正文等长时被采纳，不再因 not-shorter 回退正文', async (t) => {
+test('21. 口语版与正文等长时会被标为 too-long，而不是静默当作已压缩', async (t) => {
   const equalBody = '说明'.repeat(83);
   const equalSpoken = '口播'.repeat(83);
   assert.equal([...equalBody].length, 166, 'fixture: the body is 166 characters');
@@ -912,13 +914,21 @@ test('21. 口语版与正文等长时被采纳，不再因 not-shorter 回退正
   await waitUntil(() => app.players().length >= 1, 'the equal-length version reached the player');
   await playText(app, equalSpoken);
   const version = await app.waitForEvent('voice.spoken.version');
-  assert.equal(version.source, 'condensed', 'equal length is adopted, not rejected');
+  assert.equal(version.source, 'condensed', 'the valid candidate is still played (it is not a truncation)');
   assert.equal(version.refused, false);
   assert.equal(version.chars, 166);
+  assert.equal(version.bodyChars, 166);
+  assert.equal(version.ratio, 1);
+  assert.equal(version.tooLong, true, 'a near-copy of a long body is reported, never silently accepted');
+  assert.equal(version.verdict, 'adopted-too-long');
+  assert.equal(version.retried, false, 'the streamed lane cannot retry after audio already started');
+  const warning = await app.waitForEvent('voice.spoken.too-long');
+  assert.equal(warning.reason, 'too-long');
+  assert.equal(warning.ratio, 1);
   assert.equal(app.texts().join(''), equalSpoken, 'the 166-char spoken version is played');
   const fallbacks = (await app.events()).filter((event) => event.type === 'voice.spoken.fallback');
   assert.deepEqual(fallbacks, [], 'no fallback row for an equal-length candidate');
-  t.diagnostic(`source=${version.source} chars=${version.chars}/${[...equalBody].length} fallbacks=0`);
+  t.diagnostic(`source=${version.source} chars=${version.chars}/${[...equalBody].length} tooLong=${version.tooLong} fallbacks=0`);
 });
 
 // ---------------------------------------------------------------------------
@@ -994,5 +1004,70 @@ test('24. 清理先保护实质内容：围栏命令与 __debug__ 不被删，�
   t.diagnostic(
     `command="${command.text}" identifiers="${identifiers.text}" unsafe=${unsafe.reason}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 25. Length gate: a near-copy typed rewrite is retried once with the stronger prompt
+// ---------------------------------------------------------------------------
+const RETRY_BODY = '先说结论：不要直接删除数据，先备份再检查索引。'.repeat(7);
+const RETRY_SPOKEN = '结论：不要直接删除数据，先备份再检查索引；如果索引异常，先停服务再恢复备份。';
+
+test('25. 长正文的口语版接近原文时先重试一次更强缩短，再记录长度数据', async (t) => {
+  const calls = [];
+  const app = await mountRound(t, {
+    spoken: (source) => {
+      calls.push(source);
+      return calls.length === 1 ? RETRY_BODY : RETRY_SPOKEN;
+    },
+  });
+  app.driveTyped(1, { body: RETRY_BODY });
+  await waitUntil(() => app.spokenRequests.length >= 2, 'the too-long candidate was retried once');
+  const version = await app.waitForEvent('voice.spoken.version', (payload) => payload.purpose === 'typed');
+  const firstSystem = String(app.spokenRequests[0]?.system ?? '');
+  const secondSystem = String(app.spokenRequests[1]?.system ?? '');
+  assert.equal(calls.length, 2, 'one retry, no unbounded loop');
+  assert.ok(firstSystem.includes('【本次长度参考】'), 'the first request carries the soft length target');
+  assert.ok(!firstSystem.includes('【更强缩短重试】'), 'the first request uses the normal guide');
+  assert.ok(secondSystem.includes('【更强缩短重试】'), 'the retry carries the stronger shortening instruction');
+  assert.equal(version.source, 'condensed');
+  assert.equal(version.retried, true);
+  assert.equal(version.tooLong, false, 'the shorter retry is accepted normally');
+  assert.equal(version.verdict, 'adopted');
+  assert.equal(version.bodyChars, [...RETRY_BODY].length);
+  assert.equal(version.spokenChars, [...RETRY_SPOKEN].length);
+  assert.ok(version.ratio < 0.85, `retry ratio ${version.ratio} is no longer a near-copy`);
+  assert.equal(version.savedChars, [...RETRY_BODY].length - [...RETRY_SPOKEN].length);
+  assert.equal(app.texts().join(''), RETRY_SPOKEN, 'only the shortened retry is spoken');
+  const summary = await app.waitForEvent('voice.spoken.summary');
+  const last = summary.recent.at(-1);
+  assert.equal(last.retried, true);
+  assert.equal(last.bodyChars, version.bodyChars);
+  assert.equal('spokenText' in last, false, 'the recent summary never stores the spoken text');
+  t.diagnostic(
+    `retry calls=${calls.length} body=${version.bodyChars} spoken=${version.spokenChars} `
+    + `ratio=${version.ratio} tooLong=${version.tooLong}`,
+  );
+});
+
+test('26. 明确要求逐条完整列举时不强制缩短：不设目标、不重试、still flagged as explicit', async (t) => {
+  const calls = [];
+  const app = await mountRound(t, {
+    spoken: (source) => {
+      calls.push(source);
+      return RETRY_BODY;
+    },
+  });
+  app.driveTyped(2, { body: RETRY_BODY, utterance: '把要点逐条完整列举' });
+  const version = await app.waitForEvent('voice.spoken.version', (payload) => payload.purpose === 'typed');
+  assert.equal(calls.length, 1, 'an explicit detail request gets no shortening retry');
+  const system = String(app.spokenRequests[0]?.system ?? '');
+  assert.ok(!system.includes('【本次长度参考】'), 'an explicit detail request has no length target');
+  assert.ok(!system.includes('【更强缩短重试】'));
+  assert.equal(version.source, 'condensed');
+  assert.equal(version.retried, false);
+  assert.equal(version.tooLong, false, 'detail requests are exempt from the too-long gate');
+  assert.equal(version.reason, 'explicit-detail');
+  assert.equal(version.verdict, 'explicit-detail');
+  t.diagnostic(`detail calls=${calls.length} body=${version.bodyChars} spoken=${version.spokenChars} tooLong=${version.tooLong}`);
 });
 

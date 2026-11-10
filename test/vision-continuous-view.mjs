@@ -33,6 +33,8 @@ const state = {
   failStarts: 0,
   /** 测试可替换：返回一个假会话或一个可控 Promise。 */
   startStoryboard: null,
+  /** 最近一次 startStoryboard 收到的入参，用来核对分辨率。 */
+  startOptions: null,
 };
 globalThis.__visionContinuousHostTest = state;
 
@@ -52,6 +54,7 @@ const hooks = registerHooks({
           export const captureDevice = capture;
           export const startStoryboard = (options) => {
             s.storyboardStarts = (s.storyboardStarts ?? 0) + 1;
+            s.startOptions = options;
             if (s.failStarts > 0) {
               s.failStarts -= 1;
               throw new Error('temporary storyboard failure');
@@ -119,6 +122,7 @@ async function fixture(t, config = {}, options = {}) {
   state.sheetsToTake = options.sheetsToTake ?? 0;
   state.failStarts = options.failStarts ?? 0;
   state.startStoryboard = options.startStoryboard ?? ((startOptions) => fakeSession(startOptions));
+  state.startOptions = null;
 
   // 可预置 settings.json（例如显式 false）；未指定时按“用户已显式开启”准备，因为缺失字段
   // 现在安全迁移为 false。传 settings:null 可模拟旧文件里完全没有该字段。
@@ -607,4 +611,64 @@ test('9. 关闭时立即停采集、取消在途理解、清候选队列', async
   const final = await app.status();
   assert.equal(final.vision.understanding.runs, runsAtClose, '关闭后不再有新的后台理解');
   assert.equal(final.vision.continuous.lastUnderstandingAt, null, '迟到的理解结果不得写回');
+});
+
+// ---------------------------------------------------------------------------
+// 7. 采集分辨率：默认 1920×1200，status 显示实际生效值
+// ---------------------------------------------------------------------------
+
+test('10. 默认按 1920×1200 采集；continuous/evidenceCapture 显示分辨率且不带路径', async (t) => {
+  const app = await fixture(t, {}, { sheetsToTake: 0 });
+  await app.runPreStep({ agent: app.companionAgent(), turn: 1 });
+  await app.waitFor(async () => (await app.status()).vision.continuous.state === 'capturing',
+    'capture to start at the default resolution');
+
+  assert.equal(state.startOptions.width, 1920, '默认宽度不再是 800');
+  assert.equal(state.startOptions.height, 1200, '默认高度不再是 450');
+
+  let snapshot = await app.status();
+  assert.equal(snapshot.vision.continuous.state, 'capturing');
+  assert.equal(snapshot.vision.continuous.width, 1920);
+  assert.equal(snapshot.vision.continuous.height, 1200);
+  assert.equal(snapshot.vision.evidenceCapture.width, 1920);
+  assert.equal(snapshot.vision.evidenceCapture.height, 1200);
+  // 分辨率只是两个数字：状态里不得出现缓存目录/文件路径。
+  assert.equal(JSON.stringify({
+    continuous: snapshot.vision.continuous,
+    evidenceCapture: snapshot.vision.evidenceCapture,
+  }).includes('cache'), false, '分辨率状态不含文件路径');
+
+  // 关闭采集后不再声称有采集分辨率。
+  const off = await app.action({ action: 'vision.continuousView', enabled: false });
+  assert.equal(off.ok, true, off.error);
+  assert.equal(off.continuous.width, null, '停止后不显示旧分辨率');
+  assert.equal(off.continuous.height, null);
+  snapshot = await app.status();
+  assert.equal(snapshot.vision.continuous.width, null);
+  assert.equal(snapshot.vision.evidenceCapture.width, null);
+});
+
+test('11. config 覆盖分辨率并 clamp；status 与 startStoryboard 入参一致', async (t) => {
+  const cases = [
+    { config: { visionWidth: 1600, visionHeight: 1000 }, expected: { width: 1600, height: 1000 } },
+    { config: { visionWidth: 640, visionHeight: 360 }, expected: { width: 1280, height: 720 } },
+    { config: { visionWidth: 9000, visionHeight: 100 }, expected: { width: 2560, height: 720 } },
+  ];
+  for (const { config, expected } of cases) {
+    const app = await fixture(t, config, { sheetsToTake: 0 });
+    await app.runPreStep({ agent: app.companionAgent(), turn: 1 });
+    await app.waitFor(async () => (await app.status()).vision.continuous.state === 'capturing',
+      `capture with ${JSON.stringify(config)}`);
+
+    assert.deepEqual(
+      { width: state.startOptions.width, height: state.startOptions.height },
+      expected,
+      `startStoryboard 入参 ${JSON.stringify(config)}`,
+    );
+    const snapshot = await app.status();
+    assert.equal(snapshot.vision.continuous.width, expected.width);
+    assert.equal(snapshot.vision.continuous.height, expected.height);
+    assert.equal(snapshot.vision.evidenceCapture.width, expected.width);
+    assert.equal(snapshot.vision.evidenceCapture.height, expected.height);
+  }
 });

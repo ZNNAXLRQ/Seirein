@@ -278,6 +278,164 @@ export function looksLikePreamble(text) {
   return PREAMBLE.test(String(text ?? '').trim());
 }
 
+// ---- spoken-version length policy (soft target, adoption gate) -------------
+/**
+ * A long body has a SOFT spoken target of 40–65% of the body's characters. This is a result target,
+ * never a hard cap: it must not cause deletion of a negation, condition, number, time, risk, or a
+ * user-requested detail, and nothing is truncated mid-sentence. A short answer is untouched (the
+ * short-skip rule lives in `shouldSkipSpokenVersion`).
+ */
+export const SPOKEN_TARGET_MIN_RATIO = 0.40;
+export const SPOKEN_TARGET_MAX_RATIO = 0.65;
+/** At/above this ratio (with a long body) the candidate is too close to the body to adopt silently. */
+export const SPOKEN_TOO_LONG_RATIO = 0.85;
+/** Below this many body characters the long-body target/gate does not apply. It matches
+ * `SPOKEN_SHORT_HARD_MAX_CHARS`: above it a reply is never spoken verbatim anyway, and it also
+ * covers the reported 137-char turn (137→134, ratio 0.98) instead of letting a near-copy through. */
+export const SPOKEN_TOO_LONG_MIN_BODY = 120;
+/** One stronger shortening retry is allowed before a still-long candidate is reported as adopted. */
+export const SPOKEN_VERSION_MAX_ATTEMPTS = 2;
+/** The ledger keeps this many recent decisions for a readable comparison (never the body text). */
+export const SPOKEN_VERSION_RECENT_LIMIT = 8;
+
+/**
+ * Does the user explicitly ask for detail / a complete enumeration? Then the long-body soft target
+ * and the too-long gate are both disabled: this round is allowed to stay close to the body.
+ */
+const DETAILED_REQUEST = /详细|完整(?:列举|列|说|讲|读)|逐条|一条一条|每一条|全部(?:列举|列出)|不要省略|别省略/u;
+
+export function requestsDetailedSpoken(utterance) {
+  return DETAILED_REQUEST.test(String(utterance ?? ''));
+}
+
+/**
+ * The character target for a long body; null when the body is too short or the user requested
+ * detail (both mean "no shortening pressure this round").
+ * @returns {{bodyChars: number, min: number, max: number, minRatio: number, maxRatio: number}|null}
+ */
+export function spokenVersionTargetChars(bodyChars, { explicitDetail = false } = {}) {
+  const chars = Math.max(0, Math.floor(Number(bodyChars) || 0));
+  if (explicitDetail === true || chars <= SPOKEN_TOO_LONG_MIN_BODY) return null;
+  const min = Math.max(4, Math.round(chars * SPOKEN_TARGET_MIN_RATIO));
+  const max = Math.max(min, Math.round(chars * SPOKEN_TARGET_MAX_RATIO));
+  return {
+    bodyChars: chars, min, max,
+    minRatio: SPOKEN_TARGET_MIN_RATIO, maxRatio: SPOKEN_TARGET_MAX_RATIO,
+  };
+}
+
+/**
+ * Measure one spoken expression against its body. Observation only: it never edits either text.
+ *
+ * `tooLong` is the adoption gate (long body, ratio > 85%, not an explicit-detail round, and only
+ * for an adopted condensed rewrite). `reason` reports the gate, never a truncation.
+ *
+ * @param {{bodyText?: string, spokenText?: string, source?: string, explicitDetail?: boolean,
+ *   truncated?: boolean}} [input]
+ * @returns {{bodyChars: number, spokenChars: number, ratio: number|null, savedChars: number,
+ *   truncated: boolean, tooLong: boolean, reason: string, source: string,
+ *   targetApplies: boolean, targetMin: number|null, targetMax: number|null, inTarget: boolean}}
+ */
+export function spokenVersionMetrics({
+  bodyText = '', spokenText = '', source = 'condensed', explicitDetail = false,
+  truncated = false,
+} = {}) {
+  const bodyChars = codePoints(bodyText);
+  const spokenChars = codePoints(spokenText);
+  const ratio = bodyChars > 0 ? Math.round((spokenChars / bodyChars) * 1000) / 1000 : null;
+  const savedChars = Math.max(0, bodyChars - spokenChars);
+  const target = spokenVersionTargetChars(bodyChars, { explicitDetail });
+  const targetApplies = target !== null;
+  const inTarget = targetApplies && ratio !== null
+    && ratio >= SPOKEN_TARGET_MIN_RATIO && ratio <= SPOKEN_TARGET_MAX_RATIO;
+  const tooLong = source === 'condensed' && targetApplies && ratio !== null
+    && ratio > SPOKEN_TOO_LONG_RATIO;
+  const reason = explicitDetail === true ? 'explicit-detail' : (tooLong ? 'too-long' : '');
+  return {
+    bodyChars,
+    spokenChars,
+    ratio,
+    savedChars,
+    truncated: truncated === true,
+    tooLong,
+    reason,
+    source: String(source ?? ''),
+    targetApplies,
+    targetMin: target === null ? null : target.min,
+    targetMax: target === null ? null : target.max,
+    inTarget,
+  };
+}
+
+/**
+ * Decide what to do with one validated candidate: adopt, retry once with a stronger shortening
+ * instruction, or report that the accepted version is still too close to the body.
+ *
+ * `retry` is true only when the candidate is too-long AND this is not the final allowed attempt.
+ * Keep accepting a valid retry even when it is still long: it is already shorter than the body and
+ * the event carries `tooLong:true` instead of adopting it silently.
+ *
+ * @param {{attempt?: number, maxAttempts?: number}} [options] plus `spokenVersionMetrics` input
+ * @returns {ReturnType<typeof spokenVersionMetrics> & {attempt: number, maxAttempts: number,
+ *   retry: boolean, verdict: string}}
+ */
+export function evaluateSpokenVersion({
+  attempt = 1, maxAttempts = SPOKEN_VERSION_MAX_ATTEMPTS, ...metricsInput
+} = {}) {
+  const metrics = spokenVersionMetrics(metricsInput);
+  const attempts = Math.max(1, Math.floor(Number(maxAttempts) || 1));
+  const tried = Math.max(1, Math.min(attempts, Math.floor(Number(attempt) || 1)));
+  const retry = metrics.tooLong && tried < attempts;
+  let verdict = 'adopted';
+  if (metrics.reason === 'explicit-detail') verdict = 'explicit-detail';
+  else if (metrics.source === 'full-fallback') verdict = 'fallback';
+  else if (metrics.source === 'original') verdict = 'original';
+  else if (metrics.tooLong) verdict = retry ? 'retry-too-long' : 'adopted-too-long';
+  return { ...metrics, attempt: tried, maxAttempts: attempts, retry, verdict };
+}
+
+/**
+ * A bounded, text-free history of spoken-version decisions. `recent()` returns the last `limit`
+ * rows (oldest first) so two consecutive rounds can be compared from one status read; it never
+ * stores body or spoken text.
+ */
+export function createSpokenVersionLedger({ limit = SPOKEN_VERSION_RECENT_LIMIT } = {}) {
+  const capacity = Math.max(1, Math.floor(Number(limit) || SPOKEN_VERSION_RECENT_LIMIT));
+  const rows = [];
+  const copy = (row) => ({ ...row });
+  return {
+    record(entry = {}) {
+      const ratio = Number(entry.ratio);
+      const row = {
+        turn: Number.isSafeInteger(entry.turn) ? entry.turn : null,
+        purpose: String(entry.purpose ?? ''),
+        replyVersion: Number.isSafeInteger(entry.replyVersion) ? entry.replyVersion : null,
+        source: String(entry.source ?? ''),
+        bodyChars: Math.max(0, Math.floor(Number(entry.bodyChars) || 0)),
+        spokenChars: Math.max(0, Math.floor(Number(entry.spokenChars) || 0)),
+        ratio: Number.isFinite(ratio) ? ratio : null,
+        savedChars: Math.max(0, Math.floor(Number(entry.savedChars) || 0)),
+        truncated: entry.truncated === true,
+        tooLong: entry.tooLong === true,
+        reason: String(entry.reason ?? ''),
+        retried: entry.retried === true,
+        verdict: String(entry.verdict ?? ''),
+        ms: Math.max(0, Math.floor(Number(entry.ms) || 0)),
+        at: Number.isFinite(Number(entry.at)) ? Math.round(Number(entry.at)) : Date.now(),
+      };
+      rows.push(row);
+      while (rows.length > capacity) rows.shift();
+      return copy(row);
+    },
+    recent() {
+      return rows.map(copy);
+    },
+    snapshot() {
+      return { limit: capacity, count: rows.length, recent: rows.map(copy) };
+    },
+  };
+}
+
 /** Body text of one stream chunk across the provider delta shapes. */
 function chunkTextOf(chunk) {
   if (typeof chunk === 'string') return chunk;
