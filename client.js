@@ -222,6 +222,90 @@ window.__ModuleLoader__.load({
         });
     }
 
+    // ---- TTS 预热状态（只读展示）：纯格式化，无状态、无请求、无轮询 --------------------------
+    // `status.tts.warmup` is the host's read-only projection. This function only turns it into
+    // display text: it never starts/retries a warm-up, and a missing/broken field reads as
+    // 「不可用」 instead of inventing a state. `stale` is true only when the host/UI marks the
+    // snapshot as no longer matching the current model/reference-audio/language identity.
+    const TTS_WARMUP_STATUS_LABELS = Object.freeze({
+      unknown: '未知',
+      queued: '排队中',
+      warming: '预热中',
+      ready: '就绪',
+      failed: '失败',
+    });
+
+    /** Identity inputs the card can compare across status refreshes; paths never leave the page. */
+    function ttsWarmupConfigSignature(tts, langs) {
+      const gpt = tts?.gptSovits ?? {};
+      const models = gpt.models ?? {};
+      const applied = gpt.modelsApplied ?? {};
+      try {
+        return JSON.stringify([
+          gpt.enabled === true,
+          String(gpt.apiBase ?? ''),
+          String(gpt.refAudioPath ?? ''),
+          String(gpt.promptText ?? ''),
+          String(models.gptModelPath ?? ''),
+          String(models.sovitsModelPath ?? ''),
+          String(applied.gptPath ?? ''),
+          String(applied.sovitsPath ?? ''),
+          Number(applied.at) || 0,
+          String(gpt.textLang ?? ''),
+          String(gpt.promptLang ?? ''),
+          String(langs?.speech ?? ''),
+        ]);
+      } catch {
+        return '';
+      }
+    }
+
+    /**
+     * Format one warm-up snapshot for the read-only row. Pure: reads only its arguments.
+     * Returns `{available, status, stale, label, errorCode, retryInMs, text}`.
+     */
+    function formatTtsWarmupStatus(warmup, options = {}) {
+      const forcedStale = options !== null && typeof options === 'object' && options.stale === true;
+      if (warmup === null || typeof warmup !== 'object' || typeof warmup.status !== 'string'
+        || warmup.status.trim().length === 0) {
+        return {
+          available: false,
+          status: 'unknown',
+          stale: false,
+          label: '不可用',
+          errorCode: null,
+          retryInMs: null,
+          text: '不可用',
+        };
+      }
+      const raw = warmup.status.trim().toLowerCase();
+      const mapped = raw === 'stale' ? 'failed' : raw;
+      const status = Object.hasOwn(TTS_WARMUP_STATUS_LABELS, mapped) ? mapped : 'unknown';
+      const label = TTS_WARMUP_STATUS_LABELS[status];
+      const errorCode = typeof warmup.lastErrorCode === 'string' && warmup.lastErrorCode.trim().length > 0
+        ? warmup.lastErrorCode.trim().slice(0, 80)
+        : null;
+      const retryInMs = Number.isFinite(warmup.retryInMs) && warmup.retryInMs >= 0
+        ? Math.round(warmup.retryInMs)
+        : null;
+      const stale = forcedStale === true || warmup.stale === true || raw === 'stale'
+        || /^TTS_WARMUP_(?:STALE|PREEMPTED)$/u.test(errorCode ?? '');
+      const parts = [`${label}（${status}）`];
+      if (errorCode !== null) parts.push(`错误码：${errorCode}`);
+      if (retryInMs !== null) parts.push(`重试：${(retryInMs / 1000).toFixed(1)}s 后`);
+      parts.push(stale ? 'stale（旧状态，已失效）' : '非 stale');
+      return {
+        available: true,
+        status,
+        stale,
+        label,
+        errorCode,
+        retryInMs,
+        text: parts.join(' · '),
+      };
+    }
+    // ---- TTS 预热状态（只读展示）结束 ----------------------------------------------------------
+
     /** The global hotkeys the host ships; anything else in status is ignored. */
     const HOTKEY_ACTIONS = ['mic', 'vision', 'layerEdit', 'ambient'];
 
@@ -5411,6 +5495,9 @@ window.__ModuleLoader__.load({
       const [ttsDraft, setTtsDraft] = useState(null);
       // Last 「应用模型」 result of this visit; carries the per-model timings the status omits.
       const [ttsApply, setTtsApply] = useState(null);
+      // Read-only warm-up snapshot: remembers the config identity of the last observed status so
+      // a changed model/reference/language can mark the still-shown old snapshot stale. No request.
+      const ttsWarmupWatch = useRef(null);
       // 动作预设：列表（含覆盖值与可用性）、搜索/过滤、优先级草稿（key = action:id / family:id）。
       const [motionPresets, setMotionPresets] = useState(null);
       const [motionQuery, setMotionQuery] = useState('');
@@ -6566,6 +6653,34 @@ window.__ModuleLoader__.load({
 
       // 用户输入时是否立即打断当前播报：缺省 true（历史行为），只有明确存过 false 才关闭。
       const inputInterrupts = status.voiceInputInterruptsReply !== false;
+
+      // TTS warm-up is read-only: compare this poll's config identity with the one observed with
+      // the same warm-up snapshot. A change marks the old snapshot stale (never a retry/request).
+      const ttsWarmupView = (() => {
+        const warmup = status?.tts?.warmup ?? null;
+        const signature = ttsWarmupConfigSignature(status?.tts, status?.langs);
+        const watch = ttsWarmupWatch.current;
+        if (warmup === null || typeof warmup !== 'object') {
+          ttsWarmupWatch.current = { signature, key: null, generation: null, staleKey: null };
+          return formatTtsWarmupStatus(warmup);
+        }
+        const key = warmup.key ?? null;
+        const generation = warmup.generation ?? null;
+        const snapshotKey = `${key ?? ''}\u0000${generation ?? ''}`;
+        // Same warm-up snapshot + changed model/reference/language inputs → stale. Once marked,
+        // keep it stale until the warm-up identity itself changes, so an unrelated re-render does
+        // not silently turn an invalid snapshot back into "current".
+        const configChanged = watch !== null
+          && (watch.staleKey === snapshotKey
+            || (watch.signature !== signature && watch.key === key && watch.generation === generation));
+        ttsWarmupWatch.current = {
+          signature,
+          key,
+          generation,
+          staleKey: configChanged ? snapshotKey : null,
+        };
+        return formatTtsWarmupStatus(warmup, { stale: configChanged });
+      })();
 
       const hearingOn = status.hearing.running;
       const resources = status.resources ?? [];
@@ -8086,6 +8201,13 @@ window.__ModuleLoader__.load({
           })(),
           settingsGroup(h, 'tts', '语音合成与候音',
             h('div', { style: { ...styles.hint, marginTop: 0, marginBottom: 6 } }, '更好的音色：支持 GPT-SoVITS 可运行模型'),
+            h('div', { 'data-tts-warmup': 'status', style: styles.row },
+              h('span', { style: styles.label }, '预热状态'),
+              h('span', {
+                style: { ...styles.value, textAlign: 'right', ...(ttsWarmupView.stale ? { color: DANGER } : {}) },
+                title: '只读状态：仅作可见性展示，不宣称提速，也不自动重试',
+              }, ttsWarmupView.text)),
+            h('div', { style: styles.hint }, '只读：预热不代表首音会更快；切换模型 / 参考音频 / 语言后旧状态会标为 stale，真实收益需重启后采样。'),
             h('div', { style: styles.row },
               h('span', { style: styles.label }, '语音播报'),
               h('button', {
