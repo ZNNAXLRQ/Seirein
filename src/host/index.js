@@ -1900,8 +1900,8 @@ export function apply(ctx, config) {
     };
   };
   // ---- call mode (phase 1b) ---------------------------------------------
-  // The mode is runtime state only: every start is `normal`, and only an explicit enter/exit
-  // changes it. Entering requires at least one enabled assistant name (settings.voice.callNames).
+  // The mode is persisted in settings.voice.callMode and restored at mount; an explicit enter/exit
+  // writes it. Entering requires at least one enabled assistant name (settings.voice.callNames).
   // In call mode an utterance is delivered only when `detectAddress` finds an enabled name at a
   // sentence start; an unaddressed utterance opens no turn, is not written to memory and never
   // interrupts the sounding reply. The one exception is an explicit request to leave call mode,
@@ -1931,11 +1931,24 @@ export function apply(ctx, config) {
     writeSettings({ voice: { ...storedVoice(), callNames } });
     syncCallNameRegistry(callNames);
   };
+  /**
+   * Persist only the mode beside the other `voice` fields. `callMode` is the one stored value the
+   * next mount restores; every other saved voice field (callNames, chunking, mute, ...) is kept.
+   */
+  const saveCallMode = (mode) => {
+    writeSettings({ voice: { ...storedVoice(), callMode: mode } });
+  };
   const callModeNames = () => {
     const names = callNameList();
     return { names, enabledNames: names.filter((entry) => entry.enabled === true).map((entry) => entry.text) };
   };
-  const callModeStatus = () => ({ mode: callMode.mode, ...callModeNames() });
+  /** Why a persisted `call` could not be restored at mount; `null` when startup was not refused. */
+  let persistedCallRefused = null;
+  const callModeStatus = () => ({
+    mode: callMode.mode,
+    ...callModeNames(),
+    persistedCallRefused,
+  });
   /** Enter call mode. A refused enter changes nothing and reports why (reason + settings hint). */
   const enterCallMode = async (source = 'agent') => {
     const names = enabledCallNames();
@@ -1953,6 +1966,8 @@ export function apply(ctx, config) {
     // already-entered mode keeps its instance (and enteredAt) untouched.
     if (!wasCall) callMode = createCallMode({ names });
     callMode.enter();
+    saveCallMode('call');
+    persistedCallRefused = null;
     if (!wasCall) {
       await log.emit('call.mode.enter', { names: names.length, source }).catch(() => {});
     }
@@ -1962,9 +1977,38 @@ export function apply(ctx, config) {
   const exitCallMode = async (source = 'agent') => {
     const wasCall = callMode.mode === 'call';
     callMode.exit();
+    saveCallMode('normal');
+    persistedCallRefused = null;
     if (wasCall) await log.emit('call.mode.exit', { source }).catch(() => {});
     return { ok: true, ...callModeStatus(), source };
   };
+  /**
+   * Restore the one persisted mode at mount. `call` is honored only while an enabled name exists;
+   * with none the mount stays normal, records why and never blocks startup. Any other stored value
+   * (including the old settings file that has no `callMode` key) means normal.
+   */
+  const restorePersistedCallMode = () => {
+    if (storedVoice().callMode !== 'call') return false;
+    const names = enabledCallNames();
+    if (names.length === 0) {
+      persistedCallRefused = 'no-address-name';
+      void log.emit('call.mode.refused', {
+        reason: 'no-address-name',
+        source: 'startup',
+        persisted: true,
+      }).catch(() => {});
+      return false;
+    }
+    callMode = createCallMode({ names });
+    callMode.enter();
+    void log.emit('call.mode.enter', {
+      names: names.length,
+      source: 'startup',
+      restored: true,
+    }).catch(() => {});
+    return true;
+  };
+  restorePersistedCallMode();
   const isCallExitRequest = (text) => CALL_EXIT_REQUEST.test(String(text ?? ''));
   /**
    * The delivery decision. `normal` mode always allows; call mode allows a sentence-start address
