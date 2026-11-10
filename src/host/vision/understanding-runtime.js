@@ -23,7 +23,10 @@
  *   3. 有界与无路径：render() 只输出场景摘要、最近事件、unresolved、覆盖缺口提示，不渲染
  *      文件路径、帧 id、证据数组或任何内部对象；总长严格不超过 maxChars；
  *   4. 任何异常都不抛给调用方：宿主回调、analyze、解析、状态推进各自兜底，返回机器可读
- *      `{ok:false, reason}`。status() 与 emit() 只带计数/原因/时间，不带素材正文。
+ *      `{ok:false, reason}`。status() 与 emit() 只带计数/原因/时间/安全 meta，不带素材正文；
+ *   5. 连续失败退避：连续 N 次失败后进入指数退避（status 暴露 degraded/retryAt/lastError），
+ *      退避期保留采集与状态但不再到点请求；失败样本只在内存里保留 3 条/10 分钟/每条正文 2KB，
+ *      只通过显式 samples() 读取，隐私 clear/stop 时清空。
  *
  * 状态过期在读取时发生（current()/render()），不会后台定时清理；这样没有真实定时器的测试
  * 也能用假时钟推进验证。
@@ -37,6 +40,7 @@ import {
 } from './understanding.js';
 import { buildUnderstandingPrompt } from './understanding-prompt.js';
 import { createUnderstandingScheduler } from './understanding-scheduler.js';
+import { createUnderstandingSamples, sanitizeDiagnosticMeta } from './understanding-samples.js';
 
 /** 运行时预算；与纯计算/提示词层的默认值相互独立。 */
 export const UNDERSTANDING_RUNTIME_DEFAULTS = Object.freeze({
@@ -52,6 +56,11 @@ export const UNDERSTANDING_RUNTIME_DEFAULTS = Object.freeze({
 
 /** 后台分析最小间隔；比纯调度默认 3s 更保守，避免付费模型过频。 */
 const DEFAULT_MIN_INTERVAL_MS = 15_000;
+/** 连续失败达到这个次数才退避；少一次失败仍保持正常节奏，避免偶发错误立刻停摆。 */
+const DEFAULT_FAILURE_THRESHOLD = 3;
+/** 退避首档 60s；之后按 2 的幂增长，上限 10 分钟。绝不继续按 20s 烧请求。 */
+const DEFAULT_BACKOFF_BASE_MS = 60_000;
+const DEFAULT_BACKOFF_MAX_MS = 600_000;
 /** 原因只作为状态标签：单行、限长，避免长文本/控制字符进入 status。 */
 const MAX_REASON_CHARS = 80;
 /** provider 错误码同样只保留短机器码；正文、路径或空白一律丢弃。 */
@@ -124,6 +133,30 @@ function errorCodeText(value) {
   if (code.length === 0 || code.length > MAX_ERROR_CODE_CHARS) return '';
   if (!MACHINE_CODE.test(code)) return '';
   return code;
+}
+
+/**
+ * 失败样本正文只看分析器显式挂载的非枚举诊断字段；`ok:false` 包装里的 `text` 不信任，
+ * 避免把测试替身/失败占位文本误当模型输出。成功但解析失败（bad-json）则由调用方传入 raw。
+ */
+function diagnosticTextOf(output) {
+  if (!isObject(output)) return '';
+  try {
+    if (typeof output.diagnosticText === 'string') return output.diagnosticText;
+    if (typeof output.sampleText === 'string') return output.sampleText;
+  } catch {
+    /* 诊断字段的 getter 抛错时按“没有正文”处理 */
+  }
+  return '';
+}
+
+/** meta 来自可注入的 analyze；getter/代理抛错也不能让整次运行变成未处理拒绝。 */
+function safeDiagnosticMeta(value) {
+  try {
+    return sanitizeDiagnosticMeta(value);
+  } catch {
+    return null;
+  }
 }
 
 /** bad-json 诊断：长度与哈希；原文只在这里被摘要，绝不返回。 */
@@ -385,6 +418,16 @@ export function createUnderstandingRuntime(options = {}) {
   const maxEventsShown = toCount(source.maxEventsShown, UNDERSTANDING_RUNTIME_DEFAULTS.maxEventsShown);
   const maxAgeMs = toDuration(source.maxAgeMs, UNDERSTANDING_RUNTIME_DEFAULTS.maxAgeMs);
 
+  // 连续失败退避：阈值、首档和上限都可注入，方便用假时钟测试；生产默认 3 次 / 60s / 10min。
+  const failureThreshold = toLimit(source.failureThreshold, DEFAULT_FAILURE_THRESHOLD);
+  const backoffBaseMs = toLimit(source.backoffBaseMs, DEFAULT_BACKOFF_BASE_MS);
+  const backoffMaxMs = Math.max(
+    backoffBaseMs,
+    toLimit(source.backoffMaxMs, DEFAULT_BACKOFF_MAX_MS),
+  );
+  // 手动 runNow 可以绕过一次退避；测试需要锁死时传 false。
+  const manualBackoffBypassEnabled = source.manualBackoffBypass !== false;
+
   /** 当前连续状态；只通过 current()/render() 暴露副本。 */
   let state = null;
   /** clear/stop 递增；在途结果必须与开始时同代次才能写回。 */
@@ -401,6 +444,11 @@ export function createUnderstandingRuntime(options = {}) {
   let lastReason = '';
   /** provider 的错误码（仅短机器码）；没有错误码时为空串。 */
   let lastErrorCode = '';
+  /** status 的 `lastError`：优先 provider 错误码，其次原因码；永远是机器码。 */
+  let lastError = '';
+  /** 最近一次真实请求的机器元数据；不含正文/路径，供 empty/bad-json 对照。 */
+  let lastMeta = null;
+  let lastMetaAt = null;
   /** bad-json 的诊断：只记长度和哈希，不记原始文本/画面内容。 */
   let lastRawChars = 0;
   let lastRawHash = '';
@@ -409,6 +457,13 @@ export function createUnderstandingRuntime(options = {}) {
   let lastClearReason = '';
   /** 最近一次进入执行的分析请求的 focus 长度；只留长度，不留正文。 */
   let lastFocusChars = 0;
+
+  /** 连续失败/退避状态；成功、clear、stop 后归零。 */
+  let failureStreak = 0;
+  let degraded = false;
+  let retryAt = null;
+  let backoffMs = 0;
+  let manualBypassAvailable = false;
 
   const clock = () => {
     try {
@@ -419,6 +474,38 @@ export function createUnderstandingRuntime(options = {}) {
     }
     return Date.now();
   };
+
+  /** 有界失败样本：只在失败分支写入，最多 3 条、10 分钟、每条正文 2KB。 */
+  const failureSamples = createUnderstandingSamples({
+    now: () => clock(),
+    maxEntries: source.sampleMaxEntries,
+    ttlMs: source.sampleTtlMs,
+    maxBodyBytes: source.sampleMaxBodyBytes,
+  });
+
+  function resetBackoff() {
+    failureStreak = 0;
+    degraded = false;
+    retryAt = null;
+    backoffMs = 0;
+    manualBypassAvailable = false;
+    lastError = '';
+  }
+
+  function noteFailureForBackoff(at, reason) {
+    failureStreak += 1;
+    // lastError 只承载机器码：provider 错误码优先，其次原因码；两者都不合法时给稳定兜底。
+    lastError = lastErrorCode || errorCodeText(reason) || 'error';
+    if (failureStreak < failureThreshold) return;
+    const wasDegraded = degraded;
+    const exponent = Math.min(20, failureStreak - failureThreshold);
+    const delay = Math.min(backoffMaxMs, backoffBaseMs * (2 ** exponent));
+    degraded = true;
+    backoffMs = delay;
+    retryAt = at + delay;
+    // 只在“刚进入退避”时发放一次手动绕过；手动请求再失败也不会无限续期绕过。
+    if (!wasDegraded) manualBypassAvailable = manualBackoffBypassEnabled;
+  }
 
   function emitEvent(payload) {
     if (emit === null) return;
@@ -440,8 +527,13 @@ export function createUnderstandingRuntime(options = {}) {
       reason: outcome.reason,
       eventCount: outcome.eventCount ?? 0,
       droppedEvents: outcome.droppedEvents ?? 0,
-      // 失败诊断只带机器字段：provider 错误码与 bad-json 的长度/哈希，绝无正文或路径。
+      // 失败诊断只带机器字段：provider 错误码、bad-json 长度/哈希、请求 meta，绝无正文或路径。
       errorCode: lastErrorCode,
+      lastError,
+      meta: lastMeta,
+      degraded,
+      retryAt,
+      failureStreak,
       rawChars: lastRawChars,
       rawHash: lastRawHash,
       at: lastAt,
@@ -464,6 +556,9 @@ export function createUnderstandingRuntime(options = {}) {
     const label = reasonText(reason) || 'skipped';
     lastReason = label;
     lastErrorCode = '';
+    lastError = '';
+    lastMeta = null;
+    lastMetaAt = null;
     lastRawChars = 0;
     lastRawHash = '';
     lastAt = clock();
@@ -471,18 +566,62 @@ export function createUnderstandingRuntime(options = {}) {
     return { ok: false, reason: label };
   }
 
+  /**
+   * 连续失败退避期间真正挡住一次运行。它是“跳过”而不是新的失败：不增加 failures、不写样本、
+   * 不改变 lastError/meta；事件只带机器码、计数和 retryAt。
+   */
+  function recordBackoffSkip() {
+    lastReason = 'backoff';
+    lastAt = clock();
+    emitOutcome({ ok: false, reason: 'backoff', eventCount: 0, droppedEvents: 0 });
+    return {
+      ok: false,
+      reason: 'backoff',
+      retryAt,
+      lastError,
+      degraded: true,
+    };
+  }
+
   function recordFailure(reason, dropped = 0, diagnostics = {}) {
     const label = reasonText(reason) || 'error';
     const droppedCount = Number.isFinite(dropped) && dropped > 0 ? Math.floor(dropped) : 0;
-    const raw = rawDiagnostics(diagnostics);
+    // 诊断对象来自可注入的 analyze：逐项兜底，任何 getter/代理异常都不能让 runNow 拒绝。
+    let raw = { rawChars: 0, rawHash: '' };
+    let meta = null;
+    let sampleText = '';
+    let errorCode = '';
+    try {
+      raw = rawDiagnostics(diagnostics);
+      errorCode = errorCodeText(diagnostics?.errorCode);
+      sampleText = typeof diagnostics?.text === 'string' ? diagnostics.text : '';
+      meta = safeDiagnosticMeta(diagnostics?.meta);
+    } catch {
+      /* 诊断读取失败时保留空诊断，真实失败 reason 仍然记账 */
+    }
     failures += 1;
     lastEventCount = 0;
     droppedEvents += droppedCount;
     lastReason = label;
-    lastErrorCode = errorCodeText(diagnostics?.errorCode);
+    lastErrorCode = errorCode;
+    lastError = '';
     lastRawChars = raw.rawChars;
     lastRawHash = raw.rawHash;
+    lastMeta = meta;
     lastAt = clock();
+    lastMetaAt = lastAt;
+    noteFailureForBackoff(lastAt, label);
+    try {
+      failureSamples.record({
+        reason: label,
+        errorCode: lastErrorCode,
+        meta,
+        text: sampleText,
+        at: lastAt,
+      });
+    } catch {
+      /* 样本是诊断旁路：写入失败不能改变失败结果的记账 */
+    }
     emitOutcome({ ok: false, reason: label, eventCount: 0, droppedEvents: droppedCount });
     return {
       ok: false,
@@ -608,13 +747,21 @@ export function createUnderstandingRuntime(options = {}) {
     // 失败 `{ok:false,text:'',reason,images}`。失败必须先按真实 reason 记账：把整个包装
     // 对象交给解析器只会得到 no-scene，把 no-image-support / read-failed / timeout 吞掉。
     // 裸字符串 / 裸对象不是该包装形状（测试与自定义 analyze），保持原样作为 raw。
+    const analyzerMeta = isObject(rawOutput)
+      ? safeDiagnosticMeta(rawOutput.meta)
+      : null;
     if (isObject(rawOutput) && rawOutput.ok === false) {
       const failureReason = typeof rawOutput.reason === 'string'
         && rawOutput.reason.trim().length > 0
         ? rawOutput.reason
         : 'analyze-failed';
-      // 只透传 provider 的短错误码；错误正文/路径永远不进入事件或 status。
-      return recordFailure(failureReason, 0, { errorCode: rawOutput.errorCode });
+      // 只透传 provider 的短错误码和请求 meta；错误正文/路径永远不进入事件或 status。
+      // `diagnosticText` 只给有界样本，样本不会进入 render/status/事件正文。
+      return recordFailure(failureReason, 0, {
+        errorCode: rawOutput.errorCode,
+        meta: analyzerMeta,
+        text: diagnosticTextOf(rawOutput),
+      });
     }
     const rawEvidence = isObject(rawOutput) && typeof rawOutput.text === 'string'
       ? rawOutput.text
@@ -638,10 +785,13 @@ export function createUnderstandingRuntime(options = {}) {
 
     if (!parsed.ok) {
       lastEventCount = 0;
-      // bad-json 只带 rawChars/rawHash（parseUnderstanding 生成）；其它解析失败没有诊断字段。
+      // bad-json 带 rawChars/rawHash（parseUnderstanding 生成）；请求 meta 与原始输出只交给
+      // 有界样本。empty/bad-json 因此能对照真实 finish/chunk 元数据，而不会被误判为“不支持图片”。
       return recordFailure(parsed.reason || 'parse-error', parsed.droppedEvents || 0, {
         rawChars: parsed.rawChars,
         rawHash: parsed.rawHash,
+        meta: analyzerMeta,
+        text: typeof rawEvidence === 'string' ? rawEvidence : '',
       });
     }
 
@@ -673,8 +823,12 @@ export function createUnderstandingRuntime(options = {}) {
     lastErrorCode = '';
     lastRawChars = 0;
     lastRawHash = '';
+    lastMeta = analyzerMeta;
+    lastMetaAt = clock();
     lastWindowReason = reason;
     lastAt = clock();
+    // 成功重置连续失败/退避：下一轮重新按正常 20s 限速，不继承旧 retryAt。
+    resetBackoff();
     emitOutcome({
       ok: true,
       reason: 'ok',
@@ -713,6 +867,12 @@ export function createUnderstandingRuntime(options = {}) {
    * 本次请求进入提示词的【本次关注点】；不会写进连续状态，`status()` 只记录其长度。
    */
   function runNow(request = {}) {
+    // 手动入口：退避期内允许绕过一次；绕过是显式消费，不会无限续期。
+    return runInternal(request, true);
+  }
+
+  /** 调度器入口：退避期内不绕过；到 retryAt 后才允许探测。 */
+  function runInternal(request = {}, manual = false) {
     if (stopped) return Promise.resolve({ ok: false, reason: 'stopped' });
 
     let blocked;
@@ -732,6 +892,13 @@ export function createUnderstandingRuntime(options = {}) {
     if (analyze === null || framesBetween === null || audioBetween === null) {
       recordSkip('not-configured');
       return Promise.resolve({ ok: false, reason: 'not-configured' });
+    }
+
+    // 连续失败退避：保留采集与状态，只是不再到点就发请求。到 retryAt 后放行一次探测；
+    // 手动 runNow 额外拥有一次绕过机会，成功即重置，失败则继续指数退避。
+    if (degraded && (retryAt === null || clock() < retryAt)) {
+      if (!(manual && manualBypassAvailable)) return Promise.resolve(recordBackoffSkip());
+      manualBypassAvailable = false;
     }
 
     const at = clock();
@@ -771,7 +938,7 @@ export function createUnderstandingRuntime(options = {}) {
       now: nowSource,
       setTimer,
       clearTimer,
-      run: (window) => runNow(window),
+      run: (window) => runInternal(window, false),
       minIntervalMs,
     });
   }
@@ -781,6 +948,18 @@ export function createUnderstandingRuntime(options = {}) {
   /** 有变化 → 交给内部调度器排队（priority 透传，仍受 minInterval 约束）。 */
   function noteChange(request = {}) {
     if (stopped) return status();
+    // 退避期间照常保留采集，但不再排队；到 retryAt 后的第一份新材料才重新尝试。
+    if (degraded && (retryAt === null || clock() < retryAt)) {
+      const scheduled = scheduler.status();
+      return {
+        ...scheduled,
+        accepted: false,
+        reason: 'backoff',
+        degraded: true,
+        retryAt,
+        lastError,
+      };
+    }
     const source = isObject(request) ? request : {};
     return scheduler.note({
       from: source.from,
@@ -902,9 +1081,15 @@ export function createUnderstandingRuntime(options = {}) {
     lastWindowReason = '';
     lastReason = 'cleared';
     lastErrorCode = '';
+    lastError = '';
+    lastMeta = null;
+    lastMetaAt = null;
     lastRawChars = 0;
     lastRawHash = '';
     lastAt = clock();
+    // 隐私/切源是本地诊断样本的明确清空点；同时结束旧退避，重新开始计数。
+    failureSamples.clear();
+    resetBackoff();
     if (activeController !== null) {
       try {
         activeController.abort();
@@ -924,9 +1109,15 @@ export function createUnderstandingRuntime(options = {}) {
     generation += 1;
     lastReason = 'stopped';
     lastErrorCode = '';
+    lastError = '';
+    lastMeta = null;
+    lastMetaAt = null;
     lastRawChars = 0;
     lastRawHash = '';
     lastAt = clock();
+    // 关闭/卸载时清空样本与退避；不把任何正文留在内存里。
+    failureSamples.clear();
+    resetBackoff();
     if (activeController !== null) {
       try {
         activeController.abort();
@@ -948,6 +1139,18 @@ export function createUnderstandingRuntime(options = {}) {
       // 机器原因码与 lastReason 同源；lastErrorCode 只承载 provider 错误码（没有则空）。
       lastReasonCode: reason,
       lastErrorCode,
+      // lastError 是 status 的稳定机器标签：优先 provider 错误码，其次原因码。
+      lastError,
+      // 真实请求 meta（provider/model/计数/finish/耗时），不含正文或路径。
+      lastMeta,
+      lastMetaAt,
+      // 连续失败退避：degraded/retryAt/lastError 是给设置页和日志的稳定诊断字段。
+      degraded,
+      retryAt: degraded ? retryAt : null,
+      failureStreak,
+      backoffMs: degraded ? backoffMs : 0,
+      // 样本正文不进入 status；这里只给条数，完整样本走显式的 samples() 诊断入口。
+      sampleCount: failureSamples.count(),
       // bad-json 诊断：只给长度和哈希，原文本/画面永不进入 status。
       rawChars: lastRawChars,
       rawHash: lastRawHash,
@@ -973,6 +1176,14 @@ export function createUnderstandingRuntime(options = {}) {
     clear,
     status,
     stop,
+    /** 本地诊断入口：返回失败样本 head+tail；绝不进入 render/事件/status 正文。 */
+    samples() {
+      return failureSamples.list();
+    },
+    /** 样本边界（条数/上限/TTL），不含正文。 */
+    sampleStatus() {
+      return failureSamples.status();
+    },
     get scheduler() {
       return scheduler;
     },

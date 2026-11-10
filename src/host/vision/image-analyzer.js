@@ -23,6 +23,12 @@
  * 输出里只有机器原因码：`reason` 永不包含文件路径、异常 message 或模型正文；`errorCode`
  * 只透传 provider 的 `failure.code`（以及内部的 `'empty'` 哨兵），并限制为 ≤64 个
  * 无空白、无路径语义的机器码字符。
+ *
+ * 另挂一个**非枚举** `meta`（安全请求元数据，兼容旧结果形状）：provider/model/imageCount/
+ * contentBlockTypes/maxTokens/textChars/reasoningChars/finishKind/finishReason/errorCode/
+ * timedOut/aborted/streamOpened/chunkCount/durationMs。meta 不复制正文或路径；
+ * `errorCode:'empty'` 只表示“本次没有可用正文”，`finishKind` 始终来自真实 finish 分片，
+ * 不能反推成“模型空生成”。
  */
 
 import { basename } from 'node:path';
@@ -37,9 +43,80 @@ export const IMAGE_ANALYZER_DEFAULTS = Object.freeze({
 /** provider 错误码只保留为短机器码，避免正文/路径混进结果。 */
 const MAX_ERROR_CODE_CHARS = 64;
 const MACHINE_CODE = /^[A-Za-z0-9_.:-]+$/u;
+/** provider/model 是路由标识；允许常见分隔符，但拒绝空白、反斜杠与控制字符。 */
+const MAX_ROUTE_CHARS = 80;
+const ROUTE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/u;
+/** meta 中的内容块类型最多记录这么多；类型本身只接受短机器标识。 */
+const MAX_BLOCK_TYPES = 8;
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 路由标识：超出上限或含空白/反斜杠时留空，绝不把路径/正文塞进 meta。 */
+function metaRoute(value) {
+  const text = nonEmptyString(value);
+  if (text.length === 0 || text.length > MAX_ROUTE_CHARS) return '';
+  return ROUTE_ID.test(text) ? text : '';
+}
+
+/** finish 原因只接受短机器码；没有机器码时留空，不猜模型意图。 */
+function metaToken(value) {
+  if (typeof value !== 'string') return '';
+  return providerErrorCode(value.toLowerCase());
+}
+
+/** 去重后的内容块类型；调用方传入的列表本身有界。 */
+function blockTypesOf(blocks) {
+  const types = [];
+  for (const block of blocks) {
+    if (types.length >= MAX_BLOCK_TYPES) break;
+    if (!isObject(block) || typeof block.type !== 'string') continue;
+    const type = metaToken(block.type);
+    if (type.length === 0 || types.includes(type)) continue;
+    types.push(type);
+  }
+  return Object.freeze(types);
+}
+
+/**
+ * 把 meta 作为**非枚举**字段挂到结果上。
+ *
+ * 旧调用只读 `ok/text/reason/images`，甚至用 `deepEqual` 比较整个结果；非枚举字段不会改变
+ * `Object.keys`/`JSON.stringify`/`deepEqual` 的旧行为，但调用方仍可显式读 `result.meta`。
+ * 这是“meta 可选、不影响成功结果”的兼容方式。
+ */
+function attachMeta(result, meta) {
+  try {
+    Object.defineProperty(result, 'meta', {
+      value: Object.freeze(meta),
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+  } catch {
+    /* 极端宿主对象不允许扩展时，失败结果仍然是合法的机器原因 */
+  }
+  return result;
+}
+
+/**
+ * 失败样本需要原始输出 head+tail 时使用；同样是非枚举字段，不进入 JSON、status 或日志正文。
+ * 只在失败分支挂载，成功结果不复制模型正文。
+ */
+function attachDiagnosticText(result, text) {
+  if (typeof text !== 'string' || text.length === 0) return result;
+  try {
+    Object.defineProperty(result, 'diagnosticText', {
+      value: text,
+      enumerable: false,
+      writable: false,
+      configurable: true,
+    });
+  } catch {
+    /* 不复制正文比挂载失败更重要 */
+  }
+  return result;
 }
 
 /** 正数上限：非法值退回默认值，正数向下取整。 */
@@ -180,8 +257,16 @@ export function createImageAnalyzer({
   const tokenLimit = toLimit(maxTokens, IMAGE_ANALYZER_DEFAULTS.maxTokens);
   const deadlineMs = toLimit(timeoutMs, IMAGE_ANALYZER_DEFAULTS.timeoutMs);
 
-  // 时钟目前只作为注入契约保留：结果不含耗时字段，测试也不需要真实时间。
-  void now;
+  /** 注入时钟只用于 durationMs；时钟失败退回真实时间，不让诊断字段把请求弄崩。 */
+  const clock = () => {
+    try {
+      const value = Number(now());
+      if (Number.isFinite(value) && value >= 0) return value;
+    } catch {
+      /* 不能因为诊断时钟失败而改变请求语义 */
+    }
+    return Date.now();
+  };
 
   /** 统一失败形状：ok=false、text 为空、images 是“真正进入请求的图片数”。 */
   const failure = (reason, images = 0, errorCode = '') => {
@@ -206,21 +291,71 @@ export function createImageAnalyzer({
       const user = typeof input.user === 'string' ? input.user : '';
       const frames = selectFrames(input.frames, imageLimit);
 
+      // 诊断状态全部是局部变量：请求失败/成功都只产出数字、布尔和短机器码。
+      // `text` 只用于计算 textChars 与失败样本；meta 本身不复制正文。
+      const startedAt = clock();
+      let text = '';
+      let reasoningChars = 0;
+      let finishKind = '';
+      let finishReason = '';
+      let finishAborted = false;
+      let streamOpened = false;
+      let chunkCount = 0;
+      let provider = '';
+      let model = '';
+      let terminalReason = '';
+      // 尚未组装请求时为空；真正发请求前才写入 text/image，避免把“计划”说成“实际请求”。
+      let contentBlockTypes = Object.freeze([]);
+
+      /**
+       * 完成一次结果：统一挂 meta；失败时按需挂非枚举 diagnosticText。
+       * **绝不**从 `text.trim()===''` 反推“模型空生成”：finishKind 只来自真实 finish 分片，
+       * errorCode 的 `empty` 只是“本次没有可用正文”的哨兵。
+       */
+      const buildMeta = (images, errorCode) => {
+        const meta = {
+          provider: metaRoute(provider),
+          model: metaRoute(model),
+          imageCount: Math.max(0, Math.floor(Number(images) || 0)),
+          contentBlockTypes,
+          maxTokens: tokenLimit,
+          textChars: text.length,
+          reasoningChars,
+          finishKind,
+          finishReason: finishReason || finishKind,
+          errorCode: providerErrorCode(errorCode),
+          timedOut: terminalReason === 'timeout',
+          aborted: terminalReason === 'aborted'
+            || finishAborted
+            || signal?.aborted === true,
+          streamOpened,
+          chunkCount,
+          durationMs: Math.max(0, Math.floor(clock() - startedAt)),
+        };
+        return meta;
+      };
+      const fail = (reason, images = 0, errorCode = '') => {
+        const result = failure(reason, images, errorCode);
+        attachMeta(result, buildMeta(images, result.errorCode || ''));
+        attachDiagnosticText(result, text);
+        return result;
+      };
+
       // 1. 两个服务都必须可用：llm 发请求，attachments 保存图片。
       //    先查服务再看取消，保持“服务存在 → selection → 能力 → 帧”的既定顺序。
       const llm = serviceOf(getService, 'llm');
-      if (!isObject(llm) || typeof llm.stream !== 'function') return failure('no-llm');
+      if (!isObject(llm) || typeof llm.stream !== 'function') return fail('no-llm');
       const attachments = serviceOf(getService, 'attachments');
       if (!isObject(attachments) || typeof attachments.saveImage !== 'function') {
-        return failure('no-attachments');
+        return fail('no-attachments');
       }
 
       // 外部取消不应继续读图或保存附件；这里先于任何文件 I/O。
-      if (signal?.aborted === true) return failure('aborted');
+      if (signal?.aborted === true) return fail('aborted');
 
       // 2. 取默认模型路由；provider/model 任一为空都视为没有模型。
-      const { provider, model } = readRoute(getService);
-      if (provider.length === 0 || model.length === 0) return failure('no-model');
+      ({ provider, model } = readRoute(getService));
+      if (provider.length === 0 || model.length === 0) return fail('no-model');
 
       // 3. 能力必须“明确”支持图片；未知、缺省、探测抛错都按不支持处理。
       let info;
@@ -229,29 +364,29 @@ export function createImageAnalyzer({
           ? await llm.resolveModelInfo(provider, model, signal)
           : undefined;
       } catch {
-        return failure(signal?.aborted === true ? 'aborted' : 'no-image-support');
+        return fail(signal?.aborted === true ? 'aborted' : 'no-image-support');
       }
-      if (signal?.aborted === true) return failure('aborted');
+      if (signal?.aborted === true) return fail('aborted');
       const modalities = Array.isArray(info?.inputModalities) ? info.inputModalities : null;
-      if (modalities === null || !modalities.includes('image')) return failure('no-image-support');
+      if (modalities === null || !modalities.includes('image')) return fail('no-image-support');
 
       // 4. 能力通过后才检查帧，避免为一次必然失败的请求读盘。
-      if (frames.length === 0) return failure('no-frames');
-      if (typeof readFile !== 'function') return failure('read-failed');
+      if (frames.length === 0) return fail('no-frames');
+      if (typeof readFile !== 'function') return fail('read-failed');
 
       // 5. 逐帧读取并保存。任何一帧失败都整体失败：不能少图却假装看全。
       const images = [];
       for (let index = 0; index < frames.length; index += 1) {
-        if (signal?.aborted === true) return failure('aborted');
+        if (signal?.aborted === true) return fail('aborted');
         let data;
         try {
           data = await readFile(frames[index].file);
         } catch {
-          return failure('read-failed');
+          return fail('read-failed');
         }
         // 契约要求 saveImage 的 data 是 Uint8Array（Node Buffer 满足）；其他形状视为读失败。
-        if (!(data instanceof Uint8Array)) return failure('read-failed');
-        if (signal?.aborted === true) return failure('aborted');
+        if (!(data instanceof Uint8Array)) return fail('read-failed');
+        if (signal?.aborted === true) return fail('aborted');
 
         let attachment;
         try {
@@ -261,18 +396,18 @@ export function createImageAnalyzer({
             name: attachmentName(frames[index].file, index),
           });
         } catch {
-          return failure('save-failed');
+          return fail('save-failed');
         }
-        if (attachment === undefined || attachment === null) return failure('save-failed');
+        if (attachment === undefined || attachment === null) return fail('save-failed');
         images.push({ type: 'image', attachment });
       }
-      if (signal?.aborted === true) return failure('aborted');
+      if (signal?.aborted === true) return fail('aborted');
+      contentBlockTypes = blockTypesOf([{ type: 'text' }, ...images]);
 
       // 6. 模型请求阶段：内部 AbortController 同时承载“超时”和“外部取消”，
       //    对外只把 controller.signal 交给 llm，避免 provider 直接依赖调用方对象。
       const controller = new AbortController();
-      // 先到的原因生效：timeout / aborted 只写入一次，后到的取消不会改写已经得出的结果。
-      let terminalReason = '';
+      // terminalReason 在 analyze 开头声明：早期失败也要能生成一致的 meta。
       let timer = null;
       let listening = false;
       // 与“下一片”竞速的取消令牌；期限与外部取消都只 resolve 它一次。
@@ -321,7 +456,7 @@ export function createImageAnalyzer({
       try {
         // 外部取消可能刚好发生在 addEventListener 之前；注册后再确认一次，先于内部期限。
         const beforeTimer = reasonNow();
-        if (beforeTimer !== '') return failure(beforeTimer, images.length);
+        if (beforeTimer !== '') return fail(beforeTimer, images.length);
 
         // 超时是同步定时器也要能被测试：先登记，再发请求；真实 setTimeout 会在本轮同步代码
         // 结束后才触发，所以生产路径不会出现“未发请求先超时”。
@@ -347,39 +482,40 @@ export function createImageAnalyzer({
           });
         } catch (error) {
           const reason = reasonNow();
-          return failure(
+          return fail(
             reason || 'stream-error',
             images.length,
             reason ? '' : thrownErrorCode(error),
           );
         }
+        // 只要 provider 返回了 stream 对象，就记录“流已打开”；即使迭代器随后不可用。
+        streamOpened = stream !== null && stream !== undefined;
 
         const afterStream = reasonNow();
-        if (afterStream !== '') return failure(afterStream, images.length);
+        if (afterStream !== '') return fail(afterStream, images.length);
 
         // 7. 收集文本。等待“下一片”必须同时受期限与取消控制：provider 不响应 abort 时，
         //    直接 await iterator.next() 会永久挂起并占住在途锁，所以这里与取消令牌竞速。
         try {
           const factory = streamIteratorFactory(stream);
-          if (factory === null) return failure('stream-error', images.length);
+          if (factory === null) return fail('stream-error', images.length);
           iterator = factory.call(stream);
           if (!isObject(iterator) || typeof iterator.next !== 'function') {
-            return failure('stream-error', images.length);
+            return fail('stream-error', images.length);
           }
         } catch (error) {
           const reason = reasonNow();
-          return failure(
+          return fail(
             reason || 'stream-error',
             images.length,
             reason ? '' : thrownErrorCode(error),
           );
         }
 
-        let text = '';
         try {
           for (;;) {
             const beforeNext = reasonNow();
-            if (beforeNext !== '') return failure(beforeNext, images.length);
+            if (beforeNext !== '') return fail(beforeNext, images.length);
 
             let next;
             try {
@@ -391,7 +527,7 @@ export function createImageAnalyzer({
               next = await Promise.race([pending, cancelWait]);
             } catch (error) {
               const reason = reasonNow();
-              return failure(
+              return fail(
                 reason || 'stream-error',
                 images.length,
                 reason ? '' : thrownErrorCode(error),
@@ -399,16 +535,25 @@ export function createImageAnalyzer({
             }
 
             // 取消先到：丢弃已经在途的迟到分片，立即返回，不再拼接任何文本。
-            if (next === cancelToken) return failure(reasonNow() || 'timeout', images.length);
+            if (next === cancelToken) return fail(reasonNow() || 'timeout', images.length);
             const afterNext = reasonNow();
-            if (afterNext !== '') return failure(afterNext, images.length);
-            if (!isObject(next)) return failure('stream-error', images.length);
+            if (afterNext !== '') return fail(afterNext, images.length);
+            if (!isObject(next)) return fail('stream-error', images.length);
             if (next.done === true) break;
 
             const chunk = next.value;
+            chunkCount += 1;
             const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : '';
             if (type === 'text-delta') {
               if (typeof chunk.text === 'string') text += chunk.text;
+              continue;
+            }
+            // 私密推理只计数，绝不拼进正文；不同 provider 可能用 text 或 delta 承载分片。
+            if (/^(reasoning|thinking|thought|analysis)/u.test(type)) {
+              const reasoningText = typeof chunk?.text === 'string'
+                ? chunk.text
+                : (typeof chunk?.delta === 'string' ? chunk.delta : '');
+              reasoningChars += reasoningText.length;
               continue;
             }
             if (type === 'finish') {
@@ -416,17 +561,23 @@ export function createImageAnalyzer({
               const kind = typeof reason?.kind === 'string'
                 ? reason.kind.toLowerCase()
                 : (typeof reason === 'string' ? reason.toLowerCase() : '');
+              // 只记录真实 finish 分片里的机器码；没有 finish 就留空，不凭文本为空猜生成结果。
+              finishKind = metaToken(kind);
+              finishReason = metaToken(typeof reason === 'string' ? reason : reason?.kind) || finishKind;
               if (kind === 'error') {
-                return failure('stream-error', images.length, reason?.failure?.code ?? chunk?.failure?.code);
+                return fail('stream-error', images.length, reason?.failure?.code ?? chunk?.failure?.code);
               }
-              if (kind === 'aborted') return failure('aborted', images.length);
+              if (kind === 'aborted') {
+                finishAborted = true;
+                return fail('aborted', images.length);
+              }
               break;
             }
             // 其他分片（usage 等）与图片分析结果无关，忽略。
           }
         } catch (error) {
           const reason = reasonNow();
-          return failure(
+          return fail(
             reason || 'stream-error',
             images.length,
             reason ? '' : thrownErrorCode(error),
@@ -434,11 +585,14 @@ export function createImageAnalyzer({
         }
 
         const finalReason = reasonNow();
-        if (finalReason !== '') return failure(finalReason, images.length);
+        if (finalReason !== '') return fail(finalReason, images.length);
 
         // 空文本绝不能当作“模型看懂了”：调用方会把它渲染成空的理解结果。
-        if (text.trim().length === 0) return failure('stream-error', images.length, 'empty');
-        return { ok: true, text, reason: 'ok', images: images.length };
+        // errorCode:'empty' 只是“没有可用正文”，不等于“模型空生成”；meta.finishKind 保留真实结束原因。
+        if (text.trim().length === 0) return fail('stream-error', images.length, 'empty');
+        const result = { ok: true, text, reason: 'ok', images: images.length };
+        attachMeta(result, buildMeta(images.length, ''));
+        return result;
       } finally {
         // 尽力释放：不等待 return() 完成，否则 provider 不响应时又会挂起。
         releaseStream(stream, iterator);
