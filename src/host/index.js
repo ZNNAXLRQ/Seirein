@@ -334,11 +334,13 @@ import {
 } from './vision/comment-alignment.js';
 import { createCommentEvidence, COMMENT_EVIDENCE_DEFAULTS } from './vision/comment-evidence.js';
 // P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
-import { createImageAnalyzer } from './vision/image-analyzer.js';
+import { createImageAnalyzer, IMAGE_ANALYZER_DEFAULTS } from './vision/image-analyzer.js';
 import {
   UNDERSTANDING_RUNTIME_DEFAULTS,
   createUnderstandingRuntime,
 } from './vision/understanding-runtime.js';
+// P-187 同材料双探针：手动 action 才发两次独立请求，只读已缓存帧，不参与连续理解。
+import { createVisionProbe } from './vision/vision-probe.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
 import {
   PROACTIVE_DEFAULTS,
@@ -11957,6 +11959,41 @@ export function apply(ctx, config) {
     },
   });
   /**
+   * P-187 同材料双探针：只读已缓存帧，手动 action 才触发；不参与连续理解，也不自动替换模型。
+   *
+   * `config.visionProbeFrames` 是测试缝：生产默认从当前来源/代次的有界证据窗口取最近一帧，
+   * 绝不为了诊断再截图。真实分析器仍走默认模型（与连续理解同一个 understandingAnalyzer）；
+   * 只有宿主显式注入 understandingAnalyzer 的测试才换成替身。
+   */
+  const visionProbeFrames = typeof config?.visionProbeFrames === 'function'
+    ? () => config.visionProbeFrames()
+    : () => {
+      try {
+        const latest = evidenceWindow.latest({
+          source: vision.mode === 'scene' ? 'obs' : 'desktop',
+          sourceEpoch: visionGeneration,
+        });
+        return latest === null ? [] : [latest];
+      } catch {
+        return [];
+      }
+    };
+  const visionProbe = createVisionProbe({
+    analyze: typeof config?.understandingAnalyzer === 'function'
+      ? (options) => config.understandingAnalyzer(options)
+      : (options) => understandingAnalyzer.analyze(options),
+    frames: visionProbeFrames,
+    // 手动诊断只在视觉组件开启、非隐私/非卸载时可用；不要求首轮/连续观看已置位。
+    isBlocked: () => !visionComponentGateOpen(),
+    minIntervalMs: Number(config?.visionProbeMinIntervalMs),
+    ttlMs: Number(config?.visionProbeTtlMs),
+    budget: {
+      maxImages: 1,
+      maxTokens: IMAGE_ANALYZER_DEFAULTS.maxTokens,
+      timeoutMs: IMAGE_ANALYZER_DEFAULTS.timeoutMs,
+    },
+  });
+  /**
    * 设置页成本概览的只读数值：最短间隔是限速下限，`theoretical*` 只是“持续有变化可触发”时
    * 的算术上限，不代表定时调用，也不代表实际费用。实际费用取决于模型与图片处理方式。
    */
@@ -12789,6 +12826,8 @@ export function apply(ctx, config) {
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
+    // 手动双探针的摘要同样属于旧代次：隐私/切源后不允许从 status/action 再读回旧画面摘要。
+    visionProbe.clear();
     resetUnderstandingMaterial();
     // P-187 阶段 5：主动候选同样属于旧代次；连未回应计时一起清掉，但保留累计计数。
     resetProactive('vision-invalidated');
@@ -20576,14 +20615,31 @@ export function apply(ctx, config) {
         },
         required: ['ok', 'connected'],
       },
-      render: (_args, value) => [
-        {
-          type: 'text',
-          text: value.ok
-            ? `VTS ${value.connected ? 'connected' : 'offline'}${value.model ? ` · ${value.model}` : ''}${value.hotkeys?.length ? ` · 动作 ${value.hotkeys.join('、')}` : ''}`
-            : `VTS 失败：${value.error}`,
-        },
-      ],
+      render: (_args, value) => {
+        const lines = [value.ok
+          ? `VTS ${value.connected ? 'connected' : 'offline'}${value.model ? ` · ${value.model}` : ''}${value.hotkeys?.length ? ` · 动作 ${value.hotkeys.join('、')}` : ''}`
+          : `VTS 失败：${value.error}`];
+        if (value.controller && typeof value.controller === 'object') {
+          const controller = value.controller;
+          lines.push(`控制器：${controller.running ? '运行' : '停止'}`
+            + `${controller.locked ? ` · 锁定${controller.lockReason ? `(${controller.lockReason})` : ''}` : ''}`
+            + `${controller.source ? ` · ${controller.source}` : ''}`);
+        }
+        if (value.channels && typeof value.channels === 'object') {
+          const list = (items, max = 10) => {
+            const source = Array.isArray(items) ? items.filter((item) => typeof item === 'string') : [];
+            const shown = source.slice(0, max).join('、');
+            return source.length > max ? `${shown}…(+${source.length - max})` : shown || '无';
+          };
+          lines.push(`已接管：${list(value.channels.controlled)}`
+            + ` · 未验证：${list(value.channels.unverified)}`
+            + ` · VTS 所有：${list(value.channels.vtsOwned)}`);
+        }
+        if (typeof value.lastError === 'string' && value.lastError.length > 0) {
+          lines.push(`最近错误：${value.lastError}`);
+        }
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
     },
     execute: tools.executeLive2d,
   });
@@ -20843,6 +20899,8 @@ export function apply(ctx, config) {
         comment: commentEvidence.state(),
         // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
         understanding: understandingStatusView(),
+        // 同材料双探针的手动诊断状态：没有正文，只有计数/原因与最近一次的受限 meta。
+        probe: visionProbe.status(),
         // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
         proactive: { ...proactive.status(), enabled: proactiveEnabled(), rate: proactiveRate() },
         // P-187 阶段 6：以上证据/台词/评论/理解/主动状态的数字投影；只读、无路径/正文/帧 id。
@@ -21446,6 +21504,19 @@ export function apply(ctx, config) {
     get visionToken() { return visionToken; },
     get writeSettings() { return writeSettings; }
   }) },
+// P-187 同材料双探针：只有显式 action 才运行；结果带受限摘要，status/clear 也走同一入口。
+{ actions: ['vision.probe', 'vision.probe.status', 'vision.probe.clear'], handle: async (body) => {
+    switch (body?.action) {
+      case 'vision.probe':
+        return visionProbe.run();
+      case 'vision.probe.status':
+        return visionProbe.view();
+      case 'vision.probe.clear':
+        return visionProbe.clear();
+      default:
+        return { ok: false, error: 'unknown probe action' };
+    }
+  } },
 { actions: profileActions, handle: createProfileSettingsActions({
     get log() { return log; },
     get maintainProfile() { return maintainProfile; },
@@ -21631,6 +21702,8 @@ export function apply(ctx, config) {
           await stopEvidenceCapture('dispose');
           // P-187 阶段 3：停止后台理解的定时器/队列，在途结果因代次检查不会写回。
           understanding.stop();
+          // 手动探针不属于连续理解：卸载时同样停止并清空摘要，避免残留画面文本。
+          visionProbe.stop();
           resetUnderstandingMaterial();
           // P-187 阶段 5：先停主动评估定时器并作废在途结果，再让 invalidateVision 清一次窗口。
           stopProactive();

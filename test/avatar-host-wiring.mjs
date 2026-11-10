@@ -372,6 +372,26 @@ test('mouth is written only through the runtime (no legacy setMouth path remains
   assert.equal(result.ok, true, `the mapped mouth is accepted (${result.error})`);
   assert.equal(result.acknowledged, false, 'runtime writes are not reported as VTS-acknowledged');
 
+  // The model-visible render must carry the controller/channel evidence, not just the JSON shape.
+  const rendered = (value) => tool.output.render({ action: 'status' }, value)
+    .map((part) => part.text).join('\n');
+  const normalStatus = await tool.execute({ action: 'status' });
+  assert.equal(normalStatus.ok, true);
+  assert.match(rendered(normalStatus), /控制器：/u, 'render exposes controller state');
+  assert.match(rendered(normalStatus), /已接管：/u, 'render exposes written channels');
+  assert.match(rendered(normalStatus), /未验证：/u, 'render exposes unverified channels');
+  assert.match(rendered(normalStatus), /VTS 所有：/u, 'render exposes VTS-owned channels');
+  const degradedRender = rendered({
+    ok: true,
+    connected: true,
+    controller: { running: false, locked: true, lockReason: 'privacy', source: 'legacy' },
+    channels: { controlled: ['headX'], unverified: ['gazeX'], vtsOwned: ['bodyX'] },
+    lastError: 'inject failed',
+  });
+  assert.match(degradedRender, /控制器：停止 · 锁定\(privacy\) · legacy/u);
+  assert.match(degradedRender, /未验证：gazeX/u);
+  assert.match(degradedRender, /最近错误：inject failed/u);
+
   // Idle parameter frames may share the transport now, so wait for the mouth frame itself rather
   // than for "one new frame" (which could be a head-angle idle frame).
   const wrote = await waitFor(() => fake.frames.slice(before)
@@ -400,14 +420,14 @@ test('mouth is written only through the runtime (no legacy setMouth path remains
   assert.equal(idleStatus.live2d.runtime.idleSource, 'param', 'the idle source is the parameter engine');
   assert.ok(idleStatus.live2d.runtime.idleParams.mapped.includes('headX'), 'headX is part of the mapping');
   // Idle write tuning is observable from status, and the tuning event is recorded once at start.
-  assert.equal(idleStatus.live2d.runtime.idleActions.writeHz, 4, 'status exposes the configured idle write rate');
+  assert.equal(idleStatus.live2d.runtime.idleActions.writeHz, 15, 'status exposes the configured idle write rate');
   assert.equal(idleStatus.live2d.runtime.idleActions.suppressedBySpeech >= 0, true);
   assert.ok(
     idleStatus.live2d.runtime.motion.controllerFrames > 0,
     'status exposes how many frames the controller computed',
   );
   const tuned = await waitFor(async () => (await host.events())
-    .some((event) => event.type === 'avatar.idle.tuned' && event.payload?.writeHz === 4), 2000);
+    .some((event) => event.type === 'avatar.idle.tuned' && event.payload?.writeHz === 15), 2000);
   assert.equal(tuned, true, 'avatar.idle.tuned {writeHz} is recorded at startup');
   const headFrames = fake.frames.filter((entry) => entry.data?.parameterValues
     ?.some((value) => value.id === 'FaceAngleX'));
@@ -1097,9 +1117,9 @@ test('显式 avatarMotionWrites:false → source=legacy，写入频率仍 4Hz', 
   assert.equal(runtime.motion.writes, false, 'the explicit opt-out reaches the runtime config');
   assert.equal(runtime.motion.source, 'legacy', 'the status names the legacy writer');
   assert.equal(runtime.motion.outputFrames, 0, 'the 30 Hz pump is not running');
-  assert.equal(runtime.idleParams.writeHz, 4, 'the legacy idle cadence is preserved');
-  assert.ok(framesInSecond >= 3 && framesInSecond <= 6,
-    `1 s of legacy output stays around 4 Hz (${framesInSecond} frames)`);
+  assert.equal(runtime.idleParams.writeHz, 15, 'the legacy idle cadence is preserved');
+  assert.ok(framesInSecond >= 6 && framesInSecond <= 10,
+    `1 s of explicit legacy output stays near its capped cadence (${framesInSecond} frames)`);
   assert.equal(await waitFor(() => fake.frames.length >= 1, 3000), true, 'legacy frames reach VTS');
   console.log(
     `[motion] legacy writes=${runtime.motion.writes} source=${runtime.motion.source}`
@@ -1186,10 +1206,10 @@ test('idle tuning inherits the module defaults unless explicitly configured', as
   assert.equal(await waitDiscovered(defaultHost), true);
   const defaults = (await defaultHost.status()).live2d.runtime.idleActions;
   assert.equal(defaults.intervalMs, 7000, 'the module default interval is inherited');
-  assert.equal(defaults.amplitude, 0.18, 'the module default amplitude is inherited');
-  assert.equal(defaults.maxStep, 0.03, 'the module default step cap is inherited');
+  assert.equal(defaults.amplitude, 0.6, 'the module default amplitude is inherited');
+  assert.equal(defaults.maxStep, 0.12, 'the module default step cap is inherited');
   assert.equal(defaults.swayScale, 1.2, 'the module default sway scale is inherited');
-  assert.equal(defaults.writeHz, 4, 'the module default idle cadence is inherited');
+  assert.equal(defaults.writeHz, 15, 'the module default idle cadence is inherited');
 
   const explicitFake = await createFakeVts({
     defaultParameters: [HEAD_INPUT],

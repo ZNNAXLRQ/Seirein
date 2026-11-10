@@ -188,6 +188,11 @@ test('正常：两帧依次保存，内容块是 text + 两个 image，返回模
       { type: 'image', attachment: { id: 'att-2' } },
     ],
   }]);
+
+  // 诊断预算：实际图片数与分析器上限分开记录，供同材料双探针等独立对照。
+  assert.equal(result.meta.maxImages, 3);
+  assert.deepEqual(result.meta.budget, { maxImages: 3, maxTokens: 321, timeoutMs: 30_000 });
+  assert.equal(Object.keys(result).includes('budget'), false, 'budget 只在非枚举 meta 内');
 });
 
 test('无 llm / 无 attachments / 无 selection 分别返回机器原因且不读图', async () => {

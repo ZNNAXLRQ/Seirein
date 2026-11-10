@@ -25,8 +25,9 @@
  * 无空白、无路径语义的机器码字符。
  *
  * 另挂一个**非枚举** `meta`（安全请求元数据，兼容旧结果形状）：provider/model/imageCount/
- * contentBlockTypes/maxTokens/textChars/reasoningChars/finishKind/finishReason/errorCode/
- * timedOut/aborted/streamOpened/chunkCount/durationMs。meta 不复制正文或路径；
+ * contentBlockTypes/maxTokens/maxImages/budget/textChars/reasoningChars/finishKind/finishReason/
+ * errorCode/timedOut/aborted/streamOpened/chunkCount/durationMs。`budget` 记录本次分析器的
+ * 图片数/Token/时限上限，供同材料双探针等诊断独立对照。meta 不复制正文或路径；
  * `errorCode:'empty'` 只表示“本次没有可用正文”，`finishKind` 始终来自真实 finish 分片，
  * 不能反推成“模型空生成”。
  */
@@ -319,6 +320,13 @@ export function createImageAnalyzer({
           imageCount: Math.max(0, Math.floor(Number(images) || 0)),
           contentBlockTypes,
           maxTokens: tokenLimit,
+          // 预算与“实际送去几张图”分开记录：imageCount 是本次实际数，budget 是分析器上限。
+          maxImages: imageLimit,
+          budget: Object.freeze({
+            maxImages: imageLimit,
+            maxTokens: tokenLimit,
+            timeoutMs: deadlineMs,
+          }),
           textChars: text.length,
           reasoningChars,
           finishKind,
