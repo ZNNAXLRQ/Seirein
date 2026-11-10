@@ -136,6 +136,38 @@ function errorCodeText(value) {
 }
 
 /**
+ * token 上限截断的 finish 机器码。不同 provider 用 `max-tokens` / `max_tokens` / `length`
+ * 表达同一件事；归一化后比较，避免分隔符差异让截断被记成普通 bad-json。
+ */
+const TRUNCATION_FINISH = new Set(['maxtokens', 'length', 'tokenlimit']);
+
+function isTruncationFinish(value) {
+  if (typeof value !== 'string') return false;
+  return TRUNCATION_FINISH.has(value.toLowerCase().replace(/[^a-z]/gu, ''));
+}
+
+/** 截断的稳定错误码；provider 已给 max-tokens/length 时统一成同一个机器码。 */
+function truncationErrorCode(value) {
+  const code = errorCodeText(value);
+  if (code.length === 0) return '';
+  return isTruncationFinish(code) ? 'max-tokens' : '';
+}
+
+/**
+ * 一次分析结果是否明确是 token 上限截断。除 `finishKind` 外也接受 provider 已给出的
+ * `max-tokens` 错误码，兼容尚未写 finish meta 的旧分析器；只看机器字段，不推正文。
+ */
+function isTruncatedOutput(output, meta) {
+  if (isTruncationFinish(meta?.finishKind)) return true;
+  if (isTruncationFinish(meta?.finishReason)) return true;
+  if (isTruncationFinish(output?.finishKind)) return true;
+  if (isTruncationFinish(output?.finishReason)) return true;
+  if (truncationErrorCode(output?.errorCode).length > 0) return true;
+  if (truncationErrorCode(meta?.errorCode).length > 0) return true;
+  return false;
+}
+
+/**
  * 失败样本正文只看分析器显式挂载的非枚举诊断字段；`ok:false` 包装里的 `text` 不信任，
  * 避免把测试替身/失败占位文本误当模型输出。成功但解析失败（bad-json）则由调用方传入 raw。
  */
@@ -751,14 +783,20 @@ export function createUnderstandingRuntime(options = {}) {
       ? safeDiagnosticMeta(rawOutput.meta)
       : null;
     if (isObject(rawOutput) && rawOutput.ok === false) {
-      const failureReason = typeof rawOutput.reason === 'string'
+      const rawReason = typeof rawOutput.reason === 'string'
         && rawOutput.reason.trim().length > 0
         ? rawOutput.reason
         : 'analyze-failed';
+      // token 上限截断必须归因 truncated / max-tokens：provider 或分析器可能只给了 finishKind，
+      // 也可能沿用旧的 stream-error/empty 形状；这里统一成可被设置页与退避识别的机器码。
+      const truncated = isTruncatedOutput(rawOutput, analyzerMeta)
+        || rawReason === 'truncated';
+      const failureReason = truncated ? 'truncated' : rawReason;
+      const failureCode = truncated ? 'max-tokens' : rawOutput.errorCode;
       // 只透传 provider 的短错误码和请求 meta；错误正文/路径永远不进入事件或 status。
       // `diagnosticText` 只给有界样本，样本不会进入 render/status/事件正文。
       return recordFailure(failureReason, 0, {
-        errorCode: rawOutput.errorCode,
+        errorCode: failureCode,
         meta: analyzerMeta,
         text: diagnosticTextOf(rawOutput),
       });
@@ -766,6 +804,16 @@ export function createUnderstandingRuntime(options = {}) {
     const rawEvidence = isObject(rawOutput) && typeof rawOutput.text === 'string'
       ? rawOutput.text
       : rawOutput;
+
+    // 成功包装但 finishKind=max-tokens：正文可能只是半截 JSON。必须在解析前归因，
+    // 否则 parseUnderstanding 只会报 bad-json，掩盖“预算被推理耗尽”的真实原因。
+    if (isTruncatedOutput(rawOutput, analyzerMeta)) {
+      return recordFailure('truncated', 0, {
+        errorCode: 'max-tokens',
+        meta: analyzerMeta,
+        text: typeof rawEvidence === 'string' ? rawEvidence : '',
+      });
+    }
 
     let parsed;
     try {

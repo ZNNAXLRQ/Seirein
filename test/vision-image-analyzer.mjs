@@ -147,7 +147,13 @@ function harness(overrides = {}) {
 }
 
 test('默认预算导出且冻结', () => {
-  assert.deepEqual(IMAGE_ANALYZER_DEFAULTS, { maxImages: 3, maxTokens: 800, timeoutMs: 30_000 });
+  assert.deepEqual(IMAGE_ANALYZER_DEFAULTS, {
+    maxImages: 3,
+    maxTokens: 4096,
+    timeoutMs: 30_000,
+    retryMaxTokens: 8192,
+    maxTotalTokens: 16_384,
+  });
   assert.ok(Object.isFrozen(IMAGE_ANALYZER_DEFAULTS));
 });
 

@@ -105,7 +105,7 @@ test('成功 meta：实际路由、图片数、内容块、正文/推理长度�
   assert.equal(meta.model, 'vision-model');
   assert.equal(meta.imageCount, 2);
   assert.deepEqual(meta.contentBlockTypes, ['text', 'image']);
-  assert.equal(meta.maxTokens, 800);
+  assert.equal(meta.maxTokens, 4096);
   assert.equal(meta.textChars, '画面有一扇窗。'.length);
   assert.equal(meta.reasoningChars, '先想一想'.length);
   assert.equal(meta.finishKind, 'stop');

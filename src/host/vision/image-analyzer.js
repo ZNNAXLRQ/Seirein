@@ -26,19 +26,35 @@
  *
  * 另挂一个**非枚举** `meta`（安全请求元数据，兼容旧结果形状）：provider/model/imageCount/
  * contentBlockTypes/maxTokens/maxImages/budget/textChars/reasoningChars/finishKind/finishReason/
- * errorCode/timedOut/aborted/streamOpened/chunkCount/durationMs。`budget` 记录本次分析器的
- * 图片数/Token/时限上限，供同材料双探针等诊断独立对照。meta 不复制正文或路径；
+ * errorCode/timedOut/aborted/streamOpened/chunkCount/attempts/durationMs。`budget` 记录本次
+ * 分析器的图片数/Token/时限上限，供同材料双探针等诊断独立对照。meta 不复制正文或路径；
  * `errorCode:'empty'` 只表示“本次没有可用正文”，`finishKind` 始终来自真实 finish 分片，
  * 不能反推成“模型空生成”。
+ *
+ * 截断归因与单次成本上限：
+ *
+ *   - 默认输出预算 4096 token；`finishKind` 为 `max-tokens`/`max_tokens`/`length`（token 上限）
+ *     时最多再请求一次，预算提高到至少 8192（且不超过单次总预算 16384）；
+ *   - 重试仍是同一 provider/model，不自动换模型；最多 2 次，绝不无限重试；
+ *   - 最终仍是截断时返回 `{ok:false, reason:'truncated', errorCode:'max-tokens'}`，而不是把
+ *     半截正文交给解析器变成 `bad-json`；`meta.finishKind` 保留真实结束原因。
  */
 
 import { basename } from 'node:path';
 
-/** 默认预算：最多 3 张、单次 800 token、模型请求 30 秒。 */
+/**
+ * 默认预算：最多 3 张、单次 4096 token、模型请求 30 秒。
+ *
+ * 4096 是推理型模型的最低可用正文预算：800 token 常被 reasoning 吃光，正文只剩半截 JSON。
+ * `retryMaxTokens` 是 token 上限截断后唯一一次重试的最低预算，`maxTotalTokens` 约束同一次
+ * analyze 两次请求的 token 上限之和（成本上限）。
+ */
 export const IMAGE_ANALYZER_DEFAULTS = Object.freeze({
   maxImages: 3,
-  maxTokens: 800,
+  maxTokens: 4096,
   timeoutMs: 30_000,
+  retryMaxTokens: 8192,
+  maxTotalTokens: 16_384,
 });
 
 /** provider 错误码只保留为短机器码，避免正文/路径混进结果。 */
@@ -52,6 +68,17 @@ const MAX_BLOCK_TYPES = 8;
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * token 上限截断的 finish 机器码。不同 provider 用 `max-tokens` / `max_tokens` / `length`
+ * 表达同一件事；只比较归一化后的字母，避免分隔符差异让截断被误判成普通 bad-json。
+ */
+const TRUNCATION_FINISH = new Set(['maxtokens', 'length', 'tokenlimit']);
+
+function isTruncationFinish(value) {
+  if (typeof value !== 'string') return false;
+  return TRUNCATION_FINISH.has(value.toLowerCase().replace(/[^a-z]/gu, ''));
 }
 
 /** 路由标识：超出上限或含空白/反斜杠时留空，绝不把路径/正文塞进 meta。 */
@@ -241,7 +268,9 @@ function attachmentName(file, index) {
  * @param {(fn: Function, ms: number) => any} [options.setTimer]
  * @param {(timer: any) => void} [options.clearTimer]
  * @param {number} [options.maxImages]
- * @param {number} [options.maxTokens]
+ * @param {number} [options.maxTokens] 首次请求的输出 token 上限；默认 4096。
+ * @param {number} [options.retryMaxTokens] 截断后唯一一次重试的最低预算；默认 8192。
+ * @param {number} [options.maxTotalTokens] 单次 analyze 两次请求的 token 上限之和；默认 16384。
  * @param {number} [options.timeoutMs] 只约束模型请求阶段；本地读图/保存不占模型时限。
  */
 export function createImageAnalyzer({
@@ -252,11 +281,21 @@ export function createImageAnalyzer({
   clearTimer = clearTimeout,
   maxImages,
   maxTokens,
+  retryMaxTokens,
+  maxTotalTokens,
   timeoutMs,
 } = {}) {
   const imageLimit = toLimit(maxImages, IMAGE_ANALYZER_DEFAULTS.maxImages);
   const tokenLimit = toLimit(maxTokens, IMAGE_ANALYZER_DEFAULTS.maxTokens);
   const deadlineMs = toLimit(timeoutMs, IMAGE_ANALYZER_DEFAULTS.timeoutMs);
+  const retryFloor = toLimit(retryMaxTokens, IMAGE_ANALYZER_DEFAULTS.retryMaxTokens);
+  const totalTokenLimit = toLimit(maxTotalTokens, IMAGE_ANALYZER_DEFAULTS.maxTotalTokens);
+  // 只有预算还能真正提高时才允许重试；总预算封顶保证一次 analyze 最多花这些 token。
+  const retryTokenLimit = Math.min(
+    Math.max(retryFloor, tokenLimit * 2),
+    Math.max(0, totalTokenLimit - tokenLimit),
+  );
+  const canRetry = retryTokenLimit > tokenLimit;
 
   /** 注入时钟只用于 durationMs；时钟失败退回真实时间，不让诊断字段把请求弄崩。 */
   const clock = () => {
@@ -305,6 +344,9 @@ export function createImageAnalyzer({
       let provider = '';
       let model = '';
       let terminalReason = '';
+      // 最终一次请求真正使用的预算；重试后 meta.maxTokens 反映实际值，budget 仍记录配置上限。
+      let requestMaxTokens = tokenLimit;
+      let attempts = 0;
       // 尚未组装请求时为空；真正发请求前才写入 text/image，避免把“计划”说成“实际请求”。
       let contentBlockTypes = Object.freeze([]);
 
@@ -319,7 +361,7 @@ export function createImageAnalyzer({
           model: metaRoute(model),
           imageCount: Math.max(0, Math.floor(Number(images) || 0)),
           contentBlockTypes,
-          maxTokens: tokenLimit,
+          maxTokens: requestMaxTokens,
           // 预算与“实际送去几张图”分开记录：imageCount 是本次实际数，budget 是分析器上限。
           maxImages: imageLimit,
           budget: Object.freeze({
@@ -338,6 +380,7 @@ export function createImageAnalyzer({
             || signal?.aborted === true,
           streamOpened,
           chunkCount,
+          attempts,
           durationMs: Math.max(0, Math.floor(clock() - startedAt)),
         };
         return meta;
@@ -412,207 +455,242 @@ export function createImageAnalyzer({
       if (signal?.aborted === true) return fail('aborted');
       contentBlockTypes = blockTypesOf([{ type: 'text' }, ...images]);
 
-      // 6. 模型请求阶段：内部 AbortController 同时承载“超时”和“外部取消”，
-      //    对外只把 controller.signal 交给 llm，避免 provider 直接依赖调用方对象。
-      const controller = new AbortController();
-      // terminalReason 在 analyze 开头声明：早期失败也要能生成一致的 meta。
-      let timer = null;
-      let listening = false;
-      // 与“下一片”竞速的取消令牌；期限与外部取消都只 resolve 它一次。
-      const cancelToken = Symbol('cancelled');
-      let resolveCancel;
-      const cancelWait = new Promise((resolve) => {
-        resolveCancel = resolve;
-      });
-      const abortWith = (reason) => {
-        if (terminalReason !== '') return;
-        terminalReason = reason;
-        try {
-          controller.abort();
-        } catch {
-          /* abort 不应影响结果码 */
-        }
-        resolveCancel(cancelToken);
-      };
-      const onExternalAbort = () => abortWith('aborted');
-      const externalSignal = signal !== undefined && signal !== null && typeof signal.addEventListener === 'function'
-        ? signal
-        : null;
-      if (externalSignal !== null) {
-        try {
-          externalSignal.addEventListener('abort', onExternalAbort, { once: true });
-          listening = true;
-        } catch {
-          listening = false;
-        }
-      }
-      const stopTimer = () => {
-        if (timer === null) return;
-        try {
-          clearTimer(timer);
-        } catch {
-          /* 清理失败不改变已经得出的结果 */
-        }
-        timer = null;
-      };
-      // 已到期的原因；监听器注册失败时仍用 signal.aborted 兜底。
-      const reasonNow = () => terminalReason
-        || (externalSignal?.aborted === true ? 'aborted' : '');
+      /**
+       * 发起一次模型请求。重试时复用已经保存的图片附件，只重置本次请求的诊断状态；
+       * 每次请求都有自己的 AbortController/期限，外部取消对两次尝试都有效。
+       */
+      const runAttempt = async (attemptTokens) => {
+        requestMaxTokens = attemptTokens;
+        attempts += 1;
+        text = '';
+        reasoningChars = 0;
+        finishKind = '';
+        finishReason = '';
+        finishAborted = false;
+        streamOpened = false;
+        chunkCount = 0;
+        terminalReason = '';
 
-      let stream = null;
-      let iterator = null;
-      try {
-        // 外部取消可能刚好发生在 addEventListener 之前；注册后再确认一次，先于内部期限。
-        const beforeTimer = reasonNow();
-        if (beforeTimer !== '') return fail(beforeTimer, images.length);
-
-        // 超时是同步定时器也要能被测试：先登记，再发请求；真实 setTimeout 会在本轮同步代码
-        // 结束后才触发，所以生产路径不会出现“未发请求先超时”。
-        try {
-          timer = setTimer(() => abortWith('timeout'), deadlineMs);
-          timer?.unref?.();
-        } catch {
-          // 定时器不可用时退化：仍发请求，只是没有内部 deadline（外部 signal 仍有效）。
-          timer = null;
-        }
-
-        try {
-          stream = llm.stream({
-            provider,
-            model,
-            system,
-            messages: [{
-              role: 'user',
-              content: [{ type: 'text', text: user }, ...images],
-            }],
-            maxTokens: tokenLimit,
-            signal: controller.signal,
-          });
-        } catch (error) {
-          const reason = reasonNow();
-          return fail(
-            reason || 'stream-error',
-            images.length,
-            reason ? '' : thrownErrorCode(error),
-          );
-        }
-        // 只要 provider 返回了 stream 对象，就记录“流已打开”；即使迭代器随后不可用。
-        streamOpened = stream !== null && stream !== undefined;
-
-        const afterStream = reasonNow();
-        if (afterStream !== '') return fail(afterStream, images.length);
-
-        // 7. 收集文本。等待“下一片”必须同时受期限与取消控制：provider 不响应 abort 时，
-        //    直接 await iterator.next() 会永久挂起并占住在途锁，所以这里与取消令牌竞速。
-        try {
-          const factory = streamIteratorFactory(stream);
-          if (factory === null) return fail('stream-error', images.length);
-          iterator = factory.call(stream);
-          if (!isObject(iterator) || typeof iterator.next !== 'function') {
-            return fail('stream-error', images.length);
-          }
-        } catch (error) {
-          const reason = reasonNow();
-          return fail(
-            reason || 'stream-error',
-            images.length,
-            reason ? '' : thrownErrorCode(error),
-          );
-        }
-
-        try {
-          for (;;) {
-            const beforeNext = reasonNow();
-            if (beforeNext !== '') return fail(beforeNext, images.length);
-
-            let next;
-            try {
-              const pending = iterator.next();
-              // 竞速输掉的 next() 仍可能在之后拒绝；显式挂处理器，避免未处理拒绝。
-              if (pending !== null && typeof pending === 'object' && typeof pending.then === 'function') {
-                pending.then(undefined, () => {});
-              }
-              next = await Promise.race([pending, cancelWait]);
-            } catch (error) {
-              const reason = reasonNow();
-              return fail(
-                reason || 'stream-error',
-                images.length,
-                reason ? '' : thrownErrorCode(error),
-              );
-            }
-
-            // 取消先到：丢弃已经在途的迟到分片，立即返回，不再拼接任何文本。
-            if (next === cancelToken) return fail(reasonNow() || 'timeout', images.length);
-            const afterNext = reasonNow();
-            if (afterNext !== '') return fail(afterNext, images.length);
-            if (!isObject(next)) return fail('stream-error', images.length);
-            if (next.done === true) break;
-
-            const chunk = next.value;
-            chunkCount += 1;
-            const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : '';
-            if (type === 'text-delta') {
-              if (typeof chunk.text === 'string') text += chunk.text;
-              continue;
-            }
-            // 私密推理只计数，绝不拼进正文；不同 provider 可能用 text 或 delta 承载分片。
-            if (/^(reasoning|thinking|thought|analysis)/u.test(type)) {
-              const reasoningText = typeof chunk?.text === 'string'
-                ? chunk.text
-                : (typeof chunk?.delta === 'string' ? chunk.delta : '');
-              reasoningChars += reasoningText.length;
-              continue;
-            }
-            if (type === 'finish') {
-              const reason = chunk?.reason;
-              const kind = typeof reason?.kind === 'string'
-                ? reason.kind.toLowerCase()
-                : (typeof reason === 'string' ? reason.toLowerCase() : '');
-              // 只记录真实 finish 分片里的机器码；没有 finish 就留空，不凭文本为空猜生成结果。
-              finishKind = metaToken(kind);
-              finishReason = metaToken(typeof reason === 'string' ? reason : reason?.kind) || finishKind;
-              if (kind === 'error') {
-                return fail('stream-error', images.length, reason?.failure?.code ?? chunk?.failure?.code);
-              }
-              if (kind === 'aborted') {
-                finishAborted = true;
-                return fail('aborted', images.length);
-              }
-              break;
-            }
-            // 其他分片（usage 等）与图片分析结果无关，忽略。
-          }
-        } catch (error) {
-          const reason = reasonNow();
-          return fail(
-            reason || 'stream-error',
-            images.length,
-            reason ? '' : thrownErrorCode(error),
-          );
-        }
-
-        const finalReason = reasonNow();
-        if (finalReason !== '') return fail(finalReason, images.length);
-
-        // 空文本绝不能当作“模型看懂了”：调用方会把它渲染成空的理解结果。
-        // errorCode:'empty' 只是“没有可用正文”，不等于“模型空生成”；meta.finishKind 保留真实结束原因。
-        if (text.trim().length === 0) return fail('stream-error', images.length, 'empty');
-        const result = { ok: true, text, reason: 'ok', images: images.length };
-        attachMeta(result, buildMeta(images.length, ''));
-        return result;
-      } finally {
-        // 尽力释放：不等待 return() 完成，否则 provider 不响应时又会挂起。
-        releaseStream(stream, iterator);
-        stopTimer();
-        if (listening) {
+        // 6. 模型请求阶段：内部 AbortController 同时承载“超时”和“外部取消”，
+        //    对外只把 controller.signal 交给 llm，避免 provider 直接依赖调用方对象。
+        const controller = new AbortController();
+        // terminalReason 在 analyze 开头声明：早期失败也要能生成一致的 meta。
+        let timer = null;
+        let listening = false;
+        // 与“下一片”竞速的取消令牌；期限与外部取消都只 resolve 它一次。
+        const cancelToken = Symbol('cancelled');
+        let resolveCancel;
+        const cancelWait = new Promise((resolve) => {
+          resolveCancel = resolve;
+        });
+        const abortWith = (reason) => {
+          if (terminalReason !== '') return;
+          terminalReason = reason;
           try {
-            externalSignal.removeEventListener('abort', onExternalAbort);
+            controller.abort();
           } catch {
-            /* 清理失败不影响结果 */
+            /* abort 不应影响结果码 */
+          }
+          resolveCancel(cancelToken);
+        };
+        const onExternalAbort = () => abortWith('aborted');
+        const externalSignal = signal !== undefined && signal !== null && typeof signal.addEventListener === 'function'
+          ? signal
+          : null;
+        if (externalSignal !== null) {
+          try {
+            externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+            listening = true;
+          } catch {
+            listening = false;
           }
         }
+        const stopTimer = () => {
+          if (timer === null) return;
+          try {
+            clearTimer(timer);
+          } catch {
+            /* 清理失败不改变已经得出的结果 */
+          }
+          timer = null;
+        };
+        // 已到期的原因；监听器注册失败时仍用 signal.aborted 兜底。
+        const reasonNow = () => terminalReason
+          || (externalSignal?.aborted === true ? 'aborted' : '');
+
+        let stream = null;
+        let iterator = null;
+        try {
+          // 外部取消可能刚好发生在 addEventListener 之前；注册后再确认一次，先于内部期限。
+          const beforeTimer = reasonNow();
+          if (beforeTimer !== '') return fail(beforeTimer, images.length);
+
+          // 超时是同步定时器也要能被测试：先登记，再发请求；真实 setTimeout 会在本轮同步代码
+          // 结束后才触发，所以生产路径不会出现“未发请求先超时”。
+          try {
+            timer = setTimer(() => abortWith('timeout'), deadlineMs);
+            timer?.unref?.();
+          } catch {
+            // 定时器不可用时退化：仍发请求，只是没有内部 deadline（外部 signal 仍有效）。
+            timer = null;
+          }
+
+          try {
+            stream = llm.stream({
+              provider,
+              model,
+              system,
+              messages: [{
+                role: 'user',
+                content: [{ type: 'text', text: user }, ...images],
+              }],
+              maxTokens: attemptTokens,
+              signal: controller.signal,
+            });
+          } catch (error) {
+            const reason = reasonNow();
+            return fail(
+              reason || 'stream-error',
+              images.length,
+              reason ? '' : thrownErrorCode(error),
+            );
+          }
+          // 只要 provider 返回了 stream 对象，就记录“流已打开”；即使迭代器随后不可用。
+          streamOpened = stream !== null && stream !== undefined;
+
+          const afterStream = reasonNow();
+          if (afterStream !== '') return fail(afterStream, images.length);
+
+          // 7. 收集文本。等待“下一片”必须同时受期限与取消控制：provider 不响应 abort 时，
+          //    直接 await iterator.next() 会永久挂起并占住在途锁，所以这里与取消令牌竞速。
+          try {
+            const factory = streamIteratorFactory(stream);
+            if (factory === null) return fail('stream-error', images.length);
+            iterator = factory.call(stream);
+            if (!isObject(iterator) || typeof iterator.next !== 'function') {
+              return fail('stream-error', images.length);
+            }
+          } catch (error) {
+            const reason = reasonNow();
+            return fail(
+              reason || 'stream-error',
+              images.length,
+              reason ? '' : thrownErrorCode(error),
+            );
+          }
+
+          try {
+            for (;;) {
+              const beforeNext = reasonNow();
+              if (beforeNext !== '') return fail(beforeNext, images.length);
+
+              let next;
+              try {
+                const pending = iterator.next();
+                // 竞速输掉的 next() 仍可能在之后拒绝；显式挂处理器，避免未处理拒绝。
+                if (pending !== null && typeof pending === 'object' && typeof pending.then === 'function') {
+                  pending.then(undefined, () => {});
+                }
+                next = await Promise.race([pending, cancelWait]);
+              } catch (error) {
+                const reason = reasonNow();
+                return fail(
+                  reason || 'stream-error',
+                  images.length,
+                  reason ? '' : thrownErrorCode(error),
+                );
+              }
+
+              // 取消先到：丢弃已经在途的迟到分片，立即返回，不再拼接任何文本。
+              if (next === cancelToken) return fail(reasonNow() || 'timeout', images.length);
+              const afterNext = reasonNow();
+              if (afterNext !== '') return fail(afterNext, images.length);
+              if (!isObject(next)) return fail('stream-error', images.length);
+              if (next.done === true) break;
+
+              const chunk = next.value;
+              chunkCount += 1;
+              const type = typeof chunk?.type === 'string' ? chunk.type.toLowerCase() : '';
+              if (type === 'text-delta') {
+                if (typeof chunk.text === 'string') text += chunk.text;
+                continue;
+              }
+              // 私密推理只计数，绝不拼进正文；不同 provider 可能用 text 或 delta 承载分片。
+              if (/^(reasoning|thinking|thought|analysis)/u.test(type)) {
+                const reasoningText = typeof chunk?.text === 'string'
+                  ? chunk.text
+                  : (typeof chunk?.delta === 'string' ? chunk.delta : '');
+                reasoningChars += reasoningText.length;
+                continue;
+              }
+              if (type === 'finish') {
+                const reason = chunk?.reason;
+                const kind = typeof reason?.kind === 'string'
+                  ? reason.kind.toLowerCase()
+                  : (typeof reason === 'string' ? reason.toLowerCase() : '');
+                // 只记录真实 finish 分片里的机器码；没有 finish 就留空，不凭文本为空猜生成结果。
+                finishKind = metaToken(kind);
+                finishReason = metaToken(typeof reason === 'string' ? reason : reason?.kind) || finishKind;
+                if (kind === 'error') {
+                  return fail('stream-error', images.length, reason?.failure?.code ?? chunk?.failure?.code);
+                }
+                if (kind === 'aborted') {
+                  finishAborted = true;
+                  return fail('aborted', images.length);
+                }
+                break;
+              }
+              // 其他分片（usage 等）与图片分析结果无关，忽略。
+            }
+          } catch (error) {
+            const reason = reasonNow();
+            return fail(
+              reason || 'stream-error',
+              images.length,
+              reason ? '' : thrownErrorCode(error),
+            );
+          }
+
+          const finalReason = reasonNow();
+          if (finalReason !== '') return fail(finalReason, images.length);
+
+          // 空文本绝不能当作“模型看懂了”：调用方会把它渲染成空的理解结果。
+          // errorCode:'empty' 只是“没有可用正文”，不等于“模型空生成”；meta.finishKind 保留真实结束原因。
+          if (text.trim().length === 0) return fail('stream-error', images.length, 'empty');
+          const result = { ok: true, text, reason: 'ok', images: images.length };
+          attachMeta(result, buildMeta(images.length, ''));
+          return result;
+        } finally {
+          // 尽力释放：不等待 return() 完成，否则 provider 不响应时又会挂起。
+          releaseStream(stream, iterator);
+          stopTimer();
+          if (listening) {
+            try {
+              externalSignal.removeEventListener('abort', onExternalAbort);
+            } catch {
+              /* 清理失败不影响结果 */
+            }
+          }
+        }
+      };
+
+      let outcome = await runAttempt(tokenLimit);
+      // 首次请求被 token 上限截断：同 provider/model 提高预算重试一次。绝不换模型、绝不无限重试。
+      if (canRetry && attempts < 2 && isTruncationFinish(outcome?.meta?.finishKind)) {
+        if (signal?.aborted === true) {
+          // 取消发生在两次尝试之间：不能把上一次的 max-tokens 留在 aborted 结果里，
+          // 否则运行时会把它误归因为截断。
+          finishKind = '';
+          finishReason = '';
+          return fail('aborted', images.length);
+        }
+        outcome = await runAttempt(retryTokenLimit);
       }
+      // 最终仍是 token 上限截断：明确归因 truncated/max-tokens，不把半截正文交给 JSON 解析。
+      if (isTruncationFinish(outcome?.meta?.finishKind)) {
+        return fail('truncated', images.length, 'max-tokens');
+      }
+      return outcome;
     },
 
     /**
