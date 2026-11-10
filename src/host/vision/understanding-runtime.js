@@ -427,6 +427,10 @@ function summaryInFocus(summary, focus) {
  * @param {(payload: {parsed: object, state: object}) => void|Promise<void>} [options.onAdvance]
  *   成功并入状态后调用一次；`parsed`/`state` 是副本。回调抛错只 emit 一条
  *   `understanding-advance-callback-error`，不影响本次运行结果。
+ * @param {object} [options.eventIndex]
+ *   可选的本地宏观事件索引（`createEventIndex()`）。成功并入状态后把本次事件写进索引；
+ *   索引失败只是旁路故障，绝不影响本次理解结果。传入后 status 会多一个无正文的
+ *   `eventIndex` 计数块，`searchEvents()` 也转发到它。
  * @param {(event: {type:string,ok:boolean,reason:string,eventCount:number,droppedEvents:number,at:number|null}) => void} [options.emit]
  */
 export function createUnderstandingRuntime(options = {}) {
@@ -443,6 +447,12 @@ export function createUnderstandingRuntime(options = {}) {
   const clearTimer = typeof source.clearTimer === 'function' ? source.clearTimer : clearTimeout;
   const emit = typeof source.emit === 'function' ? source.emit : null;
   const onAdvance = typeof source.onAdvance === 'function' ? source.onAdvance : null;
+  // 本地事件索引是可选旁路：不传时行为与旧版完全一致，不影响任何现有测试/部署。
+  const eventIndex = source.eventIndex !== null
+    && typeof source.eventIndex === 'object'
+    && typeof source.eventIndex.ingest === 'function'
+    ? source.eventIndex
+    : null;
 
   const minIntervalMs = toDuration(source.minIntervalMs, DEFAULT_MIN_INTERVAL_MS);
   const maxFrames = toLimit(source.maxFrames, UNDERSTANDING_RUNTIME_DEFAULTS.maxFrames);
@@ -877,6 +887,26 @@ export function createUnderstandingRuntime(options = {}) {
     lastAt = clock();
     // 成功重置连续失败/退避：下一轮重新按正常 20s 限速，不继承旧 retryAt。
     resetBackoff();
+
+    // 本地宏观事件索引：只有成功并入状态的事件才写入；索引是旁路，任何失败都不能把一次
+    // 成功的理解变成失败。证据只传原始元数据（frames/audioLines），事件条目自身不存路径。
+    if (eventIndex !== null) {
+      try {
+        eventIndex.ingest({
+          events: parsed.events,
+          interval: built.interval,
+          frames: frameList,
+          audioLines: Array.isArray(rawAudio) ? rawAudio : [],
+          shotId: built.shotId ?? null,
+          // 来源只保留机器标签（sheet/comment/typed/...），不写正文。
+          source: reason.length > 0 ? reason : 'understanding',
+          at: lastAt,
+        });
+      } catch {
+        // 索引写入失败只影响本地检索；本次理解结果保持原样。
+      }
+    }
+
     emitOutcome({
       ok: true,
       reason: 'ok',
@@ -1180,6 +1210,15 @@ export function createUnderstandingRuntime(options = {}) {
   function status() {
     const scheduled = scheduler.status();
     const reason = lastReason || scheduled.lastReason;
+    let indexStatus = null;
+    if (eventIndex !== null) {
+      try {
+        const view = eventIndex.status();
+        if (isObject(view)) indexStatus = { ...view };
+      } catch {
+        indexStatus = null;
+      }
+    }
     return {
       ...scheduled,
       running: scheduled.running === true || busy,
@@ -1213,7 +1252,41 @@ export function createUnderstandingRuntime(options = {}) {
       stopped,
       hasState: state !== null,
       updatedAt: state !== null ? timeValue(state.updatedAt) : null,
+      // 本地索引计数（无正文/路径/id）；只有接入索引时才出现，旧调用形状不变。
+      ...(eventIndex === null ? {} : { eventIndex: indexStatus }),
     };
+  }
+
+  /**
+   * 只读本地事件检索（不调用模型、不读文件）。未接入索引时返回稳定的 no-index 结果。
+   * @param {object} [query]
+   */
+  function searchEvents(query = {}) {
+    if (eventIndex === null || typeof eventIndex.search !== 'function') {
+      return {
+        ok: true,
+        reason: 'no-index',
+        message: '未接入本地事件索引。',
+        events: [],
+        count: 0,
+        query: {},
+      };
+    }
+    try {
+      const result = eventIndex.search(query);
+      return isObject(result)
+        ? result
+        : { ok: true, reason: 'no-match', message: '', events: [], count: 0, query: {} };
+    } catch {
+      return {
+        ok: false,
+        reason: 'index-error',
+        message: '本地事件索引检索失败。',
+        events: [],
+        count: 0,
+        query: {},
+      };
+    }
   }
 
   return {
@@ -1224,6 +1297,18 @@ export function createUnderstandingRuntime(options = {}) {
     clear,
     status,
     stop,
+    /** 本地宏观事件检索（只读，无模型调用）；见 `searchEvents()`。 */
+    searchEvents,
+    /** 只读索引状态；未接入时返回 null。 */
+    eventIndexStatus() {
+      if (eventIndex === null || typeof eventIndex.status !== 'function') return null;
+      try {
+        const view = eventIndex.status();
+        return isObject(view) ? { ...view } : null;
+      } catch {
+        return null;
+      }
+    },
     /** 本地诊断入口：返回失败样本 head+tail；绝不进入 render/事件/status 正文。 */
     samples() {
       return failureSamples.list();

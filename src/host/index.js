@@ -339,6 +339,8 @@ import {
   UNDERSTANDING_RUNTIME_DEFAULTS,
   createUnderstandingRuntime,
 } from './vision/understanding-runtime.js';
+// P0 本地宏观事件索引：故事板管宏观，独立原帧管细节；检索只读、不调用模型。
+import { createEventIndex, renderEventOverview } from './vision/event-index.js';
 // P-187 同材料双探针：手动 action 才发两次独立请求，只读已缓存帧，不参与连续理解。
 import { createVisionProbe } from './vision/vision-probe.js';
 // P-187 阶段 5：主动候选仲裁与“确需开口时才生成一句”的短句生成器（均为纯模块）。
@@ -3045,6 +3047,27 @@ export function apply(ctx, config) {
     }
   };
   /**
+   * P0：本轮被动上下文里的本地事件概览。只按本轮真实窗口/镜头/用户原话查本地索引，
+   * 命中才追加“宏观事件 + 时间 + 关键台词 + 原帧引用”；没有命中就返回空，不硬关联，
+   * 也不为了补全再调一次模型。
+   */
+  const eventOverviewForContext = (focus) => {
+    if (focus === null || typeof focus !== 'object') return '';
+    try {
+      const result = eventIndex.search({
+        from: focus.from,
+        to: focus.to,
+        text: focus.queryText,
+        shotId: focus.shotId,
+        retrospective: focus.retrospective === true,
+        limit: 2,
+      });
+      return renderEventOverview(result, { maxEvents: 2, maxChars: 260 });
+    } catch {
+      return '';
+    }
+  };
+  /**
    * P-187 阶段 3：后台“按变化理解画面”的被动块。它只在陪伴上下文里渲染：voice lane 只认
    * 当天陪伴会话，typed lane 只认显式登记且未被排除的 typed companion。
    * 门禁与 ephemeral block 共用 `understandingBlockAllowed`；无状态时 render() 返回 ''。
@@ -3085,9 +3108,15 @@ export function apply(ctx, config) {
         ? understandingFocus
         : null;
       const rendered = understanding.render(focus);
+      // 本地事件索引只做宏观概览（事件/时间/台词/原帧引用），不触发第二次模型调用；
+      // 它可能在理解状态过期后仍有短时价值，因此独立于 rendered 是否为空。
+      const overview = eventOverviewForContext(focus);
+      const combined = rendered.length === 0
+        ? overview
+        : (overview.length === 0 ? rendered : `${rendered}\n${overview}`);
       // 本轮交付时间：只有非空块真正进入模型上下文才算交付；空块保持上一次真实交付时间。
-      if (rendered.length > 0) understandingDeliveredAt = Date.now();
-      return rendered;
+      if (combined.length > 0) understandingDeliveredAt = Date.now();
+      return combined;
     } catch {
       return '';
     }
@@ -11337,6 +11366,76 @@ export function apply(ctx, config) {
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
   /**
+   * P0：本地宏观事件索引。它只接收宏观理解成功后的短事件，不读像素、不调模型；
+   * 隐私/切源（invalidateVision）与卸载走同一条 clear 路径。
+   */
+  const eventIndex = createEventIndex({ now: Date.now });
+  const ORIGINAL_FRAME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/u;
+  /**
+   * 按 frameId 在当前原帧队列里找原始引用（内部字段含 file，只在宿主内使用）。
+   * 不对外暴露路径；查询本身不触发采集/淘汰，也不发事件。
+   */
+  const originalFrameRefById = (frameId) => {
+    if (typeof frameId !== 'string') return null;
+    const id = frameId.trim();
+    if (!ORIGINAL_FRAME_ID_PATTERN.test(id)) return null;
+    if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return null;
+    try {
+      for (const entry of evidenceWindow.between(0, Date.now())) {
+        for (const cell of Array.isArray(entry?.cells) ? entry.cells : []) {
+          if (cell?.frameId !== id || typeof cell.file !== 'string' || cell.file.length === 0) continue;
+          return {
+            frameId: id,
+            file: cell.file,
+            capturedAt: Number.isFinite(Number(cell.capturedAt)) ? Number(cell.capturedAt) : null,
+            ...(typeof cell.shotId === 'string' && cell.shotId.length > 0 ? { shotId: cell.shotId } : {}),
+            width: Number(cell.width) || 0,
+            height: Number(cell.height) || 0,
+            bytes: Number(cell.bytes) || 0,
+          };
+        }
+        // 没有 cells 的旧证据：entry 自己就是一张可回查的原帧。
+        if (entry?.id === id && typeof entry.file === 'string' && entry.file.length > 0) {
+          return {
+            frameId: id,
+            file: entry.file,
+            capturedAt: Number.isFinite(Number(entry.capturedAt)) ? Number(entry.capturedAt) : null,
+            ...(typeof entry.shotId === 'string' && entry.shotId.length > 0 ? { shotId: entry.shotId } : {}),
+            width: Number(entry.width) || 0,
+            height: Number(entry.height) || 0,
+            bytes: Number(entry.bytes) || 0,
+          };
+        }
+      }
+    } catch {
+      /* 证据窗口查询失败按“不可回查”处理，不猜路径 */
+    }
+    return null;
+  };
+  /**
+   * P0 细节回查入口：按 frameId 从原帧队列读图，返回字节而不是路径，供后续主模型/工具使用。
+   * 本阶段只在宿主内部提供，不注册工具、不触发额外付费调用；旧帧被淘汰/隐私边界后返回
+   * 稳定的 `not-available`，而不是拿别的帧顶替。
+   */
+  const visionFrameDetail = async (frameId) => {
+    const ref = originalFrameRefById(frameId);
+    if (ref === null) return { ok: false, reason: 'not-available' };
+    try {
+      const data = await readFile(ref.file);
+      return {
+        ok: true,
+        frameId: ref.frameId,
+        mediaType: 'image/png',
+        data,
+        bytes: data.length,
+        capturedAt: ref.capturedAt,
+        ...(ref.shotId === undefined ? {} : { shotId: ref.shotId }),
+      };
+    } catch {
+      return { ok: false, reason: 'read-failed' };
+    }
+  };
+  /**
    * P0：给故事板一个稳定的镜头身份。没有真实镜头检测器，这里只做保守分段：
    * 同一代次的相邻故事板若没有切镜（`shotBreak`）且间隔不超过 6 秒，就属于同一镜头；
    * 否则新开一个 `shot-N`。旧镜头的证据/事件因此仍可按 shotId 检索。
@@ -11963,6 +12062,8 @@ export function apply(ctx, config) {
     ? Math.max(1, Math.floor(configuredUnderstandingInterval))
     : 20_000;
   const understanding = createUnderstandingRuntime({
+    // P0：宏观理解成功后由运行时写入本地事件索引；检索/回查都不需要再调模型。
+    eventIndex,
     analyze: typeof config?.understandingAnalyzer === 'function'
       ? (options) => config.understandingAnalyzer(options)
       : (options) => understandingAnalyzer.analyze(options),
@@ -12335,6 +12436,8 @@ export function apply(ctx, config) {
         ...(focusShot === null ? {} : { shotId: focusShot }),
         retrospective: alignment.cues?.retrospective === true,
         current: alignment.cues?.current === true,
+        // 用户原话只在内存里保留有界长度，供本轮本地事件检索；不写日志/状态，隐私时随焦点清空。
+        ...(typeof text === 'string' && text.length > 0 ? { queryText: proactiveClip(text, 160) } : {}),
         timeSource: speech.timeSource,
         at,
       };
@@ -12852,6 +12955,8 @@ export function apply(ctx, config) {
       evidenceCaptureHolding = false;
       clearEvidenceRetry();
       try { understanding.clear(`continuous-off:${reason}`); } catch { /* runtime may be disposing */ }
+      // 关闭持续观看同样作废本地宏观事件索引：旧画面不能被下一轮本地检索当成“现在”。
+      try { eventIndex.clear(`continuous-off:${reason}`); } catch { /* index may be disposing */ }
       abortProactive();
       proactive.cancelAll('continuous-disabled');
       resetProactive('continuous-disabled');
@@ -13004,6 +13109,8 @@ export function apply(ctx, config) {
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
+    // P0：本地宏观事件索引与理解状态同代次；隐私/切源后旧事件不能再被检索到。
+    try { eventIndex.clear('vision-invalidated'); } catch { /* index may be disposing */ }
     // 手动双探针的摘要同样属于旧代次：隐私/切源后不允许从 status/action 再读回旧画面摘要。
     visionProbe.clear();
     resetUnderstandingMaterial();
@@ -13919,6 +14026,8 @@ export function apply(ctx, config) {
       ...(focusShot === null ? {} : { shotId: focusShot }),
       retrospective: alignment.cues?.retrospective === true,
       current: alignment.cues?.current === true,
+      // typed 轮没有音频端点；用户发送的原话只做本轮本地事件检索，长度有界、隐私时清空。
+      ...(typeof text === 'string' && text.length > 0 ? { queryText: proactiveClip(text, 160) } : {}),
       timeSource: 'typed-sent',
       at: sentAt,
     };
@@ -21404,6 +21513,12 @@ export function apply(ctx, config) {
         comment: commentEvidence.state(),
         // P-187 阶段 3 的后台理解只读状态：调度计数 + 有界状态尺寸，绝不含正文/路径/帧 id。
         understanding: understandingStatusView(),
+        // P0 本地宏观事件索引的受限状态：只给条数/时间/边界；`detailAvailable` 是当前仍可
+        // 按 frameId 回查的原帧数量，不暴露任何 frameId 或路径。
+        eventIndex: {
+          ...eventIndex.status(),
+          detailAvailable: evidenceWindow.state().cells,
+        },
         // 同材料双探针的手动诊断状态：没有正文，只有计数/原因与最近一次的受限 meta。
         probe: visionProbe.status(),
         // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
@@ -22235,6 +22350,8 @@ export function apply(ctx, config) {
           // 手动探针不属于连续理解：卸载时同样停止并清空摘要，避免残留画面文本。
           visionProbe.stop();
           resetUnderstandingMaterial();
+          // P0：事件索引是本地内存状态；卸载时连同短事件一起清掉，不留下画面描述。
+          try { eventIndex.clear('dispose'); } catch { /* index is already inert */ }
           // P-187 阶段 5：先停主动评估定时器并作废在途结果，再让 invalidateVision 清一次窗口。
           stopProactive();
           await invalidateVision().catch((error) => log.emit('vision.cleanup.failed', { error: error?.message ?? String(error) }));

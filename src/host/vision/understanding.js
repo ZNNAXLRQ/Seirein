@@ -64,8 +64,13 @@ function shotIdOf(value) {
   return SHOT_ID_PATTERN.test(text) ? text : null;
 }
 
-/** 事件稳定身份：描述 + 引用证据 + 镜头；不包含每次分析都会漂移的 from/to。 */
-function stableEventId(description, frameIds, audioIds, shotId) {
+/**
+ * 事件稳定身份：描述 + 引用证据 + 镜头；不包含每次分析都会漂移的 from/to。
+ *
+ * 导出给本地事件索引复用：同一事件在“理解状态”和“宏观事件索引”里必须得到同一个 id，
+ * 重复分析才能合并而不是各存一份。
+ */
+export function stableEventId(description, frameIds, audioIds, shotId) {
   const hash = createHash('sha1')
     .update('understanding-event-v1\u0000')
     .update(description)
