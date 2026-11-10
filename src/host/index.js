@@ -10622,7 +10622,7 @@ export function apply(ctx, config) {
         text: { type: 'string', description: 'Word or lookup text (query by text, add, update selector).' },
         query: { type: 'string', description: 'Query text when `text` is not supplied (query).' },
         canonical: { type: 'string', description: 'Preferred spelling (add/update rename).' },
-        category: { type: 'string', description: 'Lexicon category, as validated by the store.' },
+        category: { type: 'string', description: 'Lexicon category; space-separated multiple labels, e.g. 人物 动画. Chinese and English labels are both free text.' },
         usage: { type: 'string', description: 'Short usage/meaning note, stored by the lexicon (never copied into memory).' },
         reading: { type: 'string', description: 'Optional reading/pronunciation.' },
         library: { type: 'string', description: 'Target library at add time: public (shared by everyone) or voiceprint (only the confirmed self; requires a confirmed self).' },

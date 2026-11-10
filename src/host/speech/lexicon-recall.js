@@ -31,6 +31,8 @@
  */
 
 /** Default maximum number of candidates returned. */
+import { splitLexiconCategories } from './lexicon-store.js';
+
 export const RECALL_DEFAULT_LIMIT = 3;
 
 /** Hard upper bound for a caller-supplied limit. */
@@ -420,7 +422,7 @@ function contextBonus(entry, textForm) {
   let bonus = 0;
   const reasons = [];
   const category = typeof entry.category === 'string' ? entry.category : '';
-  const hints = CATEGORY_HINTS[category] ?? [];
+  const hints = splitLexiconCategories(category).flatMap((label) => CATEGORY_HINTS[label] ?? []);
   if (hints.some((hint) => textForm.includes(hint))) {
     bonus += 0.03;
     reasons.push('category:hint');

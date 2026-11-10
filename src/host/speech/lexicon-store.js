@@ -112,6 +112,28 @@ export const LEXICON_DEFAULT_LIBRARY = 'public';
 /** User-facing field limits, measured in code points (an emoji counts once). */
 export const LEXICON_TEXT_MAX_CHARS = 40;
 export const LEXICON_CATEGORY_MAX_CHARS = 40;
+/** Space-separated category labels per entry; keeps the stored string bounded. */
+export const LEXICON_CATEGORY_MAX_COUNT = 8;
+
+/**
+ * Split a free-text category field on ASCII/full-width whitespace. Used by both the store and
+ * the recall bonus, so "动画 角色" and "动画　角色" behave the same and a Chinese label is just
+ * another token.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+export function splitLexiconCategories(value) {
+  if (typeof value !== 'string') return [];
+  const seen = new Set();
+  const labels = [];
+  for (const token of value.split(/[\s\u3000]+/u)) {
+    const text = token.trim();
+    if (text.length === 0 || seen.has(text)) continue;
+    seen.add(text);
+    labels.push(text);
+  }
+  return labels;
+}
 export const LEXICON_USAGE_MAX_CHARS = 200;
 export const LEXICON_READING_MAX_CHARS = 80;
 
@@ -168,9 +190,9 @@ function textLength(value) {
  * an over-long or non-string value instead of silently rewriting the user's input.
  */
 function storedCategory(value) {
-  if (typeof value !== 'string') return LEXICON_DEFAULT_CATEGORY;
-  const text = value.trim();
-  if (text.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  const labels = splitLexiconCategories(value);
+  if (labels.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  const text = labels.slice(0, LEXICON_CATEGORY_MAX_COUNT).join(' ');
   return textLength(text) <= LEXICON_CATEGORY_MAX_CHARS ? text : LEXICON_DEFAULT_CATEGORY;
 }
 
@@ -194,8 +216,10 @@ function normalizeEntryExtras(entry) {
 function cleanCategory(value) {
   if (value === undefined || value === null) return LEXICON_DEFAULT_CATEGORY;
   if (typeof value !== 'string') return null;
-  const text = value.trim();
-  if (text.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  const labels = splitLexiconCategories(value);
+  if (labels.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  if (labels.length > LEXICON_CATEGORY_MAX_COUNT) return null;
+  const text = labels.join(' ');
   return textLength(text) <= LEXICON_CATEGORY_MAX_CHARS ? text : null;
 }
 

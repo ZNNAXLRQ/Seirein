@@ -42,6 +42,18 @@ test('1. 类别是自由文本：trim/长度上限/旧枚举兼容/空值存 unk
   assert.equal(custom.entry.category, '饮品', 'arbitrary category is stored trimmed');
   assert.equal(custom.entry.status, 'confirmed');
 
+  const multi = store.addEntry({ text: '多类别词', category: ' 人物   动画　角色 ' });
+  assert.equal(multi.ok, true);
+  assert.equal(multi.entry.category, '人物 动画 角色', 'space/full-width separated categories normalize');
+  const duplicate = store.addEntry({ text: '重复类别词', category: '动画 动画 角色' });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.entry.category, '动画 角色', 'duplicate labels collapse');
+  assert.deepEqual(
+    store.addEntry({ text: '类别过多', category: Array.from({ length: 9 }, (_, index) => `类${index}`).join(' ') }),
+    { ok: false, reason: 'invalid-category' },
+    'the category count is bounded',
+  );
+
   const legacy = store.addEntry({ text: '向晚', category: 'character' });
   assert.equal(legacy.ok, true);
   assert.equal(legacy.entry.category, 'character', 'the legacy enum ids still round-trip');
