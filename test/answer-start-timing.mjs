@@ -491,6 +491,10 @@ async function mountHost(t, { settings = {}, extra = {} } = {}) {
     langs: { speech: 'zh', subtitle: 'zh' },
     typedReply: { voice: true },
     voice: { chunking: true, ...settings.voice },
+    // This fixture's fake VTS has no model-parameter readback. The startup probe would mark the
+    // head bindings unverified and hold every answer-start gesture; the test is about timing, not
+    // the probe, so opt out explicitly (same rule as voice-wiring/avatar-turn-continuity).
+    avatar: { verifyMappingsOnStartup: false },
   }));
   hostState.players = [];
   hostState.synthCalls = [];

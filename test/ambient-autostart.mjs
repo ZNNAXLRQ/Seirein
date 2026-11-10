@@ -264,7 +264,7 @@ test('旧 hotkeys.json 缺 ambient：自动补 Ctrl+Alt+A，已有自定义项�
   assert.equal(bindings.mic, 'Ctrl+Alt+Shift+M', 'custom mic survives');
   assert.equal(bindings.vision, 'Ctrl+Alt+Shift+V', 'custom vision survives');
   assert.equal(bindings.layerEdit, 'Ctrl+Alt+Shift+E', 'custom layerEdit survives');
-  assert.equal(status.bindings.length, 4);
+  assert.equal(status.bindings.length, 5);
 
   const saved = JSON.parse(await readFile(join(root, 'data', 'hotkeys.json'), 'utf8'));
   assert.equal(saved.ambient, 'Ctrl+Alt+A', 'the filled default is written back');
