@@ -19240,8 +19240,36 @@ export function apply(ctx, config) {
     },
   });
   let speakerCandidateGeneration = 0;
+  // Whether the CURRENT capture was opened with `onSpeakerSample`. This is deliberately separate
+  // from the persisted switch: turning the shadow on while a session started without it must show
+  // "attached:false" until that session is restarted (or re-attached) by the settings action.
+  let speakerCandidateAttached = false;
+  let speakerCandidateAttachedInstance = '';
   const invalidateSpeakerCandidates = () => {
     speakerCandidateGeneration += 1;
+  };
+  /**
+   * Why candidate collection is not live right now; '' means the callback is attached and the
+   * session may collect. Status/settings use this so "0 candidates" is not mistaken for "not set up".
+   */
+  const speakerCandidateCollectReason = () => {
+    if (shutdown.closing === true) return 'shutting-down';
+    if (speakerShadowEnabled() !== true) return 'shadow-disabled';
+    if (hearing === null) return 'not-listening';
+    if (speakerCandidateAttached !== true) return 'not-attached';
+    if (features.enabled('hearing') !== true) return 'hearing-disabled';
+    if (vision.mode === 'privacy') return 'privacy';
+    return '';
+  };
+  const speakerCandidateCollecting = () => speakerCandidateCollectReason() === '';
+  const noteSpeakerCandidateCollection = (attached, reason) => {
+    noteSpeakerCandidateEvent('speaker.candidates.collection', {
+      attached: attached === true,
+      reason,
+      ...(attached === true && speakerCandidateAttachedInstance !== ''
+        ? { instanceId: speakerCandidateAttachedInstance }
+        : {}),
+    });
   };
   const noteSpeakerCandidateEvent = (type, payload) => {
     try {
@@ -19409,6 +19437,8 @@ export function apply(ctx, config) {
   // then close the Host-owned library connection (a hearing session borrows it and never owns it).
   ctx.effect(() => () => {
     invalidateSpeakerCandidates();
+    speakerCandidateAttached = false;
+    speakerCandidateAttachedInstance = '';
     try {
       speakerLibrary.close();
     } catch {
@@ -19429,7 +19459,16 @@ export function apply(ctx, config) {
     // Additive candidate block: only while the shadow is collecting, or once a previous run left
     // rows behind. The default-off status with an empty cache therefore keeps its exact old shape.
     const candidates = speakerCandidatesStatus();
-    if (speakerShadowEnabled() || candidates.count > 0) status.candidates = candidates;
+    if (speakerShadowEnabled() || candidates.count > 0) {
+      status.candidates = candidates;
+      // Additive collection state: whether THIS capture has the callback, and whether it may
+      // collect now. A candidate count of 0 with `candidateCollecting:true` means "listening, no
+      // speech yet"; `candidateCollectReason` names the gate when it is false. Kept out of the
+      // default-OFF shape so callers that pinned the old status object still see it unchanged.
+      status.candidateAttached = hearing !== null && speakerCandidateAttached === true;
+      status.candidateCollecting = speakerCandidateCollecting();
+      status.candidateCollectReason = speakerCandidateCollectReason();
+    }
     return status;
   };
   /** `speaker.status` is throttled: the counts change per utterance, the event must not spam. */
@@ -20037,6 +20076,12 @@ export function apply(ctx, config) {
         // Adopted inside the gate, so no microtask can slip between the open check and the slot.
         commit: (session) => {
           hearing = session;
+          // The callback exists only when this spawn included it. Record that per session rather
+          // than re-reading the setting, so status can distinguish "off" from "on but not attached".
+          speakerCandidateAttached = speakerShadowAtStart === true && session !== null;
+          speakerCandidateAttachedInstance = speakerCandidateAttached
+            ? String(session.instanceId ?? '')
+            : '';
         },
       });
       if (!started.started) {
@@ -20066,6 +20111,11 @@ export function apply(ctx, config) {
           hearing = null;
           // Capture is gone: a candidate callback still queued by this session must be dropped.
           invalidateSpeakerCandidates();
+          if (speakerCandidateAttached) {
+            noteSpeakerCandidateCollection(false, 'session-exit');
+          }
+          speakerCandidateAttached = false;
+          speakerCandidateAttachedInstance = '';
           heard.partial = '';
           // 采集已退出：还没等到终稿的开口锁必须释放，不能留到 TTL 才回收。
           dropSpeechEvidence();
@@ -20095,9 +20145,14 @@ export function apply(ctx, config) {
       avatarStatusIf(['idle', 'tired', 'listening'], 'waiting', 'hearing.start');
       // A manual start (hotkey / tool / settings page) also clears an autostart failure note.
       hearingAutostart?.clearDeferred();
+      // One diagnostic row per attached session: the card/status can explain why candidates are
+      // (not) arriving without making the user guess that the callback was never wired.
+      if (speakerCandidateAttached) noteSpeakerCandidateCollection(true, 'session-start');
       return { ok: true, running: true, device, devices, error: '', instanceId: hearing?.instanceId ?? '' };
     } catch (error) {
       hearing = null;
+      speakerCandidateAttached = false;
+      speakerCandidateAttachedInstance = '';
       return { ok: false, running: false, device: '', devices: [], error: error?.message ?? String(error) };
     }
   };
@@ -20118,6 +20173,9 @@ export function apply(ctx, config) {
     hearingAutostart?.cancel();
     // No candidate may be added after an explicit stop, including one hearing already queued.
     invalidateSpeakerCandidates();
+    if (speakerCandidateAttached) noteSpeakerCandidateCollection(false, 'session-stop');
+    speakerCandidateAttached = false;
+    speakerCandidateAttachedInstance = '';
     hearing?.stop();
     hearing = null;
     heard.partial = '';
@@ -21419,6 +21477,11 @@ export function apply(ctx, config) {
     get speakerTemplateStore() { return speakerTemplateStore; },
     get speakerModelState() { return speakerModelState; },
     get speakerShadowEnabled() { return speakerShadowEnabled; },
+    // Settings needs the live session fact, not the persisted switch, to decide whether a toggle
+    // must restart capture and attach/detach `onSpeakerSample`.
+    get speakerCandidateAttached() { return hearing !== null && speakerCandidateAttached === true; },
+    get speakerCandidateCollecting() { return speakerCandidateCollecting(); },
+    get speakerCandidateCollectReason() { return speakerCandidateCollectReason(); },
     get startAmbient() { return startAmbient; },
     get startListening() { return startListening; },
     get startSpeakerDownload() { return startSpeakerDownload; },

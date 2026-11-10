@@ -10,6 +10,7 @@
  *   5. `rename` 只改库显示名称，speakerId 不变，重新打开库仍可见；空/超长名称被拒绝；
  *   6. 失败回滚：库 SQLite 已写入后登记确认失败 → 库行回滚、登记恢复快照，不留半套数据；
  *   7. 静态 UI：候选数/分组、试听、勾选、删除、清空、预览、建立、重命名、提示文案与动作名。
+ *   8. 运行中开关声纹影子：当前监听补挂/摘除候选回调；隐私期拒绝收集，且不自动确认 self 或建模板。
  *
  * 不需要真实麦克风、模型、网络或 GUI。
  *
@@ -96,6 +97,16 @@ after(() => { delete globalThis.__speakerCandidateUiHostTest; });
 // ---------------------------------------------------------------------------
 
 const TOLERANCE = 1e-6;
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Poll until `predicate()` is true; a missed deadline fails the test instead of hanging it. */
+async function until(predicate, label, timeoutMs = 4000) {
+  const startedAt = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - startedAt > timeoutMs) assert.fail(`timed out: ${label}`);
+    await delay(10);
+  }
+}
 
 function close(actual, expected, message, tolerance = TOLERANCE) {
   assert.ok(
@@ -152,7 +163,7 @@ async function writeCandidates(root, specs) {
   return candidates;
 }
 
-async function newRoot() {
+async function newRoot(settings = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-speaker-candidate-ui-host-'));
   await mkdir(join(root, 'data'), { recursive: true });
   await mkdir(join(root, 'workspace'), { recursive: true });
@@ -163,7 +174,8 @@ async function newRoot() {
   await writeFile(join(root, 'data', 'settings.json'), JSON.stringify({
     langs: { speech: 'zh', subtitle: 'zh' },
     autoMemory: { enabled: false },
-    voice: { chunking: false, speakerShadow: true },
+    voice: { chunking: false, speakerShadow: true, ...(settings.voice ?? {}) },
+    ...settings,
   }));
   return root;
 }
@@ -231,6 +243,16 @@ async function mount(root) {
     );
     return JSON.parse(result);
   };
+  const status = async () => {
+    const handler = routes.get('/assistant/status');
+    assert.equal(typeof handler, 'function', 'the status route is registered');
+    let result = '';
+    await handler({ method: 'GET', url: '/assistant/status' }, {
+      writeHead() {},
+      end(value) { result = value; },
+    });
+    return JSON.parse(result);
+  };
   let disposed = false;
   const close = async () => {
     if (disposed) return;
@@ -239,7 +261,7 @@ async function mount(root) {
     if (failures.length === 1) throw failures[0];
     if (failures.length > 1) throw new AggregateError(failures, 'dispose failed');
   };
-  return { root, start, action, close };
+  return { root, start, action, status, close };
 }
 
 async function withHost(t, specs) {
@@ -679,4 +701,113 @@ test('6) 设置页 UI 静态接线：候选数/分组、试听、勾选、删除
   assert.equal((clientSource.match(/setInterval\(load, 3000\)/gu) ?? []).length, 1,
     'the original status poll remains the only one');
   console.log('[6] actions=7 copy=10 checkboxes=1 audio=1 polling=1');
+});
+
+// ---------------------------------------------------------------------------
+// 7. Live wiring: enabling the shadow attaches the candidate callback to the
+//    CURRENT capture; turning it off / entering privacy stops collection.
+// ---------------------------------------------------------------------------
+
+/** One valid microphone clip for the host callback seam (16 kHz mono Float32). */
+function sampleOf(utteranceId, overrides = {}) {
+  return {
+    utteranceId,
+    source: 'mic',
+    quality: 'ok',
+    sampleRate: 16000,
+    durationMs: 1000,
+    embedding: new Float32Array([1, 0, 0]),
+    samples: new Float32Array(16000),
+    text: '候选正文',
+    ...overrides,
+  };
+}
+
+test('7) 运行中开影子：当前监听补挂候选收集；关闭/隐私停止收集', async (t) => {
+  const root = await newRoot({ voice: { chunking: false, speakerShadow: false } });
+  const host = await mount(root);
+  t.after(async () => {
+    await host.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  });
+
+  // Capture starts with the shadow OFF: the session has no candidate callback.
+  assert.equal((await host.start()).ok, true);
+  assert.equal(state.starts.length, 1);
+  assert.equal(state.starts[0].onSpeakerSample, undefined, 'no callback before the switch is on');
+  let snapshot = await host.status();
+  assert.equal(snapshot.speaker.candidates, undefined, 'the default-OFF shape stays unchanged');
+  assert.equal(snapshot.speaker.candidateAttached, undefined);
+  assert.equal(snapshot.speaker.candidateCollecting, undefined);
+
+  // Turning it on while listening restarts that session with the callback, so the CURRENT
+  // conversation starts collecting immediately instead of waiting for a later restart.
+  const enabled = await host.action({ action: 'voice.speakerShadow', enabled: true });
+  assert.equal(enabled.ok, true, enabled.error);
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.restarted, true, 'the live capture was re-opened');
+  assert.equal(enabled.attached, true);
+  assert.equal(enabled.collecting, true);
+  assert.equal(state.starts.length, 2);
+  const liveCallback = state.starts[1].onSpeakerSample;
+  assert.equal(typeof liveCallback, 'function', 'the current session now has a candidate callback');
+  snapshot = await host.status();
+  assert.equal(snapshot.speaker.candidateAttached, true);
+  assert.equal(snapshot.speaker.candidateCollecting, true);
+  assert.equal(snapshot.speaker.candidateCollectReason, '');
+
+  liveCallback(sampleOf('live-shadow:1'));
+  await until(async () => (await host.status()).speaker.candidates?.count === 1, 'live candidate');
+  let attachedEvent;
+  await until(async () => {
+    attachedEvent = (await readEvents(root)).find(
+      (event) => event.type === 'speaker.candidates.collection' && event.payload?.attached === true,
+    );
+    return attachedEvent !== undefined;
+  }, 'candidate collection attach event');
+  assert.ok(attachedEvent !== undefined, 'attaching the callback is recorded');
+
+  // Turning it off detaches the callback from a still-running capture; the old callback can no
+  // longer add rows even if hearing already queued one.
+  const disabled = await host.action({ action: 'voice.speakerShadow', enabled: false });
+  assert.equal(disabled.ok, true, disabled.error);
+  assert.equal(disabled.restarted, true, 'the capture is re-opened without the callback');
+  assert.equal(disabled.attached, false);
+  assert.equal(disabled.collecting, false);
+  assert.equal(state.starts.length, 3);
+  assert.equal(state.starts[2].onSpeakerSample, undefined);
+  liveCallback(sampleOf('live-shadow:2'));
+  snapshot = await host.status();
+  assert.equal(snapshot.speaker.candidates.count, 1, 'a stale/off callback cannot add');
+  assert.equal(snapshot.speaker.candidateAttached, false);
+  assert.equal(snapshot.speaker.candidateCollecting, false);
+  assert.equal(snapshot.speaker.candidateCollectReason, 'shadow-disabled');
+
+  // Enable again, then enter privacy: the callback exists but collection is refused by the gate.
+  const again = await host.action({ action: 'voice.speakerShadow', enabled: true });
+  assert.equal(again.ok, true, again.error);
+  assert.equal(again.attached, true);
+  const privacyCallback = state.starts.at(-1).onSpeakerSample;
+  assert.equal(typeof privacyCallback, 'function');
+  const privacy = await host.action({ action: 'vision.mode', mode: 'privacy' });
+  assert.equal(privacy.ok, true, privacy.error);
+  privacyCallback(sampleOf('live-shadow:3'));
+  snapshot = await host.status();
+  assert.equal(snapshot.speaker.candidates.count, 1, 'privacy refuses a candidate');
+  assert.equal(snapshot.speaker.candidateAttached, true, 'the callback is still attached');
+  assert.equal(snapshot.speaker.candidateCollecting, false);
+  assert.equal(snapshot.speaker.candidateCollectReason, 'privacy');
+
+  let skipped = [];
+  await until(async () => {
+    skipped = (await readEvents(root))
+      .filter((event) => event.type === 'speaker.candidates.skipped')
+      .map((event) => event.payload?.reason);
+    return skipped.includes('shadow-disabled') && skipped.includes('privacy');
+  }, 'candidate skip reasons');
+  assert.ok(skipped.includes('shadow-disabled'), `expected shadow-disabled, got ${skipped.join(',')}`);
+  assert.ok(skipped.includes('privacy'), `expected privacy, got ${skipped.join(',')}`);
+  assert.equal(await enrollmentState(root), null, 'collection never confirms self');
+  assert.deepEqual(await libraryRows(root), [], 'collection never builds a template');
+  console.log('[7] attach=live/on restart=on detach=off privacy=refused self=null template=none');
 });

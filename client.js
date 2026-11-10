@@ -3750,6 +3750,20 @@ window.__ModuleLoader__.load({
       const notice = speakerEnrollObject(props?.candidateNotice);
       const noticeText = speakerEnrollText(notice?.message);
       const noSelection = selected.length === 0;
+      const shadowEnabled = props?.shadowEnabled === true;
+      const buildReason = !view.available
+        ? '建立基础声纹已禁用：候选接口不可用。'
+        : (view.count === 0
+            ? '建立基础声纹已禁用：还没有候选；开启声纹影子并正常说话，或点「刷新候选」。'
+            : (noSelection ? '建立基础声纹已禁用：先勾选至少一条候选。' : ''));
+      const strengthenReason = !view.available
+        ? '强化当前声纹已禁用：候选接口不可用。'
+        : (view.templateCurrentVersion === null
+            ? '强化当前声纹已禁用：还没有基础声纹版本；先建立基础声纹。'
+            : (view.count === 0
+                ? '强化当前声纹已禁用：还没有候选。'
+                : (noSelection ? '强化当前声纹已禁用：先勾选至少一条候选。' : '')));
+      const renameReason = label === '' ? '重命名已禁用：名称不能为空。' : '';
       const rollbackAsk = speakerEnrollNumber(props?.rollbackAsk);
       const templateCurrent = view.templateCurrent;
       const templateCurrentText = templateCurrent === null
@@ -3841,7 +3855,13 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.row },
           h('span', { style: styles.label }, '候选数'),
           h('span', { style: styles.value },
-            view.available ? `${view.count} 条 · 分组 ${view.groupCount}` : '不可用')),
+            view.available ? `${view.count} 条 · 分组 ${view.groupCount}` : '不可用'),
+          h('button', {
+            'data-speaker-candidate-refresh': 'true',
+            style: { ...styles.btn, ...(locked || view.loading ? styles.off : {}) },
+            disabled: locked || view.loading,
+            onClick: () => props?.onCandidateRefresh?.(),
+          }, view.loading ? '刷新中…' : '刷新候选')),
         h('div', { style: styles.row },
           h('span', { style: styles.label }, '库名称'),
           h('span', { style: styles.value },
@@ -3863,8 +3883,18 @@ window.__ModuleLoader__.load({
           : h('div', { style: { ...styles.hint, color: DANGER } }, `候选读取失败：${view.error}`),
         view.loading ? h('div', { style: styles.hint }, '正在读取声纹候选…') : null,
         view.available && view.count === 0 && !view.loading
-          ? h('div', { style: styles.hint },
-              '还没有声纹候选：先在听觉页开启「声纹影子」，正常说话会自动收集；不需要专门说三句话。')
+          ? h('div', {
+              'data-speaker-candidate-empty': 'true',
+              style: { marginTop: 6 },
+            },
+              h('div', { style: styles.hint },
+                '还没有声纹候选：先在听觉页开启「声纹影子」，正常说话会自动收集；不需要专门说三句话。'),
+              h('div', { style: styles.hint },
+                shadowEnabled
+                  ? '当前声纹影子已开启：正常说话就会进入候选；刚切换的话点「刷新候选」，或等当前会话下一次发言。'
+                  : '去「听觉」页开启「声纹影子」：当前监听会立即补挂候选收集，不用等下次重启。'),
+              h('div', { style: styles.hint },
+                '未收集到候选时也可以随时点上方「刷新候选」；不会自动确认本人，也不会自动建立声纹。'))
           : null,
         view.available
           ? h('div', { style: { marginTop: 6 } },
@@ -3930,6 +3960,24 @@ window.__ModuleLoader__.load({
             disabled: locked || !view.available || view.count === 0,
             onClick: () => props?.onCandidateClear?.(),
           }, '清空候选')),
+        buildReason === ''
+          ? null
+          : h('div', {
+              'data-speaker-candidate-build-reason': 'true',
+              style: styles.hint,
+            }, buildReason),
+        strengthenReason === ''
+          ? null
+          : h('div', {
+              'data-speaker-candidate-strengthen-reason': 'true',
+              style: styles.hint,
+            }, strengthenReason),
+        renameReason === ''
+          ? null
+          : h('div', {
+              'data-speaker-candidate-rename-reason': 'true',
+              style: styles.hint,
+            }, renameReason),
         previewText === ''
           ? null
           : h('div', {
@@ -4024,32 +4072,42 @@ window.__ModuleLoader__.load({
           ? h('div', { style: styles.mono },
               `上次读取：${new Date(view.at).toLocaleTimeString('zh-CN', { hour12: false })}`)
           : null,
+        // 主视野：状态 → 候选 → 版本/建库。旧登记条目在下面折叠，兼容但不再抢占注意力。
         h('div', { style: { marginTop: 10 } },
           h('div', { style: { ...styles.label, fontWeight: 600 } }, '登记状态'),
           row('本人 speakerId', view.available ? (view.selfId === '' ? '未登记' : view.selfId) : '不可用'),
           row('状态', view.stateText),
           row('样本', sampleText),
           row('确认时间', primary === null || primary.confirmedAt === '' ? '—' : primary.confirmedAt)),
-        view.available
-          ? h('div', { style: { marginTop: 10 } },
-              h('div', { style: { ...styles.label, fontWeight: 600 } }, `条目（${view.entries.length}）`),
-              view.empty
-                ? h('div', { style: styles.hint },
-                    '还没有登记条目：开启声纹影子后正常说话，候选会出现在下方；确认建立后才有本人声纹。')
-                : view.entries.map(entryRow))
-          : null,
-        h('div', { style: styles.hint }, SPEAKER_ENROLL_RECORD_HINT),
-        h('div', { style: { marginTop: 10 } },
-          h('div', { style: { ...styles.label, fontWeight: 600 } }, '影子观测（只记录）'),
-          row('最近一条', lastText),
-          row('三类计数', countsText),
-          view.shadow.available
-            ? null
-            : h('div', { style: styles.hint },
-                view.shadow.error === ''
-                  ? '影子状态不可用：需要宿主支持 speaker.status.shadow。'
-                  : `影子状态不可用：${view.shadow.error}（需要宿主支持 speaker.status.shadow）`)),
         speakerCandidateSection(h, props),
+        h('div', { style: styles.hint }, SPEAKER_ENROLL_RECORD_HINT),
+        h('details', {
+          'data-settings-group': 'speaker-enroll-legacy',
+          'data-seirein-speaker-legacy': 'client',
+          style: { marginTop: 12 },
+        },
+          h('summary', { style: { ...styles.value, cursor: 'pointer', fontWeight: 600 } },
+            `旧登记记录（兼容） · ${view.available ? `${view.entries.length} 条` : '不可用'}`),
+          h('div', { style: styles.hint },
+            '以下为旧版登记条目与影子观测，仅用于兼容；日常请用上方候选建立/强化声纹。旧条目的确认/拒绝/删除仍然可用。'),
+          view.available
+            ? h('div', { style: { marginTop: 10 } },
+                h('div', { style: { ...styles.label, fontWeight: 600 } }, `旧登记条目（${view.entries.length}）`),
+                view.empty
+                  ? h('div', { style: styles.hint },
+                      '还没有登记条目：开启声纹影子后正常说话，候选会出现在上方；确认建立后才有本人声纹。')
+                  : view.entries.map(entryRow))
+            : null,
+          h('div', { style: { marginTop: 10 } },
+            h('div', { style: { ...styles.label, fontWeight: 600 } }, '旧影子观测（只记录）'),
+            row('最近一条', lastText),
+            row('三类计数', countsText),
+            view.shadow.available
+              ? null
+              : h('div', { style: styles.hint },
+                  view.shadow.error === ''
+                    ? '影子状态不可用：需要宿主支持 speaker.status.shadow。'
+                    : `影子状态不可用：${view.shadow.error}（需要宿主支持 speaker.status.shadow）`))),
         props?.notice
           ? h('div', { style: { ...styles.hint, color: '#2b8a3e' } }, String(props.notice))
           : null);
@@ -7049,9 +7107,11 @@ window.__ModuleLoader__.load({
             const sourceLabel = source === 'obs' ? `OBS 场景「${vm.scene || '未指定'}」` : '桌面';
             const modeLabel = locked
               ? '隐私模式（锁定）'
-              : capturing
+              : (continuousOn && continuousState === 'capturing')
                 ? `持续观看 · ${sourceLabel}`
-                : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
+                : capturing
+                  ? `即时观看 · ${sourceLabel}`
+                  : source === 'obs' ? `OBS 场景观看 ·「${vm.scene || '未指定'}」` : '桌面观看';
             // No local state: the select value is the source the Host actually has.
             const sourceValue = source === 'obs' ? (vm.scene || '__obs__') : '__desktop__';
             // 后台理解成本概览：只读 status.vision.understanding，优先用宿主给的限速/上限；
@@ -7250,9 +7310,9 @@ window.__ModuleLoader__.load({
                     const result = capturing
                       ? await act({ action: 'vision.watch.stop' }, 'vision-watch')
                       : await act({ action: 'vision.watch.start', source, scene: vm.scene || '' }, 'vision-watch');
-                    if (result.ok) show(capturing ? '已停止持续观看' : '已开始持续观看');
+                    if (result.ok) show(capturing ? '已停止即时观看' : '已开始即时观看');
                   },
-                }, capturing ? '停止持续观看' : '启动持续观看'),
+                }, capturing ? '停止即时观看' : '启动即时观看'),
                 h('button', {
                   style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
                   disabled: busyNow,
@@ -8445,6 +8505,7 @@ window.__ModuleLoader__.load({
             candidateAudio: speakerCandidateAudio,
             candidatePreview: speakerCandidatePreview,
             candidateNotice: speakerCandidateNotice,
+            shadowEnabled: status?.speaker?.enabled === true,
             label: speakerCandidateLabel,
             onCandidateToggle: toggleSpeakerCandidate,
             onCandidateAudio: (id) => void loadSpeakerCandidateAudio(id),
@@ -8453,6 +8514,7 @@ window.__ModuleLoader__.load({
             onCandidatePreview: (ids) => void previewSpeakerCandidates(ids),
             onCandidateBuild: (ids, label) => void buildSpeakerBase(ids, label),
             onTemplateStrengthen: (ids, label) => void strengthenSpeakerTemplate(ids, label),
+            onCandidateRefresh: () => void loadSpeakerCandidates(),
             rollbackAsk: speakerTemplateRollback,
             onTemplateRollbackAsk: (version) => setSpeakerTemplateRollback(version),
             onTemplateRollbackCancel: () => setSpeakerTemplateRollback(null),

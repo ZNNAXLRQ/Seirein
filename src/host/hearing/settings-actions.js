@@ -417,21 +417,40 @@ export function createHearingSettingsActions(services) {
         return { ok: true, autoListen: enabled };
       }
       case 'voice.speakerShadow': {
-        // Observation switch only: persist, start the T1 download when needed, and restart a
-        // running capture so the option reaches its `startHearing`. A failed download leaves the
-        // shadow inactive; it never blocks capture or delivery.
+        // Observation switch only: persist, start the T1 download when needed, and make the
+        // RUNNING capture follow the switch. A session opened before the switch has no
+        // `onSpeakerSample`, so its status says `candidateAttached:false`; restarting only in that
+        // (or the reverse detach) case re-wires the current session without disturbing a session
+        // that is already in the requested state. A failed download leaves the shadow inactive; it
+        // never blocks capture or delivery.
         const enabled = body.enabled === true;
-        const wasEnabled = (0, services.speakerShadowEnabled)();
+        const running = services.hearing != null;
+        const attached = running && services.speakerCandidateAttached === true;
         (0, services.writeSettings)({ voice: { ...(0, services.storedVoice)(), speakerShadow: enabled } });
         await services.log.emit(enabled ? 'speaker.enabled' : 'speaker.disabled', { source: 'settings' });
         if (enabled) (0, services.startSpeakerDownload)();
-        (0, services.emitSpeakerStatus)(true);
-        if (wasEnabled !== enabled && services.hearing !== null) {
+        let restarted = false;
+        let restartError = '';
+        if (running && (enabled ? !attached : attached)) {
           const device = services.hearing.device;
           await (0, services.stopListening)();
-          await (0, services.startListening)(device);
+          // The same microphone is reopened: on enable it now receives `onSpeakerSample`, on
+          // disable it is opened without the callback. Turning the shadow off must not keep
+          // computing embeddings for a lane the user has switched off.
+          const started = await (0, services.startListening)(device);
+          restarted = started.ok === true;
+          if (!started.ok) restartError = started.error ?? 'START_FAILED';
         }
-        return { ok: true, enabled, model: (0, services.speakerModelState)() };
+        (0, services.emitSpeakerStatus)(true);
+        return {
+          ok: true,
+          enabled,
+          model: (0, services.speakerModelState)(),
+          restarted,
+          attached: services.speakerCandidateAttached === true,
+          collecting: services.speakerCandidateCollecting === true,
+          ...(restartError === '' ? {} : { restartError }),
+        };
       }
       case 'voice.audioRetention': {
         // Opt-in diagnosis clips, off by default. The switch is persisted first; a running store
