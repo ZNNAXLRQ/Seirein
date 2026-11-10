@@ -432,15 +432,44 @@ export async function startStoryboard({ ffmpegPath, dir, width = 800, height = 4
         if (stopped) throw new Error('storyboard stopped');
         sheets += 1;
         const capturedAt = sheetCapturedAt(sheet);
+        // 一张故事板可能覆盖数秒：把 sheet.from/to 的时长保留为 endedAt，而不是只留
+        // 最早帧的 capturedAt。逐帧采集时刻也一并返回（绝对毫秒），供证据层按真实
+        // 范围检索；它们只是时间点，不含文件路径或画面正文。
+        const fromSec = Number(sheet.from);
+        const toSec = Number(sheet.to);
+        const spanMs = Number.isFinite(fromSec) && Number.isFinite(toSec)
+          ? Math.max(0, (toSec - fromSec) * 1000)
+          : 0;
+        const endedAt = capturedAt + Math.min(spanMs, 120_000);
+        const frameTimes = [];
+        for (const frame of Array.isArray(sheet.frames) ? sheet.frames : []) {
+          const stamped = capturedAtById.get(frameIndex(frame));
+          const relative = Number(frame?.t);
+          const at = Number.isFinite(stamped)
+            ? stamped
+            : (Number.isFinite(relative) && Number.isFinite(fromSec)
+              ? capturedAt + Math.max(0, (relative - fromSec) * 1000)
+              : null);
+          if (at === null) continue;
+          frameTimes.push(Math.min(endedAt, Math.max(capturedAt, at)));
+          if (frameTimes.length >= 40) break;
+        }
+        const shotBreak = sheet.why === 'cut'
+          || (Array.isArray(sheet.frames) && sheet.frames.some((frame) => frame?.via === 'cut'));
         return {
           file, bytes: info.size, width: sheet.w, height: sheet.h,
           // Observation age comes from the earliest packed frame, never from packing/writing time:
           // a sheet that waited in the queue must keep aging instead of looking freshly captured.
           at: capturedAt,
           capturedAt,
+          // 真实可见范围：从最早打包帧到最后一帧（sheet.from/to 的时长），不再压成一个点。
+          startedAt: capturedAt,
+          endedAt,
           generatedAt: Date.now(),
           from: sheet.from, to: sheet.to,
           frames: Array.isArray(sheet.frames) ? sheet.frames.length : 0,
+          frameTimes: [...new Set(frameTimes)].sort((left, right) => left - right),
+          shotBreak,
           why: sheet.why ?? '',
         };
       } catch (error) {

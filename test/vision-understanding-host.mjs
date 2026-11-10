@@ -354,7 +354,9 @@ test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed �
     contextLaneOverride: () => (control.forceTyped === true ? 'typed' : undefined),
     allowCapture: true,
     evidenceCaptureEnabled: true,
-    evidenceCaptureTickMs: 5,
+    // 25 ms tick：既让第二份材料晚于证据窗口 200 ms 去重间隔，又不会在 260 ms 内
+    // 触发连续 30 次空 take 后的 6 s 空闲退避（5 ms tick 会，测试因此偶发超时）。
+    evidenceCaptureTickMs: 25,
     understandingMinIntervalMs: 1,
     features: {
       hearing: false, ambient: false, voice: false, vision: true,
@@ -423,6 +425,15 @@ test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed �
   const understanding = app.promptContexts.get('assistant:understanding');
   assert.ok(understanding !== undefined);
 
+  // 先固定第一次成功的结果，再立即切换第二份材料。采集循环连续 30 次空 take
+  // 后会退避到 6 s；25 ms tick 下 260 ms 的等待仍处于 active tick。
+  const success = (await app.status()).vision.understanding;
+  assert.equal(success.lastReasonCode, 'ok');
+  assert.equal(success.lastErrorCode, '');
+  assert.equal(success.rawChars, 0);
+  assert.equal(success.rawHash, '');
+  control.mode = 'fail';
+
   // voice lane（identity 推导）行为不变。
   const voiceText = understanding.text({ agent: companion() });
   assert.ok(voiceText.includes('测试场景'), `voice 陪伴轮仍注入：${voiceText}`);
@@ -439,16 +450,10 @@ test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed �
   };
   assert.equal(understanding.text({ agent: outsider }), '', 'typed 非陪伴轮不注入');
 
-  const success = (await app.status()).vision.understanding;
-  assert.equal(success.lastReasonCode, 'ok');
-  assert.equal(success.lastErrorCode, '');
-  assert.equal(success.rawChars, 0);
-  assert.equal(success.rawHash, '');
-
-  // 换一份材料并让 analyzer 失败：errorCode 只作为机器码进入 status，采集不被阻塞。
+  // 第二份材料必须晚于证据窗口的 200 ms 同源去重间隔；25 ms tick 下仍处于 active tick。
   await delay(260);
-  control.mode = 'fail';
   control.allowSecond = true;
+  // 第二份材料让 analyzer 失败：errorCode 只作为机器码进入 status，采集不被阻塞。
   await waitFor(async () => (await app.status()).vision.understanding.failures >= 1);
 
   const snapshot = await app.status();

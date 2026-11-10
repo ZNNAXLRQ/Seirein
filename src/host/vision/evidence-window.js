@@ -38,6 +38,12 @@ export const EVIDENCE_WINDOW_DEFAULTS = Object.freeze({
 });
 
 const KINDS = new Set(['shot', 'storyboard', 'frame']);
+/** 故事板一张图内部最多保留这么多个逐帧采集时刻（管道单张上限 40，这里再兜一层底）。 */
+const MAX_FRAME_TIMES = 32;
+/** 单条证据允许覆盖的最长时间范围；异常 from/to 不得把区间撑成整场会话。 */
+const MAX_EVIDENCE_SPAN_MS = 120_000;
+/** shotId 只接受单段机器标识，避免路径/正文进入证据记录。 */
+const SHOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/u;
 
 function nonNegative(value) {
   const number = Number(value);
@@ -47,6 +53,29 @@ function nonNegative(value) {
 function positive(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+/** 只接受可对外的镜头标识；含空白/路径分隔符的值一律丢弃，绝不猜一个 id。 */
+function normalizeShotId(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return SHOT_ID_PATTERN.test(text) ? text : null;
+}
+
+/**
+ * 逐帧采集时刻：只保留有限非负毫秒，夹到本张证据的真实范围内，去重排序并限长。
+ * 这些是时间点，不是文件路径，也不会把画面正文带进状态。
+ */
+function normalizeFrameTimes(value, startedAt, endedAt) {
+  if (!Array.isArray(value)) return [];
+  const times = [];
+  for (const entry of value) {
+    const number = Number(entry);
+    if (!Number.isFinite(number) || number < 0) continue;
+    times.push(Math.min(endedAt, Math.max(startedAt, number)));
+    if (times.length >= MAX_FRAME_TIMES) break;
+  }
+  return [...new Set(times)].sort((left, right) => left - right);
 }
 
 /** 代次只要可比较即可：数字与字符串都接受，但空值统一记 0。 */
@@ -79,13 +108,32 @@ export function normalizeEvidenceFrame(input, { now = Date.now } = {}) {
   const clock = positive(now()) ?? Date.now();
   // 未来时间戳不可信（时钟回拨、拼接），但也不丢弃证据：夹到当前时刻并留下原因。
   const future = capturedAt > clock + 1_000;
+  const anchor = future ? clock : capturedAt;
+  // 故事板携带真实 from/to（毫秒）与逐帧时刻；单帧退化为零宽区间。任何范围都必须
+  // 包含 `capturedAt`，并且跨度有界，避免畸形 from/to 把一条证据撑成整场会话。
+  const rawStartedAt = nonNegative(input.startedAt);
+  const rawEndedAt = nonNegative(input.endedAt);
+  let startedAt = rawStartedAt ?? anchor;
+  let endedAt = rawEndedAt ?? Math.max(startedAt, anchor);
+  startedAt = Math.min(startedAt, anchor);
+  endedAt = Math.min(Math.max(endedAt, anchor), clock);
+  if (endedAt - startedAt > MAX_EVIDENCE_SPAN_MS) {
+    if (anchor - startedAt > MAX_EVIDENCE_SPAN_MS) startedAt = anchor - MAX_EVIDENCE_SPAN_MS;
+    endedAt = Math.min(clock, startedAt + MAX_EVIDENCE_SPAN_MS);
+  }
+  if (endedAt < startedAt) endedAt = startedAt;
+  const shotId = normalizeShotId(input.shotId);
+  const frameTimes = normalizeFrameTimes(input.frameTimes, startedAt, endedAt);
   return {
     ok: true,
     frame: {
       file,
       bytes,
-      capturedAt: future ? clock : capturedAt,
-      at: future ? clock : capturedAt,
+      capturedAt: anchor,
+      at: anchor,
+      // 真实可见范围：单帧是零宽，故事板保留 from/to 的时长（不压成一个点）。
+      startedAt,
+      endedAt,
       source,
       sourceEpoch: normalizeEpoch(input.sourceEpoch),
       kind,
@@ -94,6 +142,8 @@ export function normalizeEvidenceFrame(input, { now = Date.now } = {}) {
       // 采集时间与处理时间分开：故事板可能很晚才打包完成。
       processedAt: clock,
       future,
+      ...(shotId === null ? {} : { shotId }),
+      ...(frameTimes.length === 0 ? {} : { frameTimes }),
     },
   };
 }
@@ -162,14 +212,16 @@ export function createEvidenceWindow({
     }
   };
 
-  /** 某帧是否被任一活跃锁覆盖（来源/代次一致才算）。 */
+  /** 某帧是否被任一活跃锁覆盖（来源/代次一致才算）。按可见范围相交判断，不压成采集点。 */
   function pinnedBy(entry) {
     const current = clock();
     for (const lock of locks.values()) {
       if (current >= lock.expiresAt) continue;
       if (lock.source !== null && lock.source !== entry.source) continue;
       if (lock.sourceEpoch !== null && lock.sourceEpoch !== entry.sourceEpoch) continue;
-      if (entry.capturedAt >= lock.from && entry.capturedAt <= lock.to + 500) return lock;
+      const startedAt = entry.startedAt ?? entry.capturedAt;
+      const endedAt = entry.endedAt ?? entry.capturedAt;
+      if (endedAt >= lock.from && startedAt <= lock.to + 500) return lock;
     }
     return null;
   }
@@ -194,7 +246,7 @@ export function createEvidenceWindow({
     let bytes = 0;
     // 先按时间淘汰：超过硬上限的帧即使被锁也保留不住（锁定不是无限内存的借口）。
     for (const entry of frames) {
-      const age = Math.max(0, current - entry.capturedAt);
+      const age = Math.max(0, current - (entry.endedAt ?? entry.capturedAt));
       if (age > hardLimit) {
         safeEvict(entry, 'age');
         continue;
@@ -208,7 +260,7 @@ export function createEvidenceWindow({
     while (frames.length > 0) {
       const overBytes = bytes > byteLimit();
       const overFrames = frames.length > frameLimit();
-      const overAge = Math.max(0, current - frames[0].capturedAt) > limitMs;
+      const overAge = Math.max(0, current - (frames[0].endedAt ?? frames[0].capturedAt)) > limitMs;
       if (!overBytes && !overFrames && !overAge) break;
       let target = -1;
       for (let i = 0; i < frames.length; i += 1) {
@@ -305,14 +357,18 @@ export function createEvidenceWindow({
   }
 
   /** 发言结束：把锁窗的结束点推到识别完成时刻，发言期间到达的帧也被覆盖。 */
-  function extendLock(id, { to, now: at } = {}) {
+  function extendLock(id, { from, to, now: at } = {}) {
     const record = locks.get(id);
     if (record === undefined) return null;
     const current = positive(at) ?? clock();
     const nextTo = positive(to) ?? current;
+    // 终稿带来真实 audioStartAt 时，锁窗起点可以向更早回填：第一帧 partial 到达前已经
+    // 发生的画面也要保护住，否则“刚才那句”会因锁建立得晚而缺证据。
+    const nextFrom = nonNegative(from);
+    if (nextFrom !== null && nextFrom < record.from) record.from = nextFrom;
     record.to = Math.max(record.to, nextTo);
     record.expiresAt = Math.max(record.expiresAt, current + ttl());
-    event('vision.evidence.lock.extended', { id, to: record.to });
+    event('vision.evidence.lock.extended', { id, from: record.from, to: record.to });
     return { ...record };
   }
 
@@ -340,16 +396,23 @@ export function createEvidenceWindow({
     return { ok: true, frames: count, bytes, generation };
   }
 
-  /** 命中 `[from, to]` 的证据（含边界），按采集时间升序；来源/代次可过滤。 */
+  /**
+   * 命中 `[from, to]` 的证据（含边界），按采集时间升序；来源/代次可过滤。
+   * 使用可见范围相交，而不是“采集点落在区间内”：一张覆盖数秒的故事板在窗口任意
+   * 一部分被问到时都应命中，不能被压成零宽。
+   */
   function between(from, to, { source = null, sourceEpoch = null } = {}) {
     const start = Number(from);
     const end = Number(to);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
-    return frames.filter((entry) => entry.capturedAt >= start
-      && entry.capturedAt <= end
-      && (source === null || entry.source === source)
-      && (sourceEpoch === null || entry.sourceEpoch === sourceEpoch))
-      .map((entry) => ({ ...entry }));
+    return frames.filter((entry) => {
+      const startedAt = entry.startedAt ?? entry.capturedAt;
+      const endedAt = entry.endedAt ?? entry.capturedAt;
+      return endedAt >= start
+        && startedAt <= end
+        && (source === null || entry.source === source)
+        && (sourceEpoch === null || entry.sourceEpoch === sourceEpoch);
+    }).map((entry) => ({ ...entry }));
   }
 
   /**

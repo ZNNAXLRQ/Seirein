@@ -327,7 +327,7 @@ import { createEvidenceCapture } from './vision/evidence-capture.js';
 import { createMediaTimeline } from './hearing/media-timeline.js';
 // P-186/P-187 阶段 2：评论对齐（纯计算）与主请求里的“评论证据块”（纯状态/文本）。
 import { ALIGNMENT_DEFAULTS, alignComment } from './vision/comment-alignment.js';
-import { createCommentEvidence } from './vision/comment-evidence.js';
+import { createCommentEvidence, COMMENT_EVIDENCE_DEFAULTS } from './vision/comment-evidence.js';
 // P-187 阶段 3：后台“按变化理解画面”的运行时编排与独立图片分析器（纯模块，宿主只负责注入）。
 import { createImageAnalyzer } from './vision/image-analyzer.js';
 import {
@@ -803,6 +803,55 @@ export function createUnderstandingMaterialGate() {
       return { lastMaterialSignature, lastMaterialAt };
     },
   };
+}
+
+/**
+ * P0：一轮麦克风发言的真实时间窗口。
+ *
+ * 优先使用 hearing 终稿携带的 `audioStartAt/audioEndAt`（真实采集区间），首个非空
+ * partial 的时间只做旧 hearing / 缺字段时的回退。转写完成时刻从不参与计算。
+ *
+ * @param {{startedAt?: any, endedAt?: any, partialStartedAt?: any, now?: any}} [input]
+ * @returns {{startedAt: number|null, endedAt: number|null, timeSource: 'audio'|'fallback'|'missing'}}
+ */
+export function resolveSpeechWindow({
+  startedAt,
+  endedAt,
+  partialStartedAt,
+  now,
+} = {}) {
+  const time = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+  };
+  const fallbackNow = time(now) ?? Date.now();
+  const declaredStart = time(startedAt);
+  const declaredEnd = time(endedAt);
+  const partial = time(partialStartedAt);
+  let end = declaredEnd ?? fallbackNow;
+  let start = declaredStart;
+  let timeSource = 'audio';
+  if (start === null || start > end) {
+    start = partial !== null ? Math.min(partial, end) : null;
+    timeSource = start === null ? 'missing' : 'fallback';
+  }
+  if (start !== null) end = Math.max(end, start);
+  return { startedAt: start, endedAt: end, timeSource };
+}
+
+/**
+ * P0：一句用户语音是否在指画面。只做保守的规则判断，不调用模型：
+ * 显式回溯/当前/指示词、画面名词或表演动词才算“有关”；其余闲聊不强行 attached。
+ *
+ * @param {string} text
+ * @returns {'related'|'unrelated'}
+ */
+export function speechReferenceOf(text) {
+  const body = typeof text === 'string' ? text : '';
+  return /(刚才|刚刚|之前|方才|上回|那会儿|现在|当前|此刻|这时|正在|这个|那个|这里|那里|上面|画面|屏幕|镜头|视频|剧情|表情|动作|眼神|姿势|字幕|台词|人物|角色|可爱|好看|搞笑|奇怪|厉害|漂亮|吓人|精彩|他|她|它|看|演|穿|坐|站|走|笑|哭|说)/u
+    .test(body)
+    ? 'related'
+    : 'unrelated';
 }
 
 /** Only the tool registry is required; everything else stays optional. */
@@ -2892,7 +2941,20 @@ export function apply(ctx, config) {
       const id = typeof agent?.id === 'string' && agent.id.length > 0
         ? agent.id
         : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
-      return id.length > 0 ? commentEvidence.render(id) : '';
+      if (id.length === 0) return '';
+      const block = commentEvidence.render(id);
+      if (block.length === 0) return '';
+      // 旧 hearing 没有 audioStartAt 时必须诚实标出时间来源；只补一行固定说明，不含正文。
+      const time = commentEvidenceTime.get(id);
+      if (time !== undefined && time.timeSource === 'fallback'
+        && Date.now() - time.at <= UNDERSTANDING_FOCUS_TTL_MS) {
+        const note = '\n- 时间来源：fallback（旧 hearing 未提供 audioStartAt，使用首个非空 partial）';
+        const limit = COMMENT_EVIDENCE_DEFAULTS.maxChars;
+        if (block.length + note.length <= limit) return `${block}${note}`;
+        // 评论块本身有 400 字符预算：给来源说明留位置，绝不因为附加说明突破上限。
+        return `${block.slice(0, Math.max(0, limit - note.length))}${note}`;
+      }
+      return block;
     } catch {
       return '';
     }
@@ -2916,7 +2978,11 @@ export function apply(ctx, config) {
       if (!understandingBlockAllowed({
         inScope: true, companion: true, subagent: false, visionEnabled, privacy, hasState: true,
       })) return '';
-      return understanding.render();
+      const focus = understandingFocus !== null
+        && Date.now() - understandingFocus.at <= UNDERSTANDING_FOCUS_TTL_MS
+        ? understandingFocus
+        : null;
+      return understanding.render(focus);
     } catch {
       return '';
     }
@@ -11105,11 +11171,46 @@ export function apply(ctx, config) {
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
   /**
+   * P0：给故事板一个稳定的镜头身份。没有真实镜头检测器，这里只做保守分段：
+   * 同一代次的相邻故事板若没有切镜（`shotBreak`）且间隔不超过 6 秒，就属于同一镜头；
+   * 否则新开一个 `shot-N`。旧镜头的证据/事件因此仍可按 shotId 检索。
+   */
+  const EVIDENCE_SHOT_GAP_MS = 6_000;
+  let evidenceShotSeq = 0;
+  let evidenceShot = null;
+  const evidenceShotIdOf = ({ kind, startedAt, endedAt, sourceEpoch, shotBreak = false }) => {
+    if (kind !== 'storyboard') return null;
+    const start = Number(startedAt);
+    const end = Number(endedAt);
+    const gap = evidenceShot === null || evidenceShot.epoch !== sourceEpoch
+      ? Infinity
+      : start - evidenceShot.endedAt;
+    if (evidenceShot === null || evidenceShot.epoch !== sourceEpoch || shotBreak === true
+      || !Number.isFinite(gap) || gap > EVIDENCE_SHOT_GAP_MS) {
+      evidenceShotSeq += 1;
+      evidenceShot = { id: `shot-${evidenceShotSeq}`, epoch: sourceEpoch, endedAt: Number.isFinite(end) ? end : start };
+    } else {
+      evidenceShot.endedAt = Math.max(evidenceShot.endedAt, Number.isFinite(end) ? end : start);
+    }
+    return evidenceShot.id;
+  };
+  /**
    * P-186/P-187 阶段 2：本轮评论证据。只保留“一次终稿到达后的对齐结果”，按陪伴会话短暂存放；
    * 主请求通过 runtime context 读取渲染文本（只有采集时间/帧数，没有图片、路径或台词正文）。
    * `config.commentEvidence` 是测试注入缝（和 `dialogueContext` 一样）：生产 config 来自 JSON。
    */
   const commentEvidence = config?.commentEvidence ?? createCommentEvidence();
+  /**
+   * P0：评论证据的语音时间来源。comment-evidence 为了“不写正文”只保留时间/帧数，这里
+   * 单独记一个极小的 per-session 标记，渲染时只用它补一行“回退”说明；不含台词/路径。
+   */
+  const commentEvidenceTime = new Map();
+  /**
+   * P0：本轮理解渲染焦点（语音窗口/镜头）。只在刚结束的一轮语音证据内有效；过期后
+   * understanding 回到无焦点的旧行为，不把上一轮窗口永久套在后续轮次上。
+   */
+  let understandingFocus = null;
+  const UNDERSTANDING_FOCUS_TTL_MS = 120_000;
   /**
    * P-187 阶段 3：后台画面理解。分析器只把“已经落盘的帧”交给模型；运行时负责节奏、单在途、
    * 有界状态与被动渲染。两者都不采集、不写文件、不注册工具，任何失败都不能改变采集/投递语义。
@@ -11603,6 +11704,20 @@ export function apply(ctx, config) {
       sourceEpoch: visionGeneration,
     }).filter((entry) => typeof entry.file === 'string'),
     audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
+    // P0：渲染时只检查事件引用的帧是否仍可回看；命中就标“证据已过期”，不输出 id/路径。
+    isEvidenceAvailable: (event) => {
+      const frameIds = Array.isArray(event?.evidenceFrameIds) ? event.evidenceFrameIds : [];
+      const audioIds = Array.isArray(event?.evidenceAudioIds) ? event.evidenceAudioIds : [];
+      if (frameIds.length > 0) {
+        try {
+          if (evidenceWindow.byId(frameIds).length > 0) return true;
+        } catch {
+          return false;
+        }
+      }
+      // 台词时间线保留 5 分钟，且没有按 id 回查入口；有台词证据时不误报“已过期”。
+      return frameIds.length === 0 && audioIds.length > 0;
+    },
     isBlocked: () => !understandingEnabled(),
     minIntervalMs: understandingMinIntervalMs,
     // 运行时以单对象 `{type, ok, reason, ...}` 回调 emit；展开成宿主事件名，避免 type 变成对象。
@@ -11699,6 +11814,8 @@ export function apply(ctx, config) {
     }
     try {
       const at = Date.now();
+      // 新一句开始：上一轮的渲染焦点先失效，避免本轮开口期间仍按上一轮窗口挑事件。
+      understandingFocus = null;
       const source = speechEvidenceSource();
       const lock = evidenceWindow.lock({
         at,
@@ -11720,9 +11837,15 @@ export function apply(ctx, config) {
   };
   /**
    * 终稿到达：补结束时间，按“同来源 + 同代次”取证据，对齐后挂到当前陪伴会话。
-   * 这里任何异常只记 `vision.comment.align.failed`，绝不能影响识别文本与后续投递。
+   *
+   * 时间优先级：hearing 的真实 `audioStartAt/audioEndAt` 优先；旧 hearing 缺
+   * `audioStartAt` 时才退回首个非空 partial，并把 `timeSource:'fallback'` 标出来。
+   * 转写完成时刻只在不提供结束时间时兜底，绝不用来推断画面位置。
+   *
+   * 评论证据只服务本轮 utterance：与本轮画面无关的闲聊不 attach，并清掉同一会话的
+   * 旧评论证据，避免上一条无关记录继续被下一轮看到。
    */
-  const finishSpeechEvidence = ({ text, endedAt, utteranceId } = {}) => {
+  const finishSpeechEvidence = ({ text, startedAt, endedAt, utteranceId } = {}) => {
     if (speechEvidence === null) return;
     const pending = speechEvidence;
     speechEvidence = null;
@@ -11730,15 +11853,34 @@ export function apply(ctx, config) {
       // 隐私/切源/采集换代：锁已经失效，直接释放，不把旧代次的对齐结果 attach 给新画面。
       if (pending.sourceEpoch !== visionGeneration || pending.source !== speechEvidenceSource()) return;
       const at = Date.now();
-      const declaredEnd = Number(endedAt);
-      const end = Number.isFinite(declaredEnd) && declaredEnd > 0
-        ? Math.max(declaredEnd, pending.startedAt)
-        : at;
-      evidenceWindow.extendLock(pending.lockId, { to: end });
-      // “窗口开始-回溯”：锁窗起点再向前扩一个对齐回溯范围，覆盖“刚才那个”的最远窗口；
-      // alignComment 会再按文本线索自行收窄，between 只返回仍然存在的元数据。
-      const from = Math.max(0, pending.from - ALIGNMENT_DEFAULTS.lookbackMs);
-      const evidence = evidenceWindow.between(from, end, {
+      const speech = resolveSpeechWindow({
+        startedAt,
+        endedAt,
+        partialStartedAt: pending.startedAt,
+        now: at,
+      });
+      const start = speech.startedAt;
+      const end = speech.endedAt;
+      if (start === null) return;
+      // “窗口开始-回溯”：锁窗起点按真实开口向前扩到最远回溯范围，覆盖“刚才那个”；
+      // alignComment 会再按文本线索收窄，between 只返回仍然存在的元数据。
+      const lookback = Number(ALIGNMENT_DEFAULTS.lookbackMs) || 8_000;
+      const factor = Number(ALIGNMENT_DEFAULTS.retrospectiveFactor) || 2;
+      const evidenceFrom = Math.max(0, start - lookback * factor);
+      evidenceWindow.extendLock(pending.lockId, { from: evidenceFrom, to: end });
+      const target = voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR });
+      if (speechReferenceOf(text) === 'unrelated') {
+        // 没有画面指代的闲聊：不强行 attach；清掉同会话旧记录，避免“搭便车”。
+        try { commentEvidence.clear(target.sessionId); } catch { /* 旧记录清理是旁路 */ }
+        commentEvidenceTime.delete(target.sessionId);
+        understandingFocus = null;
+        void log.emit('vision.comment.unrelated', {
+          utteranceId: typeof utteranceId === 'string' ? utteranceId : '',
+          timeSource: speech.timeSource,
+        }).catch(() => {});
+        return;
+      }
+      const evidence = evidenceWindow.between(evidenceFrom, end, {
         source: pending.source,
         sourceEpoch: pending.sourceEpoch,
       });
@@ -11748,28 +11890,79 @@ export function apply(ctx, config) {
         sourceEpoch: pending.sourceEpoch,
       });
       const latestId = latest === null ? null : latest.id;
-      const latestAt = latest === null ? null : latest.capturedAt;
+      const latestAt = latest === null ? null : (latest.endedAt ?? latest.capturedAt);
+      // alignComment 只按一个采集点判断“开口前/后”。对故事板用它在开口时仍可见的
+      // 最后一刻做代表点：跨开口的故事板不会因为 capturedAt 太早被挤出窗口；
+      // 完全在开口后的故事板仍保留真实 capturedAt，只进 afterSpeech。
+      const alignmentEvidence = evidence.map((entry) => {
+        const entryStart = Number(entry.startedAt ?? entry.capturedAt);
+        const entryEnd = Number(entry.endedAt ?? entry.capturedAt);
+        const capturedAt = entryStart <= start
+          ? Math.max(entryStart, Math.min(entryEnd, start))
+          : entry.capturedAt;
+        return { ...entry, capturedAt };
+      });
       const alignment = alignComment({
         text: typeof text === 'string' ? text : '',
-        startedAt: pending.startedAt,
+        startedAt: start,
         endedAt: end,
-        evidence,
+        evidence: alignmentEvidence,
         latestId,
         now: () => at,
       });
-      const target = voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR });
+      alignment.timeSource = speech.timeSource;
+      alignment.relevance = 'related';
+      if (typeof utteranceId === 'string' && utteranceId.length > 0) alignment.utteranceId = utteranceId;
       commentEvidence.attach({
         sessionId: target.sessionId,
         utteranceId,
-        startedAt: pending.startedAt,
+        startedAt: start,
         endedAt: end,
         alignment,
         latestId,
         latestAt,
         frameCount: evidence.length,
       });
+      commentEvidenceTime.set(target.sessionId, {
+        timeSource: speech.timeSource,
+        utteranceId: typeof utteranceId === 'string' ? utteranceId : '',
+        at,
+      });
+      // 只保留最近几个会话的时间来源标记；旧记录过期后由渲染侧忽略，不无限增长。
+      while (commentEvidenceTime.size > 8) {
+        const oldest = commentEvidenceTime.keys().next().value;
+        if (oldest === undefined) break;
+        commentEvidenceTime.delete(oldest);
+      }
+      // 本轮渲染焦点：回溯时优先上一镜头（取关联帧的镜头），否则当前/最新镜头；
+      // 事件选择由 understanding-runtime 按窗口或 shotId 命中，不再只看最后 3 条。
+      const shotById = new Map(evidence.map((entry) => [entry.id, entry.shotId ?? null]));
+      const relatedShot = (Array.isArray(alignment.relatedFrameIds) ? alignment.relatedFrameIds : [])
+        .map((id) => shotById.get(id))
+        .find((shotId) => typeof shotId === 'string' && shotId.length > 0);
+      const focusShot = alignment.cues?.retrospective === true && relatedShot !== undefined
+        ? relatedShot
+        : (latest?.shotId ?? relatedShot ?? null);
+      const focusFrom = Number.isFinite(alignment.window?.from)
+        ? alignment.window.from
+        : evidenceFrom;
+      const focusTo = Number.isFinite(alignment.window?.to) ? alignment.window.to : end;
+      understandingFocus = {
+        from: focusFrom,
+        to: focusTo,
+        ...(focusShot === null ? {} : { shotId: focusShot }),
+        retrospective: alignment.cues?.retrospective === true,
+        current: alignment.cues?.current === true,
+        at,
+      };
       // P-187 阶段 3：用户评论优先触发一次画面理解（仍受调度器的最短间隔约束）。
-      noteUnderstandingChange({ reason: 'comment', from: pending.from, to: end, priority: true });
+      // 窗口使用本轮真实语音窗口（回溯词已扩到 16 秒），不再把故事板压成零宽。
+      noteUnderstandingChange({
+        reason: 'comment',
+        from: focusFrom,
+        to: focusTo,
+        priority: true,
+      });
       // P-187 阶段 5：用户已经亲口评论这一轮画面。取消待说的主动候选并清掉“未回应”计时，
       // 避免同一事件被用户先评论后助手再主动说一遍。
       clearProactiveIgnored();
@@ -11793,8 +11986,8 @@ export function apply(ctx, config) {
         if (uncertain && evidence.length > 0 && Date.now() - lastAt >= 5_000) {
           const focus = `用户刚评论：「${proactiveClip(text, 80)}」。请只判断这句话最可能指这段画面里的哪个动作或事件，按时间比较，不要自由描述整段。`;
           void understanding.runNow({
-            from: pending.from,
-            to: end,
+            from: focusFrom,
+            to: focusTo,
             reason: 'comment-focus',
             focus,
           }).then((result) => {
@@ -11849,10 +12042,27 @@ export function apply(ctx, config) {
         return null;
       }
       const capturedAt = Number(shot.capturedAt ?? shot.at) || Date.now();
+      const startedAt = Number(shot.startedAt);
+      const endedAt = Number(shot.endedAt);
+      const rangeStart = Number.isFinite(startedAt) && startedAt > 0 ? startedAt : capturedAt;
+      const rangeEnd = Number.isFinite(endedAt) && endedAt >= rangeStart ? endedAt : capturedAt;
+      const shotId = typeof shot.shotId === 'string' && shot.shotId.length > 0
+        ? shot.shotId
+        : evidenceShotIdOf({
+          kind,
+          startedAt: rangeStart,
+          endedAt: rangeEnd,
+          sourceEpoch: generation,
+          shotBreak: shot.shotBreak === true,
+        });
       const added = evidenceWindow.add({
         file,
         bytes: info.size,
         capturedAt,
+        startedAt: rangeStart,
+        endedAt: rangeEnd,
+        shotId,
+        frameTimes: shot.frameTimes,
         source: mode === 'scene' ? 'obs' : 'desktop',
         sourceEpoch: generation,
         kind,
@@ -11982,27 +12192,35 @@ export function apply(ctx, config) {
     onSheet: async (sheet) => {
       const token = { mode: vision.mode, scene: vision.scene, generation: visionGeneration };
       const added = await rememberEvidence(sheet, { kind: 'storyboard', token });
-      // 只有真正登记进本代次窗口的画面才值得理解；窗口可以给同一时刻（非优先）。
+      // 只有真正登记进本代次窗口的画面才值得理解；窗口用故事板真实可见范围，而非零宽点。
       if (added === null) return;
+      const addedStartedAt = Number(added.startedAt);
+      const addedEndedAt = Number(added.endedAt);
       const sheetCapturedAt = Number(sheet?.capturedAt ?? added.capturedAt);
       const capturedAt = Number.isFinite(sheetCapturedAt) && sheetCapturedAt > 0
         ? sheetCapturedAt
         : Date.now();
+      const rangeStart = Number.isFinite(addedStartedAt) && addedStartedAt > 0
+        ? addedStartedAt
+        : capturedAt;
+      const rangeEnd = Number.isFinite(addedEndedAt) && addedEndedAt >= rangeStart
+        ? addedEndedAt
+        : rangeStart;
       // “最近帧”只认真正落进证据窗口的帧，不认 ffmpeg 进程/会话的 startedAt。
       continuousViewLastFrameAt = continuousViewLastFrameAt === null
-        ? capturedAt
-        : Math.max(continuousViewLastFrameAt, capturedAt);
+        ? rangeEnd
+        : Math.max(continuousViewLastFrameAt, rangeEnd);
       // 首轮前的画面只进有界证据窗口：可以缓存，但不能成为首次理解的材料，避免首轮一出现
       // 就回看启动以来的整段旧画面。
       if (companionSessionSeen !== true) return;
-      if (companionEvidenceFrom !== null && capturedAt < companionEvidenceFrom) return;
+      if (companionEvidenceFrom !== null && rangeStart < companionEvidenceFrom) return;
       // 材料签名只做去重：同一份 sheet 被重复投递时不再排一次理解（不读像素）。
       noteUnderstandingChange({
         reason: 'sheet',
-        from: capturedAt,
-        to: capturedAt,
+        from: rangeStart,
+        to: rangeEnd,
         materialSignature: understandingMaterialSignature(sheet, added),
-        materialAt: capturedAt,
+        materialAt: rangeStart,
       });
     },
     isBlocked: () => evidenceCaptureHolding !== true || visionDisposed || visionChanging
@@ -12277,6 +12495,8 @@ export function apply(ctx, config) {
     // 评论证据是这一代画面的对齐结果：锁与记录一起作废，绝不让旧代次混进新来源。
     dropSpeechEvidence();
     commentEvidence.clearAll();
+    commentEvidenceTime.clear();
+    understandingFocus = null;
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
@@ -19180,6 +19400,7 @@ export function apply(ctx, config) {
               // `finishSpeechEvidence` 内部捕获所有异常，绝不阻断下面的 acceptFinal。
               finishSpeechEvidence({
                 text: event.final,
+                startedAt: event.audioStartAt,
                 endedAt: event.audioEndAt,
                 utteranceId: event.utteranceId,
               });

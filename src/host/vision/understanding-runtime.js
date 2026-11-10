@@ -66,6 +66,8 @@ const MAX_SCENE_CHARS = 320;
 const MAX_EVENT_CHARS = 180;
 const MAX_UNRESOLVED_CHARS = 240;
 const MAX_UNCERTAINTY_CHARS = 60;
+/** 渲染时按本轮窗口选事件：窗口边界允许这么点容差，避免整秒取整把边界事件漏掉。 */
+const FOCUS_TOLERANCE_MS = 500;
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -203,6 +205,14 @@ function cloneEvent(event) {
     evidenceAudioIds: Array.isArray(event.evidenceAudioIds) ? event.evidenceAudioIds.slice() : [],
     uncertainty: event.uncertainty,
   };
+  // 时间来源/镜头/证据可用性/稳定 id 都是事件契约的一部分：保留，但不补空串。
+  if (typeof event.id === 'string' && event.id.length > 0) copy.id = event.id;
+  if (typeof event.shotId === 'string' && event.shotId.length > 0) copy.shotId = event.shotId;
+  if (typeof event.timeSource === 'string' && event.timeSource.length > 0) copy.timeSource = event.timeSource;
+  if (typeof event.timeConfidence === 'string' && event.timeConfidence.length > 0) {
+    copy.timeConfidence = event.timeConfidence;
+  }
+  if (typeof event.evidenceAvailable === 'boolean') copy.evidenceAvailable = event.evidenceAvailable;
   // reaction 是可选字段；保留它，但绝不把空串补成字段。
   if (typeof event.reaction === 'string' && event.reaction.length > 0) copy.reaction = event.reaction;
   return copy;
@@ -210,6 +220,14 @@ function cloneEvent(event) {
 
 function cloneSpan(span) {
   return { from: span.from, to: span.to };
+}
+
+function cloneSummary(summary) {
+  const copy = { text: summary.text };
+  if (typeof summary.from === 'number' && Number.isFinite(summary.from)) copy.from = summary.from;
+  if (typeof summary.to === 'number' && Number.isFinite(summary.to)) copy.to = summary.to;
+  if (typeof summary.shotId === 'string' && summary.shotId.length > 0) copy.shotId = summary.shotId;
+  return copy;
 }
 
 /** 给 onAdvance 的 parsed 副本：调用方改不到本次运行的返回值和内部状态。 */
@@ -233,6 +251,9 @@ function cloneState(state) {
     unresolved: state.unresolved,
     coverage: Array.isArray(state.coverage) ? state.coverage.map(cloneSpan) : [],
   };
+  if (Array.isArray(state.summaries) && state.summaries.length > 0) {
+    copy.summaries = state.summaries.map(cloneSummary);
+  }
   if (state.updatedAt !== undefined) copy.updatedAt = state.updatedAt;
   return copy;
 }
@@ -248,6 +269,73 @@ function stateHasContent(state) {
 }
 
 /**
+ * 本轮检索焦点：窗口（from/to）或镜头 id，二者至少有一个。渲染只接受简单值，
+ * 不把调用方对象带进状态；不可解析时退化为“无焦点”（旧的最近 N 条行为）。
+ */
+function normalizeFocus(value) {
+  const source = isObject(value) ? value : null;
+  if (source === null) return null;
+  const from = timeValue(source.from);
+  const to = timeValue(source.to);
+  let window = null;
+  if (from !== null || to !== null) {
+    if (from !== null && to !== null) window = from <= to ? { from, to } : { from: to, to: from };
+    else window = from !== null ? { from, to: from } : { from: to, to };
+  }
+  const shotId = typeof source.shotId === 'string' && source.shotId.trim().length > 0
+    ? source.shotId.trim().slice(0, 64)
+    : '';
+  if (window === null && shotId.length === 0) return null;
+  return {
+    window,
+    shotId,
+    retrospective: source.retrospective === true,
+    current: source.current === true,
+  };
+}
+
+function eventInFocus(event, focus) {
+  if (focus.window !== null) {
+    const from = timeValue(event.from);
+    const to = timeValue(event.to);
+    if (from !== null && to !== null
+      && to >= focus.window.from - FOCUS_TOLERANCE_MS
+      && from <= focus.window.to + FOCUS_TOLERANCE_MS) return true;
+  }
+  return focus.shotId.length > 0 && event.shotId === focus.shotId;
+}
+
+/**
+ * 按本轮窗口/镜头选事件。不按“最后 N 条”全局截断：
+ *   - 给定镜头且窗口内确有该镜头事件：优先该镜头（旧镜头的“刚才”不会被当前镜头挤掉）；
+ *   - 否则只看窗口：回溯（“刚才”）取更早的，当前/无 cue 取更接近现在的。
+ */
+function selectEventsForFocus(events, focus, limit) {
+  if (limit <= 0) return [];
+  if (focus === null) return events.slice(-limit);
+  const matched = events.filter((event) => eventInFocus(event, focus));
+  if (matched.length === 0) return [];
+  const shotMatched = focus.shotId.length > 0
+    ? matched.filter((event) => event.shotId === focus.shotId)
+    : [];
+  const pool = shotMatched.length > 0 ? shotMatched : matched;
+  const ordered = pool.slice().sort((left, right) => {
+    const leftFrom = timeValue(left.from) ?? 0;
+    const rightFrom = timeValue(right.from) ?? 0;
+    return leftFrom - rightFrom;
+  });
+  return focus.retrospective ? ordered.slice(0, limit) : ordered.slice(-limit);
+}
+
+function summaryInFocus(summary, focus) {
+  if (focus.window !== null
+    && typeof summary.from === 'number' && typeof summary.to === 'number'
+    && summary.to >= focus.window.from - FOCUS_TOLERANCE_MS
+    && summary.from <= focus.window.to + FOCUS_TOLERANCE_MS) return true;
+  return focus.shotId.length > 0 && summary.shotId === focus.shotId;
+}
+
+/**
  * 创建运行时编排器。
  *
  * `analyze` / `framesBetween` / `audioBetween` 由调用方注入；缺失时 runNow 返回
@@ -260,6 +348,8 @@ function stateHasContent(state) {
  *   返回值不是该包装形状（裸字符串 / 裸对象）时仍原样作为 `raw` 解析。
  * @param {(from:number,to:number) => object[]} [options.framesBetween]
  * @param {(from:number,to:number) => object[]} [options.audioBetween]
+ * @param {(event: object) => boolean} [options.isEvidenceAvailable]
+ *   可选：渲染时检查事件引用的证据是否仍可回看；只用来加“证据已过期”提示，不改变状态。
  * @param {() => boolean} [options.isBlocked]
  * @param {() => number} [options.now]
  * @param {(fn: () => void, delay: number) => any} [options.setTimer]
@@ -279,6 +369,9 @@ export function createUnderstandingRuntime(options = {}) {
   const analyze = typeof source.analyze === 'function' ? source.analyze : null;
   const framesBetween = typeof source.framesBetween === 'function' ? source.framesBetween : null;
   const audioBetween = typeof source.audioBetween === 'function' ? source.audioBetween : null;
+  const isEvidenceAvailable = typeof source.isEvidenceAvailable === 'function'
+    ? source.isEvidenceAvailable
+    : null;
   const isBlocked = typeof source.isBlocked === 'function' ? source.isBlocked : () => false;
   const nowSource = typeof source.now === 'function' ? source.now : Date.now;
   const setTimer = typeof source.setTimer === 'function' ? source.setTimer : setTimeout;
@@ -534,6 +627,10 @@ export function createUnderstandingRuntime(options = {}) {
         interval: built.interval,
         frameIds: built.frameIds,
         audioIds: built.audioLines.map((line) => line.id),
+        // 原始证据带真实可见范围/镜头；解析器据此校验“事件时间靠近所引用证据”，
+        // 但文件名/路径永远不会写进事件。
+        frames: frameList,
+        audioLines: Array.isArray(rawAudio) ? rawAudio : [],
       });
     } catch {
       return recordFailure('parse-error');
@@ -558,6 +655,8 @@ export function createUnderstandingRuntime(options = {}) {
         {
           ...parsed,
           interval: built.interval,
+          // 本次主要镜头：供旧镜头摘要/事件按镜头检索，不进入提示词正文。
+          shotId: built.shotId ?? null,
           // 把真实帧间缺口带进状态，render 才能给出“未覆盖”提示。
           gaps: built.gaps,
         },
@@ -695,20 +794,37 @@ export function createUnderstandingRuntime(options = {}) {
   function current() {
     const live = liveState();
     if (live === null) return null;
-    return {
+    const view = {
       sceneSummary: live.sceneSummary,
       events: live.events.map(cloneEvent),
       unresolved: live.unresolved,
       coverage: live.coverage.map(cloneSpan),
       updatedAt: timeValue(live.updatedAt),
     };
+    if (Array.isArray(live.summaries) && live.summaries.length > 0) {
+      view.summaries = live.summaries.map(cloneSummary);
+    }
+    return view;
+  }
+
+  /** 事件证据是否仍可回看：只影响“证据已过期”提示，不修改状态、不输出 id。 */
+  function evidenceStillAvailable(event) {
+    if (isEvidenceAvailable === null) return event.evidenceAvailable !== false;
+    try {
+      return isEvidenceAvailable(event) !== false;
+    } catch {
+      return event.evidenceAvailable !== false;
+    }
   }
 
   /**
-   * 被动注入块。只展示：场景摘要、最近 maxEventsShown 条事件（时间 + 描述 + uncertainty）、
+   * 被动注入块。只展示：场景摘要、本轮相关事件（时间 + 描述 + uncertainty）、
    * unresolved、覆盖缺口提示。不输出文件路径、帧 id、证据数组或调度器信息。
+   *
+   * 可传入 `focus`（`{from,to,shotId,retrospective,current}`）：按本轮窗口/镜头选摘要与
+   * 事件；旧镜头事件只要命中窗口/镜头就仍然可选，而不是被“最新 3 条”挤掉。
    */
-  function render() {
+  function render(focus = null) {
     const live = liveState();
     if (!stateHasContent(live)) return '';
 
@@ -716,18 +832,36 @@ export function createUnderstandingRuntime(options = {}) {
     const eventBudget = Math.min(MAX_EVENT_CHARS, Math.max(8, Math.floor(maxChars * 0.25)));
     const unresolvedBudget = Math.min(MAX_UNRESOLVED_CHARS, Math.max(8, Math.floor(maxChars * 0.25)));
     const lines = [];
+    const selection = normalizeFocus(focus);
 
-    const scene = flattenText(live.sceneSummary);
-    if (scene.length > 0) lines.push(`【场景】${clipText(scene, sceneBudget)}`);
+    let scene = flattenText(live.sceneSummary);
+    let sceneLabel = '场景';
+    if (selection !== null && Array.isArray(live.summaries) && live.summaries.length > 0) {
+      // 镜头命中优先于“窗口里也有”：切镜后的 16 秒窗口仍应显示上一镜头摘要。
+      const shotMatched = selection.shotId.length > 0
+        ? live.summaries.filter((summary) => summary.shotId === selection.shotId)
+        : [];
+      const windowMatched = live.summaries.filter((summary) => summaryInFocus(summary, selection));
+      const matching = shotMatched.length > 0 ? shotMatched : windowMatched;
+      const chosen = matching.length > 0
+        ? matching[matching.length - 1]
+        : live.summaries[live.summaries.length - 1];
+      if (chosen !== undefined) {
+        scene = flattenText(chosen.text);
+        sceneLabel = matching.length > 0 ? '场景（本轮窗口）' : '最近场景（可能不在本轮窗口）';
+      }
+    }
+    if (scene.length > 0) lines.push(`【${sceneLabel}】${clipText(scene, sceneBudget)}`);
 
-    const events = maxEventsShown > 0 ? live.events.slice(-maxEventsShown) : [];
+    const events = selectEventsForFocus(live.events, selection, maxEventsShown);
     for (const event of events) {
       const description = flattenText(event.description);
       if (description.length === 0) continue;
       const uncertainty = clipText(uncertaintyText(event.uncertainty), MAX_UNCERTAINTY_CHARS);
       const suffix = uncertainty.length > 0 ? `（不确定：${uncertainty}）` : '';
+      const availability = evidenceStillAvailable(event) ? '' : '（证据已过期，不可回看）';
       lines.push(
-        `- ${clockText(event.from)}–${clockText(event.to)} ${clipText(description, eventBudget)}${suffix}`,
+        `- ${clockText(event.from)}–${clockText(event.to)} ${clipText(description, eventBudget)}${suffix}${availability}`,
       );
     }
 

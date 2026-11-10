@@ -49,6 +49,40 @@ const MAX_UNKNOWN_IDS = 12;
 const MAX_UNCERTAINTY_CHARS = 80;
 /** advanceUnderstanding 默认的环形长度。 */
 const DEFAULT_RING = 32;
+/** 镜头摘要环形长度：旧镜头摘要不能因为新摘要出现就被覆盖。 */
+const DEFAULT_SUMMARY_RING = 8;
+/** 事件时间与所引用证据的容差：超过这个距离就不能当成“证据时刻”。 */
+const EVENT_EVIDENCE_TOLERANCE_MS = 2_000;
+/** 单条事件最多保留的证据 id 数：状态有界，渲染也从不输出 id。 */
+const MAX_EVENT_EVIDENCE_IDS = 16;
+/** 镜头 id 只接受有界机器标识；路径/空白/正文一律不进入状态。 */
+const SHOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/u;
+
+function shotIdOf(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return SHOT_ID_PATTERN.test(text) ? text : null;
+}
+
+/** 事件稳定身份：描述 + 引用证据 + 镜头；不包含每次分析都会漂移的 from/to。 */
+function stableEventId(description, frameIds, audioIds, shotId) {
+  const hash = createHash('sha1')
+    .update('understanding-event-v1\u0000')
+    .update(description)
+    .update('\u0000frame\u0000')
+    .update([...frameIds].sort().join('\u0000'))
+    .update('\u0000audio\u0000')
+    .update([...audioIds].sort().join('\u0000'))
+    .update('\u0000shot\u0000')
+    .update(shotId ?? '')
+    .digest('hex')
+    .slice(0, 16);
+  return `ue-${hash}`;
+}
+
+function boundedIds(ids) {
+  return Array.isArray(ids) ? ids.slice(0, MAX_EVENT_EVIDENCE_IDS) : [];
+}
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -173,7 +207,8 @@ export function buildUnderstandingInput(input = {}) {
   const frameBudget = toLimit(input.maxFrames, UNDERSTANDING_DEFAULTS.maxFrames);
   const audioBudget = toLimit(input.maxAudioLines, UNDERSTANDING_DEFAULTS.maxAudioLines);
 
-  // 帧：时间与 id 必须真实；区间外的帧不参与本次理解。
+  // 帧：时间与 id 必须真实；与区间相交的帧才参与本次理解。故事板保留可见范围，
+  // 不能因为 capturedAt 落在区间外一点点就把整段证据丢掉。
   const validFrames = [];
   if (Array.isArray(input.frames)) {
     for (const entry of input.frames) {
@@ -181,8 +216,16 @@ export function buildUnderstandingInput(input = {}) {
       const id = trimmed(entry.id);
       const capturedAt = toTime(entry.capturedAt);
       if (id.length === 0 || capturedAt === null) continue;
-      if (capturedAt < interval.from || capturedAt > interval.to) continue;
-      validFrames.push({ id, capturedAt });
+      const startedAt = toTime(entry.startedAt) ?? capturedAt;
+      const endedAt = toTime(entry.endedAt) ?? capturedAt;
+      if (endedAt < interval.from || startedAt > interval.to) continue;
+      validFrames.push({
+        id,
+        capturedAt,
+        startedAt: Math.min(startedAt, capturedAt),
+        endedAt: Math.max(endedAt, capturedAt),
+        shotId: shotIdOf(entry.shotId),
+      });
     }
   }
   validFrames.sort((a, b) => a.capturedAt - b.capturedAt || a.id.localeCompare(b.id));
@@ -201,8 +244,20 @@ export function buildUnderstandingInput(input = {}) {
   for (let i = 1; i < frames.length; i += 1) {
     const previous = frames[i - 1];
     const current = frames[i];
-    if (current.capturedAt - previous.capturedAt > GAP_MS) {
-      gaps.push({ from: previous.capturedAt, to: current.capturedAt });
+    // 用可见范围算缺口：上一张故事板结束到下一张开始之间的空洞才是真正没看到。
+    if (current.startedAt - previous.endedAt > GAP_MS) {
+      gaps.push({ from: previous.endedAt, to: current.startedAt });
+    }
+  }
+  // 本次选中的主要镜头：只作为状态里摘要的检索线索，不进入提示词。
+  const shotCounts = new Map();
+  let dominantShotId = null;
+  for (const frame of frames) {
+    if (frame.shotId === null) continue;
+    const count = (shotCounts.get(frame.shotId) ?? 0) + 1;
+    shotCounts.set(frame.shotId, count);
+    if (dominantShotId === null || count > (shotCounts.get(dominantShotId) ?? 0)) {
+      dominantShotId = frame.shotId;
     }
   }
 
@@ -238,7 +293,10 @@ export function buildUnderstandingInput(input = {}) {
     reason: 'ok',
     interval,
     frameIds: frames.map((frame) => frame.id),
-    frames,
+    // 保持提示词/既有测试契约：帧只输出 id 与采集时刻。真实范围与镜头元数据由
+    // 解析器从原始证据读取，不在这里混入文件路径。
+    frames: frames.map((frame) => ({ id: frame.id, capturedAt: frame.capturedAt })),
+    shotId: dominantShotId,
     audioLines,
     previousScene,
     focus,
@@ -363,6 +421,100 @@ export function parseUnderstanding(input = {}) {
 
   const frameSet = idSet(input.frameIds);
   const audioSet = idSet(input.audioIds);
+
+  /**
+   * 证据时间元数据：用于“事件时间必须靠近所引用证据”。只读取 id/时间/镜头；
+   * 文件路径与正文即使被调用方传进来也绝不会写进事件。兼容旧调用：没有元数据时
+   * 不做邻近校验，事件标 timeSource:'fallback'，明确表示时间无法由证据证明。
+   */
+  const frameMeta = new Map();
+  if (Array.isArray(input.frames)) {
+    for (const entry of input.frames) {
+      if (!isObject(entry)) continue;
+      const id = trimmed(entry.id);
+      if (id.length === 0 || !frameSet.has(id) || frameMeta.has(id)) continue;
+      const capturedAt = toTime(entry.capturedAt) ?? toTime(entry.at);
+      if (capturedAt === null) continue;
+      const startedAt = toTime(entry.startedAt) ?? capturedAt;
+      const endedAt = toTime(entry.endedAt) ?? capturedAt;
+      frameMeta.set(id, {
+        startedAt: Math.min(startedAt, capturedAt),
+        endedAt: Math.max(endedAt, capturedAt),
+        shotId: shotIdOf(entry.shotId),
+      });
+    }
+  }
+  const audioMeta = new Map();
+  if (Array.isArray(input.audioLines)) {
+    for (const entry of input.audioLines) {
+      if (!isObject(entry)) continue;
+      const id = trimmed(entry.id);
+      const audioStartAt = toTime(entry.audioStartAt);
+      const audioEndAt = toTime(entry.audioEndAt);
+      if (id.length === 0 || !audioSet.has(id) || audioMeta.has(id)) continue;
+      if (audioStartAt === null || audioEndAt === null || audioEndAt < audioStartAt) continue;
+      audioMeta.set(id, { startedAt: audioStartAt, endedAt: audioEndAt });
+    }
+  }
+
+  /** 事件区间与一个真实证据范围是否足够近（相交或距离不超过容差）。 */
+  function nearRange(from, to, range) {
+    return range.endedAt + EVENT_EVIDENCE_TOLERANCE_MS >= from
+      && range.startedAt - EVENT_EVIDENCE_TOLERANCE_MS <= to;
+  }
+
+  /** 选出事件引用的镜头：优先与事件时间靠近的帧，其次第一条带镜头的引用帧。 */
+  function shotForEvent(frameIds, from, to) {
+    let firstShot = null;
+    for (const id of frameIds) {
+      const meta = frameMeta.get(id);
+      if (meta === undefined || meta.shotId === null) continue;
+      if (firstShot === null) firstShot = meta.shotId;
+      if (nearRange(from, to, meta)) return meta.shotId;
+    }
+    return firstShot;
+  }
+
+  /** 事件时间来源：能落到真实证据上才算 evidence/audio；只落在分析区间内则明确标低。 */
+  function timeSourceForEvent(frameIds, audioIds, from, to) {
+    let frameKnown = false;
+    let frameNear = false;
+    for (const id of frameIds) {
+      const meta = frameMeta.get(id);
+      if (meta === undefined) continue;
+      frameKnown = true;
+      if (nearRange(from, to, meta)) {
+        frameNear = true;
+        break;
+      }
+    }
+    if (frameNear) return { timeSource: 'evidence', timeConfidence: 'high' };
+    let audioKnown = false;
+    let audioNear = false;
+    for (const id of audioIds) {
+      const meta = audioMeta.get(id);
+      if (meta === undefined) continue;
+      audioKnown = true;
+      if (nearRange(from, to, meta)) {
+        audioNear = true;
+        break;
+      }
+    }
+    if (audioNear) return { timeSource: 'audio', timeConfidence: 'high' };
+    if (frameKnown || audioKnown) return { timeSource: 'model', timeConfidence: 'low' };
+    return { timeSource: 'fallback', timeConfidence: 'unknown' };
+  }
+
+  function withTimeMismatch(uncertainty) {
+    const note = '时间与引用证据不一致';
+    if (typeof uncertainty === 'number') {
+      return clipText(`${uncertainty}；${note}`, MAX_UNCERTAINTY_CHARS);
+    }
+    const text = typeof uncertainty === 'string' ? uncertainty.trim() : '';
+    if (text.length === 0) return note;
+    if (text.includes(note)) return text;
+    return clipText(`${text}；${note}`, MAX_UNCERTAINTY_CHARS);
+  }
   const unknownEvidenceIds = [];
   const unknownSeen = new Set();
   const noteUnknown = (value) => {
@@ -435,13 +587,26 @@ export function parseUnderstanding(input = {}) {
       continue;
     }
     const reaction = clipText(trimmed(rawEvent.reaction), UNDERSTANDING_DEFAULTS.maxReactionChars);
+    const shotId = shotForEvent(frameEvidence.ids, from, to);
+    const timing = timeSourceForEvent(frameEvidence.ids, audioEvidence.ids, from, to);
+    // 时间落在本次 interval 内、却离所引用的帧/台词很远：保留事件但明确降为低时间把握，
+    // 绝不把它当成“画面里确实发生了这件事”。没有证据时间元数据时保留旧行为（fallback）。
+    const uncertainty = timing.timeSource === 'model'
+      ? withTimeMismatch(normalizeUncertainty(rawEvent.uncertainty))
+      : normalizeUncertainty(rawEvent.uncertainty);
     const parsedEvent = {
+      // 稳定 id 跨重叠分析去重：描述 + 证据 + 镜头，不含会漂移的 from/to。
+      id: stableEventId(description, frameEvidence.ids, audioEvidence.ids, shotId),
       from,
       to,
       description,
-      evidenceFrameIds: frameEvidence.ids,
-      evidenceAudioIds: audioEvidence.ids,
-      uncertainty: normalizeUncertainty(rawEvent.uncertainty),
+      evidenceFrameIds: boundedIds(frameEvidence.ids),
+      evidenceAudioIds: boundedIds(audioEvidence.ids),
+      uncertainty,
+      evidenceAvailable: true,
+      timeSource: timing.timeSource,
+      timeConfidence: timing.timeConfidence,
+      ...(shotId === null ? {} : { shotId }),
     };
     // reaction 只是可选的角度；空白/畸形当作“没有”，绝不写空串占位。
     if (reaction.length > 0) parsedEvent.reaction = reaction;
@@ -567,6 +732,61 @@ function resolveUpdatedAt(options) {
   return toTime(source);
 }
 
+/** 归一化历史摘要环形；旧状态没有 summaries 时返回空数组。 */
+function normalizeSummaries(value) {
+  if (!Array.isArray(value)) return [];
+  const summaries = [];
+  for (const entry of value) {
+    if (!isObject(entry)) continue;
+    const text = clipText(trimmed(entry.text), UNDERSTANDING_DEFAULTS.maxSceneChars);
+    if (text.length === 0) continue;
+    const from = toTime(entry.from);
+    const to = toTime(entry.to);
+    summaries.push({
+      text,
+      ...(from === null || to === null || to < from ? {} : { from, to }),
+      ...(shotIdOf(entry.shotId) === null ? {} : { shotId: shotIdOf(entry.shotId) }),
+    });
+  }
+  return summaries.slice(-DEFAULT_SUMMARY_RING);
+}
+
+/** 同 id 事件合并：扩大时间范围、合并证据，保留原位置，避免重复分析把旧事件挤走。 */
+function mergeEventInto(target, incoming) {
+  const from = toTime(target.from);
+  const to = toTime(target.to);
+  const nextFrom = toTime(incoming.from);
+  const nextTo = toTime(incoming.to);
+  if (from === null || nextFrom === null || nextFrom < from) target.from = incoming.from;
+  if (to === null || nextTo === null || nextTo > to) target.to = incoming.to;
+  const frameIds = boundedIds([
+    ...(Array.isArray(target.evidenceFrameIds) ? target.evidenceFrameIds : []),
+    ...(Array.isArray(incoming.evidenceFrameIds) ? incoming.evidenceFrameIds : []),
+  ]);
+  const audioIds = boundedIds([
+    ...(Array.isArray(target.evidenceAudioIds) ? target.evidenceAudioIds : []),
+    ...(Array.isArray(incoming.evidenceAudioIds) ? incoming.evidenceAudioIds : []),
+  ]);
+  target.evidenceFrameIds = [...new Set(frameIds)];
+  target.evidenceAudioIds = [...new Set(audioIds)];
+  if (typeof incoming.timeSource === 'string') {
+    // 只要有一次能落到真实证据上，就保留较强的时间来源。
+    const rank = { evidence: 3, audio: 2, fallback: 1, model: 0 };
+    const oldRank = rank[target.timeSource] ?? -1;
+    const newRank = rank[incoming.timeSource] ?? -1;
+    if (newRank > oldRank) target.timeSource = incoming.timeSource;
+  }
+  if (incoming.timeConfidence === 'high') target.timeConfidence = 'high';
+  if (typeof incoming.uncertainty === 'string' && incoming.uncertainty.length > 0
+    && !(typeof target.uncertainty === 'string' && target.uncertainty.length > 0)) {
+    target.uncertainty = incoming.uncertainty;
+  }
+  if (incoming.evidenceAvailable === false) target.evidenceAvailable = false;
+  if (typeof incoming.shotId === 'string' && typeof target.shotId !== 'string') {
+    target.shotId = incoming.shotId;
+  }
+}
+
 /**
  * 把新结果并入连续状态。返回对象只包含状态字段，不修改 `previous` / `update`：
  *
@@ -593,10 +813,25 @@ export function advanceUnderstanding(previous, update, options = {}) {
 
   const previousEvents = Array.isArray(base.events) ? base.events : [];
   const nextEvents = Array.isArray(next.events) ? next.events : [];
-  const events = [...previousEvents, ...nextEvents]
+  const events = previousEvents
     .map(cloneEvent)
-    .filter((event) => event !== null)
-    .slice(-eventLimit);
+    .filter((event) => event !== null);
+  for (const incoming of nextEvents) {
+    const event = cloneEvent(incoming);
+    if (event === null) continue;
+    const id = typeof event.id === 'string' ? event.id : '';
+    if (id.length > 0) {
+      const existing = events.find((candidate) => candidate.id === id);
+      // 同一事件在重叠窗口里被再次分析：合并时间/证据，不追加成第二条，也不移到队尾。
+      if (existing !== undefined) {
+        mergeEventInto(existing, event);
+        continue;
+      }
+    }
+    events.push(event);
+    if (events.length > eventLimit) events.splice(0, events.length - eventLimit);
+  }
+  if (events.length > eventLimit) events.splice(0, events.length - eventLimit);
 
   const previousScene = typeof base.sceneSummary === 'string' ? base.sceneSummary : '';
   const nextScene = trimmed(next.sceneSummary);
@@ -604,6 +839,31 @@ export function advanceUnderstanding(previous, update, options = {}) {
     nextScene.length > 0 ? nextScene : previousScene,
     UNDERSTANDING_DEFAULTS.maxSceneChars,
   );
+
+  const summaries = normalizeSummaries(base.summaries);
+  if (nextScene.length > 0) {
+    const interval = normalizeInterval(next.interval);
+    const shotId = shotIdOf(next.shotId);
+    if (interval !== null || shotId !== null) {
+      const entry = {
+        text: clipText(nextScene, UNDERSTANDING_DEFAULTS.maxSceneChars),
+        ...(interval === null ? {} : { from: interval.from, to: interval.to }),
+        ...(shotId === null ? {} : { shotId }),
+      };
+      const last = summaries[summaries.length - 1];
+      const sameShot = last !== undefined && shotId !== null && last.shotId === shotId;
+      // 两个不同镜头即使时间窗口重叠也不能互相覆盖；只有镜头未知时才按重叠窗口续写。
+      const shotsConflict = last !== undefined && shotId !== null
+        && typeof last.shotId === 'string' && last.shotId !== shotId;
+      const overlaps = last !== undefined && !shotsConflict && interval !== null
+        && typeof last.from === 'number' && typeof last.to === 'number'
+        && last.to >= interval.from && last.from <= interval.to;
+      // 同一镜头/重叠窗口的重复分析只更新该镜头的摘要；新镜头才追加，旧镜头摘要不被覆盖。
+      if (sameShot || overlaps) summaries[summaries.length - 1] = entry;
+      else summaries.push(entry);
+      if (summaries.length > DEFAULT_SUMMARY_RING) summaries.splice(0, summaries.length - DEFAULT_SUMMARY_RING);
+    }
+  }
 
   const previousUnresolved = typeof base.unresolved === 'string' ? base.unresolved : '';
   const nextUnresolved = trimmed(next.unresolved);
@@ -618,6 +878,7 @@ export function advanceUnderstanding(previous, update, options = {}) {
   ]).slice(-coverageLimit);
 
   const result = { sceneSummary, events, unresolved, coverage };
+  if (summaries.length > 0) result.summaries = summaries;
   const updatedAt = resolveUpdatedAt(opts);
   if (updatedAt !== null) result.updatedAt = updatedAt;
   return result;
