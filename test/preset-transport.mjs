@@ -81,7 +81,9 @@ async function connect(rig, rows) {
   rig.runtime.setStatus('speaking', 'preset-transport-test');
 }
 
-async function run(rig, from, to, stepMs = 33) {
+const FRAME_MS = 1000 / 30;
+
+async function run(rig, from, to, stepMs = FRAME_MS) {
   for (let at = from; at <= to; at += stepMs) {
     rig.tick(at);
     // Let the single-flight writer settle before the next tick stages another frame.
@@ -343,7 +345,7 @@ test('8. 传输全部 ok:false（19 次）：prepared>0、attempted=failed=19、
   const started = startPreset(rig.runtime, { state: 'idle', event: 'idle', recipe: 'idle-eye-side' });
   assert.deepEqual(started.channels, ['gazeX']);
   for (let index = 0; index < 19; index += 1) {
-    rig.tick(index * 33);
+    rig.tick(index * FRAME_MS);
     await flush();
   }
 
@@ -374,7 +376,7 @@ test('9. 传输抛异常：failed（带 errorCode），绝不 committed', async 
   await connect(rig, rowsFor(['gazeX']));
   startPreset(rig.runtime, { state: 'idle', event: 'idle', recipe: 'idle-eye-side' });
   for (let index = 0; index < 3; index += 1) {
-    rig.tick(index * 33);
+    rig.tick(index * FRAME_MS);
     await flush();
   }
 
@@ -398,7 +400,7 @@ test('10. 成功：committed 值 == 实际发送值，带 at；visible 仍不可
   await connect(rig, rowsFor(['gazeX']));
   startPreset(rig.runtime, { state: 'idle', event: 'idle', recipe: 'idle-eye-side' });
   for (let index = 0; index < 12; index += 1) {
-    rig.tick(index * 33);
+    rig.tick(index * FRAME_MS);
     await flush();
   }
 
@@ -457,7 +459,7 @@ test('12. 迟到成功属于旧动作：不记到新动作，记 stale', async (
   await connect(rig, rowsFor(['gazeX']));
   startPreset(rig.runtime, { state: 'idle', event: 'idle', recipe: 'idle-eye-side' });
   for (let index = 0; index < 12; index += 1) {
-    rig.tick(index * 33);
+    rig.tick(index * FRAME_MS);
     await flush();
   }
   assert.equal(rig.calls.length, 12);
