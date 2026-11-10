@@ -421,6 +421,9 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
   assert.deepEqual(beforeStatus.avatar.mapping, {
     lastAt: null,
     ok: null,
+    stale: false,
+    staleReason: '',
+    discarded: [],
     channels: {},
     unverified: [],
   }, 'no probe record yet');
@@ -452,7 +455,7 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
     .some((event) => event.type === 'avatar.mapping.probe'), 2000, 25);
   assert.equal(eventFound, true, 'avatar.mapping.probe was recorded');
   const event = (await host.events()).find((entry) => entry.type === 'avatar.mapping.probe');
-  assert.deepEqual(Object.keys(event.payload).sort(), ['at', 'channels', 'ok', 'unverified']);
+  assert.deepEqual(Object.keys(event.payload).sort(), ['at', 'channels', 'discarded', 'ok', 'stale', 'staleReason', 'unverified']);
   assert.equal(event.payload.ok, true);
   assert.equal(event.payload.channels.gazeX.changed, true);
   assert.equal(event.payload.channels.gazeY.changed, false);
