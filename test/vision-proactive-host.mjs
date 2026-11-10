@@ -150,6 +150,16 @@ function assertProactiveShape(view, enabled) {
   assert.equal(typeof view.spokenLastHour, 'number');
   assert.equal(typeof view.consecutiveIgnored, 'number');
   assert.equal(typeof view.canceledEvents, 'number');
+  // 供给诊断：把“无成功事件/无 reaction/propose 被拒”与候选过滤分开。
+  assert.equal(typeof view.eventsWithReaction, 'number');
+  assert.equal(typeof view.proposeCalls, 'number');
+  assert.ok(view.lastAdvanceAt === null || typeof view.lastAdvanceAt === 'number');
+  assert.ok(view.lastReactionEventId === null || typeof view.lastReactionEventId === 'string');
+  assert.ok(view.lastProposeRejectReason === null || typeof view.lastProposeRejectReason === 'string');
+  assert.equal(typeof view.advanceStage, 'string');
+  // 两阶段门禁只有计数，detail 回查永远不产生模型调用。
+  assert.equal(typeof view.detail, 'object');
+  assert.equal(view.detail.modelCalls, 0);
   assert.equal(JSON.stringify(view).includes('cache'), false, '状态里不含证据路径');
   assert.equal(JSON.stringify(view).includes('understand:'), false, '状态里不含候选 id/正文');
   assert.equal(JSON.stringify(view).includes('frame'), false, '状态里不含帧 id');
@@ -165,6 +175,7 @@ test('裸挂载：vision.proactive 可读，默认启用且没有候选/正文',
   assert.equal(view.lastTopic, null);
   assert.equal(view.lastSpokenAt, null);
   assert.equal(view.counts.proposed, 0);
+  assert.equal(view.advanceStage, 'no-advance', '裸挂载从未成功 advance，不是候选被过滤');
   assert.equal(state.storyboardStarts, 0, '主动接线不得触发真实采集');
 });
 

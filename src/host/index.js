@@ -350,6 +350,8 @@ import {
   revalidateProactiveCandidate,
 } from './vision/proactive-candidate.js';
 import { createProactiveLineGenerator } from './vision/proactive-line.js';
+// P-187 阶段 5 补充：宏观候选先本地过滤，只在确实需要细节时回查本地事件索引/原帧。
+import { createProactiveTwoStageGate } from './vision/proactive-detail.js';
 // P-187 阶段 6：把证据/台词/评论/理解/主动状态汇总成可评估的数字（纯投影，无 I/O）。
 import { summarizeAudiovisual } from './vision/audiovisual-metrics.js';
 import { KIND_ENUM, ResourceStore } from './memory/resources.js';
@@ -11603,6 +11605,45 @@ export function apply(ctx, config) {
    */
   const continuousViewEnabled = () => readSettings()?.vision?.continuousView === true;
   const proactive = createProactiveArbiter();
+  /**
+   * 上游供给诊断（只读、有界）：`proposed=0` 到底是“从没有成功 advance”、
+   * “成功但 0 个 reaction”，还是“有 reaction 但 propose 被拒”，必须能在一个 status 里区分。
+   * 这些数字在每个 onAdvance 更新；不新增定时器，也不改变任何门禁。
+   */
+  const proactiveSupply = {
+    advances: 0,
+    eventsSeen: 0,
+    eventsWithReaction: 0,
+    lastAdvanceAt: null,
+    lastReactionEventId: null,
+    lastAdvanceReason: '',
+  };
+  /**
+   * 候选进入短句生成前的两阶段门禁：本地过滤（过期/重复/已评论/quiet/busy）→ 只有
+   * 宏观描述过短且带索引身份时才回查 event-index。回查只读本地事件索引，不调用模型。
+   * 没有 `sourceEventId` 的旧候选/测试 double 直接使用候选自身证据。
+   */
+  const proactiveDetailGate = createProactiveTwoStageGate({
+    now: () => Date.now(),
+    eventIndex,
+    // 原帧仍可回看：优先按候选自己的证据 id 判断（与发送前 revalidate 同一口径）。
+    // 事件索引展开故事板 cells 后给出的 frameIds 只作补充，不能反过来否掉仍可见的候选证据。
+    evidenceAvailable: (frameIds, candidate) => {
+      const normalizeIds = (value) => (Array.isArray(value)
+        ? value.filter((id) => typeof id === 'string' && id.trim().length > 0)
+        : []);
+      const candidateIds = normalizeIds(candidate?.evidenceFrameIds);
+      const detailIds = normalizeIds(frameIds);
+      const ids = candidateIds.length > 0 ? candidateIds : detailIds;
+      if (ids.length === 0) return false;
+      try {
+        const found = new Set(evidenceWindow.byId(ids).map((entry) => entry.id));
+        return ids.every((id) => found.has(id));
+      } catch {
+        return false;
+      }
+    },
+  });
   const proactiveLine = createProactiveLineGenerator({
     getService,
     // 延迟读取：persona 在宿主函数更后段才初始化，真正生成时一定已就绪。
@@ -11703,6 +11744,7 @@ export function apply(ctx, config) {
     proactiveGeneration += 1;
     abortProactive();
     clearProactiveIgnored();
+    proactiveDetailGate.reset();
     proactive.reset(reason);
   };
   /** 卸载：除了代次/窗口，还要停掉 5 秒评估定时器本身。 */
@@ -11771,9 +11813,36 @@ export function apply(ctx, config) {
     });
     if (decision.speak !== true || decision.candidate === null) return decision;
 
+    const candidate = decision.candidate;
+    // 两阶段门禁：候选先在本代/本地状态里过滤（过期、重复、用户先评论、quiet、busy），
+    // 只有确实需要细节时才回查事件索引；回查失败/细节不足都不进入短句模型。
+    const detailGate = proactiveDetailGate.consider(candidate, {
+      userCommentAt: lastUserCommentAt,
+      assistantReplyAt: lastAssistantReplyAt,
+      userSpeaking: speechEvidence !== null,
+      assistantBusy: ttsIsSpeaking() === true || playback !== null,
+      pendingReply: proactivePendingReply(),
+      quietUntil: proactive.status().quietUntil,
+    });
+    if (detailGate.ok !== true) {
+      // 过期/重复/用户已评论/细节不可用：这条候选在本代已经不该开口，直接取消；
+      // 临时 busy/quiet 只本轮跳过，候选仍可被下一次评估看到。
+      const drop = detailGate.stage === 'detail'
+        || detailGate.cancel === true
+        || detailGate.reason === 'expired'
+        || detailGate.reason === 'duplicate';
+      if (drop) proactive.cancelFor([candidate.id]);
+      void log.emit('vision.proactive.detail', {
+        stage: detailGate.stage,
+        reason: detailGate.reason,
+        detailCalls: detailGate.detailCalls === 1 ? 1 : 0,
+        modelCalls: 0,
+      }).catch(() => {});
+      return { speak: false, reason: detailGate.reason };
+    }
+
     proactiveBusy = true;
     const generation = proactiveGeneration;
-    const candidate = decision.candidate;
     const abortController = new AbortController();
     proactiveAbort = abortController;
     try {
@@ -11786,6 +11855,8 @@ export function apply(ctx, config) {
           : (options) => proactiveLine.generate(options);
       const line = await generate({
         event: candidate,
+        // 第二阶段按需回查到的本地细节（原帧引用/台词摘要）；不需要细节时就是候选自身证据。
+        detail: detailGate.evidence,
         state: understanding.current(),
         // 关闭开关/候选取消/重置/组件关闭时由宿主 abort；生成器与“下一片”竞速后及时返回。
         signal: abortController.signal,
@@ -11866,8 +11937,28 @@ export function apply(ctx, config) {
    * 分析耗时不会重置新鲜度；事件身份用描述+证据摘要，重复分析只合并、不续期。
    */
   const proposeProactive = (update) => {
-    if (!proactiveEnabled()) return;
     const events = Array.isArray(update?.parsed?.events) ? update.parsed.events : [];
+    // 供给诊断先于开关门禁记账：这样“当时开关关闭”不会伪装成“没有 reaction/没有成功事件”。
+    // 只保留计数与事件下标；不写事件正文、路径或帧 id。
+    proactiveSupply.advances += 1;
+    proactiveSupply.eventsSeen += events.length;
+    proactiveSupply.lastAdvanceAt = Date.now();
+    let reactionEvents = 0;
+    let lastReactionEventId = null;
+    for (const event of events) {
+      if (event === null || typeof event !== 'object' || Array.isArray(event)) continue;
+      const reaction = typeof event.reaction === 'string' ? event.reaction.trim() : '';
+      if (reaction.length === 0) continue;
+      reactionEvents += 1;
+      const eventId = typeof event.id === 'string' ? proactiveClip(event.id.trim(), 64) : '';
+      if (eventId.length > 0) lastReactionEventId = eventId;
+    }
+    proactiveSupply.eventsWithReaction += reactionEvents;
+    if (lastReactionEventId !== null) proactiveSupply.lastReactionEventId = lastReactionEventId;
+    proactiveSupply.lastAdvanceReason = !proactiveEnabled()
+      ? 'disabled'
+      : (reactionEvents > 0 ? 'reaction' : (events.length > 0 ? 'no-reaction' : 'no-events'));
+    if (!proactiveEnabled()) return;
     const importantMaxAgeMs = proactiveImportantMaxAgeMs();
     const understoodAt = Date.now();
     let added = 0;
@@ -11897,6 +11988,8 @@ export function apply(ctx, config) {
         // id 只用于本次登记/取消；重复分析的身份由稳定的 eventId 决定。
         id: `understand:${occurredAt}:${index}`,
         eventId: proactiveEventId(description, frames, audio),
+        // 理解层事件 id（ue-*）：第二阶段按它在本地事件索引里回查原帧/台词；不参与去重身份。
+        sourceEventId: typeof event.id === 'string' ? event.id : '',
         occurredAt,
         understoodAt,
         from,
@@ -11919,6 +12012,54 @@ export function apply(ctx, config) {
       }).catch(() => {});
       void evaluateProactive('advance');
     }
+  };
+
+  /**
+   * `proposed=0` 的三分法，全部来自只读计数：
+   *   - no-advance / no-events：onAdvance 从未成功或本次成功但没有事件；
+   *   - no-reaction：有事件但没有一条带 reaction（设计上的硬门）；
+   *   - propose-rejected：带 reaction 的事件确实调用了 propose，但被拒（如 expired）；
+   *   - proposed：至少成功登记过一条。
+   * `lastReason=assistant-reply` 不参与这里，它只说明最近一次清池动作。
+   */
+  const proactiveAdvanceStage = () => {
+    if (!proactiveEnabled()) return 'disabled';
+    const snapshot = proactive.status();
+    const proposed = Number(snapshot?.counts?.proposed) || 0;
+    if (proposed > 0) return 'proposed';
+    if (proactiveSupply.advances === 0) return 'no-advance';
+    if (proactiveSupply.lastAdvanceReason === 'disabled') return 'disabled-at-advance';
+    if (proactiveSupply.eventsWithReaction === 0) {
+      return proactiveSupply.eventsSeen === 0 ? 'no-events' : 'no-reaction';
+    }
+    const reject = snapshot?.lastProposeRejectReason ?? snapshot?.lastRejectReason ?? null;
+    if (reject !== null && reject !== undefined) return 'propose-rejected';
+    if ((Number(snapshot?.proposeCalls) || 0) > 0) return 'propose-merged';
+    return 'reaction-not-proposed';
+  };
+
+  /** `/assistant/status` 的只读主动视图：保留旧字段，只追加有界诊断。 */
+  const proactiveStatusView = () => {
+    const snapshot = proactive.status();
+    const reject = snapshot.lastProposeRejectReason ?? snapshot.lastRejectReason ?? null;
+    const calls = Number(snapshot.proposeCalls);
+    return {
+      ...snapshot,
+      enabled: proactiveEnabled(),
+      rate: proactiveRate(),
+      // 上游供给计数：eventsWithReaction 是“有反应事件”的累计值，不是候选数。
+      eventsWithReaction: proactiveSupply.eventsWithReaction,
+      eventsSeen: proactiveSupply.eventsSeen,
+      advances: proactiveSupply.advances,
+      lastAdvanceAt: proactiveSupply.lastAdvanceAt,
+      lastReactionEventId: proactiveSupply.lastReactionEventId,
+      lastAdvanceReason: proactiveSupply.lastAdvanceReason,
+      proposeCalls: Number.isFinite(calls) ? calls : 0,
+      lastProposeRejectReason: reject,
+      advanceStage: proactiveAdvanceStage(),
+      // 两阶段门禁的计数：detailCalls>0 但 modelCalls 始终 0，回查不产生额外模型调用。
+      detail: proactiveDetailGate.status(),
+    };
   };
 
   // 5 秒兜底评估：只在确实有候选时读一次状态；unref 不拖住宿主退出。
@@ -21522,14 +21663,14 @@ export function apply(ctx, config) {
         // 同材料双探针的手动诊断状态：没有正文，只有计数/原因与最近一次的受限 meta。
         probe: visionProbe.status(),
         // P-187 阶段 5 的主动候选只读状态：计数/最近时间/原因，绝不含候选正文或路径。
-        proactive: { ...proactive.status(), enabled: proactiveEnabled(), rate: proactiveRate() },
+        proactive: proactiveStatusView(),
         // P-187 阶段 6：以上证据/台词/评论/理解/主动状态的数字投影；只读、无路径/正文/帧 id。
         audiovisual: summarizeAudiovisual({
           evidence: evidenceWindow.state(),
           media: mediaTimeline.state(),
           comment: commentEvidence.state(),
           understanding: understandingStatusView(),
-          proactive: { ...proactive.status(), enabled: proactiveEnabled(), rate: proactiveRate() },
+          proactive: proactiveStatusView(),
           uptimeMs: Date.now() - mountedAt,
         }),
       },

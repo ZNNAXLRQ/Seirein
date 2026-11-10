@@ -25,6 +25,9 @@
  *     代次边界，连取消集、抽签记录、最近主题与时机窗口一起清空，但保留累计计数。
  *   - 三个时间分开：occurredAt（内容实际发生）、understoodAt（分析完成，仅诊断）、
  *     expiresAt（最晚允许表达）。expiresAt 以 occurredAt 为锚，分析完成再晚也不续期。
+ *   - `proposeCalls` 与 `lastProposeRejectReason` 是纯诊断：前者统计 propose 被调用次数
+ *     （成功/合并/拒绝都算），后者是最近一次拒绝的短机器码。它们让“从未有反应事件”和
+ *     “有反应但 propose 被拒”在 status 上可区分；`lastRejectReason` 作为旧字段保留。
  */
 
 /** 默认值：不再有固定配额，只保留有效期、静默期与同时候选数；计时/频率仍可显式覆盖。 */
@@ -167,6 +170,9 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
   // 身份优先用显式 eventId；没有 eventId 时用 id。描述文本不参与身份。
   const eventId = normalizeId(input.eventId);
   const identity = eventId.length > 0 ? eventId : id;
+  // 上游理解层的事件 id（ue-*）：只用于第二阶段按事件身份回查本地索引/原帧，不参与
+  // 候选身份或去重。旧调用方不提供时为空串，详情阶段会退化为使用候选自己的证据。
+  const sourceEventId = normalizeId(input.sourceEventId);
 
   if (typeof input.description !== 'string') return { ok: false, reason: 'malformed' };
   const description = input.description.trim();
@@ -242,6 +248,7 @@ function normalizeCandidate(input, at, config, canceled, spokenAt) {
     candidate: Object.freeze({
       id,
       eventId,
+      sourceEventId,
       from,
       to,
       occurredAt,
@@ -511,6 +518,7 @@ export function createProactiveArbiter(options = {}) {
   /** 事件身份历史：与候选队列分开，prune() 不碰；reset() 才清空。 */
   const identityHistory = new Map();
   const speakTimes = [];
+  let proposeCalls = 0;
   let proposed = 0;
   let rejected = 0;
   let expired = 0;
@@ -536,6 +544,8 @@ export function createProactiveArbiter(options = {}) {
      * @returns 归一化候选（冻结对象），证据缺失/过期/畸形/已取消/重复时返回 null。
      */
     propose(input) {
+      // 调用次数先记账：即使输入畸形、过期、重复，status 也能看出“propose 是否真的被调用”。
+      proposeCalls += 1;
       const at = currentTime();
       prune(at);
 
@@ -883,7 +893,10 @@ export function createProactiveArbiter(options = {}) {
         canceledEvents: canceled.size,
         // 有界身份历史只暴露数量；不含 eventId/id 正文。lastRejectReason 是短机器码。
         identities: identityHistory.size,
+        // 诊断二分：proposeCalls=0 表示从未尝试登记；>0 且 proposed=0 时看最近的拒绝原因。
+        proposeCalls,
         lastRejectReason,
+        lastProposeRejectReason: lastRejectReason,
         spokenLastHour: recentSpeakCount(at),
         consecutiveIgnored,
         quietUntil,
