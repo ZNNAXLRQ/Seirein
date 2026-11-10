@@ -198,7 +198,7 @@ export const POSTURE_COMPONENT_TARGET_LIMIT = 72;
  * remains a recognisable part of the held pose instead of rounding away to ≈0.2°.
  */
 export const POSTURE_COMPONENTS = Object.freeze([
-  Object.freeze({ id: 'natural', label: '自然', headX: 0, headY: 0, headZ: 0 }),
+  Object.freeze({ id: 'natural', label: '自然', headX: 0.3, headY: 0.05, headZ: 0.5 }),
   Object.freeze({ id: 'lean-left', label: '左侧倾', headX: 0.35, headY: 0, headZ: 1 }),
   Object.freeze({ id: 'lean-right', label: '右侧倾', headX: -0.35, headY: 0, headZ: -1 }),
   Object.freeze({ id: 'look-back', label: '偏头/回看', headX: 1, headY: 0.45, headZ: 0.55 }),

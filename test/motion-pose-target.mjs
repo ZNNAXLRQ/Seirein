@@ -183,12 +183,19 @@ test('1. 静止保持：组件 target 可辨认（≥3°/0.10），瞬时姿态�
       }
     }
 
-    // The dominant axis of every non-natural component must be a real held target, not a trace.
+    // The dominant axis of every lean/look component must be a real held target, not a trace.
+    // `natural` is now deliberately the smallest NON-ZERO shape instead of a 10–20 s zero hold:
+    // it must carry a real target, but it does not have to reach the full lean band.
     const dominant = Math.max(...POSTURE_COMPONENT_CHANNELS.map(
       (channel) => Math.abs(component.semantic?.[channel] ?? 0),
     ));
     maxTargetSemantic = Math.max(maxTargetSemantic, dominant);
-    if (component.id !== 'natural') {
+    if (component.id === 'natural') {
+      assert.ok(dominant > 0,
+        `natural carries a non-zero held target (${dominant}), never a 10–20 s all-zero hold`);
+      assert.ok(dominant <= POSTURE_COMPONENT_MAX_AMPLITUDE + 1e-9,
+        `natural dominant target ${dominant} ≤ ${POSTURE_COMPONENT_MAX_AMPLITUDE}`);
+    } else {
       assert.ok(dominant >= POSTURE_COMPONENT_MIN_AMPLITUDE - 1e-6,
         `${component.id} dominant target ${dominant} ≥ ${POSTURE_COMPONENT_MIN_AMPLITUDE}`);
       assert.ok(dominant <= POSTURE_COMPONENT_MAX_AMPLITUDE + 1e-9,
@@ -304,6 +311,11 @@ test('2. 基础微动仍轻：基底贡献 ≤ ~6.6°，hold drift ≤1°，组�
       (channel) => Math.abs(motion.holdDrift?.[channel] ?? 0) * 30,
     ));
     if (component?.observed === null || component?.observed === undefined) continue;
+    // A component swap is interpolated over 1.2–1.8 s. During that window `observed.idle` still
+    // carries the PREVIOUS component while `observed.mixed` already names the NEW one, so
+    // `idle − mixed` would mix two different shapes and must not be read as the base layer.
+    // Measure the base only once the current component has settled.
+    if (at - component.startedAt < 2_000) continue;
     for (const channel of POSTURE_COMPONENT_CHANNELS) {
       const idle = component.observed.idle?.[channel] ?? 0;
       const mixed = component.observed.mixed?.[channel] ?? 0;
