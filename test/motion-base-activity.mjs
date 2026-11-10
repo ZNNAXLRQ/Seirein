@@ -260,9 +260,10 @@ test('3. 隐私锁 / 断连 / dispose：计数冻结，不报错', async (t) => 
 });
 
 // ---------------------------------------------------------------------------------------------
-// 4. ownership table: head plugin, blink plugin + nativePossible, breath/gaze also verified-only
+// 4. ownership table: head plugin, blink follows the effective owner (VTS until plugin+eyes),
+//    breath/gaze also verified-only
 // ---------------------------------------------------------------------------------------------
-test('4. 所有权表：head/blink plugin，breath 按 verified，gaze 仅 verified，body/arms 不写', async (t) => {
+test('4. 所有权表：head plugin，blink 按有效 owner，breath 按 verified，gaze 仅 verified，body/arms 不写', async (t) => {
   const fake = createFakeTransport();
   const runtime = await connectRuntime(t, { transport: fake.transport });
   const applied = await runtime.setChannelMappings([
@@ -280,7 +281,11 @@ test('4. 所有权表：head/blink plugin，breath 按 verified，gaze 仅 verif
   assert.equal(ownership.channels.headX.source, 'plugin');
   assert.equal(ownership.channels.headX.owner, 'plugin-base');
   assert.equal(ownership.channels.headX.verified, true);
-  assert.equal(ownership.channels.blink.source, 'plugin');
+  assert.equal(ownership.channels.blink.source, 'vts-native',
+    'no eye mapping means VTS still owns the actual blink');
+  assert.equal(ownership.channels.blink.owner, 'vts-native');
+  assert.equal(ownership.channels.blink.status, 'native');
+  assert.equal(ownership.channels.blink.verified, false);
   assert.equal(ownership.channels.blink.nativePossible, true, 'VTS native idle may blink too');
   assert.equal(ownership.channels.breath.source, 'plugin', 'a verified breath input is plugin-driven');
   assert.equal(ownership.channels.breath.verified, true);
@@ -290,9 +295,10 @@ test('4. 所有权表：head/blink plugin，breath 按 verified，gaze 仅 verif
   assert.equal(ownership.channels.bodyY.source, 'vts-native');
   assert.equal(ownership.channels.bodyZ.source, 'vts-native');
   assert.equal(ownership.channels.arms.source, 'unsupported', 'arms are never written');
-  assert.ok(ownership.plugin.includes('headX') && ownership.plugin.includes('blink'));
+  assert.ok(ownership.plugin.includes('headX') && !ownership.plugin.includes('blink'));
   assert.ok(ownership.plugin.includes('breath') && ownership.plugin.includes('gazeX'));
   assert.ok(ownership.vtsNative.includes('bodyX'));
+  assert.ok(ownership.vtsNative.includes('blink'));
   assert.deepEqual(ownership.unsupported, ['arms']);
   // The view never leaks an input name or a path.
   const serialized = JSON.stringify(ownership);

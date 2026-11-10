@@ -240,6 +240,12 @@ async function startHost(fake, extra = {}, { personaText = '' } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'avatar-host-wiring-'));
   await mkdir(join(root, 'data'), { recursive: true });
   await writeFile(join(root, 'data', 'features.json'), JSON.stringify({ avatar: true }), 'utf8');
+  // This suite pins channel wiring/motion output, not startup mapping verification. The fake model
+  // parameter list carries names only (no live values), so an automatic head/gaze probe would read
+  // null values and correctly downgrade the name-verified rows; keep the suite deterministic by
+  // explicitly opting out of the one startup probe (the dedicated auto-verify tests cover it).
+  await writeFile(join(root, 'data', 'settings.json'),
+    JSON.stringify({ avatar: { verifyMappingsOnStartup: false } }), 'utf8');
   if (personaText.length > 0) {
     await mkdir(join(root, 'memory'), { recursive: true });
     // The settings box is the persona source; the style build reads it fresh.

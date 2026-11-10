@@ -137,7 +137,11 @@ test('1. 缺省 vts：idleEye=false、blink.owner=vts、blinkSent 不增长', as
   const eyeRows = rig.fake.frames.flat().filter((entry) => entry.channel === 'eyeOpenL'
     || entry.channel === 'eyeOpenR');
   assert.equal(eyeRows.length, 0, 'the transport never received an eye-open row');
-  assert.equal(snap.motion.channelOwnership.channels.blink.owner, 'vts');
+  assert.equal(snap.motion.channelOwnership.channels.blink.owner, 'vts-native',
+    'the ownership table names the effective VTS-native owner, not a requested plugin owner');
+  assert.equal(snap.motion.channelOwnership.channels.blink.source, 'vts-native');
+  assert.equal(snap.motion.channelOwnership.channels.blink.status, 'native');
+  assert.equal(snap.motion.channelOwnership.channels.blink.verified, false);
   assert.equal(snap.motionLayers.blink.owner, 'vts');
   console.log(`[blink 1] owner=${snap.blink.owner} idleEye=${snap.idleParams.eye}`
     + ` generated=${snap.blink.generated} sent=${snap.blink.sent}`);

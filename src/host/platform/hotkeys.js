@@ -83,6 +83,7 @@ export const DEFAULT_HOTKEYS = {
   vision: 'Ctrl+Alt+V',
   layerEdit: 'Ctrl+Alt+E',
   ambient: 'Ctrl+Alt+A',
+  callMode: 'Ctrl+Alt+C',
 };
 
 /** Actions the poller still knows. Anything else in a saved/config table is pruned on load. */

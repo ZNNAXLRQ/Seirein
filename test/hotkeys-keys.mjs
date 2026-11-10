@@ -238,6 +238,8 @@ test('6. 回归：旧组合、默认表、numpad 不冲突、重复组合仍上�
   assert.equal(shipped.layerEdit.vk, 0x45);
   assert.deepEqual(shipped.ambient.mods, [0x11, 0x12]);
   assert.equal(shipped.ambient.vk, 0x41);
+  assert.deepEqual(shipped.callMode.mods, [0x11, 0x12]);
+  assert.equal(shipped.callMode.vk, 0x43);
   assert.deepEqual(findHotkeyConflicts(DEFAULT_HOTKEYS), []);
   assert.deepEqual(
     findHotkeyConflicts({ mic: 'Ctrl+Num1', vision: 'Ctrl+1' }),

@@ -91,10 +91,7 @@ export {
   CONFUSED_BROW_CHANNELS,
 } from './motion-config.js';
 import { toHeadInputValue, toInputValue } from './dynamics.js';
-import {
-  PROBE_TIMEOUT_MS,
-  probeGazeMapping as probeGazeChannels,
-} from './avatarMotion.js';
+import { PROBE_TIMEOUT_MS } from './avatarMotion.js';
 export {
   HEAD_DEGREES_PER_POSE_UNIT,
   createBlinkState,
@@ -567,6 +564,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * older one: the older probe's late result may not overwrite the evidence of the newer probe.
    */
   let gazeProbeSeq = 0;
+  /**
+   * Channels the explicit/startup action probe may measure. The pure discovery probe in
+   * avatarMotion.js stays gaze-only; the host facade owns this wider runtime probe so no discovery
+   * path gains a new side effect.
+   */
+  const PROBE_ACTION_CHANNEL_ORDER = Object.freeze([
+    'gazeX', 'gazeY', 'headX', 'headY', 'headZ', 'eyeOpenL', 'eyeOpenR',
+  ]);
+  const PROBE_ACTION_VALUE = 0.5;
+  /** Eye-open inputs are unipolar (1 = fully open): probe them with a positive value. */
+  const PROBE_EYE_VALUE = 1;
   /**
    * Reference-counted pause ownership for explicit gaze probes. Overlap and timeout must not
    * restore a stale boolean: each live probe owns one token, and only the last token reopens the
@@ -1587,6 +1595,23 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   // ---- channel takeover: verified input mappings only ------------------------------------
+  /** The three posture axes whose runtime proof is reported separately from name matching. */
+  const HEAD_STATUS_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
+
+  /** Head axes whose mapping is not verified right now (its name-rule verdict may still be a candidate). */
+  const headUnverifiedChannels = () => HEAD_STATUS_CHANNELS
+    .filter((channel) => channelState.bindings.get(channel)?.verified !== true);
+
+  /** Per-channel runtime probe evidence: `{ok, changed, delta, error}`, never before/after values. */
+  function probeEvidenceView(channels = CHANNELS) {
+    const evidence = {};
+    for (const channel of channels) {
+      const probe = copyProbeEvidence(channelState.bindings.get(channel)?.probe);
+      if (probe !== null) evidence[channel] = probe;
+    }
+    return evidence;
+  }
+
   /**
    * Takeover view plus the amplitude actually in force on every taken-over style channel.
    * A channel that is not controlled+verified is never listed, so it cannot silently receive a
@@ -1605,6 +1630,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       controlled,
       skipped: [...channelState.skipped],
       unverified: [...channelState.unverified],
+      /** `headX/headY/headZ` without a verified mapping: the base layer may not claim to drive them. */
+      headUnverified: headUnverifiedChannels(),
+      /** Last runtime probe verdict per channel (`changed:true` is the only proof). */
+      probe: probeEvidenceView(),
       effectiveAmplitude,
     };
   };
@@ -1633,6 +1662,25 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     appendLog('debug', `${type}: ${channel}`, { event: type, channel, reason, ...data });
   }
 
+  /** Keep only the documented probe evidence: channel verdict + numeric delta + error text. */
+  function copyProbeEvidence(raw) {
+    if (raw === null || typeof raw !== 'object') return null;
+    const evidence = {
+      ok: raw.ok === true,
+      changed: raw.changed === true,
+      error: String(raw.error ?? ''),
+    };
+    if (raw.delta !== null && typeof raw.delta === 'object') {
+      const delta = {};
+      for (const [name, value] of Object.entries(raw.delta)) {
+        if (value === null) delta[String(name)] = null;
+        else if (Number.isFinite(Number(value))) delta[String(name)] = Number(value);
+      }
+      evidence.delta = delta;
+    }
+    return evidence;
+  }
+
   /** Normalise one discovery/config row; a row is usable only with an explicit input name. */
   const channelBinding = (channel, entry) => {
     const inputName = asInputName(entry);
@@ -1653,6 +1701,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       modelParams: (Array.isArray(entry?.modelParams) ? entry.modelParams : [])
         .map((name) => String(name ?? '').trim())
         .filter((name) => name.length > 0),
+      /** A previous runtime probe stays visible when a discovery snapshot is re-applied. */
+      probe: copyProbeEvidence(entry?.probe),
     };
   };
 
@@ -1927,20 +1977,124 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     };
   }
 
+  /** Keep only numeric/null values: a probe result is evidence, never a page of transport payload. */
+  function sanitizeProbeDelta(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const delta = {};
+    for (const [name, value] of Object.entries(raw)) {
+      if (value === null) delta[String(name)] = null;
+      else if (Number.isFinite(Number(value))) delta[String(name)] = Number(value);
+    }
+    return delta;
+  }
+
   /**
-   * Explicit production entry: prove `gazeX`/`gazeY` at runtime by injecting one value and reading
-   * the target model parameters before/after. This is never called by discovery or a timer.
+   * Run one probe with a hard timeout. A never-settling transport becomes safe failure data; a late
+   * settlement is ignored after the safe result (the pause token is released by the caller).
+   */
+  function probeWithTimeout(probeInputMapping, request, timeoutMs) {
+    const call = Promise.resolve()
+      .then(() => probeInputMapping(request))
+      .then(
+        (value) => ({ timedOut: false, value, error: '' }),
+        (error) => ({ timedOut: false, value: null, error: errorText(error) }),
+      );
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      if (!(Number.isFinite(timeoutMs) && timeoutMs > 0)) return;
+      timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+      timer.unref?.();
+    });
+    return Promise.race([call, timeout]).then((settled) => {
+      if (timer !== null) clearTimeout(timer);
+      if (settled?.timedOut === true) {
+        return {
+          ok: false,
+          changed: false,
+          delta: {},
+          error: `mapping probe timed out after ${timeoutMs} ms`,
+        };
+      }
+      if (settled?.error) return { ok: false, changed: false, delta: {}, error: settled.error };
+      return settled?.value;
+    });
+  }
+
+  /**
+   * One explicit action-probe pass over the selected rows. Only `changed:true` is evidence; an
+   * unchanged/failed/timeout row stays in `channels` and is listed in `mappingUnverified`. The
+   * projection carries `changed`/`delta`/`error` only — raw before/after values never leave here.
+   */
+  async function probeActionRows({ rows, probeInputMapping, timeoutMs = host.gazeProbeTimeoutMs, now = clockNow }) {
+    const readAt = () => {
+      const value = typeof now === 'function' ? Number(now()) : Date.now();
+      return new Date(Number.isFinite(value) ? value : Date.now()).toISOString();
+    };
+    const resultChannels = {};
+    const mappingUnverified = [];
+    let ok = true;
+    let firstError = '';
+    for (const row of rows) {
+      const ownValue = Number(row?.probeValue);
+      const value = Number.isFinite(ownValue) ? ownValue : PROBE_ACTION_VALUE;
+      const parameterNames = Array.isArray(row.modelParams) ? [...row.modelParams] : [];
+      const outcome = await probeWithTimeout(probeInputMapping, {
+        inputName: row.inputName,
+        parameterNames,
+        value,
+      }, timeoutMs);
+      // `changed` is decisive, but an explicit ok:false/timedOut always wins over a contradictory
+      // "changed" from a failed measurement.
+      const completed = outcome !== null && typeof outcome === 'object' && outcome.ok !== false
+        && outcome.timedOut !== true;
+      const changed = completed && outcome.changed === true;
+      const error = String(outcome?.error ?? '') || (completed ? '' : 'mapping probe failed');
+      if (!completed) ok = false;
+      if (error.length > 0 && firstError.length === 0) firstError = error;
+      resultChannels[row.channel] = {
+        inputName: String(row.inputName ?? ''),
+        parameterNames,
+        changed,
+        delta: sanitizeProbeDelta(outcome?.delta),
+        error,
+      };
+      if (!changed) mappingUnverified.push(row.channel);
+    }
+    return {
+      ok: ok && rows.length > 0,
+      channels: resultChannels,
+      mappingUnverified,
+      at: readAt(),
+      error: firstError,
+    };
+  }
+
+  /** Channels the explicit/startup probe measures on this connection. */
+  function probeActionChannels() {
+    const channels = PROBE_ACTION_CHANNEL_ORDER
+      .filter((channel) => channel !== 'eyeOpenL' && channel !== 'eyeOpenR');
+    // Eyes are written only by the plugin blink owner; VTS-owned blinking must not be injected.
+    if (host.blinkOwner === 'plugin') channels.push('eyeOpenL', 'eyeOpenR');
+    return channels;
+  }
+
+  /**
+   * Explicit production entry: prove the action mappings at runtime by injecting one value and
+   * reading the target model parameters before/after. It measures gazeX/gazeY and headX/headY/headZ,
+   * plus eyeOpenL/eyeOpenR only while the plugin owns blinking (`blinkOwner:'plugin'`). This is
+   * never called by discovery or a timer by itself.
    *
-   * It runs only while this runtime is connected AND at least one current gaze binding has both an
+   * It runs only while this runtime is connected AND at least one selected binding has both an
    * input name and target model parameters. Every runtime-owned write path is paused for the whole
    * measurement; after the finally block the transport's existing `probeActive` flag is restored and
    * a motion frame held in the slot is pumped. `changed:true` keeps/marks the channel verified;
    * `changed:false`, a timeout or an error marks it unverified but NEVER removes the binding.
    *
    * Expected failures are data: the method never throws and always returns the public shape
-   * `{ok, channels:{gazeX,gazeY}, mappingUnverified, at, error}`. A result whose captured
+   * `{ok, channels, mappingUnverified, at, error}`. A result whose captured
    * connection/mapping/target no longer matches is returned with `stale:true` and
-   * `discarded:<reason>` instead; it carries no applicable channel evidence.
+   * `discarded:<reason>` instead; it carries no applicable channel evidence. Raw before/after
+   * values stay inside the transport measurement and are never copied into this result.
    */
   async function probeGazeMapping(options = {}) {
     const at = () => new Date(clockNow()).toISOString();
@@ -1965,22 +2119,25 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     };
     if (state.disposed === true) return failure('avatar runtime has been disposed');
     if (state.connected !== true) return failure('VTube Studio 未连接');
-    if (isCancelled()) return failure('gaze mapping probe cancelled');
+    if (isCancelled()) return failure('action mapping probe cancelled');
 
     const rows = [];
-    for (const channel of ['gazeX', 'gazeY']) {
+    for (const channel of probeActionChannels()) {
       const binding = channelState.bindings.get(channel);
       if (binding === undefined) continue;
+      const eye = channel === 'eyeOpenL' || channel === 'eyeOpenR';
       rows.push({
         channel,
         inputName: binding.inputName,
         modelParams: Array.isArray(binding.modelParams) ? binding.modelParams : [],
+        // Eye-open inputs are unipolar; a positive value proves an open-eye row without closing it.
+        ...(eye ? { probeValue: PROBE_EYE_VALUE } : {}),
       });
     }
     const hasTarget = rows.some((row) => String(row.inputName ?? '').trim().length > 0
       && Array.isArray(row.modelParams) && row.modelParams.length > 0);
     if (!hasTarget) {
-      return failure('没有可探测的视线映射（需要已发现的 gazeX/gazeY 输入与模型参数）');
+      return failure('没有可探测的动作映射（需要已发现的视线/头部输入与模型参数）');
     }
 
     const probe = typeof transport?.probeInputMapping === 'function'
@@ -2007,16 +2164,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // the flag back to true after the outer timeout already resumed writes. Hold the pause with an
     // explicit token + reference count instead; only the last live owner restores the transport.
     if (probePauseTokens.size === 0) probePauseBaseline = previousProbeActive;
-    const probePauseToken = Symbol('gaze-probe-pause');
+    const probePauseToken = Symbol('mapping-probe-pause');
     probePauseTokens.add(probePauseToken);
     let result;
     try {
       setGazeProbeActive(true);
-      result = await probeGazeChannels({
-        channels: rows,
+      result = await probeActionRows({
+        rows,
         probeInputMapping: async (request) => {
           // Re-assert before every call: VtsClient clears its own flag in its finally block, so the
-          // whole two-channel operation would otherwise re-open the frame loop between channels.
+          // whole multi-channel operation would otherwise re-open the frame loop between channels.
           // Do NOT re-assert in a `finally`: after an outer timeout that would re-lock writes with
           // no remaining owner.
           if (!probePauseTokens.has(probePauseToken)) {
@@ -2037,7 +2194,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         if (frameWritesPaused() !== true) pumpMotion();
       }
     }
-    if (result === null || result === undefined) result = failure('gaze mapping probe failed');
+    if (result === null || result === undefined) result = failure('action mapping probe failed');
 
     // Stale evidence is thrown away before it can touch verified/controlled or mark a channel
     // unverified. A newer result (or the mapping/connection it belongs to) wins.
@@ -2062,7 +2219,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
 
     // Apply the evidence to the takeover set. The binding is updated in place, never removed: a
-    // diagnostic failure means "not proven", not "the eye channel cannot be driven".
+    // diagnostic failure means "not proven", not "the channel cannot be driven".
     let applied = false;
     const unverified = new Set(channelState.unverified);
     for (const [channel, row] of Object.entries(result.channels ?? {})) {
@@ -2070,6 +2227,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (binding === undefined) continue;
       binding.verified = row?.changed === true;
       binding.mappingUnverified = row?.changed !== true;
+      binding.probe = copyProbeEvidence({
+        ok: String(row?.error ?? '').length === 0,
+        changed: row?.changed === true,
+        delta: row?.delta,
+        error: row?.error,
+      });
       if (binding.verified) unverified.delete(channel);
       else unverified.add(channel);
       applied = true;
@@ -2077,10 +2240,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     if (applied) {
       channelState.unverified = CHANNELS.filter((channel) => unverified.has(channel));
       refreshIdleParamMap();
-      refreshIdleActionPool('gaze-probe');
+      refreshIdleActionPool('mapping-probe');
       refreshPresetCapabilities();
       // A failed probe closes the gaze-component gate; an accepted one may open it.
       syncComponentGazeGate();
+      // Eye evidence can open (or close) the plugin blink owner on this same result.
+      reconcileBlinkOwner();
     }
     return result;
   }
@@ -5418,17 +5583,20 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       nativePossible: true,
     });
     const breathVerified = breathBinding() !== null;
+    // Blink ownership mirrors the EFFECTIVE writer: the layer is always generated, but only a
+    // plugin-owned blink (explicit request + both eyes verified) injects eye rows. The default
+    // VTS owner keeps its native blink, so the ownership table must not label it plugin.
+    const blinkPluginOwned = effectiveBlinkOwner() === 'plugin';
     const entries = {
       headX: head('headX'),
       headY: head('headY'),
       headZ: head('headZ'),
       blink: {
-        source: 'plugin',
-        /** Effective owner, so this view agrees with `blink.owner` and `idleParams.eye`. */
-        owner: effectiveBlinkOwner(),
+        source: blinkPluginOwned ? 'plugin' : 'vts-native',
+        owner: blinkPluginOwned ? 'plugin' : 'vts-native',
         designatedOwner: 'plugin',
-        verified: true,
-        status: 'plugin',
+        verified: blinkPluginOwned,
+        status: blinkPluginOwned ? 'plugin' : 'native',
         /** VTS's own idle animation may blink independently: this layer is not exclusive. */
         nativePossible: true,
         /** The blink chain is always computed; the eye INPUT is opt-in (`idleEye`). */
@@ -5438,6 +5606,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         eyeVerified: eyeBindingsVerified(),
         /** Why that opt-in is off (e.g. `idleEye-off`), independent of VTS native idle. */
         eyeWriteOptInReason: eyeWriteOptInReason(),
+        /** Generated cycles remain observable even while VTS owns the actual blink. */
+        generated: inner.snapshot().motion?.baseActivity?.blinkCount ?? 0,
+        sent: blinkEvidence.sent,
       },
       breath: {
         source: breathVerified ? 'plugin' : 'vts-native',
@@ -5493,6 +5664,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       generatedCountMeaning: 'breath phase wraps produced by the controller (not a transport write)',
       sentCountMeaning: 'committed breath rows on a verified input',
     };
+    const headUnverified = headUnverifiedChannels();
     const baseActivityView = innerSnap.motion?.baseActivity === null
       || innerSnap.motion?.baseActivity === undefined ? null : {
         ...innerSnap.motion.baseActivity,
@@ -5503,6 +5675,15 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         blinkSentMeaning: 'committed eye-open sends that belonged to a newer generated cycle',
         breathOwner,
         breathDriven: breathView.driven,
+        /**
+         * Head axes without a verified mapping. `headDriven` is writer eligibility only: the base
+         * layer may accumulate `headMotionMs` while computing, but it must not claim to drive an
+         * unverified axis (the frame simply omits that channel).
+         */
+        headUnverified: [...headUnverified],
+        headDriven: headUnverified.length === 0,
+        headDrivenMeaning: 'all three head axes have a verified mapping; not a proof VTS rendered them',
+        headProbe: probeEvidenceView(HEAD_STATUS_CHANNELS),
       };
     const blinkView = {
       generated: innerSnap.motion?.baseActivity?.blinkCount ?? 0,
@@ -5862,8 +6043,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     /** Explicit blink ownership: `plugin` only while BOTH eye inputs are verified, else `vts`. */
     setBlinkOwner,
     setChannelMappings,
-    /** Explicit, non-automatic gazeX/gazeY mapping proof; pauses all facade writes while it runs. */
+    /**
+     * Explicit, non-automatic action-mapping proof (gaze + head, plus eye while plugin owns blink);
+     * pauses all facade writes while it runs. `probeGazeMapping` is the historical name.
+     */
     probeGazeMapping,
+    probeMapping: probeGazeMapping,
     setStyle,
     setStatus,
     setIntent,

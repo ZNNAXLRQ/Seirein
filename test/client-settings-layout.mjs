@@ -410,19 +410,21 @@ test('12. 端到端渲染：14 张卡片都落进 12 个分区，分区内顺序
   console.log(`12) cards=${cards.length} sections=${tree.length} memory=${bySection.memory.join(',')}`);
 });
 
-// ---- 7. explicit gaze-mapping probe entry ---------------------------------------------------
-test('13. 形象卡片：验证视线映射按钮 + 结果行 + 启动时自动验证开关，一次动作、无轮询、失败不清空其它状态', () => {
+// ---- 7. explicit action-mapping probe entry -------------------------------------------------
+test('13. 形象卡片：验证动作映射按钮 + 结果行 + 启动时自动验证开关，一次动作、无轮询、失败不清空其它状态', () => {
   assert.equal((clientSource.match(/action: 'avatar\.mapping\.probe'/gu) ?? []).length, 1,
     '形象卡片只有一处显式触发');
-  assert.ok(clientSource.includes("'验证视线映射'"), '按钮文案存在');
+  assert.ok(clientSource.includes("'验证动作映射'"), '按钮文案存在');
   assert.ok(clientSource.includes('data-avatar-mapping'), '结果行有稳定标记');
   assert.ok(clientSource.includes('status.avatar?.mapping'), '结果行读取 status.avatar.mapping');
   for (const text of ['已连通', '未变化', '失败：']) {
     assert.ok(clientSource.includes(text), `结果行能显示「${text}」`);
   }
+  assert.ok(clientSource.includes('短暂暂停动作'), '按钮说明会短暂暂停并测动作');
+  assert.ok(clientSource.includes('头部'), '按钮说明覆盖头部探测');
   assert.equal((clientSource.match(/action: 'avatar\.verifyMappingsOnStartup\.set'/gu) ?? []).length, 1,
     '启动时自动验证开关只有一个持久化动作');
-  assert.ok(clientSource.includes("'启动时自动验证视线映射'"), '开关标签存在');
+  assert.ok(clientSource.includes("'启动时自动验证动作映射'"), '开关标签存在');
   assert.equal((clientSource.match(/data-settings-toggle': 'avatar-verify-mappings-on-startup'/gu) ?? []).length, 1,
     '开关有稳定标记');
   assert.ok(clientSource.includes('失败不重试'), '开关说明启动验证不会自动重试');

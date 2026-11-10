@@ -495,7 +495,7 @@ test('5. 客户端静态：一个显式按钮 + 结果行，无轮询', async ()
 
   assert.equal((clientSource.match(/action: 'avatar\.mapping\.probe'/gu) ?? []).length, 1,
     '客户端只有一处显式触发');
-  assert.ok(clientSource.includes("'验证视线映射'"), '按钮文案存在');
+  assert.ok(clientSource.includes("'验证动作映射'"), '按钮文案存在');
   assert.ok(clientSource.includes('data-avatar-mapping'), '结果行有稳定标记');
   assert.ok(clientSource.includes('已连通'), '结果行能显示已连通');
   assert.ok(clientSource.includes('未变化'), '结果行能显示未变化');

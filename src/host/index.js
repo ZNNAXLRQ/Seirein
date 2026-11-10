@@ -3660,7 +3660,7 @@ export function apply(ctx, config) {
       return {
         ok: false,
         code: 'invalid-boolean',
-        error: '启动时自动验证视线映射只能是开或关',
+        error: '启动时自动验证动作映射只能是开或关',
         verifyMappingsOnStartup: storedAvatarVerifyMappingsOnStartup(),
       };
     }
@@ -3796,6 +3796,26 @@ export function apply(ctx, config) {
         .filter((entry) => entry.mappingSource === 'explicit')
         .map((entry) => [entry.channel, entry.mappingSource]),
     );
+    // Head proof is reported separately: a name-rule match alone is not runtime evidence that VTS
+    // really wired FaceAngleX/Y/Z to ParamAngleX/Y/Z. These are the axes currently without it.
+    const headUnverified = channels.length === 0
+      ? []
+      : ['headX', 'headY', 'headZ'].filter((channel) => {
+        const entry = channels.find((candidate) => candidate.channel === channel);
+        return entry === undefined || entry.verified !== true;
+      });
+    // Per-channel runtime probe evidence only (`changed`/`delta`/`error`); never raw before/after.
+    const probeEvidence = Object.fromEntries(
+      channels
+        .filter((entry) => entry.probe !== null && typeof entry.probe === 'object')
+        .map((entry) => [entry.channel, {
+          ok: entry.probe.ok === true,
+          changed: entry.probe.changed === true,
+          error: String(entry.probe.error ?? ''),
+          ...(entry.probe.delta !== null && typeof entry.probe.delta === 'object'
+            ? { delta: { ...entry.probe.delta } } : {}),
+        }]),
+    );
     return {
       discovered: capability.discovered === true,
       ok: capability.ok === true,
@@ -3805,9 +3825,13 @@ export function apply(ctx, config) {
       verified,
       /**
        * Injectable but not proven: an explicit mapping still awaiting its probe, or a
-       * changed:false/failed gaze probe. The channel itself is never removed.
+       * changed:false/failed probe. The channel itself is never removed.
        */
       mappingUnverified,
+      /** Head axes without a verified mapping (`headDriven` names the base-layer consequence). */
+      headUnverified,
+      /** Last runtime probe verdict per channel, keyed by channel name. */
+      probeEvidence,
       /** Explicit channelMap names VTS did not list; the channel is not enabled through them. */
       mappingInvalid,
       /** channel → 'explicit' for a valid user-declared input (never auto-verified). */
@@ -4153,9 +4177,10 @@ export function apply(ctx, config) {
     // One batched idle frame keeps the per-parameter request count at 10 Hz instead of 70 Hz.
     writeFrame: (entries) => injectAvatarParameters(entries),
     /**
-     * Explicit gaze-mapping evidence. The runtime calls this only from the user-triggered
-     * `avatar.mapping.probe` action; discovery never opts into it. VtsClient.probeInputMapping
-     * already pauses its 30 Hz frame loop with its own `probeActive` flag.
+     * Explicit action-mapping evidence. The runtime calls this only from the user-triggered
+     * `avatar.mapping.probe` action and the one-per-connection startup attempt; discovery never
+     * opts into it. VtsClient.probeInputMapping already pauses its 30 Hz frame loop with its own
+     * `probeActive` flag.
      */
     probeInputMapping: (request) => vtsClient().probeInputMapping(request),
     /**
@@ -4272,9 +4297,9 @@ export function apply(ctx, config) {
     return result;
   };
 
-  // ---- explicit gaze-mapping proof (never automatic) -------------------------------------
+  // ---- explicit action-mapping proof (never automatic on its own) ------------------------
   /**
-   * Last user-triggered gaze-mapping probe, as the status contract expects:
+   * Last user-triggered action-mapping probe, as the status contract expects:
    * `{lastAt, ok, channels, unverified}`. `null` before the first click; no discovery path writes it.
    */
   let avatarMappingProbe = null;
@@ -4303,10 +4328,10 @@ export function apply(ctx, config) {
         unverified: [...avatarMappingProbe.unverified],
       });
   /**
-   * Keep the discovery view honest after a manual probe: `changed:true` is verified, everything
+   * Keep the discovery view honest after a runtime probe: `changed:true` is verified, everything
    * else is mappingUnverified, while the injectable channel itself is never removed.
    */
-  const applyGazeProbeToCapabilities = (probe) => {
+  const applyProbeToCapabilities = (probe) => {
     const capability = runtime.avatarMotion;
     if (capability === null || capability === undefined || !Array.isArray(capability.channels)) return;
     let touched = false;
@@ -4345,7 +4370,7 @@ export function apply(ctx, config) {
    * emits one `avatar.mapping.probe` event with its `source`, and never retries. A missing/disposed
    * runtime is a safe failure, not a throw.
    */
-  const probeAvatarGazeMapping = async ({ source = 'manual', cancelled = null } = {}) => {
+  const probeAvatarMapping = async ({ source = 'manual', cancelled = null } = {}) => {
     const probeSource = source === 'startup' ? 'startup' : 'manual';
     const current = avatarRuntime;
     let result;
@@ -4359,7 +4384,7 @@ export function apply(ctx, config) {
       };
     } else {
       try {
-        result = await current.probeGazeMapping(
+        result = await current.probeMapping(
           typeof cancelled === 'function' ? { cancelled } : {},
         );
       } catch (error) {
@@ -4402,7 +4427,7 @@ export function apply(ctx, config) {
       channels,
       unverified,
     };
-    applyGazeProbeToCapabilities({ channels, unverified });
+    applyProbeToCapabilities({ channels, unverified });
     await log.emit('avatar.mapping.probe', {
       source: probeSource,
       ok,
@@ -4431,7 +4456,7 @@ export function apply(ctx, config) {
     };
   };
 
-  // ---- automatic startup gaze verification (settings.avatar.verifyMappingsOnStartup) --------
+  // ---- automatic startup action verification (settings.avatar.verifyMappingsOnStartup) ----
   /**
    * At most ONE automatic probe per VTS connection generation. Triggered by the completed
    * connect/discovery path, never by a timer and never by a retry loop:
@@ -4439,7 +4464,8 @@ export function apply(ctx, config) {
    *  - privacy cancels the startup attempt (no retry after leaving it);
    *  - a missing/disposed runtime or an unpublished discovery does not consume the attempt, so
    *    the later trigger from the completed discovery can still run;
-   *  - no gaze input+modelParams records one skip line and consumes the connection's attempt;
+   *  - no gaze/head input+modelParams (plus eye rows when the plugin owns blinking) records one
+   *    skip line and consumes the connection's attempt;
    *  - a completed probe (success, no-change, error or stale) is the only result, and its
    *    in-flight cancellation predicate discards it before it can verify anything.
    */
@@ -4451,9 +4477,12 @@ export function apply(ctx, config) {
       return false;
     }
   };
+  /** The startup probe measures gaze + head, and eye rows only while the plugin owns blinking. */
   const avatarProbeTargetAvailable = (capability = runtime.avatarMotion) => {
     const rows = Array.isArray(capability?.channels) ? capability.channels : [];
-    return rows.some((row) => (row?.channel === 'gazeX' || row?.channel === 'gazeY')
+    const channels = ['gazeX', 'gazeY', 'headX', 'headY', 'headZ'];
+    if (storedAvatarBlinkOwner() === 'plugin') channels.push('eyeOpenL', 'eyeOpenR');
+    return rows.some((row) => channels.includes(row?.channel)
       && row?.injectable !== false
       && String(row?.inputName ?? '').trim().length > 0
       && Array.isArray(row?.modelParams) && row.modelParams.length > 0);
@@ -4490,9 +4519,9 @@ export function apply(ctx, config) {
       avatarAutoProbeGeneration = generation;
       await log.emit('avatar.mapping.probe.skipped', {
         source: 'startup',
-        reason: 'no-gaze-mapping',
+        reason: 'no-probe-mapping',
       }).catch(() => {});
-      return { ok: true, skipped: 'no-gaze-mapping' };
+      return { ok: true, skipped: 'no-probe-mapping' };
     }
     // Mark before awaiting: a second trigger from the same discovery/connect path must never start
     // a second measurement, and an error/timeout is recorded once rather than retried.
@@ -4504,7 +4533,7 @@ export function apply(ctx, config) {
       if (current.snapshot().disposed === true) return true;
       return avatarMappingPrivacyLocked();
     };
-    return probeAvatarGazeMapping({ source: 'startup', cancelled });
+    return probeAvatarMapping({ source: 'startup', cancelled });
   }
 
   /** Idempotent teardown; the disposed instance stays readable from status. */
@@ -4678,11 +4707,17 @@ export function apply(ctx, config) {
        * nothing yet; it never throws and never contains an input name/path.
        */
       motionLayers: snap.motionLayers ?? null,
-      /** Verified takeover set; unmapped channels are skipped, failed explicit probes unverified. */
+      /**
+       * Verified takeover set; unmapped channels are skipped, failed probes unverified. Head axes
+       * and per-channel probe evidence are reported separately so name matching cannot pass as a
+       * runtime proof.
+       */
       channels: {
         controlled: snap.channels?.controlled ?? [],
         skipped: snap.channels?.skipped ?? [],
         unverified: snap.channels?.unverified ?? [],
+        headUnverified: snap.channels?.headUnverified ?? [],
+        probe: snap.channels?.probe ?? {},
       },
       idleParams: {
         mapped: snap.idleParams?.mapped ?? [],
@@ -8957,6 +8992,21 @@ export function apply(ctx, config) {
       if (result.running) ambientAutostart?.clearDeferred();
     }
 
+    if (action === 'callMode') {
+      // One key toggles the same persisted call mode as the settings page. Entering still
+      // requires an enabled address name; a refused enter changes nothing and is surfaced in
+      // the trigger payload/event.
+      try {
+        const result = callMode.mode === 'call'
+          ? await exitCallMode('hotkey')
+          : await enterCallMode('hotkey');
+        payload.mode = result.mode;
+        if (!result.ok) payload.error = result.error;
+      } catch (error) {
+        payload.error = error?.message ?? String(error);
+      }
+    }
+
     await log.emit('hotkey.triggered', payload);
   };
 
@@ -10769,7 +10819,7 @@ export function apply(ctx, config) {
   register({
     name: 'assistant_hotkeys',
     description:
-      'Inspect or change the global hotkey bindings (mic = toggle microphone, vision = toggle privacy, layerEdit = toggle avatar-layer edit mode, ambient = toggle ambient audio), or simulate a combo to test the poller end to end. Supports numpad names (Num1..Num9, NumAdd, NumMultiply, NumSubtract, NumDecimal, NumDivide, distinct from the main-row digits) and single non-printing keys such as F9 or Num5; plain letters/digits/symbols still need a modifier. Numpad Enter shares VK_RETURN with Enter and cannot be distinguished, so bind it as Enter.',
+      'Inspect or change the global hotkey bindings (mic = toggle microphone, vision = toggle privacy, layerEdit = toggle avatar-layer edit mode, ambient = toggle ambient audio, callMode = toggle call/normal mode), or simulate a combo to test the poller end to end. Supports numpad names (Num1..Num9, NumAdd, NumMultiply, NumSubtract, NumDecimal, NumDivide, distinct from the main-row digits) and single non-printing keys such as F9 or Num5; plain letters/digits/symbols still need a modifier. Numpad Enter shares VK_RETURN with Enter and cannot be distinguished, so bind it as Enter.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -19933,7 +19983,7 @@ export function apply(ctx, config) {
       live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
       vtsAuth,
       /**
-       * Explicit gaze-mapping evidence, kept separate from `live2d.capabilities` (name/discovery
+       * Explicit action-mapping evidence, kept separate from `live2d.capabilities` (name/discovery
        * evidence): `lastAt:null, ok:null` means no probe has been run, not a failure.
        * `channelMap` is the persisted explicit input names (safe view: no paths, no settings dump).
        */
@@ -20533,8 +20583,8 @@ export function apply(ctx, config) {
     get vtsConnect() { return vtsConnect; },
     get writeSettings() { return writeSettings; }
   }) },
-// One explicit user click proves (or fails to prove) the gaze mapping; never automatic/retried.
-{ actions: ['avatar.mapping.probe'], handle: async () => probeAvatarGazeMapping() },
+// One explicit user click proves (or fails to prove) the action mapping; never automatic/retried.
+{ actions: ['avatar.mapping.probe'], handle: async () => probeAvatarMapping() },
 // Explicit startup-verification switch (settings.avatar.verifyMappingsOnStartup), default true.
 { actions: ['avatar.verifyMappingsOnStartup.set'], handle: async (body) => setAvatarVerifyMappingsOnStartup(body) },
 // Explicit gaze input names (settings.avatar.channelMap); validated, persisted, then rediscovered.

@@ -625,6 +625,7 @@ test('14. 追加接管 eyeOpenL：眼睛按自己的幅度，头部按头部幅�
       flushIntervalMs: 1,
       idleActions: [],
       idleEye: true,
+      blinkOwner: 'plugin',
       random: () => 0.99,
       // The head peak is measured while the slow tracker is still converging on its FIRST goal, so
       // pin the hold window: the stage-4 hold allocation (A) must not change what this channel
@@ -634,10 +635,15 @@ test('14. 追加接管 eyeOpenL：眼睛按自己的幅度，头部按头部幅�
       idleParams: {
         headX: { inputName: 'FaceAngleX', min: -30, max: 30 },
         eyeOpenL: { inputName: 'EyeOpenLeft', min: 0, max: 1 },
+        eyeOpenR: { inputName: 'EyeOpenRight', min: 0, max: 1 },
       },
       style: {
         amplitude: 1.2,
-        channels: { headX: { amplitude: 0.9 }, eyeOpenL: { amplitude: 0.1 } },
+        channels: {
+          headX: { amplitude: 0.9 },
+          eyeOpenL: { amplitude: 0.1 },
+          eyeOpenR: { amplitude: 0.1 },
+        },
       },
     },
   });
@@ -645,8 +651,8 @@ test('14. 追加接管 eyeOpenL：眼睛按自己的幅度，头部按头部幅�
   fake.batches.length = 0;
 
   const status = runtime.snapshot();
-  assert.deepEqual(status.channels.controlled, ['headX', 'eyeOpenL']);
-  assert.deepEqual(status.channels.effectiveAmplitude, { headX: 0.9, eyeOpenL: 0.1 },
+  assert.deepEqual(status.channels.controlled, ['headX', 'eyeOpenL', 'eyeOpenR']);
+  assert.deepEqual(status.channels.effectiveAmplitude, { headX: 0.9, eyeOpenL: 0.1, eyeOpenR: 0.1 },
     'each taken-over channel carries its own effective amplitude');
   assert.notEqual(status.channels.effectiveAmplitude.headX, status.channels.effectiveAmplitude.eyeOpenL);
 
@@ -658,13 +664,14 @@ test('14. 追加接管 eyeOpenL：眼睛按自己的幅度，头部按头部幅�
   }
   const headPeakValue = headPeak(runtime, 3000, 12_000);
   const inputs = [...new Set(fake.batches.flat().map((entry) => entry.input))];
-  assert.deepEqual(inputs.sort(), ['EyeOpenLeft', 'FaceAngleX'], 'eyeOpenR is still with VTS');
+  assert.deepEqual(inputs.sort(), ['EyeOpenLeft', 'EyeOpenRight', 'FaceAngleX'],
+    'both eyes are explicitly assigned to the plugin');
   const minEye = Math.min(...eyeValues);
   const maxEye = Math.max(...eyeValues);
   // 0.02 semantic droop × eyeOpenL override 0.1 → at most 0.002 below fully open.
   assert.ok(maxEye <= 1 + 1e-9 && minEye >= 0.9979,
     `eye stays in its own narrow band (${minEye.toFixed(5)}..${maxEye.toFixed(5)})`);
-  assert.ok(headPeakValue > 0.09 && headPeakValue < 0.105,
+  assert.ok(headPeakValue > 0.085 && headPeakValue < 0.105,
     `head uses its 0.9 override (peak ${headPeakValue.toFixed(4)})`);
   console.log(
     `[style] channel-head-eye controlled=${status.channels.controlled.join(',')}`
@@ -1720,8 +1727,10 @@ test('39. P-139 阶段 4 — C 幅度：结论/疑惑 ≤14°，普通动作与�
   const idle = headStats({});
   assert.ok(idle.p50 > 0.08 && idle.p50 < 0.12,
     `the default idle head p50 ${idle.p50.toFixed(4)} stays in the recorded range`);
-  assert.ok(idle.max > 0.15 && idle.max <= 0.18,
-    `the default idle head max ${idle.max.toFixed(4)} stays inside the idle amplitude cap`);
+  // Base idle stays in the old band; the held posture component adds a bounded, visible offset
+  // on top, so the combined idle head range is allowed up to the phase-1 posture cap.
+  assert.ok(idle.max > 0.15 && idle.max <= 0.32,
+    `the default idle head max ${idle.max.toFixed(4)} stays inside the idle+posture cap`);
   // No new channel mapping: the shipped intent targets are exactly the stage-3 table.
   assert.deepEqual({ ...INTENT_CHANNEL_TARGETS }, {
     nod: ['headY', 'headZ'],

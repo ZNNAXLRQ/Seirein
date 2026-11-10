@@ -29,7 +29,7 @@ const OLD_BINDINGS = {
   unknownAction: 'Ctrl+Alt+U',
 };
 
-const KEPT = ['ambient', 'layerEdit', 'mic', 'vision'];
+const KEPT = ['ambient', 'callMode', 'layerEdit', 'mic', 'vision'];
 /** OLD_BINDINGS predates ambient, so pruning alone keeps only these three. */
 const PRUNED = ['layerEdit', 'mic', 'vision'];
 const RETIRED = ['avatar', 'pauseAll', 'ptt', 'settings', 'unknownAction'];

@@ -387,7 +387,7 @@ test('4. 无 gaze 映射与未连接均安全跳过', async (t) => {
   }), true, 'discovery completed without a gaze mapping');
   assert.equal(await waitFor(async () => (await host.events())
     .some((entry) => entry.type === 'avatar.mapping.probe.skipped'
-      && entry.payload?.reason === 'no-gaze-mapping')), true,
+      && entry.payload?.reason === 'no-probe-mapping')), true,
   'the skipped attempt is recorded once');
   await sleep(250);
   assert.equal((await host.events()).some((entry) => entry.type === 'avatar.mapping.probe'), false,

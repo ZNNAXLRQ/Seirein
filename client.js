@@ -307,13 +307,14 @@ window.__ModuleLoader__.load({
     // ---- TTS 预热状态（只读展示）结束 ----------------------------------------------------------
 
     /** The global hotkeys the host ships; anything else in status is ignored. */
-    const HOTKEY_ACTIONS = ['mic', 'vision', 'layerEdit', 'ambient'];
+    const HOTKEY_ACTIONS = ['mic', 'vision', 'layerEdit', 'ambient', 'callMode'];
 
     const HOTKEY_LABEL = {
       mic: '麦克风静音 / 恢复',
       vision: '隐私场景（视觉）切换',
       layerEdit: '形象编辑模式',
       ambient: '环境声音',
+      callMode: '通话模式 / 普通模式切换',
     };
 
     const KIND_OPTIONS = ['source', 'endpoint', 'convention', 'credential', 'note'];
@@ -5493,7 +5494,7 @@ window.__ModuleLoader__.load({
       // 眨眼控制方（settings.avatar.blinkOwner）：null = 未编辑，按钮回显 status；
       // 失败时回到最近一次确认值，不把界面留在宿主拒绝的选择上。
       const [avatarBlinkOwnerDraft, setAvatarBlinkOwnerDraft] = useState(null);
-      // 启动时自动验证视线映射（settings.avatar.verifyMappingsOnStartup）：null = 未编辑，
+      // 启动时自动验证动作映射（settings.avatar.verifyMappingsOnStartup）：null = 未编辑，
       // 开关回显 status；保存失败回到 status 的已确认值。
       const [avatarAutoVerifyDraft, setAvatarAutoVerifyDraft] = useState(null);
       const [fastpathReviewOpen, setFastpathReviewOpen] = useState(false);
@@ -7381,21 +7382,33 @@ window.__ModuleLoader__.load({
               };
             }
             const entries = Object.entries(record.channels ?? {});
+            // The probe now covers head (and eyes while the plugin owns blinking), so the result row
+            // uses human labels instead of raw channel ids.
+            const channelLabel = {
+              gazeX: '视线X',
+              gazeY: '视线Y',
+              headX: '头部X',
+              headY: '头部Y',
+              headZ: '头部Z',
+              eyeOpenL: '左眼',
+              eyeOpenR: '右眼',
+            };
+            const labelOf = (name) => channelLabel[name] ?? name;
             if (record.ok === false) {
               const reason = entries
                 .map(([, row]) => String(row?.error ?? ''))
                 .find((text) => text.length > 0)
-                ?? (entries.length === 0 ? 'VTS 未连接或没有可探测的视线参数' : '探测失败');
+                ?? (entries.length === 0 ? 'VTS 未连接或没有可探测的动作参数' : '探测失败');
               return { state: 'failed', text: `失败：${reason}` };
             }
-            const changed = entries.filter(([, row]) => row?.changed === true).map(([name]) => name);
-            const unchanged = entries.filter(([, row]) => row?.changed !== true).map(([name]) => name);
+            const changed = entries.filter(([, row]) => row?.changed === true).map(([name]) => labelOf(name));
+            const unchanged = entries.filter(([, row]) => row?.changed !== true).map(([name]) => labelOf(name));
             if (entries.length > 0 && unchanged.length === 0) {
               return { state: 'connected', text: `已连通：${changed.join('、')}` };
             }
             return {
               state: 'unchanged',
-              text: `未变化：${unchanged.join('、') || '视线通道'}（注入后参数未变）`,
+              text: `未变化：${unchanged.join('、') || '动作通道'}（注入后参数未变）`,
             };
           })();
           // 启动时自动验证：设置只影响“下一次连接/能力发现”的一次自动探测，不会立即重试，
@@ -7412,8 +7425,8 @@ window.__ModuleLoader__.load({
             if (result?.ok === true) {
               setAvatarAutoVerifyDraft(result.verifyMappingsOnStartup !== false);
               show(result.verifyMappingsOnStartup !== false
-                ? '已开启启动时自动验证视线映射（下次连接生效）'
-                : '已关闭启动时自动验证视线映射');
+                ? '已开启启动时自动验证动作映射（下次连接生效）'
+                : '已关闭启动时自动验证动作映射');
             } else {
               setAvatarAutoVerifyDraft(autoVerifySaved);
               show(`保存启动时自动验证设置失败：${result?.error ?? '设置未保存'}`);
@@ -7575,12 +7588,12 @@ window.__ModuleLoader__.load({
                       h('span', { style: styles.hint }, caps?.error ? `探测失败：${caps.error}` : ''),
                     ),
                     h('div', { style: { ...styles.row, marginTop: 6 } },
-                      settingsField(h, '启动时自动验证视线映射',
+                      settingsField(h, '启动时自动验证动作映射',
                         h('button', {
                           'data-settings-toggle': 'avatar-verify-mappings-on-startup',
                           style: { ...(autoVerifyOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
                           disabled: busy !== '',
-                          title: '每次 VTS 连接/能力发现完成后自动验证一次；失败不重试，也不永久写入验证结果',
+                          title: '每次 VTS 连接/能力发现完成后自动验证一次（视线与头部，插件接管眨眼时也测眨眼）；失败不重试，也不永久写入验证结果',
                           onClick: () => void setAutoVerify(),
                         }, autoVerifyOn ? '已开启' : '已关闭')),
                       h('span', { style: styles.hint }, '每次连接只自动验证一次；失败不重试，可随时手动验证。'),
@@ -7590,10 +7603,10 @@ window.__ModuleLoader__.load({
                         style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
                         disabled: busy !== '',
                         title: ready
-                          ? '注入一个测试值，检查视线输入是否真的驱动模型参数（只执行一次）'
+                          ? '短暂暂停动作约数秒，注入测试值检查视线、头部（插件接管眨眼时也测眨眼）输入是否真的驱动模型参数（只执行一次）'
                           : 'VTS 未连接：点击会返回失败原因，不影响其它设置',
                         onClick: () => act({ action: 'avatar.mapping.probe' }, 'avatar-mapping'),
-                      }, '验证视线映射'),
+                      }, '验证动作映射'),
                       h('span', {
                         style: mappingView.state === 'failed'
                           ? { ...styles.value, color: DANGER }
@@ -7601,6 +7614,7 @@ window.__ModuleLoader__.load({
                         'data-avatar-mapping': mappingView.state,
                       }, mappingView.text),
                     ),
+                    h('div', { style: styles.hint }, '验证会短暂暂停动作，测视线、头部与眨眼（仅插件接管时）；只增加映射证据，不改变基础层幅度或组件。'),
                     h('div', { style: styles.hint }, '「可注入」只说明值能发出去；「已验证」才说明有证据它驱动该部位。模型是否响应取决于 VTS 内的参数映射。'),
                   );
                 })(),
@@ -7633,7 +7647,7 @@ window.__ModuleLoader__.load({
                       + (invalidConfigured.length > 0
                         ? ` · 配置无效：${invalidConfigured.map(([channel]) => channel).join('、')} 不在 VTS 输入列表，未启用`
                         : needsProbe.length > 0
-                          ? ' · 仍需验证（点「验证视线映射」实测后才算接通）'
+                          ? ' · 仍需验证（点「验证动作映射」实测后才算接通）'
                           : ' · 已通过运行期验证');
                   const channelRow = (channel, label) => settingsField(h, label,
                     h('input', {
