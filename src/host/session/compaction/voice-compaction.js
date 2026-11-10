@@ -93,6 +93,23 @@ export const VOICE_NATIVE_EXCLUDED_IDS = Object.freeze([
   'persona', 'agent-instructions', 'planning', 'compaction',
 ]);
 
+/**
+ * The packages that provide the compaction service, independent of the row `id` and of how deeply
+ * a release nests them. A duplicated `compaction` group is not the only way to create a second
+ * compaction service: a renamed wrapper can hide the same package rows. Both the native merge and
+ * the audit therefore decide by package name, never by group id alone.
+ * @param {unknown} name package name of one declaration row
+ * @returns {boolean} whether the row provides compaction (basic, command or pruner)
+ */
+export function isVoiceCompactionPackage(name) {
+  const value = typeof name === 'string' ? name.trim() : '';
+  if (value.length === 0) return false;
+  return VOICE_COMPACTION_REQUIRED_PLUGINS.includes(value)
+    || VOICE_COMPACTION_OPTIONAL_PLUGINS.includes(value)
+    || value.includes('/dsh-compaction-')
+    || value.includes('/dsh-command-compact');
+}
+
 /** Whether a declaration carries the group composed from the live standard preset. */
 export function hasVoiceNativeTools(definition) {
   return Array.isArray(definition?.plugins)
@@ -115,18 +132,24 @@ export function mergeVoicePresetWithNativeTools(base, standard) {
     const id = typeof row.id === 'string' ? row.id : '';
     const name = packageNameOf(row);
     return VOICE_NATIVE_EXCLUDED_IDS.includes(id)
+      || isVoiceCompactionPackage(name)
       || name.includes('/dsh-persona')
       || name.includes('/dsh-agent-instructions')
-      || name.includes('/dsh-plan-mode')
-      || name.includes('/dsh-compaction-');
+      || name.includes('/dsh-plan-mode');
   };
-  // Recursive: a persona row must be removed even when a release renames or nests its group.
+  // Recursive: a compaction provider must be removed by PACKAGE even when a release renames the
+  // wrapper groups, and an identity row must be removed even when a release nests it differently.
   // All other row keys (disabled, isolate, config) are copied so group semantics survive.
   const filterRow = (row) => {
     if (excluded(row)) return null;
     const copy = { ...row };
     if (Array.isArray(row.config)) {
-      copy.config = row.config.map(filterRow).filter((entry) => entry !== null);
+      const kept = row.config.map(filterRow).filter((entry) => entry !== null);
+      // A wrapper that only carried removed rows must disappear with them; keeping an empty but
+      // valid group would leave a structural row with no purpose (and, for a compaction wrapper,
+      // misleading composition evidence).
+      if (row.group === true && row.config.length > 0 && kept.length === 0) return null;
+      copy.config = kept;
     }
     return copy;
   };
@@ -160,6 +183,16 @@ export const VOICE_COMPACTION_NEAR_LIMIT_THROTTLE_MS = 60_000;
 export const VOICE_COMPACTION_DEFAULT_WINDOW_TOKENS = 128_000;
 /** What the operator must do when a live Agent was never assembled. */
 export const VOICE_COMPACTION_RESTART_NOTE = '需重启 DSH 或执行 voice.session.recover 重新装配';
+/**
+ * Concrete recovery for the one migration case this plugin cannot fix at runtime: a same-id
+ * compaction-only declaration that this instance did not register. The shipped registry has no
+ * provenance and no safe replace/unregister for an arbitrary record, so the declaration must be
+ * removed at its SOURCE (profile patch / bundle), never by mutating `agentPresets.definitions`.
+ */
+export const VOICE_NATIVE_TOOLS_RECOVERY = Object.freeze({
+  UNOWNED: '先检查 profile patch 或插件 bundle 中是否有 id=seirein-voice 的旧 agent preset 行：有则删除（或改成含 seirein-native-tools 的新定义），再重启 DSH；没有则重启 DSH 释放旧插件实例后会重新注册。不要直接修改运行中的 agentPresets.definitions。',
+  STANDARD_UNAVAILABLE: '当前读不到 standard preset：确认它已装载后重启 DSH，插件会在注册时重新组合原生能力。',
+});
 /**
  * Written once when a COMPLETED compaction left context pressure at/above the threshold, or freed
  * nothing. It is a debug trace, not a trigger: nothing rolls the session over on it.
@@ -239,6 +272,9 @@ export function assessVoiceCompactionPreset(definition, { allowNativeTools = fal
       }
       hasExtraKeys(row, native ? 'native' : 'plugin');
       if (row.group === true) {
+        // A renamed wrapper is structural, but a nested group still labelled `compaction` is the
+        // same second-compaction marker the top-level check rejects.
+        if (native && row.id === 'compaction') addExtra('native:compaction-group');
         walk(row.config, depth + 1, { native });
         continue;
       }
@@ -248,8 +284,12 @@ export function assessVoiceCompactionPreset(definition, { allowNativeTools = fal
         continue;
       }
       if (native) {
-        if (name.includes('/dsh-persona') || name.includes('/dsh-agent-instructions')
-          || name.includes('/dsh-plan-mode') || name.includes('/dsh-compaction-')) {
+        // Package-based: `command-compact` and any compaction-* row cannot hide behind a renamed
+        // group or a local row id. The native group may carry native capabilities, never a second
+        // compaction service.
+        if (isVoiceCompactionPackage(name)
+          || name.includes('/dsh-persona') || name.includes('/dsh-agent-instructions')
+          || name.includes('/dsh-plan-mode')) {
           addExtra(`native:${name}`);
         }
         continue;
@@ -345,6 +385,13 @@ export function createVoiceCompaction({
   let presetPending = null;
   /** Disposer returned by `agentPresets.register()`; owned only when this instance registered. */
   let presetUnregister = null;
+  /**
+   * The registry record this instance's last successful `register()` installed. Ownership is
+   * proven by identity: the shipped record has no provenance field, but `definitions.get(id)` is
+   * the exact object `register()` stored, so a changed object means another declaration now owns
+   * the id and must not be disposed by this instance.
+   */
+  let ownedRecord = null;
   /** A detach in progress; a later attach waits for the previous definition to be gone. */
   let presetRelease = null;
   /** Last sampled pressure (worst voice Agent), independent of any event emission. */
@@ -442,6 +489,17 @@ export function createVoiceCompaction({
   const readExisting = async (presets) => readPresetById(presets, presetId);
 
   /**
+   * Whether the registry exposes the real record map. Ownership is proven by the identity of the
+   * record object, so a build that answers only metadata (the `has`/`list` fallback above) cannot
+   * prove it and is therefore never upgraded in place.
+   */
+  const hasReadableDefinitions = (presets) => {
+    const declarations = presets?.definitions;
+    return declarations instanceof Map
+      || (declarations !== null && typeof declarations === 'object');
+  };
+
+  /**
    * Ensure the plugin-owned preset exists, at most once per instance.
    *
    * A same-id declaration is reused ONLY after `assessVoiceCompactionPreset` proves it carries the
@@ -451,21 +509,22 @@ export function createVoiceCompaction({
    * callers fail open, so voice keeps running without compaction — and status reports exactly that,
    * so fail-open is never mistaken for a working compressor. `unavailable` is retried because the
    * registry service may simply not be mounted yet.
+   *
+   * Upgrade policy (checked against `@deepseek-ai/dsh-agent-preset-registry` 0.2.2-rc.1, shipped
+   * at `app.asar/dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js`):
+   *  - `register()` rejects a duplicate id (lines 486-489) and returns the ONLY removal handle
+   *    (lines 497-509); `definitions` stores `{ config, context, ready }` with no provenance
+   *    (lines 451, 490-494);
+   *  - `resolve()`/`list()`/`mount()` only read (lines 612-624, 702-711); there is no
+   *    `replace`/`unregister(id)` method, and deleting from `definitions` directly would skip
+   *    `generation.retired`/`collect()` (lines 561-565), leaving the old revision live.
+   * Therefore only a declaration THIS instance registered can be upgraded (proven by the record's
+   * object identity plus its disposer). A leftover declaration is never deleted or overwritten: it
+   * is reused with `nativeToolsStale` and concrete source-level recovery steps.
    */
   const ensurePreset = async (presetsArg) => {
     if (presetRelease !== null) await presetRelease.catch(() => {});
-    if (
-      presetState.status === 'registered' || presetState.status === 'reused'
-      || presetState.status === 'failed' || presetState.status === 'conflict'
-    ) {
-      return presetState;
-    }
     if (presetPending !== null) return await presetPending;
-    const presets = presetsArg ?? getService('agentPresets');
-    if (presets === undefined || presets === null) {
-      presetState = { status: 'unavailable', source: null, registered: false, error: null, reason: null, at: Date.now() };
-      return presetState;
-    }
 
     /** Reuse only an audited-compatible declaration; anything else is an explicit conflict. */
     const adoptExisting = (record, standard = null) => {
@@ -487,21 +546,136 @@ export function createVoiceCompaction({
         return presetState;
       }
       const nativeTools = hasVoiceNativeTools(definition);
+      // A metadata-only build can answer `{ config: { id } }` without the child list; that is not
+      // a readable standard definition and must stay "unknown", never "not stale".
+      const standardReadable = Array.isArray(standard?.plugins);
+      // Compare against the target a fresh registration would install: a leftover compaction-only
+      // declaration is stale exactly when the live standard preset still contributes native rows.
+      const target = standardReadable
+        ? mergeVoicePresetWithNativeTools(presetDefinition, standard)
+        : null;
+      const nativeAvailable = target !== null && hasVoiceNativeTools(target);
+      const stale = nativeTools
+        ? null // a reused native group proves it exists, but not which standard version it copied
+        : (nativeAvailable ? true : (standardReadable ? false : null));
       presetState = {
         status: 'reused', source, registered: false, error: null, reason: null,
         at: Date.now(),
         nativeTools,
         nativeToolsSource: nativeTools ? 'reused-standard' : 'compaction-only',
-        // Reuse never re-reads standard. A compact-only declaration is therefore visibly behind
-        // the current standard definition; a reused native declaration cannot prove its version.
-        nativeToolsStale: nativeTools ? null : standard !== null,
+        nativeToolsStale: stale,
+        nativeToolsUpgrade: nativeTools
+          ? 'not-needed'
+          : (nativeAvailable ? 'blocked-unowned' : (standardReadable ? 'not-needed' : 'blocked-standard-unavailable')),
+        nativeToolsRecovery: stale === true
+          ? VOICE_NATIVE_TOOLS_RECOVERY.UNOWNED
+          : (stale === null && !nativeTools ? VOICE_NATIVE_TOOLS_RECOVERY.STANDARD_UNAVAILABLE : ''),
       };
       note('voice.compaction.preset.reused', {
         presetId, source, plugins: audit.plugins,
-        nativeTools, nativeToolsStale: presetState.nativeToolsStale,
+        nativeTools, nativeToolsSource: presetState.nativeToolsSource,
+        nativeToolsStale: presetState.nativeToolsStale,
+        nativeToolsUpgrade: presetState.nativeToolsUpgrade,
       });
       return presetState;
     };
+
+    /**
+     * Upgrade a compaction-only declaration THIS instance registered after the live standard
+     * preset became readable. Ownership is required twice: the disposer came from our own
+     * `register()`, and the live record is still the exact object that registration stored. If
+     * another declaration now owns the id, the stale disposer is dropped WITHOUT calling it (the
+     * shipped disposer deletes by id and would remove the other declaration).
+     */
+    const upgradeOwned = async (presets) => {
+      const disposer = presetUnregister;
+      if (presetState.status !== 'registered' || presetState.nativeTools === true
+        || typeof disposer !== 'function' || ownedRecord === null
+        || !hasReadableDefinitions(presets)) {
+        return presetState;
+      }
+      let standardRecord;
+      try {
+        standardRecord = await readPresetById(presets, 'standard');
+      } catch {
+        return presetState;
+      }
+      const standard = definitionOf(standardRecord);
+      const effective = mergeVoicePresetWithNativeTools(presetDefinition, standard);
+      if (!hasVoiceNativeTools(effective)) return presetState;
+      const current = await readExisting(presets);
+      if (current === undefined || current !== ownedRecord) {
+        presetUnregister = null;
+        ownedRecord = null;
+        return adoptExisting(current, standard);
+      }
+      presetUnregister = null;
+      ownedRecord = null;
+      try {
+        await disposer();
+        const nextDisposer = await presets.register(effective);
+        presetUnregister = typeof nextDisposer === 'function' ? nextDisposer : null;
+        ownedRecord = (await readExisting(presets)) ?? null;
+        const nativeTools = hasVoiceNativeTools(definitionOf(ownedRecord));
+        presetState = {
+          status: 'registered', source: 'registered', registered: true,
+          error: null, reason: null, at: Date.now(), nativeTools,
+          nativeToolsSource: nativeTools ? 'standard-live' : 'compaction-only',
+          nativeToolsStale: nativeTools ? false : null,
+          nativeToolsUpgrade: nativeTools ? 'applied' : 'not-needed',
+          nativeToolsRecovery: nativeTools ? '' : VOICE_NATIVE_TOOLS_RECOVERY.STANDARD_UNAVAILABLE,
+        };
+        note('voice.compaction.preset.registered', {
+          presetId,
+          source: 'registered',
+          upgraded: true,
+          nativeTools,
+          nativeToolsSource: presetState.nativeToolsSource,
+          plugins: Array.isArray(effective?.plugins) ? effective.plugins.length : 0,
+        });
+      } catch (error) {
+        presetState = {
+          status: 'failed', source: null, registered: false,
+          error: describe(error), reason: null, at: Date.now(),
+          nativeTools: false, nativeToolsSource: 'compaction-only',
+          nativeToolsStale: null, nativeToolsUpgrade: 'failed',
+          nativeToolsRecovery: VOICE_NATIVE_TOOLS_RECOVERY.UNOWNED,
+        };
+        note('voice.compaction.preset.register-failed', {
+          presetId, error: presetState.error, upgraded: true,
+        });
+      }
+      return presetState;
+    };
+
+    if (presetState.status === 'registered') {
+      // Only an owned compaction-only registration can be safely refreshed. Reused, failed and
+      // conflict states are latched exactly as before.
+      if (presetState.nativeTools !== true && typeof presetUnregister === 'function') {
+        const presets = presetsArg ?? getService('agentPresets');
+        if (presets !== undefined && presets !== null) {
+          const run = upgradeOwned(presets);
+          presetPending = run;
+          try {
+            return await run;
+          } finally {
+            if (presetPending === run) presetPending = null;
+          }
+        }
+      }
+      return presetState;
+    }
+    if (
+      presetState.status === 'reused'
+      || presetState.status === 'failed' || presetState.status === 'conflict'
+    ) {
+      return presetState;
+    }
+    const presets = presetsArg ?? getService('agentPresets');
+    if (presets === undefined || presets === null) {
+      presetState = { status: 'unavailable', source: null, registered: false, error: null, reason: null, at: Date.now() };
+      return presetState;
+    }
 
     const run = (async () => {
       const existing = await readExisting(presets);
@@ -525,31 +699,39 @@ export function createVoiceCompaction({
       // The companion preset is composed from the LIVE standard preset, not a frozen tool list:
       // a new DSH release or a user-installed native plugin appears in the standard declaration
       // and is inherited here on the next registration. Persona, coding instructions, plan mode
-      // and the duplicate compaction group are deliberately excluded by the merge.
+      // and any compaction provider (even inside renamed groups) are deliberately excluded.
       let effective = presetDefinition;
       let nativeTools = false;
+      let standardReadable = false;
       try {
         const standardRecord = await readPresetById(presets, 'standard');
         const standard = definitionOf(standardRecord);
+        standardReadable = Array.isArray(standard?.plugins);
         effective = mergeVoicePresetWithNativeTools(presetDefinition, standard);
         nativeTools = hasVoiceNativeTools(effective);
       } catch {
         // Standard preset unavailable: keep the compaction-only fallback rather than blocking voice.
+        standardReadable = false;
       }
       try {
         const disposer = await presets.register(effective);
         presetUnregister = typeof disposer === 'function' ? disposer : null;
+        // Only a readable record map can prove ownership later; metadata-only builds stay unowned.
+        ownedRecord = hasReadableDefinitions(presets) ? ((await readExisting(presets)) ?? null) : null;
         presetState = {
           status: 'registered', source: 'registered', registered: true,
           error: null, reason: null, at: Date.now(), nativeTools,
           nativeToolsSource: nativeTools ? 'standard-live' : 'compaction-only',
-          nativeToolsStale: false,
+          nativeToolsStale: nativeTools ? false : (standardReadable ? false : null),
+          nativeToolsUpgrade: nativeTools || standardReadable ? 'not-needed' : 'blocked-standard-unavailable',
+          nativeToolsRecovery: nativeTools || standardReadable ? '' : VOICE_NATIVE_TOOLS_RECOVERY.STANDARD_UNAVAILABLE,
         };
         note('voice.compaction.preset.registered', {
           presetId,
           source: 'registered',
           nativeTools,
           nativeToolsSource: presetState.nativeToolsSource,
+          nativeToolsStale: presetState.nativeToolsStale,
           plugins: Array.isArray(effective?.plugins) ? effective.plugins.length : 0,
         });
       } catch (error) {
@@ -569,7 +751,9 @@ export function createVoiceCompaction({
             note('voice.compaction.preset.conflict', { presetId, source: 'unknown', reason: presetState.reason });
             return presetState;
           }
-          return adoptExisting(raced);
+          let standardRecord = null;
+          try { standardRecord = await readPresetById(presets, 'standard'); } catch { standardRecord = null; }
+          return adoptExisting(raced, definitionOf(standardRecord));
         }
         presetState = { status: 'failed', source: null, registered: false, error: describe(error), reason: null, at: Date.now() };
         note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
@@ -767,6 +951,7 @@ export function createVoiceCompaction({
     const early = presetUnregister;
     const releasedSource = presetState.source;
     presetUnregister = null;
+    ownedRecord = null;
     presetState = { status: 'idle', source: null, registered: false, error: null, reason: null, at: 0 };
     if (pending === null && typeof early !== 'function') return null;
     const release = (async () => {
@@ -774,6 +959,7 @@ export function createVoiceCompaction({
       // A registration that settled while detach waited is still ours to remove.
       const disposer = early ?? presetUnregister;
       presetUnregister = null;
+      ownedRecord = null;
       if (typeof disposer === 'function') {
         await disposer();
         note('voice.compaction.preset.released', { presetId, source: releasedSource, owned: true });
