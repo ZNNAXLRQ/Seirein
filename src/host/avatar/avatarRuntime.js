@@ -567,6 +567,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * older one: the older probe's late result may not overwrite the evidence of the newer probe.
    */
   let gazeProbeSeq = 0;
+  /**
+   * Reference-counted pause ownership for explicit gaze probes. Overlap and timeout must not
+   * restore a stale boolean: each live probe owns one token, and only the last token reopens the
+   * frame loop. A timed-out probe's late transport completion owns no token anymore.
+   */
+  const probePauseTokens = new Set();
+  let probePauseBaseline = false;
 
   // The core reads `inputs` at write time, so this object can be mutated after connect() when a
   // transport discovers the model's input map. `mouthInput` itself is always null here; the
@@ -1982,6 +1989,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     };
 
     const previousProbeActive = transportProbeActive();
+    // A probe can overlap another one and can time out while its transport request is still in
+    // flight. A per-call boolean restored in `finally` is racy: a late inner completion would set
+    // the flag back to true after the outer timeout already resumed writes. Hold the pause with an
+    // explicit token + reference count instead; only the last live owner restores the transport.
+    if (probePauseTokens.size === 0) probePauseBaseline = previousProbeActive;
+    const probePauseToken = Symbol('gaze-probe-pause');
+    probePauseTokens.add(probePauseToken);
     let result;
     try {
       setGazeProbeActive(true);
@@ -1990,12 +2004,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         probeInputMapping: async (request) => {
           // Re-assert before every call: VtsClient clears its own flag in its finally block, so the
           // whole two-channel operation would otherwise re-open the frame loop between channels.
-          setGazeProbeActive(true);
-          try {
-            return await probe(request);
-          } finally {
-            setGazeProbeActive(true);
+          // Do NOT re-assert in a `finally`: after an outer timeout that would re-lock writes with
+          // no remaining owner.
+          if (!probePauseTokens.has(probePauseToken)) {
+            return { ok: false, error: 'probe cancelled after timeout' };
           }
+          setGazeProbeActive(true);
+          return await probe(request);
         },
         timeoutMs: host.gazeProbeTimeoutMs,
         now: clockNow,
@@ -2003,9 +2018,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     } catch (error) {
       result = failure(errorText(error));
     } finally {
-      // Restore the exact prior flag (another probe may already be running), then resume the pump.
-      setGazeProbeActive(previousProbeActive);
-      if (frameWritesPaused() !== true) pumpMotion();
+      probePauseTokens.delete(probePauseToken);
+      if (probePauseTokens.size === 0) {
+        setGazeProbeActive(probePauseBaseline);
+        if (frameWritesPaused() !== true) pumpMotion();
+      }
     }
     if (result === null || result === undefined) result = failure('gaze mapping probe failed');
 

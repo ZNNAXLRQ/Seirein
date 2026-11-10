@@ -234,3 +234,68 @@ test('4. 旧结果不覆盖新结果：并发探测 → 旧结果 superseded', a
     runtime.dispose();
   }
 });
+
+test('5. 探测超时后迟到完成不得重新暂停写入', async () => {
+  const pending = deferred();
+  const started = deferred();
+  const transport = createTransport(async () => {
+    started.resolve();
+    return pending.promise;
+  });
+  const runtime = createAvatarRuntime({
+    transport,
+    config: { autoTickMs: 0, gazeProbeTimeoutMs: 40 },
+  });
+  try {
+    assert.equal((await runtime.connect()).ok, true);
+    await runtime.setChannelMappings([GAZE_ROW('EyeRightX', true)]);
+    const probe = runtime.probeGazeMapping();
+    await started.promise;
+    assert.equal(transport.probeActive, true, 'the live probe owns the pause');
+    const result = await probe;
+    assert.equal(result.ok, false, 'the probe itself timed out');
+    assert.equal(transport.probeActive, false, 'timeout released the pause');
+    pending.resolve({ ok: true, changed: true, delta: { ParamEyeBallX: 0.5 }, error: '' });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(transport.probeActive, false,
+      'the late transport completion did not re-lock writes');
+  } finally {
+    runtime.dispose();
+  }
+});
+
+test('6. 两个探测重叠：先结束的不得提前放行，最后一个结束才恢复', async () => {
+  const first = deferred();
+  const second = deferred();
+  const firstStarted = deferred();
+  const secondStarted = deferred();
+  let calls = 0;
+  const transport = createTransport(async () => {
+    calls += 1;
+    if (calls === 1) {
+      firstStarted.resolve();
+      return first.promise;
+    }
+    secondStarted.resolve();
+    return second.promise;
+  });
+  const runtime = createRuntime(transport);
+  try {
+    assert.equal((await runtime.connect()).ok, true);
+    await runtime.setChannelMappings([GAZE_ROW('EyeRightX', true)]);
+    const older = runtime.probeGazeMapping();
+    await firstStarted.promise;
+    const newer = runtime.probeGazeMapping();
+    await secondStarted.promise;
+    assert.equal(transport.probeActive, true, 'both probes pause');
+
+    first.resolve({ ok: true, changed: true, delta: { ParamEyeBallX: 0.5 }, error: '' });
+    await older;
+    assert.equal(transport.probeActive, true, 'the second live probe keeps the pause');
+    second.resolve({ ok: true, changed: true, delta: { ParamEyeBallX: 0.5 }, error: '' });
+    await newer;
+    assert.equal(transport.probeActive, false, 'the last owner restored writes');
+  } finally {
+    runtime.dispose();
+  }
+});
