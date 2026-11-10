@@ -2571,6 +2571,10 @@ const releaseConfig = (extra = {}) => ({
   flushIntervalMs: 1,
   idleActions: [],
   idleSwayScale: 0,
+  // Expression RELEASE is measured against the idle baseline: keep the phase-3 gaze component out
+  // of this suite so its own held gaze cannot mask a missing release. The component is covered by
+  // test/motion-multi-component.mjs.
+  componentGazeEnabled: false,
   idleParams: {
     headX: { inputName: 'FaceAngleX', min: -30, max: 30 },
     headY: { inputName: 'FaceAngleY', min: -30, max: 30 },

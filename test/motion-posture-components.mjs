@@ -117,6 +117,9 @@ async function makeIdleRuntime({ config = {}, rows = rowsFor(['headX', 'headY', 
       idleActions: [],
       idleWriteHz: 10,
       motionWrites: false,
+      // This suite isolates the phase-1 HEAD component/expression ownership boundary. The phase-3
+      // gaze component (verified gaze) is covered by test/motion-multi-component.mjs.
+      componentGazeEnabled: false,
       ...config,
     },
   });

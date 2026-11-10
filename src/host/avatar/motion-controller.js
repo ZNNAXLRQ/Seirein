@@ -190,6 +190,51 @@ export const POSTURE_COMPONENTS = Object.freeze([
 ]);
 
 
+// ---------------------------------------------------------------------------------------------
+// Phase 3 — a SECOND, independent component: gaze (head posture component + gaze component)
+// ---------------------------------------------------------------------------------------------
+//
+// Scope (explicit, do not over-read this layer):
+//   - this is a HEAD + GAZE component combination, NOT a body/arm implementation;
+//   - body/breath stay VTS-native and are never written by the component layer;
+//   - this plugin still does not start/stop VTS's own idle animation, so the native idle may
+//     coexist and which one wins visually is unverified;
+//   - real visual appearance has NOT been verified on a real VTS model.
+//
+// A gaze component is held independently of the head component (its own 6–12 s window and its own
+// seeded draw), but it is written ONLY when BOTH gazeX and gazeY bindings are `verified` and its
+// channel ownership is `plugin`. An explicit channelMap declaration is never proof: the runtime
+// facade sets this gate from the verified takeover set, and an unverified/native-possible gaze is
+// left to VTS (no write at all).
+export const POSTURE_GAZE_COMPONENT_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
+
+/** Independent gaze hold band. A persona may stretch/shrink the draw inside this band only. */
+export const POSTURE_GAZE_COMPONENT_MIN_MS = 6_000;
+export const POSTURE_GAZE_COMPONENT_MAX_MS = 12_000;
+
+/**
+ * Semantic amplitude band of the gaze component, in the SAME 30°-per-unit convention the head
+ * component uses: 0.12 = 3.6° EQUIVALENT. This is a semantic cap, not a measured eye rotation:
+ * the VTS gaze inputs are normalized (±1), so 0.12 is 12 % of the eye range. The writer's own
+ * `intentWriteValue` limit (gaze ±1) is wider, so this component cap is the binding bound.
+ */
+export const POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE = 0.08;
+export const POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE = 0.12;
+
+/**
+ * Shape weights of one gaze component. Only the two verified gaze channels are used; a `value` is
+ * `weight × amplitude`, clamped per channel to the 0.12 semantic cap, so a shape can never ask for
+ * more than the component budget. The four directions are deliberately distinct so two consecutive
+ * holds are visibly different.
+ */
+export const POSTURE_GAZE_COMPONENTS = Object.freeze([
+  Object.freeze({ id: 'gaze-left', label: '左看', gazeX: -1, gazeY: 0 }),
+  Object.freeze({ id: 'gaze-right', label: '右看', gazeX: 1, gazeY: 0 }),
+  Object.freeze({ id: 'gaze-up', label: '上看', gazeX: 0, gazeY: 1 }),
+  Object.freeze({ id: 'gaze-down', label: '下看', gazeX: 0, gazeY: -1 }),
+]);
+
+
 /** Intent kinds that count as a short response (they are the ones that may use B). */
 export const SHORT_ACTION_INTENTS = Object.freeze(['nod', 'tilt']);
 
@@ -526,6 +571,18 @@ const DEFAULT_CONFIG = Object.freeze({
    */
   postureComponentMinMs: POSTURE_COMPONENT_MIN_MS,
   postureComponentMaxMs: POSTURE_COMPONENT_MAX_MS,
+  /**
+   * Phase 3 gaze component hold window (6–12 s), independently configurable. It is deliberately
+   * shorter than the head component so the eyes can move on while the head keeps its lean.
+   */
+  postureGazeComponentMinMs: POSTURE_GAZE_COMPONENT_MIN_MS,
+  postureGazeComponentMaxMs: POSTURE_GAZE_COMPONENT_MAX_MS,
+  /**
+   * Seed/config gate for the gaze component. The pure controller defaults to FALSE: a caller that
+   * does not know the verified takeover set must not silently write gaze. The avatar-runtime facade
+   * sets it through `setComponentGazeVerified()` from `gazeX`+`gazeY` verified bindings only.
+   */
+  componentGazeVerified: false,
   /** Base planned transition length; divided by persona tempo, then clamped to 1.2–1.8 s. */
   postureTransitionMs: POSTURE_TRANSITION.BASE_MS,
   /** Host-driven state (listening/thinking/speaking/waiting/tired); scales, never rewrites, style. */
@@ -920,6 +977,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const componentRandom = createSeededRandom(
     `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:posture-component`,
   );
+  // The phase-3 gaze component has its OWN stream too: adding the second component must not shift
+  // the head component / base-posture sequence a recorded trajectory already pins.
+  const gazeComponentRandom = createSeededRandom(
+    `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:gaze-component`,
+  );
   const postureHoldMinMs = Math.max(1000, finite(cfg.postureHoldMinMs, DEFAULT_CONFIG.postureHoldMinMs));
   const postureHoldMaxMs = Math.max(postureHoldMinMs, finite(cfg.postureHoldMaxMs, DEFAULT_CONFIG.postureHoldMaxMs));
   // P-139 stage 4 (A): an explicitly configured window is authority; only an unconfigured runtime
@@ -933,6 +995,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const postureComponentMaxMs = Math.max(
     postureComponentMinMs,
     Math.min(POSTURE_COMPONENT_MAX_MS, finite(cfg.postureComponentMaxMs, POSTURE_COMPONENT_MAX_MS)),
+  );
+  const postureGazeComponentMinMs = Math.max(
+    POSTURE_GAZE_COMPONENT_MIN_MS,
+    Math.min(POSTURE_GAZE_COMPONENT_MAX_MS, finite(
+      cfg.postureGazeComponentMinMs,
+      POSTURE_GAZE_COMPONENT_MIN_MS,
+    )),
+  );
+  const postureGazeComponentMaxMs = Math.max(
+    postureGazeComponentMinMs,
+    Math.min(POSTURE_GAZE_COMPONENT_MAX_MS, finite(
+      cfg.postureGazeComponentMaxMs,
+      POSTURE_GAZE_COMPONENT_MAX_MS,
+    )),
   );
   const decisionIntervalMs = 1000 / Math.max(0.1, Math.min(8, finite(cfg.decisionHz, DEFAULT_CONFIG.decisionHz)));
   const motionFollow = Math.max(0.05, finite(cfg.motionFollow, MOTION_LIMITS.FOLLOW_PER_SECOND));
@@ -1034,7 +1110,32 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         componentHistory: [],
         /** Set by relax/interrupt so a cleared component cannot silently revive mid-transition. */
         componentPaused: false,
+        /**
+         * Phase 3 gaze component: a second, independent hold that contributes to the gaze base only.
+         * `value` is semantic (±0.12, 1 unit = 30° equivalent), never a posture-target offset. It is
+         * cleared by interrupt/relax and written only while `componentGazeVerified` is true.
+         */
+        gazeComponent: null,
+        gazeComponentTransitions: 0,
+        gazeComponentHistory: [],
+        gazeComponentPaused: false,
+        /** Verified + ownership gate. False by default; the facade sets it from verified bindings. */
+        componentGazeVerified: cfg.componentGazeVerified === true,
       },
+      /**
+       * Phase 3 unified arbitration evidence (read-only). The newest values describe the last frame
+       * where a same-channel conflict was really arbitrated. `componentYield` is the fraction of the
+       * head/gaze component contribution that survived after a preset took the channel: 1 means no
+       * conflict, 0.2 is the INTENT_IDLE_RATIO floor. It is evidence, never a target.
+       */
+      arbitration: {
+        at: null,
+        presetActive: 0,
+        head: [],
+        gaze: [],
+      },
+      /** Phase 3: old preset EXIT/cancel tails suppressed by a newer owner on the same channel. */
+      presetArbitration: { at: null, suppressed: [] },
       /** The one active planned transition (null while holding / drifting). */
       transition: null,
       axes: Object.fromEntries(MOTION_AXES.map((axis) => [axis, { current: 0, velocity: 0 }])),
@@ -1417,6 +1518,120 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   /**
+   * One gaze-component draw. The gaze component does NOT feed `posture.target` (a head target must
+   * never carry an eye value); it contributes to the gaze base only. Its amplitude is bounded in the
+   * semantic 30°-unit convention and clamped per channel, so the component can never exceed 0.12.
+   */
+  function drawGazeComponent(now) {
+    const pool = POSTURE_GAZE_COMPONENTS;
+    const current = state.motion.posture.gazeComponent;
+    let index = Math.floor(gazeComponentRandom() * pool.length) % pool.length;
+    if (current !== null && pool.length > 1 && pool[index].id === current.id) {
+      // Consecutive holds must not look identical: draw a different direction.
+      index = (index + 1 + Math.floor(gazeComponentRandom() * (pool.length - 1))) % pool.length;
+    }
+    const spec = pool[index];
+    const amplitude = POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE
+      + (POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE - POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE) * gazeComponentRandom();
+    const drawMs = postureGazeComponentMinMs
+      + (postureGazeComponentMaxMs - postureGazeComponentMinMs) * gazeComponentRandom();
+    // The gaze hold stays inside its own 6–12 s band; persona tempo may stretch/shrink it there.
+    const influenced = drawMs * Math.max(0.8, Math.min(1.2, (1 / postureTempo()) * traitEffects().hold));
+    const holdMs = Math.max(
+      postureGazeComponentMinMs,
+      Math.min(postureGazeComponentMaxMs, influenced),
+    );
+    const value = {};
+    const degrees = {};
+    for (const channel of POSTURE_GAZE_COMPONENT_CHANNELS) {
+      const semantic = clampMotion(
+        finite(spec[channel], 0) * amplitude,
+        POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE,
+      );
+      value[channel] = semantic;
+      // 1 semantic unit = 30° (the same convention as the head component). This is an EQUIVALENT
+      // angle, not a measured eye rotation; the VTS gaze input itself is normalized (±1).
+      degrees[channel] = semantic * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+    }
+    return {
+      id: spec.id,
+      label: spec.label,
+      startedAt: now,
+      holdUntil: now + holdMs,
+      durationMs: holdMs,
+      amplitude,
+      channels: [...POSTURE_GAZE_COMPONENT_CHANNELS],
+      value,
+      semantic: { ...value },
+      degrees,
+      /** Filled every output frame by advanceGenerators (component/gesture/yield evidence). */
+      observed: null,
+    };
+  }
+
+  function recordGazeComponent(component) {
+    const history = state.motion.posture.gazeComponentHistory;
+    history.push({
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      durationMs: component.durationMs,
+      amplitude: component.amplitude,
+    });
+    while (history.length > 8) history.shift();
+  }
+
+  /** Install one gaze component. It has no posture transition: the gaze follow itself smooths it. */
+  function installGazeComponent(now) {
+    const motion = state.motion;
+    const component = drawGazeComponent(now);
+    motion.posture.gazeComponent = component;
+    motion.posture.gazeComponentPaused = false;
+    recordGazeComponent(component);
+    // A component now owns gaze: any old preset/expression release entry on those channels must be
+    // handed off, otherwise a timed-out release could force a 0 over the new component.
+    handOffReleases(POSTURE_GAZE_COMPONENT_CHANNELS);
+    return component;
+  }
+
+  /**
+   * Gaze component lifetime — checked on EVERY frame (not the 1 Hz head decision gate) so the two
+   * components keep independent 6–12 s / 10–20 s windows even while a head transition is in flight.
+   * There is still no extra timer and no second writer.
+   */
+  function stepGazeComponent(now) {
+    const posture = state.motion.posture;
+    if (posture.componentGazeVerified !== true) {
+      if (posture.gazeComponent !== null) posture.gazeComponent = null;
+      return null;
+    }
+    if (posture.gazeComponentPaused === true) return null;
+    const component = posture.gazeComponent;
+    if (component !== null && now < component.holdUntil) return component;
+    const fresh = installGazeComponent(now);
+    if (component !== null) posture.gazeComponentTransitions += 1;
+    return fresh;
+  }
+
+  /** Drop both components (interrupt / relax) and freeze them until a later normal move resumes. */
+  function pausePostureComponents() {
+    const posture = state.motion.posture;
+    posture.component = null;
+    posture.componentPaused = true;
+    posture.gazeComponent = null;
+    posture.gazeComponentPaused = true;
+  }
+
+  /** True while either independent component owns the channel (release/ownership arbitration). */
+  function componentOwnsChannel(channel) {
+    const posture = state.motion.posture;
+    if (POSTURE_COMPONENT_CHANNELS.includes(channel) && posture.component !== null) return true;
+    return POSTURE_GAZE_COMPONENT_CHANNELS.includes(channel)
+      && posture.componentGazeVerified === true
+      && posture.gazeComponent !== null;
+  }
+
+  /**
    * The planned-transition window for one cause (B / item 4): an idle re-draw keeps 1.2–1.8 s, a
    * short response action lands in 0.8–1.2 s, a conversation-end relax decays over 2–4 s. A
    * component swap uses the same idle window; it is a slow posture decision, never a new writer.
@@ -1610,6 +1825,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       recordPostureComponent(motion.posture.component);
       motion.posture.componentPaused = false;
     }
+    // The gaze component resumes on the same normal move (never immediately after interrupt/relax)
+    // and only when the verified gate is open. `stepGazeComponent` then owns its own expiry.
+    if (motion.posture.componentGazeVerified === true && motion.posture.gazeComponentPaused === true) {
+      installGazeComponent(now);
+    }
     const next = drawPostureTarget({ listening });
     motion.posture.base = { ...next };
     rollPostureHold(now);
@@ -1666,6 +1886,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   function advanceMotion(dt, frame) {
     const motion = state.motion;
     const now = state.lastAt ?? 0;
+    // Phase 3: the gaze component owns its own 6–12 s lifetime on every frame, independently of
+    // the 1 Hz head decision/hold gate and of any in-flight head transition.
+    stepGazeComponent(now);
     stepPostureDecision(dt, now);
     // Conversation end: a short delay keeps inter-sentence gaps from triggering the loose pose.
     const speakingNow = state.speech !== null || state.release !== null
@@ -1742,10 +1965,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const base = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
     motion.relaxPlan = { startedAt: now, durationMs: duration, from: clamp01(motion.relax) };
     motion.posture.base = { ...base };
-    // A relax clears the component: the explicit decay owns the pose until it ends, and a cleared
-    // component is not revived behind the decay. A later normal move may select a fresh one.
-    motion.posture.component = null;
-    motion.posture.componentPaused = true;
+    // A relax clears both phase-3 components: the explicit decay owns the pose until it ends, and a
+    // cleared component is not revived behind the decay. A later normal move may select fresh ones.
+    pausePostureComponents();
     // The explicit relax owns the decay from here on: the implicit speech-end ramp must not fight it.
     motion.relaxStartedAt = null;
     const transition = startPostureTransition(base, now, { kind: 'relax', durationMs: duration });
@@ -3053,7 +3275,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (state.releases.has(channel)) continue;
       const owned = state.presets.active.some((other) => other !== item && other.channels.includes(channel))
         || state.expressions.some((other) => other.channels.includes(channel))
-        || state.intents.some((other) => other.channels.includes(channel));
+        || state.intents.some((other) => other.channels.includes(channel))
+        // Phase 3: an independent gaze component owns gazeX/gazeY. An old preset's release must
+        // never be allowed to force a 0 over the component (and no channel is double-owned).
+        || componentOwnsChannel(channel);
       if (owned) continue;
       state.releases.set(channel, { kind: `preset:${item.presetId}`, atMs, frames: 0, last: null });
     }
@@ -3427,7 +3652,16 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const gaze = { x: 0, y: 0 };
     const centers = Object.create(null);
     let eye = null;
-    if (state.presets.active.length === 0) return { adds, gaze, eye, centers, active: 0 };
+    if (state.presets.active.length === 0) {
+      state.motion.presetArbitration = { at: now, suppressed: [] };
+      return { adds, gaze, eye, centers, active: 0 };
+    }
+    // Channels a NEWER trajectory already owns. Iterating newest → oldest lets an older action's
+    // EXIT (or cancel fade) hand the channel over instead of dragging the new action back with a
+    // stale tail. This is the same rule takeover/centre already use, applied to the whole stack:
+    // a new owner is never overwritten by an old preset's closing frames.
+    const newerChannels = new Set();
+    const suppressedExits = [];
     for (let index = state.presets.active.length - 1; index >= 0; index -= 1) {
       const item = state.presets.active[index];
       const elapsed = now - item.startedAt;
@@ -3488,6 +3722,18 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           if (!item.channels.includes(channel)) continue;
           let scaled = finite(value, 0) * fade;
           if (item.yieldChannels.has(channel)) scaled *= yieldFade;
+          // An older action in its closing phase must not overwrite the newer owner of the same
+          // channel. Its active/hold contribution is left untouched (two actions may legitimately
+          // overlap); only the exit/cancel tail is dropped once a newer action really owns it.
+          const superseded = newerChannels.has(channel)
+            && (envelope.phase === 'exit' || item.cancelledAt !== null);
+          if (superseded) {
+            scaled = 0;
+            suppressedExits.push({
+              channel, presetId: item.presetId, phase: envelope.phase,
+              reason: item.cancelledAt !== null ? 'cancel-fade' : 'exit',
+            });
+          }
           if (!Number.isFinite(scaled)) continue;
           if (PRESET_HEAD_CHANNELS.includes(channel) || channel === 'bodyX' || channel === 'bodyY' || channel === 'bodyZ') {
             adds[channel] += scaled;
@@ -3508,6 +3754,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (!contributed && item.cancelledAt === null && elapsed >= item.durationMs) {
         removePresetItem(item, now, { interrupted: false });
       }
+      // Only a still-live newer trajectory may claim the channel for the next (older) iteration.
+      if (item.done !== true) {
+        for (const channel of item.channels) newerChannels.add(channel);
+      }
     }
     adds.headX = presetClamp(adds.headX, 0.95);
     adds.headY = presetClamp(adds.headY, 0.95);
@@ -3516,6 +3766,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     adds.browR = presetClamp(adds.browR, 0.6);
     gaze.x = presetClamp(gaze.x, EXPRESSION_MOTION.MAX_GAZE);
     gaze.y = presetClamp(gaze.y, EXPRESSION_MOTION.MAX_GAZE);
+    state.motion.presetArbitration = { at: now, suppressed: suppressedExits };
     return { adds, gaze, eye, centers, active: state.presets.active.length };
   }
 
@@ -4379,7 +4630,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (state.releases.has(channel)) continue;
       // A NEW expression or intent already drives this channel: direct handoff, never a zeroing.
       const owned = state.expressions.some((other) => other !== item && other.channels.includes(channel))
-        || state.intents.some((other) => other.channels.includes(channel));
+        || state.intents.some((other) => other.channels.includes(channel))
+        // The independent gaze component is a real owner too: no old expression release may zero it.
+        || componentOwnsChannel(channel);
       if (owned) continue;
       state.releases.set(channel, { kind: item.kind, atMs, frames: 0, last: null });
     }
@@ -4612,6 +4865,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (now < item.startedAt) continue;
       if (item.cancelledAt !== null && now - item.cancelledAt >= Math.max(1, item.cancelFadeMs)) continue;
       for (const channel of item.channels) set.add(channel);
+    }
+    // Phase 3: the gaze component is an independent owner of gazeX/gazeY, but only while its
+    // verified+plugin gate is open and the master idle switch is on. It never adds a channel to the
+    // write set when unverified/native-possible, and body channels are never added here.
+    const posture = state.motion.posture;
+    if (posture.componentGazeVerified === true && posture.gazeComponent !== null
+      && state.intent.flags?.idle !== false) {
+      const value = posture.gazeComponent.value ?? {};
+      if (Math.abs(finite(value.gazeX, 0)) > 1e-6 || Math.abs(finite(value.gazeY, 0)) > 1e-6) {
+        for (const channel of POSTURE_GAZE_COMPONENT_CHANNELS) set.add(channel);
+      }
     }
     return [...set];
   }
@@ -4937,20 +5201,62 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // Expression gaze (thinking looks up, listening recentres) is part of the idle base: an
     // explicit attention target still overrides it in applyDynamics.
     const expressionGaze = state.expressionGaze ?? { x: 0, y: 0 };
+    const gazeComponent = motion.posture.componentGazeVerified === true
+      ? motion.posture.gazeComponent : null;
+    // Same-channel arbitration for the gaze component: a preset/expression gaze is the EXPRESSION
+    // and keeps its full value; only the component target yields. It is clamped to the same
+    // INTENT_IDLE_RATIO window the head idle base uses, so a small gesture does not get buried under
+    // a held gaze and a large gesture leaves the component a visible tail. The head/gaze caps are
+    // applied per channel BEFORE this fold, so the sum can never exceed each component's budget.
+    const yieldGaze = (componentValue, gestureValue) => {
+      const gesture = finite(gestureValue, 0);
+      if (gesture === 0) return finite(componentValue, 0);
+      const cap = INTENT_IDLE_RATIO * Math.abs(gesture);
+      return Math.max(-cap, Math.min(cap, finite(componentValue, 0)));
+    };
+    const componentGazeX = yieldGaze(gazeComponent?.value?.gazeX, expressionGaze.x);
+    const componentGazeY = yieldGaze(gazeComponent?.value?.gazeY, expressionGaze.y);
+    // Phase 3 per-channel cap on the HEAD component AFTER the live persona/status gain is known.
+    // `headSemanticGain()` froze the axis at draw time, but a later status/style switch can change
+    // the gain; without this second cap the SAME component could grow past 0.15 semantic. The
+    // excess is subtracted from the idle base, so base drift is preserved while the component never
+    // exceeds its budget. Evidence records the capped contribution, not the un-capped request.
+    const headComponentAxes = motion.posture.component?.axes ?? null;
+    const componentHeadRaw = {
+      headX: headXAmp * finite(headComponentAxes?.headX, 0),
+      headY: headYAmp * finite(headComponentAxes?.headY, 0),
+      headZ: headZAmp * finite(headComponentAxes?.headZ, 0),
+    };
+    const componentHeadCapped = {
+      headX: Math.max(-POSTURE_COMPONENT_MAX_AMPLITUDE,
+        Math.min(POSTURE_COMPONENT_MAX_AMPLITUDE, componentHeadRaw.headX)),
+      headY: Math.max(-POSTURE_COMPONENT_MAX_AMPLITUDE,
+        Math.min(POSTURE_COMPONENT_MAX_AMPLITUDE, componentHeadRaw.headY)),
+      headZ: Math.max(-POSTURE_COMPONENT_MAX_AMPLITUDE,
+        Math.min(POSTURE_COMPONENT_MAX_AMPLITUDE, componentHeadRaw.headZ)),
+    };
+    const componentHeadAdjust = {
+      headX: componentHeadCapped.headX - componentHeadRaw.headX,
+      headY: componentHeadCapped.headY - componentHeadRaw.headY,
+      headZ: componentHeadCapped.headZ - componentHeadRaw.headZ,
+    };
     const idle = {
       ...neutralPose(),
       gazeX: idleEnabled
-        ? gazeXAmp * axis('gazeX') + (thinking ? 0.05 * idleChannelSway('gazeX') : 0) + finite(expressionGaze.x, 0)
+        ? gazeXAmp * axis('gazeX') + (thinking ? 0.05 * idleChannelSway('gazeX') : 0)
+          + componentGazeX + finite(expressionGaze.x, 0)
         : 0,
       gazeY: idleEnabled
-        ? gazeYAmp * axis('gazeY') + (thinking ? -0.02 * idleChannelSway('gazeY') : 0) + finite(expressionGaze.y, 0)
+        ? gazeYAmp * axis('gazeY') + (thinking ? -0.02 * idleChannelSway('gazeY') : 0)
+          + componentGazeY + finite(expressionGaze.y, 0)
         : 0,
       // A thinking pause adds a shallow micro-nod; it is part of the same idle base, not a write.
       headX: headXAmp * axis('headX')
         + (thinking ? 0.02 * idleChannelSway('headX') * smoothNoise1(hash32(motionSeed, 'think'), t * 0.8) : 0)
-        + motion.holdDrift.headX,
-      headY: headYAmp * axis('headY') + motion.holdDrift.headY + speechMicro,
-      headZ: headZAmp * axis('headZ') + motion.holdDrift.headZ,
+        + motion.holdDrift.headX + componentHeadAdjust.headX,
+      headY: headYAmp * axis('headY') + motion.holdDrift.headY + speechMicro
+        + componentHeadAdjust.headY,
+      headZ: headZAmp * axis('headZ') + motion.holdDrift.headZ + componentHeadAdjust.headZ,
       browL: 0,
       browR: 0,
       mouth: 0,
@@ -4987,9 +5293,37 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         target: { ...activeComponent.axes },
         semantic: { ...activeComponent.semantic },
         mixed: {
-          headX: headXAmp * finite(activeComponent.axes.headX, 0),
-          headY: headYAmp * finite(activeComponent.axes.headY, 0),
-          headZ: headZAmp * finite(activeComponent.axes.headZ, 0),
+          headX: componentHeadCapped.headX,
+          headY: componentHeadCapped.headY,
+          headZ: componentHeadCapped.headZ,
+        },
+        /** The un-capped contribution the live gain asked for (evidence of the per-frame cap). */
+        uncapped: {
+          headX: componentHeadRaw.headX,
+          headY: componentHeadRaw.headY,
+          headZ: componentHeadRaw.headZ,
+        },
+      };
+    }
+    if (gazeComponent !== null) {
+      const gesture = {
+        gazeX: finite(expressionGaze.x, 0),
+        gazeY: finite(expressionGaze.y, 0),
+      };
+      gazeComponent.observed = {
+        at: state.lastAt,
+        target: { ...gazeComponent.value },
+        semantic: { ...gazeComponent.semantic },
+        degrees: { ...gazeComponent.degrees },
+        /** The component share that survived same-channel arbitration (≤0.12 per channel). */
+        mixed: { gazeX: componentGazeX, gazeY: componentGazeY },
+        gesture,
+        /** 1 = component untouched, INTENT_IDLE_RATIO floor = a gesture took the channel. */
+        yieldScale: {
+          gazeX: Math.abs(gazeComponent.value.gazeX) > 1e-9
+            ? Math.abs(componentGazeX) / Math.abs(gazeComponent.value.gazeX) : 1,
+          gazeY: Math.abs(gazeComponent.value.gazeY) > 1e-9
+            ? Math.abs(componentGazeY) / Math.abs(gazeComponent.value.gazeY) : 1,
         },
       };
     }
@@ -5138,6 +5472,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // drives, the idle micro-motion may only contribute INTENT_IDLE_RATIO of the gesture
     // magnitude. The gesture is added AFTER that limit, so it is never cancelled or diluted;
     // everything that is not idle micro-motion (manual pose / touch) is preserved unchanged.
+    //
+    // Phase 3 records the same decision as evidence: the independent head component rides the idle
+    // base, so its contribution is reduced by exactly the same factor while the preset keeps its own
+    // full value. After the preset exits the component goal was never rewritten, so it recovers.
+    const headComponent = state.motion.posture.component;
+    const headConflicts = [];
     for (const [channel, value] of Object.entries(intent.adds)) {
       if (value === 0) continue;
       const idleBase = finite(generators.idle?.[channel], 0);
@@ -5145,7 +5485,52 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const idlePart = Math.max(-cap, Math.min(cap, idleBase));
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
       composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
+      const componentBefore = finite(headComponent?.observed?.mixed?.[channel], 0);
+      if (componentBefore !== 0) {
+        const retained = Math.abs(idleBase) > 1e-12 ? idlePart / idleBase : 0;
+        headConflicts.push({
+          channel,
+          gesture: value,
+          idleBase,
+          componentBefore,
+          componentAfter: componentBefore * retained,
+          yieldScale: retained,
+          presetIds: state.presets.active
+            .filter((item) => item.done !== true && item.channels.includes(channel))
+            .map((item) => item.presetId),
+        });
+      }
     }
+    // The gaze component is arbitrated inside advanceGenerators (it is part of the idle gaze base);
+    // copy that evidence into the same read-only record so status/tests see ONE arbitration table.
+    const gazeComponent = state.motion.posture.gazeComponent;
+    const gazeConflicts = [];
+    if (gazeComponent?.observed !== null && gazeComponent?.observed !== undefined) {
+      for (const channel of POSTURE_GAZE_COMPONENT_CHANNELS) {
+        const before = finite(gazeComponent.value?.[channel], 0);
+        const gesture = finite(gazeComponent.observed.gesture?.[channel], 0);
+        if (gesture === 0) continue;
+        const after = finite(gazeComponent.observed.mixed?.[channel], 0);
+        gazeConflicts.push({
+          channel,
+          gesture,
+          idleBase: before,
+          componentBefore: before,
+          componentAfter: after,
+          yieldScale: Math.abs(before) > 1e-9 ? Math.abs(after) / Math.abs(before) : 1,
+          presetIds: state.presets.active
+            .filter((item) => item.done !== true && item.channels.includes(channel))
+            .map((item) => item.presetId),
+        });
+      }
+    }
+    state.motion.arbitration = {
+      at: now,
+      presetActive: state.presets.active.filter((item) => item.done !== true).length,
+      head: headConflicts,
+      gaze: gazeConflicts,
+      suppressedExits: state.motion.presetArbitration.suppressed.map((entry) => ({ ...entry })),
+    };
     // Centre operations are a bounded blend to the CURRENT natural baseline (the active posture
     // component included), applied AFTER the idle arbitration. Applying a frozen/live additive
     // here instead would subtract the idle base twice and overshoot when another trajectory moved.
@@ -5236,12 +5621,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     for (const axis of SPRING_AXES) state.springs[axis] = { current: 0, velocity: 0 };
     state.gaze = { x: 0, y: 0, weight: 0 };
     state.lastSpeech = { index: -1, level: 0, speaking: false };
-    // A barge-in clears the posture component as well as the pose it was riding on. The target/base
-    // are reset so the old component goal cannot re-converge on the next tick; a later moved
-    // decision may select a fresh component, never resume the old one.
+    // A barge-in clears BOTH posture components (head + gaze) as well as the pose they ride on. The
+    // target/base are reset so the old component goal cannot re-converge on the next tick; a later
+    // moved decision may select fresh components, never resume the old ones.
     const motion = state.motion;
-    motion.posture.component = null;
-    motion.posture.componentPaused = true;
+    pausePostureComponents();
     motion.posture.target = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
     motion.posture.base = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
     motion.transition = null;
@@ -5506,8 +5890,43 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         target: { ...(component.observed.target ?? {}) },
         semantic: { ...(component.observed.semantic ?? {}) },
         mixed: { ...(component.observed.mixed ?? {}) },
+        uncapped: { ...(component.observed.uncapped ?? {}) },
         idle: component.observed.idle === undefined ? null : { ...component.observed.idle },
         pose: component.observed.pose === undefined ? null : { ...component.observed.pose },
+      },
+    };
+  }
+
+  /**
+   * Phase 3 gaze-component snapshot. `value`/`semantic` are the bounded semantic target; `degrees`
+   * is the 30°-equivalent annotation (NOT a measured eye rotation); `mixed` is the share that
+   * survived same-channel arbitration. `verified` is the gate that allowed the draw at all.
+   */
+  function gazeComponentSnapshot() {
+    const posture = state.motion.posture;
+    const component = posture.gazeComponent;
+    if (component === null) return null;
+    return {
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      holdUntil: component.holdUntil,
+      durationMs: component.durationMs,
+      remainingMs: Math.max(0, component.holdUntil - (state.lastAt ?? 0)),
+      amplitude: component.amplitude,
+      channels: [...component.channels],
+      value: { ...component.value },
+      semantic: { ...component.semantic },
+      degrees: { ...component.degrees },
+      verified: posture.componentGazeVerified === true,
+      observed: component.observed === null ? null : {
+        at: component.observed.at,
+        target: { ...(component.observed.target ?? {}) },
+        semantic: { ...(component.observed.semantic ?? {}) },
+        degrees: { ...(component.observed.degrees ?? {}) },
+        mixed: { ...(component.observed.mixed ?? {}) },
+        gesture: { ...(component.observed.gesture ?? {}) },
+        yieldScale: { ...(component.observed.yieldScale ?? {}) },
       },
     };
   }
@@ -5521,6 +5940,23 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     state.baseActivity.enabled = enabled !== false;
     if (!state.baseActivity.enabled) state.baseActivity.state = 'stopped';
     return { enabled: state.baseActivity.enabled };
+  }
+
+  /**
+   * Phase 3 gaze-component gate. The caller must pass `true` ONLY when BOTH gazeX and gazeY are
+   * verified plugin-owned channels (never for a declaration, a native-possible candidate or a
+   * single verified axis). On false the current component is dropped immediately and no gaze is
+   * added to the write set; on true the next frame draws a fresh component (unless a relax/interrupt
+   * pause is still in force, which only a later normal move clears).
+   */
+  function setComponentGazeVerified(verified) {
+    const next = verified === true;
+    const posture = state.motion.posture;
+    const changed = posture.componentGazeVerified !== next;
+    posture.componentGazeVerified = next;
+    if (!next) posture.gazeComponent = null;
+    recordEvent('avatar.motion.component.gaze-gate', { verified: next, changed });
+    return { verified: next, changed, component: posture.gazeComponent !== null };
   }
 
   function snapshot() {
@@ -5667,6 +6103,24 @@ export function createBehaviorRuntime({ config = {} } = {}) {
                 ...state.motion.posture.lastComponentTransition,
                 axes: [...state.motion.posture.lastComponentTransition.axes],
               },
+          /** Phase 3: the independent gaze component, its verified gate and its own hold. */
+          gazeComponent: gazeComponentSnapshot(),
+          gazeComponentPaused: state.motion.posture.gazeComponentPaused,
+          gazeComponentTransitions: state.motion.posture.gazeComponentTransitions,
+          gazeComponentHistory: state.motion.posture.gazeComponentHistory.map((entry) => ({ ...entry })),
+          componentGazeVerified: state.motion.posture.componentGazeVerified === true,
+          componentGazeOwnership: state.motion.posture.componentGazeVerified === true
+            ? 'plugin' : 'vts-native',
+          componentCaps: {
+            headSemantic: POSTURE_COMPONENT_MAX_AMPLITUDE,
+            headMinMs: postureComponentMinMs,
+            headMaxMs: postureComponentMaxMs,
+            gazeSemantic: POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE,
+            gazeDegreesEquivalent: POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE
+              * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT,
+            gazeMinMs: postureGazeComponentMinMs,
+            gazeMaxMs: postureGazeComponentMaxMs,
+          },
         },
         transition: state.motion.transition === null ? null : {
           ...state.motion.transition,
@@ -5705,6 +6159,26 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           maxVelocity: Math.max(motionMaxVelocity, POSTURE_TRANSITION.MAX_VELOCITY),
           maxAcceleration: Math.max(motionMaxAcceleration, POSTURE_TRANSITION.MAX_ACCELERATION),
           follow: motionFollow,
+        },
+        /**
+         * Phase 3 unified arbitration evidence (one table for head AND gaze). `componentAfter`
+         * is the component share that really survives; `yieldScale` is its factor (1 = no
+         * conflict, INTENT_IDLE_RATIO floor = a gesture took the channel). It never rewrites a
+         * component target, so the component recovers when the preset exits.
+         */
+        arbitration: {
+          at: state.motion.arbitration.at,
+          presetActive: state.motion.arbitration.presetActive,
+          head: state.motion.arbitration.head.map((entry) => ({
+            ...entry,
+            presetIds: [...entry.presetIds],
+          })),
+          gaze: state.motion.arbitration.gaze.map((entry) => ({
+            ...entry,
+            presetIds: [...entry.presetIds],
+          })),
+          /** Newer-owner evidence: an old preset's EXIT/cancel tail that was NOT allowed to write. */
+          suppressedExits: (state.motion.arbitration.suppressedExits ?? []).map((entry) => ({ ...entry })),
         },
         /**
          * Autonomous expression layer: which bounded envelopes are active, plus the 20–40 s
@@ -5763,6 +6237,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     setStatus,
     /** Phase 2: gate the base-activity counters only (privacy lock / disconnect / disposed). */
     setBaseActivityEnabled,
+    /** Phase 3: verified+plugin gate for the gaze component (both gazeX and gazeY). */
+    setComponentGazeVerified,
     setIdleActions,
     intent,
     // Motion preset execution: selection, execution, interruption and the proof-bearing state.

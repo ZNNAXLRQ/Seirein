@@ -968,6 +968,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       debugEvent: (type, data) => appendLog('debug', type, data),
     },
   });
+  // Phase 3: the gaze component starts CLOSED. Only the verified takeover set may open it; a
+  // caller-supplied `componentGazeVerified:true` is never accepted as proof.
+  inner.setComponentGazeVerified(false);
 
   // ---- logging / errors ------------------------------------------------------------------
   function appendLog(level, message, data = {}) {
@@ -1778,6 +1781,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // The discrete pool depends on the verified set: recompute it (and record it once) here.
     refreshIdleActionPool('channels');
     refreshPresetCapabilities();
+    // Phase 3: the gaze component's write gate is the verified+plugin set, not the channelMap.
+    syncComponentGazeGate();
     return { ok: true, code: null, channels: statusChannels() };
   }
 
@@ -1886,6 +1891,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       refreshIdleParamMap();
       refreshIdleActionPool('gaze-probe');
       refreshPresetCapabilities();
+      // A failed probe closes the gaze-component gate; an accepted one may open it.
+      syncComponentGazeGate();
     }
     return result;
   }
@@ -1966,6 +1973,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // A disconnected runtime controls nothing; a reconnect re-verifies the mappings it is given.
     idleParamMap = normalizeIdleParams(null);
     idleSkipAt.clear();
+    // No verified channels = no gaze component: close the gate with the takeover set.
+    inner.setComponentGazeVerified(false);
     // No verified channels = no channel filtering: restore the host's own pool (hotkey path).
     refreshIdleActionPool('reset');
   }
@@ -4806,6 +4815,28 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
 
   // ---- observation -----------------------------------------------------------------------
   /**
+   * Phase 3 gaze-component gate. `plugin` ownership means BOTH gazeX and gazeY have a verified
+   * binding from discovery/an accepted probe. A declaration (`channelMap`), a single verified axis
+   * or a `native-possible` candidate is NOT enough: the component must not write in those cases.
+   */
+  function componentGazeAllowed() {
+    // A suite / host may explicitly keep the phase-3 gaze component off; the default is on, and
+    // even then it opens only from the verified takeover set below.
+    if (userConfig.componentGazeEnabled === false) return false;
+    const x = channelState.bindings.get('gazeX');
+    const y = channelState.bindings.get('gazeY');
+    return x !== undefined && y !== undefined
+      && x.verified === true && y.verified === true
+      && String(x.inputName ?? '').trim().length > 0
+      && String(y.inputName ?? '').trim().length > 0;
+  }
+
+  /** Project the verified gate to the controller. Called only when the takeover set changes. */
+  function syncComponentGazeGate() {
+    return inner.setComponentGazeVerified(componentGazeAllowed());
+  }
+
+  /**
    * Phase 2 channel ownership — READ-ONLY and input-name free (a status view must never leak a
    * transport path or a guessed parameter). Each entry answers two separate questions:
    *
@@ -5049,13 +5080,33 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         })),
       },
       /**
-       * Phase 2 status projection (`live2d.runtime.motionLayers` in the host status). Both fields
-       * are read-only: the counters are advanced by the ONE frame loop, ownership is derived from
-       * the verified takeover set. No input name/path is included.
+       * Phase 2/3 status projection (`live2d.runtime.motionLayers` in the host status). All fields
+       * are read-only: activity counters are advanced by the ONE frame loop, ownership is derived
+       * from the verified takeover set, components come from the ONE posture controller. No input
+       * name/path is included.
        */
       motionLayers: {
         baseActivity: innerSnap.motion?.baseActivity ?? null,
         channelOwnership,
+        /**
+         * Phase 3 head+gaze components and their unified arbitration. `scope` is explicit: this is
+         * NOT a body/arm completion, VTS native idle is not taken over, and real visual appearance
+         * is not verified. `gazeVerified` is the plugin-ownership gate (both gaze axes).
+         */
+        components: {
+          scope: 'phase3-head+gaze',
+          head: innerSnap.motion?.posture?.component ?? null,
+          gaze: innerSnap.motion?.posture?.gazeComponent ?? null,
+          gazeVerified: innerSnap.motion?.posture?.componentGazeVerified === true,
+          gazeOwnership: innerSnap.motion?.posture?.componentGazeOwnership ?? 'vts-native',
+          headPaused: innerSnap.motion?.posture?.componentPaused === true,
+          gazePaused: innerSnap.motion?.posture?.gazeComponentPaused === true,
+          caps: innerSnap.motion?.posture?.componentCaps ?? null,
+          arbitration: innerSnap.motion?.arbitration ?? null,
+          bodyWritten: false,
+          nativeIdleOwned: false,
+          visualVerified: false,
+        },
       },
       /** Discrete idle pool actually sampled, plus the fallback mode currently in force. */
       idleActions: {
