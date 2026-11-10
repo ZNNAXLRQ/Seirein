@@ -11,7 +11,7 @@ import test from 'node:test';
 import { registerHooks } from 'node:module';
 import { Readable } from 'node:stream';
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -36,12 +36,13 @@ const hooks = registerHooks({
         shortCircuit: true,
         source: `
           const s = globalThis.__visionUnderstandingHostTest;
-          export const resolveFfmpeg = () => null;
+          export const resolveFfmpeg = () => (s.allowCapture === true ? 'ffmpeg' : null);
           export const resolveFfplay = () => null;
           export const capture = (options) => s.makeShot(options.dir);
           export const captureDesktop = capture;
           export const captureDevice = capture;
-          export const startStoryboard = () => {
+          export const startStoryboard = (options) => {
+            if (typeof s.storyboardFactory === 'function') return s.storyboardFactory(options);
             s.storyboardStarts = (s.storyboardStarts ?? 0) + 1;
             throw new Error('real capture forbidden');
           };
@@ -72,11 +73,21 @@ async function fixture(t, options = {}) {
   const routes = new Map();
   const promptSections = new Map();
   const promptContexts = new Map();
+  const listeners = new Map();
   const disposers = [];
   const effect = (fn) => {
     const cleanup = fn();
     if (typeof cleanup === 'function') disposers.push(cleanup);
     return cleanup;
+  };
+  const on = (type, handler) => {
+    const list = listeners.get(type) ?? [];
+    list.push(handler);
+    listeners.set(type, list);
+    return () => {
+      const index = list.indexOf(handler);
+      if (index >= 0) list.splice(index, 1);
+    };
   };
   const attachments = {
     async saveImage({ data, mediaType, name }) {
@@ -89,8 +100,17 @@ async function fixture(t, options = {}) {
       return { provider, id: model, name: model, inputModalities: ['text', 'image'] };
     },
   };
+  await mkdir(join(root, 'workspace'), { recursive: true });
+  await mkdir(join(root, 'data'), { recursive: true });
+  if (options.features !== null && typeof options.features === 'object') {
+    await writeFile(join(root, 'data', 'features.json'), `${JSON.stringify(options.features)}\n`, 'utf8');
+  }
+  if (options.settings !== null && typeof options.settings === 'object') {
+    await writeFile(join(root, 'data', 'settings.json'), `${JSON.stringify(options.settings)}\n`, 'utf8');
+  }
   apply({
     effect,
+    on,
     get: (service) => (service === 'attachments' ? attachments : service === 'llm' ? llm : undefined),
     tools: { register(definition) { tools.set(definition.name, definition); return () => tools.delete(definition.name); } },
     inject: (_dependencies, register) => register({
@@ -127,6 +147,8 @@ async function fixture(t, options = {}) {
 
   state.captures = 0;
   state.storyboardStarts = 0;
+  state.allowCapture = options.allowCapture === true;
+  state.storyboardFactory = null;
   state.makeShot = async () => {
     throw new Error('no capture expected in the understanding host test');
   };
@@ -152,7 +174,7 @@ async function fixture(t, options = {}) {
     await dispose();
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   });
-  return { root, status, action, dispose, promptSections, promptContexts };
+  return { root, status, action, dispose, promptSections, promptContexts, listeners };
 }
 
 test('裸挂载：assistant:understanding 已注册且渲染空，status 只给计数不碰采集', async (t) => {
@@ -176,6 +198,10 @@ test('裸挂载：assistant:understanding 已注册且渲染空，status 只给�
   assert.equal(view.failures, 0);
   assert.equal(view.stopped, false);
   assert.equal(view.hasState, false);
+  assert.equal(view.lastReasonCode, '', '失败原因码初始为空');
+  assert.equal(view.lastErrorCode, '', 'provider 错误码初始为空');
+  assert.equal(view.rawChars, 0, 'bad-json 诊断初始为空');
+  assert.equal(view.rawHash, '');
   assert.deepEqual(view.state, { sceneChars: 0, events: 0, unresolvedChars: 0 });
   // 设置页成本概览的只读数值：20 秒是限速下限，不是定时器；上限只是算术值。
   assert.equal(view.intervalMs, 20_000, '默认最短间隔 20 秒');
@@ -305,3 +331,137 @@ test('隐私、切源或停止后材料签名重置；评论 priority 路径不�
   assert.match(hostSource.slice(disposeAt, disposeAt + 200), /resetUnderstandingMaterial\(\)/,
     '卸载停止理解时也重置签名');
 });
+
+// ---------------------------------------------------------------------------
+// 真实采集接线：voice + typed 陪伴轮都渲染 understanding；analyzer 失败只留机器码
+// ---------------------------------------------------------------------------
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(check, timeoutMs = 5_000) {
+  const until = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return;
+    if (Date.now() > until) assert.fail('condition not met before timeout');
+    await delay(10);
+  }
+}
+
+test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed 非陪伴轮为空；失败 errorCode 可读且采集继续', async (t) => {
+  const control = { mode: 'ok', forceTyped: false, allowSecond: false, takes: 0 };
+  const app = await fixture(t, {
+    // 用测试缝模拟“同一陪伴会话里的文字轮”：identity 仍是 companion，lane 改成 typed。
+    contextLaneOverride: () => (control.forceTyped === true ? 'typed' : undefined),
+    allowCapture: true,
+    evidenceCaptureEnabled: true,
+    evidenceCaptureTickMs: 5,
+    understandingMinIntervalMs: 1,
+    features: {
+      hearing: false, ambient: false, voice: false, vision: true,
+      subtitle: false, avatar: false, memory: false, fastpath: false,
+    },
+    settings: { vision: { continuousView: true } },
+    understandingAnalyzer: async (options) => {
+      if (control.mode === 'fail') {
+        return { ok: false, text: '', reason: 'stream-error', errorCode: 'rate_limited', images: 1 };
+      }
+      const at = Number(options?.interval?.from) || Date.now();
+      return {
+        ok: true,
+        text: JSON.stringify({
+          sceneSummary: '测试场景：桌面上有一个打开的窗口',
+          events: [],
+          unresolved: '',
+          // 事件时间只用于展示；这里没有事件，保留字段方便未来扩展。
+          observedAt: at,
+        }),
+        reason: 'ok',
+        images: 1,
+      };
+    },
+  });
+
+  const screenDir = join(app.root, 'cache', 'screens');
+  await mkdir(screenDir, { recursive: true });
+  await writeFile(join(screenDir, 'sheet-1.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01]));
+  await writeFile(join(screenDir, 'sheet-2.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x02]));
+  state.storyboardFactory = () => ({
+    engine: 'fake',
+    sourceKind: 'screen',
+    done: Promise.resolve(),
+    stop: () => {},
+    take: async () => {
+      if (control.takes === 0) {
+        control.takes = 1;
+        return { file: join(screenDir, 'sheet-1.png'), capturedAt: Date.now(), width: 2, height: 2, frames: 2 };
+      }
+      if (control.allowSecond === true && control.takes === 1) {
+        control.takes = 2;
+        return { file: join(screenDir, 'sheet-2.png'), capturedAt: Date.now(), width: 2, height: 2, frames: 2 };
+      }
+      return null;
+    },
+  });
+
+  const companionId = voiceSessionTarget({ root: app.root }).sessionId;
+  const workspace = join(app.root, 'workspace');
+  const companion = () => ({
+    id: companionId,
+    session: { id: companionId, header: { cwd: workspace } },
+  });
+  const handlers = app.listeners.get('agent/pre-step') ?? [];
+  assert.ok(handlers.length > 0, 'Host 注册了 agent/pre-step');
+  await handlers[0]({
+    agent: companion(),
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+    messages: [{ id: 'u-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '嗨' }] }],
+  }, async () => ({ kind: 'enter', messages: [] }));
+
+  await waitFor(async () => (await app.status()).vision.understanding.hasState === true);
+  const understanding = app.promptContexts.get('assistant:understanding');
+  assert.ok(understanding !== undefined);
+
+  // voice lane（identity 推导）行为不变。
+  const voiceText = understanding.text({ agent: companion() });
+  assert.ok(voiceText.includes('测试场景'), `voice 陪伴轮仍注入：${voiceText}`);
+
+  // typed lane + 同一 companion：文字陪伴轮现在也注入。
+  control.forceTyped = true;
+  const typedText = understanding.text({ agent: companion() });
+  assert.ok(typedText.includes('测试场景'), `typed 陪伴轮注入：${typedText}`);
+
+  // typed 但不是 companion：不注入。
+  const outsider = {
+    id: 'gui-typed-session',
+    session: { id: 'gui-typed-session', header: { cwd: workspace } },
+  };
+  assert.equal(understanding.text({ agent: outsider }), '', 'typed 非陪伴轮不注入');
+
+  const success = (await app.status()).vision.understanding;
+  assert.equal(success.lastReasonCode, 'ok');
+  assert.equal(success.lastErrorCode, '');
+  assert.equal(success.rawChars, 0);
+  assert.equal(success.rawHash, '');
+
+  // 换一份材料并让 analyzer 失败：errorCode 只作为机器码进入 status，采集不被阻塞。
+  await delay(260);
+  control.mode = 'fail';
+  control.allowSecond = true;
+  await waitFor(async () => (await app.status()).vision.understanding.failures >= 1);
+
+  const snapshot = await app.status();
+  const failed = snapshot.vision.understanding;
+  assert.equal(failed.lastReasonCode, 'stream-error');
+  assert.equal(failed.lastErrorCode, 'rate_limited');
+  assert.equal(failed.rawChars, 0);
+  assert.equal(failed.rawHash, '');
+  assert.equal(snapshot.vision.evidenceCapture.running, true, 'understanding 失败不阻塞持续采集');
+  assert.ok(snapshot.vision.evidenceCapture.sheets >= 2, '第二份材料仍被采集并交给理解');
+
+  // 失败只增加计数，不销毁上一段已理解状态。
+  assert.ok(understanding.text({ agent: companion() }).includes('测试场景'),
+    '失败不清空既有 understanding 状态');
+});
+

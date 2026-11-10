@@ -703,6 +703,42 @@ const UNDERSTANDING_INJECTION_ORDER = AUDIOVISUAL_INJECTION_ORDER + 1;
 /** 后台理解每次分析最多交给模型的图片数；与运行时默认值同源，供设置页成本概览使用。 */
 export const UNDERSTANDING_MAX_IMAGES = UNDERSTANDING_RUNTIME_DEFAULTS.maxFrames;
 
+/**
+ * 被动画面理解块的统一门禁。
+ *
+ * 与 recent / nonverbal / audiovisual 不同，understanding 不再是 voice lane 独占：
+ * 同一陪伴会话里的文字轮也能看到后台已经理解出的画面。它仍然只属于陪伴上下文：
+ * 必须 = 工作区内 + 陪伴 agent + 视觉组件开启 + 非隐私 + 非 subagent，并且确实有状态。
+ * `lane = null` 表示“不按 lane 限定”（供理解文本渲染本身使用）；显式 lane 时只接受
+ * voice / typed。fastpath 与任何未知 lane 都不注入。
+ */
+export function understandingBlockAllowed({
+  lane = null,
+  inScope = false,
+  companion = false,
+  subagent = false,
+  visionEnabled = false,
+  privacy = false,
+  hasState = false,
+} = {}) {
+  if (subagent === true) return false;
+  if (inScope !== true || companion !== true) return false;
+  if (visionEnabled !== true || privacy === true) return false;
+  if (hasState !== true) return false;
+  if (lane !== null && lane !== undefined && lane !== 'voice' && lane !== 'typed') return false;
+  return true;
+}
+
+/**
+ * 生成 understanding ephemeral block；门禁不通过或没有状态时返回 null，绝不产生空块。
+ * 调用方负责把文本交给 layer planner 做预算裁剪；这里不再拼接或截断正文。
+ */
+export function understandingEphemeralBlock(text, options = {}) {
+  const value = typeof text === 'string' ? text : '';
+  if (!understandingBlockAllowed({ ...options, hasState: value.length > 0 })) return null;
+  return { name: 'understanding', text: value, separator: '\n', keep: 'head' };
+}
+
 /** 材料签名的上限：只用来判断“是不是同一份材料”，不携带正文、不读像素。 */
 const MATERIAL_SIGNATURE_MAX_CHARS = 240;
 const MATERIAL_FILE_MAX_CHARS = 80;
@@ -2795,8 +2831,20 @@ export function apply(ctx, config) {
    * P-59: the lane of one prompt render. The dated companion session is the voice entry; every
    * other session (GUI typing, resumed, etc.) is the typed entry. Identity is read per render and
    * an unreadable identity falls back to typed instead of throwing into assembly.
+   *
+   * `config.contextLaneOverride` 是测试缝（生产 config 来自 JSON，不可能携带函数）：Host 测试
+   * 用它模拟“同一陪伴会话里的文字轮”（companion 身份 + typed lane），而不必真的改变生产
+   * 的会话身份映射。
    */
   const contextLaneOf = (context) => {
+    if (typeof config?.contextLaneOverride === 'function') {
+      try {
+        const override = config.contextLaneOverride(context);
+        if (override === 'voice' || override === 'typed' || override === 'fastpath') return override;
+      } catch {
+        /* fall through to the identity-derived lane */
+      }
+    }
     try {
       const agent = context?.agent;
       const id = typeof agent?.id === 'string' && agent.id.length > 0
@@ -2850,8 +2898,9 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * P-187 阶段 3：后台“按变化理解画面”的被动块。门禁与 audiovisual 完全一致：
-   * workspace + 陪伴 agent + voice lane + 视觉组件开启；无状态时 render() 返回 ''。
+   * P-187 阶段 3：后台“按变化理解画面”的被动块。它只在陪伴上下文里渲染，但不再限定 voice lane：
+   * 同一陪伴会话里的文字轮也能看到已经理解出的画面。门禁与 ephemeral block 共用
+   * `understandingBlockAllowed`；无状态时 render() 返回 ''。
    *
    * `understanding` 与 `commentEvidence` 一样在本函数之后才初始化：这里只能在函数体内引用，
    * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
@@ -2860,16 +2909,21 @@ export function apply(ctx, config) {
     try {
       if (!inWorkspaceScope(context)) return '';
       if (!isCompanionAgent(context?.agent)) return '';
-      if (contextLaneOf(context) !== 'voice') return '';
-      if (features.enabled('vision') !== true) return '';
+      let visionEnabled = false;
+      try { visionEnabled = features.enabled('vision') === true; } catch { visionEnabled = false; }
+      let privacy = true;
+      try { privacy = vision.mode === 'privacy'; } catch { privacy = true; }
+      if (!understandingBlockAllowed({
+        inScope: true, companion: true, subagent: false, visionEnabled, privacy, hasState: true,
+      })) return '';
       return understanding.render();
     } catch {
       return '';
     }
   };
   /**
-   * 当前动态观察：recent 对话 + 本轮视听证据 + 后台画面理解，使用与实际 plan 完全相同的门禁。
-   * 缓存 plan 保存这三个指纹；任一变化都必须重算整份 plan。空值也是真实观察，不是“未知”。
+   * 当前动态观察：recent 对话 + 本轮视听证据 + 后台画面理解。recent/audiovisual 仍是 voice
+   * lane 独占；只有 understanding 跟随陪伴上下文进入 typed 轮。空值也是真实观察，不是“未知”。
    */
   const currentObservations = (context, lane) => {
     try {
@@ -2880,11 +2934,13 @@ export function apply(ctx, config) {
       } catch {
         companion = false;
       }
-      if (!companion || lane !== 'voice') return { recent: '', audiovisual: '', understanding: '' };
+      if (!companion) return { recent: '', audiovisual: '', understanding: '' };
+      const voiceLane = lane === 'voice';
+      const understandingLane = voiceLane || lane === 'typed';
       return {
-        recent: features.enabled('hearing') ? dialogueSummary.render() : '',
-        audiovisual: commentEvidenceForContext(context),
-        understanding: understandingForContext(context),
+        recent: voiceLane && features.enabled('hearing') ? dialogueSummary.render() : '',
+        audiovisual: voiceLane ? commentEvidenceForContext(context) : '',
+        understanding: understandingLane ? understandingForContext(context) : '',
       };
     } catch {
       return { recent: '', audiovisual: '', understanding: '' };
@@ -2940,8 +2996,21 @@ export function apply(ctx, config) {
     if (inScope) ephemeralBlocks.push({ name: 'environment', text: renderEnvironment(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'nonverbal', text: nonverbalCue.render(), separator: '\n', keep: 'head' });
     if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'audiovisual', text: audiovisualText, separator: '\n', keep: 'head' });
-    // P-187 阶段 3：画面理解排在视听证据之后；无内容时块为空，不占可见文本。
-    if (inScope && companion && lane === 'voice') ephemeralBlocks.push({ name: 'understanding', text: understandingText, separator: '\n', keep: 'head' });
+    // P-187 阶段 3：画面理解排在视听证据之后；语音轮与文字陪伴轮都注入，但仍然只属于陪伴
+    // 上下文（视觉开启、非隐私、有状态、非 subagent）。空文本返回 null，不占可见文本。
+    let understandingVisionEnabled = false;
+    try { understandingVisionEnabled = features.enabled('vision') === true; } catch { understandingVisionEnabled = false; }
+    let understandingPrivacy = true;
+    try { understandingPrivacy = vision.mode === 'privacy'; } catch { understandingPrivacy = true; }
+    const understandingBlock = understandingEphemeralBlock(understandingText, {
+      lane,
+      inScope,
+      companion,
+      subagent: false,
+      visionEnabled: understandingVisionEnabled,
+      privacy: understandingPrivacy,
+    });
+    if (understandingBlock !== null) ephemeralBlocks.push(understandingBlock);
     const plan = assembleLayerPlan({
       lane,
       budget: resolveContextBudget(
@@ -11589,6 +11658,10 @@ export function apply(ctx, config) {
         pending: 0,
         lastAt: null,
         lastReason: '',
+        lastReasonCode: '',
+        lastErrorCode: '',
+        rawChars: 0,
+        rawHash: '',
         runs: 0,
         failures: 0,
         droppedEvents: 0,
@@ -14807,7 +14880,7 @@ export function apply(ctx, config) {
     const ephemeralText = [
       lane === 'voice' ? nonverbalCue.render() : '',
       lane === 'voice' ? commentEvidenceForContext(context) : '',
-      lane === 'voice' ? understandingForContext(context) : '',
+      lane === 'voice' || lane === 'typed' ? understandingForContext(context) : '',
       renderEnvironment(),
     ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n');
     return {

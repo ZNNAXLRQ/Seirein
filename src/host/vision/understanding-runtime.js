@@ -54,6 +54,11 @@ export const UNDERSTANDING_RUNTIME_DEFAULTS = Object.freeze({
 const DEFAULT_MIN_INTERVAL_MS = 15_000;
 /** 原因只作为状态标签：单行、限长，避免长文本/控制字符进入 status。 */
 const MAX_REASON_CHARS = 80;
+/** provider 错误码同样只保留短机器码；正文、路径或空白一律丢弃。 */
+const MAX_ERROR_CODE_CHARS = 64;
+const MACHINE_CODE = /^[A-Za-z0-9_.:-]+$/u;
+/** raw 摘要只保留长度和哈希；原文永不进入事件/status。 */
+const MAX_RAW_HASH_CHARS = 64;
 /** 定向分析的关注点上限；只作为提示词上下文，不进入状态/status 正文。 */
 const MAX_FOCUS_CHARS = 200;
 /** 单个描述/场景的渲染预算上限（仍受总 maxChars 兜底）。 */
@@ -105,6 +110,29 @@ function reasonText(value) {
     .replace(/[\u0000-\u001f\u007f]+/g, ' ')
     .trim()
     .slice(0, MAX_REASON_CHARS);
+}
+
+/**
+ * provider 错误码：只接受短机器码。与 image-analyzer 的透出规则一致，任何可能夹带
+ * 正文/路径/空白的值都丢弃，宁可空着也不污染日志或 status。
+ */
+function errorCodeText(value) {
+  if (typeof value !== 'string') return '';
+  const code = value.trim();
+  if (code.length === 0 || code.length > MAX_ERROR_CODE_CHARS) return '';
+  if (!MACHINE_CODE.test(code)) return '';
+  return code;
+}
+
+/** bad-json 诊断：长度与哈希；原文只在这里被摘要，绝不返回。 */
+function rawDiagnostics(diagnostics) {
+  const source = isObject(diagnostics) ? diagnostics : {};
+  const chars = Number(source.rawChars);
+  const hash = typeof source.rawHash === 'string' ? source.rawHash.trim() : '';
+  return {
+    rawChars: Number.isSafeInteger(chars) && chars >= 0 ? chars : 0,
+    rawHash: hash.length > 0 && hash.length <= MAX_RAW_HASH_CHARS ? hash : '',
+  };
 }
 
 /** 渲染前扁平化：换行/控制字符不参与结构，避免模型文本伪造小节。 */
@@ -278,6 +306,11 @@ export function createUnderstandingRuntime(options = {}) {
   let droppedEvents = 0;
   let lastEventCount = 0;
   let lastReason = '';
+  /** provider 的错误码（仅短机器码）；没有错误码时为空串。 */
+  let lastErrorCode = '';
+  /** bad-json 的诊断：只记长度和哈希，不记原始文本/画面内容。 */
+  let lastRawChars = 0;
+  let lastRawHash = '';
   let lastAt = null;
   let lastWindowReason = '';
   let lastClearReason = '';
@@ -314,6 +347,10 @@ export function createUnderstandingRuntime(options = {}) {
       reason: outcome.reason,
       eventCount: outcome.eventCount ?? 0,
       droppedEvents: outcome.droppedEvents ?? 0,
+      // 失败诊断只带机器字段：provider 错误码与 bad-json 的长度/哈希，绝无正文或路径。
+      errorCode: lastErrorCode,
+      rawChars: lastRawChars,
+      rawHash: lastRawHash,
       at: lastAt,
     });
   }
@@ -333,21 +370,35 @@ export function createUnderstandingRuntime(options = {}) {
   function recordSkip(reason) {
     const label = reasonText(reason) || 'skipped';
     lastReason = label;
+    lastErrorCode = '';
+    lastRawChars = 0;
+    lastRawHash = '';
     lastAt = clock();
     emitOutcome({ ok: false, reason: label, eventCount: 0, droppedEvents: 0 });
     return { ok: false, reason: label };
   }
 
-  function recordFailure(reason, dropped = 0) {
+  function recordFailure(reason, dropped = 0, diagnostics = {}) {
     const label = reasonText(reason) || 'error';
     const droppedCount = Number.isFinite(dropped) && dropped > 0 ? Math.floor(dropped) : 0;
+    const raw = rawDiagnostics(diagnostics);
     failures += 1;
     lastEventCount = 0;
     droppedEvents += droppedCount;
     lastReason = label;
+    lastErrorCode = errorCodeText(diagnostics?.errorCode);
+    lastRawChars = raw.rawChars;
+    lastRawHash = raw.rawHash;
     lastAt = clock();
     emitOutcome({ ok: false, reason: label, eventCount: 0, droppedEvents: droppedCount });
-    return { ok: false, reason: label, droppedEvents: droppedCount };
+    return {
+      ok: false,
+      reason: label,
+      droppedEvents: droppedCount,
+      errorCode: lastErrorCode,
+      rawChars: lastRawChars,
+      rawHash: lastRawHash,
+    };
   }
 
   function staleOutcome() {
@@ -469,7 +520,8 @@ export function createUnderstandingRuntime(options = {}) {
         && rawOutput.reason.trim().length > 0
         ? rawOutput.reason
         : 'analyze-failed';
-      return recordFailure(failureReason);
+      // 只透传 provider 的短错误码；错误正文/路径永远不进入事件或 status。
+      return recordFailure(failureReason, 0, { errorCode: rawOutput.errorCode });
     }
     const rawEvidence = isObject(rawOutput) && typeof rawOutput.text === 'string'
       ? rawOutput.text
@@ -489,7 +541,11 @@ export function createUnderstandingRuntime(options = {}) {
 
     if (!parsed.ok) {
       lastEventCount = 0;
-      return recordFailure(parsed.reason || 'parse-error', parsed.droppedEvents || 0);
+      // bad-json 只带 rawChars/rawHash（parseUnderstanding 生成）；其它解析失败没有诊断字段。
+      return recordFailure(parsed.reason || 'parse-error', parsed.droppedEvents || 0, {
+        rawChars: parsed.rawChars,
+        rawHash: parsed.rawHash,
+      });
     }
 
     // 解析后、写回前再查一次代次：clear/stop 可能发生在 await 与解析之间。
@@ -515,6 +571,9 @@ export function createUnderstandingRuntime(options = {}) {
     lastEventCount = parsed.events.length;
     droppedEvents += parsed.droppedEvents;
     lastReason = 'ok';
+    lastErrorCode = '';
+    lastRawChars = 0;
+    lastRawHash = '';
     lastWindowReason = reason;
     lastAt = clock();
     emitOutcome({
@@ -708,6 +767,9 @@ export function createUnderstandingRuntime(options = {}) {
     lastClearReason = reasonText(reason);
     lastWindowReason = '';
     lastReason = 'cleared';
+    lastErrorCode = '';
+    lastRawChars = 0;
+    lastRawHash = '';
     lastAt = clock();
     if (activeController !== null) {
       try {
@@ -727,6 +789,9 @@ export function createUnderstandingRuntime(options = {}) {
     stopped = true;
     generation += 1;
     lastReason = 'stopped';
+    lastErrorCode = '';
+    lastRawChars = 0;
+    lastRawHash = '';
     lastAt = clock();
     if (activeController !== null) {
       try {
@@ -741,10 +806,17 @@ export function createUnderstandingRuntime(options = {}) {
   /** 只读诊断：调度器状态 + 运行时分析计数；不含素材正文（focus 只给长度）。 */
   function status() {
     const scheduled = scheduler.status();
+    const reason = lastReason || scheduled.lastReason;
     return {
       ...scheduled,
       running: scheduled.running === true || busy,
-      lastReason: lastReason || scheduled.lastReason,
+      lastReason: reason,
+      // 机器原因码与 lastReason 同源；lastErrorCode 只承载 provider 错误码（没有则空）。
+      lastReasonCode: reason,
+      lastErrorCode,
+      // bad-json 诊断：只给长度和哈希，原文本/画面永不进入 status。
+      rawChars: lastRawChars,
+      rawHash: lastRawHash,
       lastWindowReason: lastWindowReason || scheduled.lastReason,
       lastAt: lastAt ?? scheduled.lastAt,
       runs,

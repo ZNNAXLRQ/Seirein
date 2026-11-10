@@ -21,6 +21,8 @@
  * 看到模型输出质量。`from > to` 同样丢弃。
  */
 
+import { createHash } from 'node:crypto';
+
 /** 第一版试验参数；条数/字符都有上限，不按“大约”猜。 */
 export const UNDERSTANDING_DEFAULTS = Object.freeze({
   /** 一次分析最多看几张。 */
@@ -244,7 +246,23 @@ export function buildUnderstandingInput(input = {}) {
   };
 }
 
-/** 解码模型原始输出：支持对象、JSON 字符串，以及常见的一层 ```json 围栏。 */
+/**
+ * 给 bad-json 诊断用的有界摘要：只保留原始输出的长度与哈希，绝不把正文/画面内容带出去。
+ * 哈希用于同一份坏输出在日志里可关联，无法反推出原文。
+ */
+function rawDiagnostics(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) return {};
+  return {
+    rawChars: raw.length,
+    rawHash: createHash('sha1').update(raw).digest('hex').slice(0, 16),
+  };
+}
+
+/**
+ * 解码模型原始输出：支持对象、JSON 字符串、一层 ```json 围栏，以及 JSON 外夹带少量说明
+ * 的常见输出。先按整体/围栏解析；仍失败时取第一个 `{` 到最后一个 `}` 再解析。只做位置
+ * 容错，不猜测或修补字段；仍失败才是 bad-json。
+ */
 function decodeRaw(raw) {
   if (raw === null || raw === undefined) return { ok: false, reason: 'not-object' };
   if (typeof raw === 'object') {
@@ -253,24 +271,41 @@ function decodeRaw(raw) {
   }
   if (typeof raw !== 'string') return { ok: false, reason: 'not-object' };
   let text = raw.trim();
-  if (text.length === 0) return { ok: false, reason: 'bad-json' };
+  if (text.length === 0) return { ok: false, reason: 'bad-json', ...rawDiagnostics(raw) };
   if (text.startsWith('```')) {
     const fenced = text.match(/^```[a-zA-Z0-9_-]*\s*\n?([\s\S]*?)\n?```\s*$/);
     if (fenced !== null) text = fenced[1].trim();
   }
-  if (text.length === 0) return { ok: false, reason: 'bad-json' };
+  if (text.length === 0) return { ok: false, reason: 'bad-json', ...rawDiagnostics(raw) };
+
   let value;
+  let parsed = false;
   try {
     value = JSON.parse(text);
+    parsed = true;
   } catch {
-    return { ok: false, reason: 'bad-json' };
+    parsed = false;
   }
+  if (!parsed) {
+    // 说明/前后缀夹在 JSON 外：只取第一个 { 到最后一个 }，不做字段级修补。
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        value = JSON.parse(text.slice(start, end + 1));
+        parsed = true;
+      } catch {
+        parsed = false;
+      }
+    }
+  }
+  if (!parsed) return { ok: false, reason: 'bad-json', ...rawDiagnostics(raw) };
   if (!isObject(value)) return { ok: false, reason: 'not-object' };
   return { ok: true, value };
 }
 
-function parseFailure(reason, interval) {
-  return {
+function parseFailure(reason, interval, diagnostics = {}) {
+  const result = {
     ok: false,
     reason,
     interval,
@@ -280,6 +315,14 @@ function parseFailure(reason, interval) {
     droppedEvents: 0,
     unknownEvidenceIds: [],
   };
+  const source = diagnostics !== null && typeof diagnostics === 'object' ? diagnostics : {};
+  if (Number.isSafeInteger(source.rawChars) && source.rawChars >= 0) {
+    result.rawChars = source.rawChars;
+  }
+  if (typeof source.rawHash === 'string' && source.rawHash.length > 0) {
+    result.rawHash = source.rawHash;
+  }
+  return result;
 }
 
 /**
@@ -307,7 +350,7 @@ export function parseUnderstanding(input = {}) {
   if (interval === null) return parseFailure('no-interval', null);
 
   const decoded = decodeRaw(input.raw);
-  if (!decoded.ok) return parseFailure(decoded.reason, interval);
+  if (!decoded.ok) return parseFailure(decoded.reason, interval, decoded);
   const value = decoded.value;
 
   const sceneSummary = clipText(trimmed(value.sceneSummary), UNDERSTANDING_DEFAULTS.maxSceneChars);
