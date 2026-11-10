@@ -10,8 +10,13 @@ import {
   VOICE_COMPACTION_PRESET,
   assessVoiceCompactionPreset,
   createVoiceCompaction,
+  hasVoiceNativeTools,
   mergeVoicePresetWithNativeTools,
 } from '../src/host/session/compaction/voice-compaction.js';
+
+const flatten = (definition) => (Array.isArray(definition?.plugins)
+  ? definition.plugins.flatMap((row) => (row?.group === true && Array.isArray(row.config) ? row.config : [row]))
+  : []);
 
 const standard = {
   id: 'standard',
@@ -46,8 +51,10 @@ const standard = {
 
 test('native merge copies live tool capabilities but not coding identity/plan/duplicate compaction', () => {
   const merged = mergeVoicePresetWithNativeTools(VOICE_COMPACTION_PRESET, standard);
-  assert.equal(merged.nativeTools, true);
-  const ids = merged.plugins.map((row) => row.id);
+  assert.equal(hasVoiceNativeTools(merged), true);
+  const nativeGroup = merged.plugins.find((row) => row.id === 'seirein-native-tools');
+  assert.ok(nativeGroup && nativeGroup.group === true, 'native rows are wrapped in a real Cordis group');
+  const ids = flatten(merged).map((row) => row.id);
   assert.ok(ids.includes('tool-todo'));
   assert.ok(ids.includes('tool-jobs'));
   assert.ok(ids.includes('tool-schedule'));
@@ -56,8 +63,8 @@ test('native merge copies live tool capabilities but not coding identity/plan/du
   assert.equal(ids.includes('persona'), false);
   assert.equal(ids.includes('agent-instructions'), false);
   assert.equal(ids.includes('planning'), false);
-  assert.equal(ids.filter((id) => id === 'compaction').length, 1);
-  assert.equal(merged.plugins.find((row) => row.id === 'delegation').isolate.workflowEngine, true);
+  assert.equal(merged.plugins.filter((row) => row.id === 'compaction').length, 1);
+  assert.equal(flatten(merged).find((row) => row.id === 'delegation').isolate.workflowEngine, true);
 });
 
 test('audit accepts a marked native composition but still rejects arbitrary extra tools', () => {
@@ -88,9 +95,9 @@ test('registration reads the standard preset at runtime and registers the merged
   });
   const state = await engine.ensurePreset(presets);
   assert.equal(state.status, 'registered');
-  assert.equal(state.nativeTools, true);
+  assert.equal(hasVoiceNativeTools(registered), true);
   assert.ok(Array.isArray(registered?.plugins));
-  const ids = registered.plugins.map((row) => row.id);
+  const ids = flatten(registered).map((row) => row.id);
   assert.ok(ids.includes('tool-jobs') && ids.includes('tool-todo'));
   assert.equal(ids.includes('persona'), false);
 });

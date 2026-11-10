@@ -93,6 +93,12 @@ export const VOICE_NATIVE_EXCLUDED_IDS = Object.freeze([
   'persona', 'agent-instructions', 'planning', 'compaction',
 ]);
 
+/** Whether a declaration carries the group composed from the live standard preset. */
+export function hasVoiceNativeTools(definition) {
+  return Array.isArray(definition?.plugins)
+    && definition.plugins.some((row) => row?.id === 'seirein-native-tools' && row?.group === true);
+}
+
 /**
  * Copy the live `standard` preset's non-identity rows into Seirein's voice preset. This is the
  * dynamic link: a new DSH release or a user-added plugin that appears in the standard preset is
@@ -102,8 +108,7 @@ export const VOICE_NATIVE_EXCLUDED_IDS = Object.freeze([
  * @param {object|null} standard - registry definition of the standard preset.
  * @returns {object} base when no standard rows exist, otherwise a merged declaration.
  */
-export function mergeVoicePresetWithNativeTools(base, standard) {
-  const source = Array.isArray(standard?.plugins) ? standard.plugins : [];
+export function mergeVoicePresetWithNativeTools(base, standard) {  const source = Array.isArray(standard?.plugins) ? standard.plugins : [];
   const native = source.filter((row) => {
     if (row === null || typeof row !== 'object') return false;
     const id = typeof row.id === 'string' ? row.id : '';
@@ -117,10 +122,17 @@ export function mergeVoicePresetWithNativeTools(base, standard) {
   if (native.length === 0) return base;
   return {
     ...base,
-    // Marker used by the audit to distinguish a deliberately composed native-tool preset from an
-    // arbitrary profile declaration that happens to carry tools.
-    nativeTools: true,
-    plugins: [...(Array.isArray(base?.plugins) ? base.plugins : []), ...native],
+    plugins: [
+      ...(Array.isArray(base?.plugins) ? base.plugins : []),
+      {
+        // A real Cordis group (not an unknown preset key) keeps the copied rows composable and
+        // gives the audit one explicit marker for "native rows composed from standard".
+        id: 'seirein-native-tools',
+        name: 'cordis:group',
+        group: true,
+        config: native,
+      },
+    ],
   };
 }
 
@@ -172,7 +184,7 @@ const packageNameOf = (row) => (typeof row?.name === 'string' ? row.name.trim() 
  * @returns {{compatible: boolean, reason: string, plugins: string[], missing: string[], extras: string[]}}
  */
 export function assessVoiceCompactionPreset(definition, { allowNativeTools = false } = {}) {
-  const nativeComposition = allowNativeTools === true && definition?.nativeTools === true;
+  const nativeComposition = allowNativeTools === true && hasVoiceNativeTools(definition);
   const leaves = [];
   const extras = [];
   const addExtra = (value) => {
@@ -436,7 +448,7 @@ export function createVoiceCompaction({
       }
       presetState = {
         status: 'reused', source, registered: false, error: null, reason: null,
-        at: Date.now(), nativeTools: definition?.nativeTools === true,
+        at: Date.now(), nativeTools: hasVoiceNativeTools(definition),
       };
       note('voice.compaction.preset.reused', { presetId, source, plugins: audit.plugins });
       return presetState;
@@ -467,7 +479,7 @@ export function createVoiceCompaction({
         const standardRecord = await readPresetById(presets, 'standard');
         const standard = definitionOf(standardRecord);
         effective = mergeVoicePresetWithNativeTools(presetDefinition, standard);
-        nativeTools = effective !== presetDefinition;
+        nativeTools = hasVoiceNativeTools(effective);
       } catch {
         // Standard preset unavailable: keep the compaction-only fallback rather than blocking voice.
       }
