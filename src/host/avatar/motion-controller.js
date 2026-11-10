@@ -171,22 +171,37 @@ export const POSTURE_COMPONENT_MAX_MS = 20_000;
 
 /**
  * Semantic amplitude band of one component. ONE SEMANTIC UNIT = 30° (the writer's documented
- * convention), so 0.15 = 4.5°. The cap is applied to the COMPONENT TARGET after the persona/status
- * gain is known; this layer never multiplies a global "visibility" gain on top.
+ * convention), so 0.12–0.15 = 3.6–4.5°. The band is deliberately kept close to the cap: the
+ * component target must still be recognisable after the live persona/status gain is folded in.
+ * The cap is applied to the COMPONENT TARGET after the gain is known; this layer never multiplies a
+ * global "visibility" gain on top of the instant output (base micro-motion stays as light as before).
  */
-export const POSTURE_COMPONENT_MIN_AMPLITUDE = 0.10;
+export const POSTURE_COMPONENT_MIN_AMPLITUDE = 0.12;
 export const POSTURE_COMPONENT_MAX_AMPLITUDE = 0.15;
+
+/**
+ * A component target is expressed as a pose-unit offset inserted into the SAME `posture.target` the
+ * base posture uses. Cancelling a quiet persona's small gain needs a larger offset (semantic target
+ * / live gain), so the offset may exceed 1. It is bounded here so a near-zero gain cannot produce an
+ * unbounded internal number; the semantic target itself is still capped by
+ * POSTURE_COMPONENT_MAX_AMPLITUDE. `POSTURE_COMPONENT_TARGET_LIMIT` is the post-add bound for the
+ * combined base + component goal (base stays in ±1, so it only leaves room for the offset).
+ */
+export const POSTURE_COMPONENT_AXIS_LIMIT = 64;
+export const POSTURE_COMPONENT_TARGET_LIMIT = 72;
 
 /**
  * The phase-1 component library. `headX/headY/headZ` are normalized shape weights: the selected
  * amplitude (semantic units, ≤0.15) is converted to that axis's own pose unit through the live
  * persona gain, so the target stays semantic-bounded instead of depending on a hard-coded scale.
+ * Every non-zero weight is kept well above the old 0.18–0.28 trace range, so an accompanying axis
+ * remains a recognisable part of the held pose instead of rounding away to ≈0.2°.
  */
 export const POSTURE_COMPONENTS = Object.freeze([
   Object.freeze({ id: 'natural', label: '自然', headX: 0, headY: 0, headZ: 0 }),
-  Object.freeze({ id: 'lean-left', label: '左侧倾', headX: 0.22, headY: 0, headZ: 1 }),
-  Object.freeze({ id: 'lean-right', label: '右侧倾', headX: -0.22, headY: 0, headZ: -1 }),
-  Object.freeze({ id: 'look-back', label: '偏头/回看', headX: 1, headY: 0.18, headZ: 0.28 }),
+  Object.freeze({ id: 'lean-left', label: '左侧倾', headX: 0.35, headY: 0, headZ: 1 }),
+  Object.freeze({ id: 'lean-right', label: '右侧倾', headX: -0.35, headY: 0, headZ: -1 }),
+  Object.freeze({ id: 'look-back', label: '偏头/回看', headX: 1, headY: 0.45, headZ: 0.55 }),
 ]);
 
 
@@ -1443,7 +1458,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const next = {};
     for (const axis of MOTION_AXES) {
       const offset = component?.axes?.[axis] ?? 0;
-      next[axis] = clampMotion(finite(base?.[axis], 0) + offset, 1);
+      // The component offset may exceed one pose unit when it cancels a quiet persona's tiny
+      // per-axis gain; the semantic cap is applied later to the contribution, not to this internal
+      // offset. The base itself is still drawn inside ±1.
+      next[axis] = clampMotion(finite(base?.[axis], 0) + offset, POSTURE_COMPONENT_TARGET_LIMIT);
     }
     return next;
   }
@@ -1468,14 +1486,24 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const holdMs = Math.max(postureComponentMinMs, Math.min(postureComponentMaxMs, influenced));
     const axes = {};
     const semantic = {};
+    const targetDegrees = {};
+    const saturated = {};
     for (const channel of POSTURE_COMPONENT_CHANNELS) {
       const gain = headSemanticGain(channel);
       const shape = finite(spec[channel], 0);
-      const axis = gain > 1e-9 ? (shape * amplitude) / gain : 0;
-      axes[channel] = clampMotion(axis, 1);
-      // Record the semantic target AFTER the clamp as well: a clamped axis must not be reported as
-      // an amplitude it never reaches.
+      const requested = gain > 1e-9 ? (shape * amplitude) / gain : 0;
+      // A quiet/tired persona has a tiny per-axis gain, so reaching a 0.12–0.15 semantic target
+      // needs an internal offset above 1. The bound only stops a near-zero gain from exploding; the
+      // published TARGET is the semantic value below (≤ the component cap), never this offset.
+      axes[channel] = clampMotion(requested, POSTURE_COMPONENT_AXIS_LIMIT);
+      saturated[channel] = Math.abs(requested) > POSTURE_COMPONENT_AXIS_LIMIT + 1e-9;
+      // Record the semantic target AFTER both clamps as well: an axis that never reaches its target
+      // must not be reported as an amplitude it did not produce.
       semantic[channel] = axes[channel] * gain;
+      // The writer's documented head convention is 1 semantic unit = 30°. This is the semantic
+      // target angle BEFORE any transport-specific normalisation (the facade annotates the verified
+      // input range separately and marks it unknown when no verified mapping exists).
+      targetDegrees[channel] = semantic[channel] * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
     }
     return {
       id: spec.id,
@@ -1487,6 +1515,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       channels: [...POSTURE_COMPONENT_CHANNELS],
       axes,
       semantic,
+      targetSemantic: { ...semantic },
+      targetDegrees,
+      targetDegreesBasis: 'semantic-30deg-per-unit (mapping-unverified)',
+      axisLimit: POSTURE_COMPONENT_AXIS_LIMIT,
+      saturated,
       /** Filled every output frame by advanceGenerators (target/mixed/pose evidence). */
       observed: null,
     };
@@ -1734,7 +1767,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const observed = finite(motion.axes[axis].current, 0) + (motionRandom() * 2 - 1) * 0.02;
       const offset = component?.axes?.[axis] ?? 0;
       base[axis] = clampMotion(observed - offset, 1);
-      target[axis] = clampMotion(base[axis] + offset, 1);
+      target[axis] = clampMotion(base[axis] + offset, POSTURE_COMPONENT_TARGET_LIMIT);
     }
     motion.posture.base = base;
     motion.posture.target = target;
@@ -5292,11 +5325,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         at: state.lastAt,
         target: { ...activeComponent.axes },
         semantic: { ...activeComponent.semantic },
+        targetSemantic: { ...activeComponent.semantic },
+        targetDegrees: { ...activeComponent.targetDegrees },
+        targetDegreesBasis: activeComponent.targetDegreesBasis,
         mixed: {
           headX: componentHeadCapped.headX,
           headY: componentHeadCapped.headY,
           headZ: componentHeadCapped.headZ,
         },
+        mixedBasis: 'head-contribution-after-live-gain-and-semantic-cap',
         /** The un-capped contribution the live gain asked for (evidence of the per-frame cap). */
         uncapped: {
           headX: componentHeadRaw.headX,
@@ -5488,13 +5525,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const componentBefore = finite(headComponent?.observed?.mixed?.[channel], 0);
       if (componentBefore !== 0) {
         const retained = Math.abs(idleBase) > 1e-12 ? idlePart / idleBase : 0;
+        // The arbitration replaces the WHOLE idle contribution (base swing + component) with one
+        // bounded share. The component's surviving share is therefore bounded by the same cap; the
+        // old proportional attribution could report more than the cap when the base opposed the
+        // component. Keep `idleScale` as the raw whole-idle ratio for diagnostics.
+        const componentAfter = Math.max(-cap, Math.min(cap, componentBefore));
         headConflicts.push({
           channel,
           gesture: value,
           idleBase,
           componentBefore,
-          componentAfter: componentBefore * retained,
-          yieldScale: retained,
+          componentAfter,
+          yieldScale: Math.abs(componentBefore) > 1e-12
+            ? Math.abs(componentAfter) / Math.abs(componentBefore) : retained,
+          idleScale: retained,
           presetIds: state.presets.active
             .filter((item) => item.done !== true && item.channels.includes(channel))
             .map((item) => item.presetId),
@@ -5885,11 +5929,23 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       channels: [...component.channels],
       target: { ...component.axes },
       semantic: { ...component.semantic },
+      /** Named target view: semantic units (1 = 30° under the writer's documented convention). */
+      targetSemantic: { ...(component.targetSemantic ?? component.semantic ?? {}) },
+      /** Semantic target angle before transport normalisation; the facade adds the verified range. */
+      targetDegrees: { ...(component.targetDegrees ?? {}) },
+      targetDegreesBasis: component.targetDegreesBasis ?? 'semantic-30deg-per-unit (mapping-unverified)',
+      axisLimit: component.axisLimit ?? POSTURE_COMPONENT_AXIS_LIMIT,
+      /** True when the live persona gain forced the internal offset to its safety bound. */
+      saturated: { ...(component.saturated ?? {}) },
       observed: component.observed === null ? null : {
         at: component.observed.at,
         target: { ...(component.observed.target ?? {}) },
         semantic: { ...(component.observed.semantic ?? {}) },
+        targetSemantic: { ...(component.observed.targetSemantic ?? {}) },
+        targetDegrees: { ...(component.observed.targetDegrees ?? {}) },
+        targetDegreesBasis: component.observed.targetDegreesBasis ?? null,
         mixed: { ...(component.observed.mixed ?? {}) },
+        mixedBasis: component.observed.mixedBasis ?? null,
         uncapped: { ...(component.observed.uncapped ?? {}) },
         idle: component.observed.idle === undefined ? null : { ...component.observed.idle },
         pose: component.observed.pose === undefined ? null : { ...component.observed.pose },
@@ -6113,6 +6169,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
             ? 'plugin' : 'vts-native',
           componentCaps: {
             headSemantic: POSTURE_COMPONENT_MAX_AMPLITUDE,
+            headSemanticMin: POSTURE_COMPONENT_MIN_AMPLITUDE,
+            headSemanticMax: POSTURE_COMPONENT_MAX_AMPLITUDE,
+            headAxisLimit: POSTURE_COMPONENT_AXIS_LIMIT,
+            headTargetLimit: POSTURE_COMPONENT_TARGET_LIMIT,
             headMinMs: postureComponentMinMs,
             headMaxMs: postureComponentMaxMs,
             gazeSemantic: POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE,

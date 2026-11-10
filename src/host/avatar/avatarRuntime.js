@@ -511,6 +511,39 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     lastErrorCode: null,
     lastStaleReason: '',
   };
+  /**
+   * Layered component evidence: `target` (held component goal), `mixed` (the contribution after the
+   * live persona/status gain and the semantic cap), `sent` (the semantic value the ONE writer really
+   * produced) and `sendResult` (the transport verdict). Only semantics are stored here; the mapped
+   * input value/range is annotated next to them. A component target is NEVER inferred from the base
+   * micro-motion: only the selected component channels appear.
+   */
+  const componentEvidence = {
+    frame: 0,
+    at: null,
+    channels: Object.create(null),
+    summary: {
+      frames: 0,
+      sentRows: 0,
+      failedRows: 0,
+      staleRows: 0,
+      lastResult: null,
+      lastError: null,
+      lastErrorCode: null,
+    },
+  };
+  /**
+   * Blink evidence. The controller's `baseActivity.blinkCount` counts the blink MACHINE's generated
+   * cycles (idle → closing), not pixels. `sent` only advances when a committed eye-open row belonged
+   * to a newer generated cycle, so `eyeWriteOptIn:false` leaves it at 0 by construction.
+   */
+  const blinkEvidence = {
+    sent: 0,
+    lastSentCycle: 0,
+    lastSentAt: null,
+    lastResult: null,
+    lastError: null,
+  };
   /** Output generation: bumped by lock/disconnect/close, so a queued old frame can never send. */
   let motionEpoch = 0;
   let motionLocked = false;
@@ -1107,6 +1140,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function motionEntries(pose, at, snap) {
     const entries = [];
     const written = new Set();
+    noteComponentTargets(snap, at, { resetFrame: true });
     const speaking = mouthActiveForIdle(at, snap);
     const speechScale = speaking ? IDLE_SPEECH_SCALE : 1;
     const writeScale = postureWriteScale(snap);
@@ -1119,14 +1153,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (item.inputName === '' || written.has(item.inputName)) continue;
       const raw = pose[item.channel];
       if (!Number.isFinite(raw)) continue;
-      const value = intentChannels.has(item.channel)
+      const semanticValue = intentChannels.has(item.channel)
         ? intentWriteValue(item.channel, raw)
         : idleWriteValue(item, raw, speechScale, { writeScale });
+      const inputValue = writeInputValue(item, item.channel, semanticValue);
       entries.push({
         input: item.inputName,
-        value: writeInputValue(item, item.channel, value),
+        value: inputValue,
         channel: item.channel,
       });
+      noteComponentWrite(item.channel, semanticValue, inputValue, at);
       written.add(item.inputName);
     }
     for (const channel of intentChannels) {
@@ -1136,11 +1172,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (speaking && isMouthOwnedInput(binding.inputName)) continue;
       const raw = pose[channel];
       if (!Number.isFinite(raw)) continue;
+      const semanticValue = intentWriteValue(channel, raw);
+      const inputValue = writeInputValue(binding, channel, semanticValue);
       entries.push({
         input: binding.inputName,
-        value: writeInputValue(binding, channel, intentWriteValue(channel, raw)),
+        value: inputValue,
         channel,
       });
+      noteComponentWrite(channel, semanticValue, inputValue, at);
       written.add(binding.inputName);
     }
     // Breath rides the same single-slot frame; with no verified channel it adds nothing.
@@ -2733,6 +2772,233 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
+   * Read the component target/mixed semantics from one controller snapshot. Only a selected
+   * component contributes: the base posture/micro-motion is never promoted into component evidence.
+   */
+  function componentTargetsFrom(snap) {
+    const targets = new Map();
+    const head = snap?.motion?.posture?.component;
+    if (head !== null && head !== undefined) {
+      const channels = Array.isArray(head.channels) ? head.channels : ['headX', 'headY', 'headZ'];
+      for (const channel of channels) {
+        const targetSemantic = asNumberOrNull(
+          head.observed?.targetSemantic?.[channel]
+          ?? head.targetSemantic?.[channel]
+          ?? head.semantic?.[channel]
+          ?? head.observed?.semantic?.[channel],
+        );
+        targets.set(channel, {
+          kind: 'head',
+          targetSemantic,
+          mixed: asNumberOrNull(head.observed?.mixed?.[channel]),
+        });
+      }
+    }
+    const gaze = snap?.motion?.posture?.gazeComponent;
+    if (gaze !== null && gaze !== undefined) {
+      const channels = Array.isArray(gaze.channels) ? gaze.channels : ['gazeX', 'gazeY'];
+      for (const channel of channels) {
+        targets.set(channel, {
+          kind: 'gaze',
+          targetSemantic: asNumberOrNull(gaze.value?.[channel] ?? gaze.observed?.target?.[channel]),
+          mixed: asNumberOrNull(gaze.observed?.mixed?.[channel]),
+        });
+      }
+    }
+    return targets;
+  }
+
+  /**
+   * Annotate one semantic component target with the verified transport conversion. A head target
+   * follows the writer's 30°-per-semantic-unit convention and is additionally mapped onto the
+   * verified input range (so a ±90 roll input is visible as such). With no verified mapping the
+   * angle is explicitly `unknown`, never guessed.
+   */
+  function componentTargetMapping(kind, channel, targetSemantic) {
+    if (targetSemantic === null) {
+      return { targetInput: null, targetDegrees: null, targetDegreesBasis: 'unknown', inputRange: null };
+    }
+    if (kind === 'head') {
+      const row = idleParamMap.find((item) => item.channel === channel && item.inputName !== '');
+      if (row === undefined) {
+        return { targetInput: null, targetDegrees: null, targetDegreesBasis: 'unknown', inputRange: null };
+      }
+      const range = Number.isFinite(row.min) && Number.isFinite(row.max) && row.max > row.min
+        ? { min: row.min, max: row.max }
+        : null;
+      return {
+        targetInput: toHeadInputValue(row, targetSemantic),
+        targetDegrees: targetSemantic * 30,
+        targetDegreesBasis: 'verified-head-30deg-per-semantic-unit',
+        inputRange: range,
+      };
+    }
+    const binding = channelState.bindings.get(channel);
+    if (binding?.verified !== true || String(binding.inputName ?? '').trim() === '') {
+      return { targetInput: null, targetDegrees: null, targetDegreesBasis: 'unknown', inputRange: null };
+    }
+    const range = Number.isFinite(binding.min) && Number.isFinite(binding.max) && binding.max > binding.min
+      ? { min: binding.min, max: binding.max }
+      : null;
+    return {
+      targetInput: toInputValue(binding, targetSemantic, { bidirectional: isBidirectional(channel) }),
+      // Gaze is normalized ±1 on the wire, so this is the same 30°-per-unit EQUIVALENT annotation,
+      // not a measured eye rotation.
+      targetDegrees: targetSemantic * 30,
+      targetDegreesBasis: 'verified-gaze-30deg-equivalent-not-measured',
+      inputRange: range,
+    };
+  }
+
+  function asNumberOrNull(value) {
+    return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * Refresh the per-channel target/mixed evidence. `resetFrame` marks the start of one assembled
+   * send frame: `sent`/`sendResult` are cleared for that frame. A read-only snapshot sync keeps the
+   * last real write result while updating the target.
+   */
+  function noteComponentTargets(snap, at, { resetFrame = false } = {}) {
+    const targets = componentTargetsFrom(snap);
+    if (resetFrame) {
+      componentEvidence.frame += 1;
+      componentEvidence.summary.frames += 1;
+    }
+    componentEvidence.at = at;
+    const seen = new Set();
+    for (const [channel, info] of targets) {
+      seen.add(channel);
+      const previous = componentEvidence.channels[channel] ?? null;
+      if (previous === null && info.targetSemantic === null && info.mixed === null) continue;
+      const mapping = componentTargetMapping(info.kind, channel, info.targetSemantic);
+      const record = {
+        ...(previous ?? {}),
+        channel,
+        kind: info.kind,
+        at,
+        active: true,
+        targetSemantic: info.targetSemantic,
+        mixed: info.mixed,
+        targetInput: mapping.targetInput,
+        targetDegrees: mapping.targetDegrees,
+        targetDegreesBasis: mapping.targetDegreesBasis,
+        inputRange: mapping.inputRange,
+      };
+      if (resetFrame || previous === null) {
+        record.sent = null;
+        record.sentSemantic = null;
+        record.sentDegrees = null;
+        record.sentInput = null;
+        record.sendResult = 'not-written';
+        record.reason = mapping.targetDegreesBasis === 'unknown' ? 'unmapped-or-unverified' : 'no-row-in-this-frame';
+      }
+      componentEvidence.channels[channel] = record;
+    }
+    for (const [channel, record] of Object.entries(componentEvidence.channels)) {
+      if (seen.has(channel) !== true) record.active = false;
+    }
+  }
+
+  /** Record the semantic value the writer produced for one component channel before mapping. */
+  function noteComponentWrite(channel, semantic, inputValue, at) {
+    const record = componentEvidence.channels[channel];
+    if (record === undefined) return;
+    record.sent = inputValue;
+    record.sentInput = inputValue;
+    record.sentSemantic = semantic;
+    // 1 semantic unit = 30° on head channels; for a gaze channel this is the same 30°-equivalent
+    // annotation the target uses, never a measured eye rotation.
+    record.sentDegrees = Number.isFinite(semantic) ? semantic * 30 : null;
+    record.sendResult = 'pending';
+    record.reason = 'send-pending';
+    record.lastResult = 'pending';
+    record.lastSentAt = at;
+  }
+
+  /** Fold the transport verdict of one send into the component evidence (never a commit early). */
+  function noteComponentSendResult(rows, phase, error, at) {
+    const entries = Array.isArray(rows) ? rows : [];
+    for (const entry of entries) {
+      const record = componentEvidence.channels[entry?.channel];
+      if (record === undefined) continue;
+      if (phase === 'attempted') {
+        record.sendResult = 'pending';
+        record.reason = 'send-pending';
+        continue;
+      }
+      record.lastResult = phase === 'committed' ? 'ok' : phase;
+      record.lastSentAt = at;
+      if (phase === 'committed') {
+        record.sendResult = 'ok';
+        record.reason = 'committed';
+        record.sent = Number.isFinite(entry.value) ? entry.value : record.sent;
+        record.sentInput = record.sent;
+        componentEvidence.summary.sentRows += 1;
+        componentEvidence.summary.lastResult = 'ok';
+      } else if (phase === 'failed') {
+        record.sendResult = 'failed';
+        record.reason = 'transport-failed';
+        record.lastError = errorText(error);
+        record.lastErrorCode = String(error?.code ?? error?.errorCode ?? AVATAR_ERROR_CODES.WRITE_FAILED);
+        componentEvidence.summary.failedRows += 1;
+        componentEvidence.summary.lastResult = 'failed';
+        componentEvidence.summary.lastError = record.lastError;
+        componentEvidence.summary.lastErrorCode = record.lastErrorCode;
+      } else if (phase === 'stale') {
+        record.sendResult = 'stale';
+        record.reason = 'stale-result';
+        componentEvidence.summary.staleRows += 1;
+        componentEvidence.summary.lastResult = 'stale';
+      }
+    }
+  }
+
+  /** Why the eye-open idle row is (not) in the write set. `idleEye-off` is the normal default. */
+  function eyeWriteOptInReason() {
+    if (host.idleEye === true) return 'idleEye-on';
+    const left = channelState.bindings.get('eyeOpenL');
+    const right = channelState.bindings.get('eyeOpenR');
+    if (left?.verified !== true || right?.verified !== true) return 'eye-input-unverified-or-unmapped';
+    return 'idleEye-off';
+  }
+
+  function componentEvidenceView() {
+    const channels = {};
+    for (const [channel, record] of Object.entries(componentEvidence.channels)) {
+      channels[channel] = {
+        ...record,
+        inputRange: record.inputRange === null || record.inputRange === undefined
+          ? null : { ...record.inputRange },
+      };
+    }
+    return {
+      frame: componentEvidence.frame,
+      at: componentEvidence.at,
+      channels,
+      summary: { ...componentEvidence.summary },
+      /**
+       * Field semantics, so no consumer has to infer them:
+       *   targetSemantic/targetDegrees  the HELD component goal (before transport mapping)
+       *   mixed                         component share after live gain + semantic cap
+       *   sent                          the mapped value actually handed to the transport
+       *   sentInput                     alias of `sent` (kept for explicit naming)
+       *   sentSemantic/sentDegrees      the semantic value/30° angle the writer produced
+       *   sendResult                    pending | ok | failed | stale | not-written
+       */
+      semantics: {
+        target: 'selected component target, semantic 30°-unit convention',
+        mixed: 'component contribution after live persona/status gain and per-frame semantic cap',
+        sent: 'value after the verified channel mapping that was actually handed to the transport',
+        sentSemantic: 'semantic value the ONE writer produced before mapping (null when no row)',
+        sentDegrees: 'sentSemantic × 30 (gaze: 30°-equivalent, not a measured rotation)',
+        sentInput: 'alias of sent',
+        sendResult: 'transport verdict for the last send that carried this channel',
+      },
+    };
+  }
+
+  /**
    * Capture one send's identity and record `prepared` BEFORE the transport is called. The ticket
    * carries the connection generation/epoch and the preset action identity at assembly time, so a
    * later settle can be checked against exactly the send it belongs to. `prepared` is parameters
@@ -2750,6 +3016,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       at: frameAt,
       owners: null,
       presetChannels: null,
+      /** Blink evidence: which generated cycle this send belongs to, and whether it carries an eye. */
+      blinkCycle: Number.isFinite(snap?.motion?.baseActivity?.blinkCount)
+        ? snap.motion.baseActivity.blinkCount : 0,
+      eyeRows: entries.some((entry) => entry?.channel === 'eyeOpenL' || entry?.channel === 'eyeOpenR'),
     };
     if (entries.length > 0) {
       transportEvidence.prepared += 1;
@@ -2824,6 +3094,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     transportEvidence.attempted += 1;
     transportEvidence.attemptedRows += sentRows.length;
     transportEvidence.lastAttemptedAt = now;
+    noteComponentSendResult(sentRows, 'attempted', null, now);
+    if (ticket.eyeRows === true) blinkEvidence.lastResult = 'pending';
     const presetRows = presetRowsFor(ticket, sentRows);
     if (presetRows.length > 0) {
       inner.notePresetTransport({
@@ -2860,6 +3132,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     transportEvidence.committed += 1;
     transportEvidence.committedRows += sentRows.length;
     transportEvidence.lastCommittedAt = now;
+    noteComponentSendResult(sentRows, 'committed', null, now);
+    if (ticket.eyeRows === true) {
+      blinkEvidence.lastResult = 'ok';
+      blinkEvidence.lastSentAt = now;
+      // One committed eye row per generated blink cycle: an idle eye frame between blinks shares the
+      // same cycle number and must not invent a second blink.
+      if (ticket.blinkCycle > blinkEvidence.lastSentCycle) {
+        blinkEvidence.sent += 1;
+        blinkEvidence.lastSentCycle = ticket.blinkCycle;
+      }
+    }
     return true;
   }
 
@@ -2873,6 +3156,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     transportEvidence.lastFailedAt = now;
     transportEvidence.lastError = errorText(error);
     transportEvidence.lastErrorCode = code;
+    noteComponentSendResult(sentRows, 'failed', error, now);
+    if (ticket?.eyeRows === true) {
+      blinkEvidence.lastResult = 'failed';
+      blinkEvidence.lastError = transportEvidence.lastError;
+    }
     const presetRows = presetRowsFor(ticket, sentRows);
     if (presetRows.length > 0) {
       inner.notePresetTransport({
@@ -2894,6 +3182,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     transportEvidence.staleRows += sentRows.length;
     transportEvidence.lastStaleAt = now;
     transportEvidence.lastStaleReason = String(reason ?? 'stale');
+    noteComponentSendResult(sentRows, 'stale', null, now);
+    if (ticket?.eyeRows === true) blinkEvidence.lastResult = 'stale';
     if (notifyPreset !== true) return false;
     const presetRows = presetRowsFor(ticket, sentRows);
     if (presetRows.length > 0) {
@@ -4068,6 +4358,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     lastIdleSuppressedAt = Number.NEGATIVE_INFINITY;
     const frame = inner.takePendingFrame();
     if (frame.size === 0) return;
+    noteComponentTargets(snap, at, { resetFrame: true });
     const entries = [];
     const writtenInputs = new Set();
     idleFloor.changed = false;
@@ -4118,11 +4409,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       const value = intentChannels.has(item.channel)
         ? intentWriteValue(item.channel, raw)
         : idleWriteValue(item, raw, speechScale, { allowFloor: true, writeScale });
+      const inputValue = writeInputValue(item, item.channel, value);
       entries.push({
         input: item.inputName,
-        value: writeInputValue(item, item.channel, value),
+        value: inputValue,
         channel: item.channel,
       });
+      noteComponentWrite(item.channel, value, inputValue, at);
       writtenInputs.add(item.inputName);
     }
     // Intent-only channels: written only while the intent is active/settling AND the channel was
@@ -4140,11 +4433,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       const raw = frame.get(channel);
       if (!Number.isFinite(raw)) continue;
       const value = intentWriteValue(channel, raw);
+      const inputValue = writeInputValue(binding, channel, value);
       entries.push({
         input: binding.inputName,
-        value: writeInputValue(binding, channel, value),
+        value: inputValue,
         channel,
       });
+      noteComponentWrite(channel, value, inputValue, at);
       writtenInputs.add(binding.inputName);
     }
     // Breath is appended last: it never owns another channel's input and never replaces an idle row.
@@ -4902,6 +5197,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         nativePossible: true,
         /** The blink chain is always computed; the eye INPUT is opt-in (`idleEye`). */
         eyeWriteOptIn: host.idleEye === true,
+        /** Why that opt-in is off (e.g. `idleEye-off`), independent of VTS native idle. */
+        eyeWriteOptInReason: eyeWriteOptInReason(),
       },
       breath: {
         source: breathVerified ? 'plugin' : 'vts-native',
@@ -4938,6 +5235,47 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const innerSnap = inner.snapshot();
     const speaking = innerSnap.turn.speaking === true;
     const channelOwnership = channelOwnershipView();
+    const now = clockNow();
+    // Reflect the current target/mixed without inventing a send: the last real `sent`/`sendResult`
+    // stay visible until the next frame that actually carries the channel is assembled.
+    noteComponentTargets(innerSnap, now, { resetFrame: false });
+    const breathOwner = breathBinding() !== null ? 'plugin' : 'vts-native';
+    const breathView = {
+      mapped: breathBinding() !== null,
+      input: breathBinding()?.inputName ?? '',
+      writes: breathStats.writes,
+      skipped: breathStats.skipped,
+      lastAt: breathStats.lastAt,
+      /** Who is DESIGNED to drive the channel right now; the count alone never claims a write. */
+      owner: breathOwner,
+      driven: breathOwner === 'plugin' && breathStats.writes > 0,
+      /** Generated phase wraps from the controller. They are not proof of a written breath row. */
+      generatedCycles: innerSnap.motion?.baseActivity?.breathCycles ?? 0,
+      generatedCountMeaning: 'breath phase wraps produced by the controller (not a transport write)',
+      sentCountMeaning: 'committed breath rows on a verified input',
+    };
+    const baseActivityView = innerSnap.motion?.baseActivity === null
+      || innerSnap.motion?.baseActivity === undefined ? null : {
+        ...innerSnap.motion.baseActivity,
+        /** blinkCount is the generated blink-machine cycle count; blinkSent is a committed eye write. */
+        blinkGenerated: innerSnap.motion.baseActivity.blinkCount,
+        blinkSent: blinkEvidence.sent,
+        blinkCountMeaning: 'generated blink-machine cycles (idle → closing), not screen blinks',
+        blinkSentMeaning: 'committed eye-open sends that belonged to a newer generated cycle',
+        breathOwner,
+        breathDriven: breathView.driven,
+      };
+    const blinkView = {
+      generated: innerSnap.motion?.baseActivity?.blinkCount ?? 0,
+      sent: blinkEvidence.sent,
+      generatedCountMeaning: 'blink-machine cycles (idle → closing), not screen blinks',
+      sentCountMeaning: 'committed eye-open sends that belonged to a newer generated cycle',
+      eyeWriteOptIn: host.idleEye === true,
+      eyeWriteOptInReason: eyeWriteOptInReason(),
+      lastSentAt: blinkEvidence.lastSentAt,
+      lastResult: blinkEvidence.lastResult,
+      lastError: blinkEvidence.lastError,
+    };
     return {
       connected: state.connected,
       /** True from the start of disconnect() until its transport close settles (success or failure). */
@@ -4957,6 +5295,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       connectedAt: state.connectedAt,
       lastActivityAt: state.lastActivityAt,
       idleSince: state.idleSince,
+      /**
+       * Blink output evidence. `generated` is the controller blink machine's cycle count and is kept
+       * separate from `sent` (a committed eye-open row). `eyeWriteOptInReason` names WHY the eye row
+       * is absent (the default `idleEye-off`), without relying on whether VTS native idle runs.
+       */
+      blink: blinkView,
       /**
        * Idle motion provenance. 'param' means this runtime's continuous frames drive mapped
        * head/eye/gaze inputs; 'hotkey' is only the host's discrete fallback, never the engine.
@@ -5008,13 +5352,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
        * Breath output state. `mapped` is proof of a verified channel; while it is false the runtime
        * writes nothing and reports `avatar.breath.skipped {reason:'no-verified-channel'}`.
        */
-      breath: {
-        mapped: breathBinding() !== null,
-        input: breathBinding()?.inputName ?? '',
-        writes: breathStats.writes,
-        skipped: breathStats.skipped,
-        lastAt: breathStats.lastAt,
-      },
+      breath: breathView,
       /**
        * Continuous motion output: interpolation rate, output generation, single-slot/single-flight
        * counters and the controller state the pose was built from.
@@ -5044,6 +5382,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         lastFrameAt: motionPump.lastFrameAt,
         lastSentAt: motionPump.lastSentAt,
         ...innerSnap.motion,
+        /** Blink/breath counts keep their generated-vs-sent split in the motion projection too. */
+        baseActivity: baseActivityView,
+        /**
+         * Layered component evidence (target / mixed / sent / sendResult) for the selected head and
+         * gaze component channels. This is the read-only observation view; the controller record is
+         * still available under `posture.component`.
+         */
+        componentEvidence: componentEvidenceView(),
         /** Phase 2 ownership table: who may drive each channel, and whether the mapping is verified. */
         channelOwnership,
         /**
@@ -5086,8 +5432,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
        * name/path is included.
        */
       motionLayers: {
-        baseActivity: innerSnap.motion?.baseActivity ?? null,
+        baseActivity: baseActivityView,
         channelOwnership,
+        /** Dedicated blink split: generated machine cycles vs committed eye rows. */
+        blink: blinkView,
         /**
          * Phase 3 head+gaze components and their unified arbitration. `scope` is explicit: this is
          * NOT a body/arm completion, VTS native idle is not taken over, and real visual appearance
@@ -5103,6 +5451,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           gazePaused: innerSnap.motion?.posture?.gazeComponentPaused === true,
           caps: innerSnap.motion?.posture?.componentCaps ?? null,
           arbitration: innerSnap.motion?.arbitration ?? null,
+          /** target / mixed / sent / sendResult layered evidence (head + verified gaze). */
+          evidence: componentEvidenceView(),
           bodyWritten: false,
           nativeIdleOwned: false,
           visualVerified: false,
