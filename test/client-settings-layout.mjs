@@ -411,7 +411,7 @@ test('12. 端到端渲染：14 张卡片都落进 12 个分区，分区内顺序
 });
 
 // ---- 7. explicit gaze-mapping probe entry ---------------------------------------------------
-test('13. 形象卡片：验证视线映射按钮 + 结果行，一次动作、无轮询、失败不清空其它状态', () => {
+test('13. 形象卡片：验证视线映射按钮 + 结果行 + 启动时自动验证开关，一次动作、无轮询、失败不清空其它状态', () => {
   assert.equal((clientSource.match(/action: 'avatar\.mapping\.probe'/gu) ?? []).length, 1,
     '形象卡片只有一处显式触发');
   assert.ok(clientSource.includes("'验证视线映射'"), '按钮文案存在');
@@ -420,12 +420,23 @@ test('13. 形象卡片：验证视线映射按钮 + 结果行，一次动作、�
   for (const text of ['已连通', '未变化', '失败：']) {
     assert.ok(clientSource.includes(text), `结果行能显示「${text}」`);
   }
+  assert.equal((clientSource.match(/action: 'avatar\.verifyMappingsOnStartup\.set'/gu) ?? []).length, 1,
+    '启动时自动验证开关只有一个持久化动作');
+  assert.ok(clientSource.includes("'启动时自动验证视线映射'"), '开关标签存在');
+  assert.equal((clientSource.match(/data-settings-toggle': 'avatar-verify-mappings-on-startup'/gu) ?? []).length, 1,
+    '开关有稳定标记');
+  assert.ok(clientSource.includes('失败不重试'), '开关说明启动验证不会自动重试');
   assert.doesNotMatch(
     clientSource,
     /action: 'avatar\.mapping\.probe'[\s\S]{0,300}?setInterval/u,
     '验证按钮不新增轮询',
   );
+  assert.doesNotMatch(
+    clientSource,
+    /action: 'avatar\.verifyMappingsOnStartup\.set'[\s\S]{0,300}?setInterval/u,
+    '自动验证开关不新增轮询',
+  );
   assert.equal((clientSource.match(/setInterval\(load, 3000\)/gu) ?? []).length, 1,
     '全局轮询仍只有原有的那一个');
-  console.log('13) mappingButton=1 resultRow=1 poll=0');
+  console.log('13) mappingButton=1 autoVerifySwitch=1 resultRow=1 poll=0');
 });

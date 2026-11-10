@@ -1942,7 +1942,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * connection/mapping/target no longer matches is returned with `stale:true` and
    * `discarded:<reason>` instead; it carries no applicable channel evidence.
    */
-  async function probeGazeMapping() {
+  async function probeGazeMapping(options = {}) {
     const at = () => new Date(clockNow()).toISOString();
     const failure = (errorTextValue) => ({
       ok: false,
@@ -1951,8 +1951,21 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       at: at(),
       error: String(errorTextValue ?? ''),
     });
+    // The startup caller can revoke its own measurement (privacy flip, disconnect, runtime
+    // replacement, unload). The check runs before any request and again before the result is
+    // applied, so a revoked probe can never verify/unverify a channel. Manual callers pass none.
+    const cancelled = typeof options?.cancelled === 'function' ? options.cancelled : null;
+    const isCancelled = () => {
+      if (cancelled === null) return false;
+      try {
+        return cancelled() === true;
+      } catch {
+        return true;
+      }
+    };
     if (state.disposed === true) return failure('avatar runtime has been disposed');
     if (state.connected !== true) return failure('VTube Studio 未连接');
+    if (isCancelled()) return failure('gaze mapping probe cancelled');
 
     const rows = [];
     for (const channel of ['gazeX', 'gazeY']) {
@@ -2036,6 +2049,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         channels: rows.map((row) => row.channel),
       });
       return discardGazeProbeResult(result, staleReason);
+    }
+    if (isCancelled()) {
+      // A privacy flip/unload/runtime replacement while measuring is a cancellation, not a
+      // failed mapping: expose no applicable evidence and keep verified/controlled untouched.
+      appendLog('debug', 'avatar.mapping.probe.discarded', {
+        event: 'avatar.mapping.probe.discarded',
+        reason: 'cancelled',
+        channels: rows.map((row) => row.channel),
+      });
+      return discardGazeProbeResult(result, 'cancelled');
     }
 
     // Apply the evidence to the takeover set. The binding is updated in place, never removed: a

@@ -5493,6 +5493,9 @@ window.__ModuleLoader__.load({
       // 眨眼控制方（settings.avatar.blinkOwner）：null = 未编辑，按钮回显 status；
       // 失败时回到最近一次确认值，不把界面留在宿主拒绝的选择上。
       const [avatarBlinkOwnerDraft, setAvatarBlinkOwnerDraft] = useState(null);
+      // 启动时自动验证视线映射（settings.avatar.verifyMappingsOnStartup）：null = 未编辑，
+      // 开关回显 status；保存失败回到 status 的已确认值。
+      const [avatarAutoVerifyDraft, setAvatarAutoVerifyDraft] = useState(null);
       const [fastpathReviewOpen, setFastpathReviewOpen] = useState(false);
       const [fastpathGroups, setFastpathGroups] = useState([]);
       const [fastpathFilter, setFastpathFilter] = useState(FASTPATH_GROUP_ALL);
@@ -7395,6 +7398,27 @@ window.__ModuleLoader__.load({
               text: `未变化：${unchanged.join('、') || '视线通道'}（注入后参数未变）`,
             };
           })();
+          // 启动时自动验证：设置只影响“下一次连接/能力发现”的一次自动探测，不会立即重试，
+          // 也不会把 verified 永久写进 settings。失败时回滚到 status 的已确认值。
+          const autoVerifySaved = status.avatar?.verifyMappingsOnStartup !== false;
+          const autoVerifyOn = avatarAutoVerifyDraft ?? autoVerifySaved;
+          const setAutoVerify = async () => {
+            const next = !autoVerifyOn;
+            setAvatarAutoVerifyDraft(next);
+            const result = await act(
+              { action: 'avatar.verifyMappingsOnStartup.set', enabled: next },
+              'avatar-auto-verify',
+            );
+            if (result?.ok === true) {
+              setAvatarAutoVerifyDraft(result.verifyMappingsOnStartup !== false);
+              show(result.verifyMappingsOnStartup !== false
+                ? '已开启启动时自动验证视线映射（下次连接生效）'
+                : '已关闭启动时自动验证视线映射');
+            } else {
+              setAvatarAutoVerifyDraft(autoVerifySaved);
+              show(`保存启动时自动验证设置失败：${result?.error ?? '设置未保存'}`);
+            }
+          };
           return settingsCard(h, 'avatar', '形象与动作',
               settingsGroup(h, 'vts', 'VTS 连接与表情',
                 line('VTS', ready
@@ -7549,6 +7573,17 @@ window.__ModuleLoader__.load({
                         },
                       }, '重新探测'),
                       h('span', { style: styles.hint }, caps?.error ? `探测失败：${caps.error}` : ''),
+                    ),
+                    h('div', { style: { ...styles.row, marginTop: 6 } },
+                      settingsField(h, '启动时自动验证视线映射',
+                        h('button', {
+                          'data-settings-toggle': 'avatar-verify-mappings-on-startup',
+                          style: { ...(autoVerifyOn ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+                          disabled: busy !== '',
+                          title: '每次 VTS 连接/能力发现完成后自动验证一次；失败不重试，也不永久写入验证结果',
+                          onClick: () => void setAutoVerify(),
+                        }, autoVerifyOn ? '已开启' : '已关闭')),
+                      h('span', { style: styles.hint }, '每次连接只自动验证一次；失败不重试，可随时手动验证。'),
                     ),
                     h('div', { style: { ...styles.row, marginTop: 6 } },
                       h('button', {

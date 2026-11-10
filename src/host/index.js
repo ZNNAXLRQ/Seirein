@@ -3352,6 +3352,10 @@ export function apply(ctx, config) {
   const AVATAR_BLINK_OWNERS = Object.freeze(['plugin', 'vts']);
   const normalizeAvatarBlinkOwner = (value) => (value === 'plugin' ? 'plugin' : 'vts');
   const storedAvatarBlinkOwner = () => normalizeAvatarBlinkOwner(storedAvatarSettings().blinkOwner);
+  // ---- explicit startup gaze verification (settings.avatar.verifyMappingsOnStartup) ---------
+  // Missing/non-boolean is the documented default `true`; only a persisted literal `false`
+  // opts out. Nothing here writes a probe result back: verified is live runtime evidence only.
+  const storedAvatarVerifyMappingsOnStartup = () => storedAvatarSettings().verifyMappingsOnStartup !== false;
   /** Both eye inputs must be controlled (verified) before `plugin` can be selected or stay active. */
   const avatarEyeVerified = () => {
     const current = avatarRuntime;
@@ -3645,6 +3649,40 @@ export function apply(ctx, config) {
     };
   };
   /**
+   * Explicit startup-verification switch (`avatar.verifyMappingsOnStartup.set`). The write merges
+   * into the existing `settings.avatar` object so channelMap/blinkOwner/every other field survives.
+   * The setting only governs the NEXT connection/discovery trigger: toggling it never probes now
+   * and never turns a failed probe into a retry.
+   */
+  const setAvatarVerifyMappingsOnStartup = async (body = {}) => {
+    const requested = body?.enabled ?? body?.verifyMappingsOnStartup;
+    if (typeof requested !== 'boolean') {
+      return {
+        ok: false,
+        code: 'invalid-boolean',
+        error: '启动时自动验证视线映射只能是开或关',
+        verifyMappingsOnStartup: storedAvatarVerifyMappingsOnStartup(),
+      };
+    }
+    const avatar = { ...storedAvatarSettings(), verifyMappingsOnStartup: requested };
+    try {
+      writeSettings({ avatar });
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'settings-write-failed',
+        error: `保存启动时自动验证设置失败：${error?.message ?? String(error)}`,
+        verifyMappingsOnStartup: storedAvatarVerifyMappingsOnStartup(),
+      };
+    }
+    await log.emit('avatar.verifyMappingsOnStartup.set', { enabled: requested }).catch(() => {});
+    return {
+      ok: true,
+      setting: requested,
+      verifyMappingsOnStartup: requested,
+    };
+  };
+  /**
    * Hand the discovery result to the runtime. It takes over a channel only when discovery has an
    * `inputName` with `injectable:true`; an explicit `channel → inputName` config is probed first.
    * An unmapped channel is skipped and recorded — never mapped to a Live2D model parameter name.
@@ -3730,6 +3768,10 @@ export function apply(ctx, config) {
         })
         .catch(() => {});
     }
+    // Discovery has committed the gaze bindings this connection will use. The automatic probe is
+    // scheduled here (never awaited) so a slow/failed measurement cannot delay connect or status;
+    // same-generation dedupe makes this a once-per-connection attempt.
+    void maybeAutoProbeAvatarMapping();
     return result;
   };
 
@@ -4215,6 +4257,10 @@ export function apply(ctx, config) {
       // The new socket recovers the gate a previous drop closed. Privacy holds no motion gate.
       unlockAvatarMotion('disconnect');
       refreshAvatarAttention();
+      // A runtime that connected AFTER discovery already has the gaze bindings: try the one
+      // automatic probe now. If discovery is still in flight this is a no-op, and the discovery
+      // completion below retries the same one-per-connection evaluation.
+      void maybeAutoProbeAvatarMapping();
       // First avatar connect: build the persona style NOW (background, no await) instead of
       // waiting for the 60 s housekeeping tick. A reconnect keeps the style already installed.
       if (avatarStyleBooted !== true) {
@@ -4294,11 +4340,13 @@ export function apply(ctx, config) {
       .map((entry) => entry.channel);
   };
   /**
-   * The ONE explicit production entry (`avatar.mapping.probe` action). It calls the runtime only,
-   * records the result projection (never a path or page text), emits one `avatar.mapping.probe`
-   * event and never retries. A missing/disposed runtime is a safe failure, not a throw.
+   * The ONE probe executor used by the explicit `avatar.mapping.probe` action and the startup
+   * attempt. It calls the runtime only, records the result projection (never a path or page text),
+   * emits one `avatar.mapping.probe` event with its `source`, and never retries. A missing/disposed
+   * runtime is a safe failure, not a throw.
    */
-  const probeAvatarGazeMapping = async () => {
+  const probeAvatarGazeMapping = async ({ source = 'manual', cancelled = null } = {}) => {
+    const probeSource = source === 'startup' ? 'startup' : 'manual';
     const current = avatarRuntime;
     let result;
     if (current === null || current.snapshot().disposed === true) {
@@ -4311,7 +4359,9 @@ export function apply(ctx, config) {
       };
     } else {
       try {
-        result = await current.probeGazeMapping();
+        result = await current.probeGazeMapping(
+          typeof cancelled === 'function' ? { cancelled } : {},
+        );
       } catch (error) {
         result = {
           ok: false,
@@ -4354,6 +4404,7 @@ export function apply(ctx, config) {
     };
     applyGazeProbeToCapabilities({ channels, unverified });
     await log.emit('avatar.mapping.probe', {
+      source: probeSource,
       ok,
       stale,
       staleReason,
@@ -4363,6 +4414,7 @@ export function apply(ctx, config) {
       at,
     }).catch(() => {});
     return {
+      source: probeSource,
       ok,
       stale,
       staleReason,
@@ -4378,6 +4430,82 @@ export function apply(ctx, config) {
       error: String(result?.error ?? ''),
     };
   };
+
+  // ---- automatic startup gaze verification (settings.avatar.verifyMappingsOnStartup) --------
+  /**
+   * At most ONE automatic probe per VTS connection generation. Triggered by the completed
+   * connect/discovery path, never by a timer and never by a retry loop:
+   *  - `false` opts out entirely;
+   *  - privacy cancels the startup attempt (no retry after leaving it);
+   *  - a missing/disposed runtime or an unpublished discovery does not consume the attempt, so
+   *    the later trigger from the completed discovery can still run;
+   *  - no gaze input+modelParams records one skip line and consumes the connection's attempt;
+   *  - a completed probe (success, no-change, error or stale) is the only result, and its
+   *    in-flight cancellation predicate discards it before it can verify anything.
+   */
+  let avatarAutoProbeGeneration = null;
+  const avatarMappingPrivacyLocked = () => {
+    try {
+      return vision.mode === 'privacy';
+    } catch {
+      return false;
+    }
+  };
+  const avatarProbeTargetAvailable = (capability = runtime.avatarMotion) => {
+    const rows = Array.isArray(capability?.channels) ? capability.channels : [];
+    return rows.some((row) => (row?.channel === 'gazeX' || row?.channel === 'gazeY')
+      && row?.injectable !== false
+      && String(row?.inputName ?? '').trim().length > 0
+      && Array.isArray(row?.modelParams) && row.modelParams.length > 0);
+  };
+  async function maybeAutoProbeAvatarMapping() {
+    if (storedAvatarVerifyMappingsOnStartup() !== true) return { ok: true, skipped: 'disabled' };
+    const generation = avatarConnectionGeneration;
+    if (avatarAutoProbeGeneration === generation) return { ok: true, skipped: 'already-attempted' };
+    const current = avatarRuntime;
+    if (current === null || current.snapshot().disposed === true) {
+      return { ok: true, skipped: 'no-runtime' };
+    }
+    if (vts === null || vts.ready !== true) return { ok: true, skipped: 'not-connected' };
+    if (shutdown.closing === true) return { ok: true, skipped: 'shutdown' };
+    try {
+      if (features.enabled('avatar') !== true) return { ok: true, skipped: 'avatar-disabled' };
+    } catch {
+      return { ok: true, skipped: 'avatar-disabled' };
+    }
+    if (avatarMappingPrivacyLocked()) {
+      // Privacy is a capture lock, but startup verification is explicitly cancelled while it is
+      // on: consume this connection's one attempt so leaving privacy is not an automatic retry.
+      avatarAutoProbeGeneration = generation;
+      await log.emit('avatar.mapping.probe.skipped', { source: 'startup', reason: 'privacy' }).catch(() => {});
+      return { ok: true, skipped: 'privacy' };
+    }
+    const capability = runtime.avatarMotion;
+    if (capability === null || capability === undefined) {
+      // Discovery has not committed yet. Do not consume the attempt: the discovery completion
+      // (or a later runtime-connected trigger) evaluates this same connection again.
+      return { ok: true, skipped: 'no-discovery' };
+    }
+    if (!avatarProbeTargetAvailable(capability)) {
+      avatarAutoProbeGeneration = generation;
+      await log.emit('avatar.mapping.probe.skipped', {
+        source: 'startup',
+        reason: 'no-gaze-mapping',
+      }).catch(() => {});
+      return { ok: true, skipped: 'no-gaze-mapping' };
+    }
+    // Mark before awaiting: a second trigger from the same discovery/connect path must never start
+    // a second measurement, and an error/timeout is recorded once rather than retried.
+    avatarAutoProbeGeneration = generation;
+    const cancelled = () => {
+      if (shutdown.closing === true) return true;
+      if (avatarConnectionGeneration !== generation) return true;
+      if (avatarRuntime !== current) return true;
+      if (current.snapshot().disposed === true) return true;
+      return avatarMappingPrivacyLocked();
+    };
+    return probeAvatarGazeMapping({ source: 'startup', cancelled });
+  }
 
   /** Idempotent teardown; the disposed instance stays readable from status. */
   const disposeAvatarRuntime = (reason = 'dispose') => {
@@ -19809,7 +19937,13 @@ export function apply(ctx, config) {
        * evidence): `lastAt:null, ok:null` means no probe has been run, not a failure.
        * `channelMap` is the persisted explicit input names (safe view: no paths, no settings dump).
        */
-      avatar: { mapping: avatarMappingStatus(), channelMap: avatarChannelMapStatus(), blink: avatarBlinkStatus() },
+      avatar: {
+        mapping: avatarMappingStatus(),
+        channelMap: avatarChannelMapStatus(),
+        blink: avatarBlinkStatus(),
+        // Missing = true (documented default); only a persisted false opts out of the startup probe.
+        verifyMappingsOnStartup: storedAvatarVerifyMappingsOnStartup(),
+      },
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
@@ -20401,6 +20535,8 @@ export function apply(ctx, config) {
   }) },
 // One explicit user click proves (or fails to prove) the gaze mapping; never automatic/retried.
 { actions: ['avatar.mapping.probe'], handle: async () => probeAvatarGazeMapping() },
+// Explicit startup-verification switch (settings.avatar.verifyMappingsOnStartup), default true.
+{ actions: ['avatar.verifyMappingsOnStartup.set'], handle: async (body) => setAvatarVerifyMappingsOnStartup(body) },
 // Explicit gaze input names (settings.avatar.channelMap); validated, persisted, then rediscovered.
 { actions: ['avatar.channelMap.set'], handle: async (body) => setAvatarChannelMap(body) },
 // Explicit blink ownership (settings.avatar.blinkOwner); plugin requires both eye inputs verified.

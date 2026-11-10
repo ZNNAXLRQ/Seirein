@@ -9,7 +9,8 @@
  *      every runtime-owned write is held while a probe measures and resumes afterwards;
  *   3. a never-settling probe becomes a bounded timeout, not a hung caller;
  *   4. the real host action records `avatar.mapping.probe`, `/assistant/status.avatar.mapping`
- *      has the documented shape, and neither discovery nor status runs a probe automatically;
+ *      has the documented shape, and the explicit probe stays one click when startup auto-verify
+ *      is disabled;
  *   5. the client ships exactly one explicit button/action and no new polling.
  */
 import assert from 'node:assert/strict';
@@ -313,10 +314,13 @@ async function createFakeVts() {
   };
 }
 
-async function startHost(fake) {
+async function startHost(fake, { settings } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'vts-mapping-probe-'));
   await mkdir(join(root, 'data'), { recursive: true });
   await writeFile(join(root, 'data', 'features.json'), JSON.stringify({ avatar: true }), 'utf8');
+  if (settings !== undefined) {
+    await writeFile(join(root, 'data', 'settings.json'), JSON.stringify(settings), 'utf8');
+  }
   const routes = new Map();
   const disposers = [];
   const collect = (fn) => {
@@ -391,9 +395,11 @@ async function startHost(fake) {
   return { root, callRoute, status, events, dispose };
 }
 
-test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默认不自动探测', async (t) => {
+test('4. 宿主 action/status：关闭自动验证后显式触发一次、事件仅结果字段', async (t) => {
   const fake = await createFakeVts();
-  const host = await startHost(fake);
+  const host = await startHost(fake, {
+    settings: { avatar: { verifyMappingsOnStartup: false, blinkOwner: 'vts' } },
+  });
   t.after(async () => {
     host.dispose();
     await fake.close();
@@ -418,6 +424,8 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
   assert.equal(reads(), readsAfterDiscovery,
     'capability discovery did not run an automatic parameter-value probe');
   const beforeStatus = await host.status();
+  assert.equal(beforeStatus.avatar.verifyMappingsOnStartup, false,
+    'the explicit false setting is projected and opted out of the startup probe');
   assert.deepEqual(beforeStatus.avatar.mapping, {
     lastAt: null,
     ok: null,
@@ -455,7 +463,8 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
     .some((event) => event.type === 'avatar.mapping.probe'), 2000, 25);
   assert.equal(eventFound, true, 'avatar.mapping.probe was recorded');
   const event = (await host.events()).find((entry) => entry.type === 'avatar.mapping.probe');
-  assert.deepEqual(Object.keys(event.payload).sort(), ['at', 'channels', 'discarded', 'ok', 'stale', 'staleReason', 'unverified']);
+  assert.deepEqual(Object.keys(event.payload).sort(), ['at', 'channels', 'discarded', 'ok', 'source', 'stale', 'staleReason', 'unverified']);
+  assert.equal(event.payload.source, 'manual');
   assert.equal(event.payload.ok, true);
   assert.equal(event.payload.channels.gazeX.changed, true);
   assert.equal(event.payload.channels.gazeY.changed, false);
