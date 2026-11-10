@@ -83,6 +83,47 @@ export const VOICE_COMPACTION_REQUIRED_PLUGINS = Object.freeze([
 export const VOICE_COMPACTION_OPTIONAL_PLUGINS = Object.freeze([
   '@deepseek-ai/dsh-compaction-tool-result-pruner',
 ]);
+
+/**
+ * Standard-preset rows that must not be copied into the companion preset: the coding persona,
+ * repository instructions, plan mode and the duplicate compaction group. Every other row is a
+ * native DSH capability (tools, jobs, goals, schedules, subagents, workflows, skills, web, …).
+ */
+export const VOICE_NATIVE_EXCLUDED_IDS = Object.freeze([
+  'persona', 'agent-instructions', 'planning', 'compaction',
+]);
+
+/**
+ * Copy the live `standard` preset's non-identity rows into Seirein's voice preset. This is the
+ * dynamic link: a new DSH release or a user-added plugin that appears in the standard preset is
+ * picked up on the next registration instead of being hard-coded here. The companion keeps its
+ * own persona/context; only native capability rows are inherited.
+ * @param {object} base - Seirein's compaction-only declaration.
+ * @param {object|null} standard - registry definition of the standard preset.
+ * @returns {object} base when no standard rows exist, otherwise a merged declaration.
+ */
+export function mergeVoicePresetWithNativeTools(base, standard) {
+  const source = Array.isArray(standard?.plugins) ? standard.plugins : [];
+  const native = source.filter((row) => {
+    if (row === null || typeof row !== 'object') return false;
+    const id = typeof row.id === 'string' ? row.id : '';
+    const name = typeof row.name === 'string' ? row.name : '';
+    return !VOICE_NATIVE_EXCLUDED_IDS.includes(id)
+      && !name.includes('/dsh-persona')
+      && !name.includes('/dsh-agent-instructions')
+      && !name.includes('/dsh-plan-mode')
+      && !name.includes('/dsh-compaction-');
+  });
+  if (native.length === 0) return base;
+  return {
+    ...base,
+    // Marker used by the audit to distinguish a deliberately composed native-tool preset from an
+    // arbitrary profile declaration that happens to carry tools.
+    nativeTools: true,
+    plugins: [...(Array.isArray(base?.plugins) ? base.plugins : []), ...native],
+  };
+}
+
 /** Declaration keys that would grant a preset more than compaction. */
 const VOICE_COMPACTION_EXTRA_KEYS = Object.freeze([
   'tools', 'permissions', 'persona', 'systemPrompt', 'prompt', 'allowedTools', 'sandbox', 'mcp',
@@ -130,11 +171,15 @@ const packageNameOf = (row) => (typeof row?.name === 'string' ? row.name.trim() 
  * @param {unknown} definition the registry's stored declaration (already unwrapped from its record)
  * @returns {{compatible: boolean, reason: string, plugins: string[], missing: string[], extras: string[]}}
  */
-export function assessVoiceCompactionPreset(definition) {
+export function assessVoiceCompactionPreset(definition, { allowNativeTools = false } = {}) {
+  const nativeComposition = allowNativeTools === true && definition?.nativeTools === true;
   const leaves = [];
   const extras = [];
+  const addExtra = (value) => {
+    if (!nativeComposition) extras.push(value);
+  };
   for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
-    if (definition?.[key] !== undefined) extras.push(`preset:${key}`);
+    if (definition?.[key] !== undefined) addExtra(`preset:${key}`);
   }
   if (!Array.isArray(definition?.plugins)) {
     return { compatible: false, reason: '无法读取 preset 定义内容（缺少 plugins）', plugins: [], missing: [], extras };
@@ -143,21 +188,20 @@ export function assessVoiceCompactionPreset(definition) {
     if (!Array.isArray(list) || depth > 4) return;
     for (const row of list) {
       if (row === null || typeof row !== 'object') {
-        extras.push('插件:?');
+        addExtra('插件:?');
         continue;
       }
       if (row.group === true) {
         for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
-          if (row[key] !== undefined) extras.push(`group:${key}`);
+          if (row[key] !== undefined) addExtra(`group:${key}`);
         }
         walk(row.config, depth + 1);
         continue;
       }
       const name = packageNameOf(row);
       if (name.length === 0) {
-        // Without a package name a row proves nothing, whatever its local id claims.
         const label = typeof row.id === 'string' && row.id.length > 0 ? row.id : '?';
-        extras.push(`插件:${label}(无包名)`);
+        addExtra(`插件:${label}(无包名)`);
         continue;
       }
       leaves.push(name);
@@ -167,7 +211,7 @@ export function assessVoiceCompactionPreset(definition) {
   const allowed = new Set([...VOICE_COMPACTION_REQUIRED_PLUGINS, ...VOICE_COMPACTION_OPTIONAL_PLUGINS]);
   const missing = VOICE_COMPACTION_REQUIRED_PLUGINS.filter((name) => !leaves.includes(name));
   for (const name of leaves) {
-    if (!allowed.has(name)) extras.push(`插件:${name}`);
+    if (!allowed.has(name)) addExtra(`插件:${name}`);
   }
   const reasons = [];
   if (missing.length > 0) reasons.push(`缺少压缩能力: ${missing.join(', ')}`);
@@ -315,13 +359,17 @@ export function createVoiceCompaction({
     return 'profile';
   };
 
-  /** Read a declaration without the registry's loader-settling diagnostic (safe during activation). */
-  const readExisting = async (presets) => {
+  /** Read one declaration without the registry's loader-settling diagnostic. */
+  const readPresetById = async (presets, id) => {
     const declarations = presets?.definitions;
-    if (declarations instanceof Map) return declarations.get(presetId);
+    if (declarations instanceof Map) return declarations.get(id);
+    if (declarations !== null && typeof declarations === 'object') {
+      const direct = declarations[id];
+      if (direct !== undefined) return direct;
+    }
     if (typeof presets?.has === 'function') {
       try {
-        return presets.has(presetId) ? { config: { id: presetId } } : undefined;
+        return presets.has(id) ? { config: { id } } : undefined;
       } catch {
         return undefined;
       }
@@ -330,13 +378,16 @@ export function createVoiceCompaction({
     if (typeof presets?.list === 'function') {
       try {
         const rows = await presets.list();
-        return Array.isArray(rows) ? rows.find((row) => row?.id === presetId) : undefined;
+        return Array.isArray(rows) ? rows.find((row) => row?.id === id) : undefined;
       } catch {
         return undefined;
       }
     }
     return undefined;
   };
+
+  /** Read a declaration without the registry's loader-settling diagnostic (safe during activation). */
+  const readExisting = async (presets) => readPresetById(presets, presetId);
 
   /**
    * Ensure the plugin-owned preset exists, at most once per instance.
@@ -370,7 +421,7 @@ export function createVoiceCompaction({
       // `plugins` and misreport a fully compatible preset as a conflict.
       const definition = definitionOf(record);
       const source = sourceOf(record, definition);
-      const audit = assessVoiceCompactionPreset(definition);
+      const audit = assessVoiceCompactionPreset(definition, { allowNativeTools: true });
       if (!audit.compatible) {
         presetState = {
           status: 'conflict',
@@ -403,14 +454,32 @@ export function createVoiceCompaction({
         note('voice.compaction.preset.register-failed', { presetId, error: presetState.error });
         return presetState;
       }
+      // The companion preset is composed from the LIVE standard preset, not a frozen tool list:
+      // a new DSH release or a user-installed native plugin appears in the standard declaration
+      // and is inherited here on the next registration. Persona, coding instructions, plan mode
+      // and the duplicate compaction group are deliberately excluded by the merge.
+      let effective = presetDefinition;
+      let nativeTools = false;
       try {
-        const disposer = await presets.register(presetDefinition);
+        const standardRecord = await readPresetById(presets, 'standard');
+        const standard = definitionOf(standardRecord);
+        effective = mergeVoicePresetWithNativeTools(presetDefinition, standard);
+        nativeTools = effective !== presetDefinition;
+      } catch {
+        // Standard preset unavailable: keep the compaction-only fallback rather than blocking voice.
+      }
+      try {
+        const disposer = await presets.register(effective);
         presetUnregister = typeof disposer === 'function' ? disposer : null;
-        presetState = { status: 'registered', source: 'registered', registered: true, error: null, reason: null, at: Date.now() };
+        presetState = {
+          status: 'registered', source: 'registered', registered: true,
+          error: null, reason: null, at: Date.now(), nativeTools,
+        };
         note('voice.compaction.preset.registered', {
           presetId,
           source: 'registered',
-          plugins: Array.isArray(presetDefinition?.plugins) ? presetDefinition.plugins.length : 0,
+          nativeTools,
+          plugins: Array.isArray(effective?.plugins) ? effective.plugins.length : 0,
         });
       } catch (error) {
         // A declaration that appeared between the read and register() is a migration race, not a
