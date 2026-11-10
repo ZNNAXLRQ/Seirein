@@ -234,7 +234,8 @@ try {
   });
   results.declaredGaze = { gazeX: declared.inputs.gazeX };
   assert(declared.mapped.includes('gazeX'), 'declared custom input makes gazeX injectable');
-  assert(declared.verified.includes('gazeX'), 'declared custom input is verified, not merely a candidate');
+  assert(!declared.verified.includes('gazeX'), 'declared custom input is not verified until a probe');
+  assert(declared.inputs.gazeX?.mappingUnverified === true, 'declared custom input is marked mapping-unverified');
   assert(declared.inputs.gazeX?.inputSource === 'declared', 'entry records the declaration as its source');
 
   // ---- b) injectInputs ----------------------------------------------------

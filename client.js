@@ -5389,6 +5389,9 @@ window.__ModuleLoader__.load({
       const [chatConfirm, setChatConfirm] = useState(false);
       const [layerDraft, setLayerDraft] = useState(null);
       const [spoutDraft, setSpoutDraft] = useState(null);
+      // 显式视线输入映射（settings.avatar.channelMap）：null = 未编辑，输入框回显 status；
+      // 保存失败时用 status.avatar.channelMap 回滚，避免输入框停在宿主拒绝的值上。
+      const [avatarChannelMapDraft, setAvatarChannelMapDraft] = useState(null);
       const [fastpathReviewOpen, setFastpathReviewOpen] = useState(false);
       const [fastpathGroups, setFastpathGroups] = useState([]);
       const [fastpathFilter, setFastpathFilter] = useState(FASTPATH_GROUP_ALL);
@@ -7425,6 +7428,108 @@ window.__ModuleLoader__.load({
                       }, mappingView.text),
                     ),
                     h('div', { style: styles.hint }, '「可注入」只说明值能发出去；「已验证」才说明有证据它驱动该部位。模型是否响应取决于 VTS 内的参数映射。'),
+                  );
+                })(),
+                (() => {
+                  // 显式视线输入映射：只暴露 gazeX/gazeY 两个 input 名。保存/清除都走同一个
+                  // `avatar.channelMap.set` 动作；宿主按当前 VTS InputParameterList 校验，非法即拒绝。
+                  const saved = status.avatar?.channelMap ?? {};
+                  const current = {
+                    gazeX: String(saved.gazeX ?? ''),
+                    gazeY: String(saved.gazeY ?? ''),
+                  };
+                  const draft = avatarChannelMapDraft ?? current;
+                  const caps = l.capabilities ?? null;
+                  const verifiedSet = new Set(Array.isArray(caps?.verified) ? caps.verified : []);
+                  const invalidSet = new Set(Array.isArray(caps?.mappingInvalid) ? caps.mappingInvalid : []);
+                  const configured = [['gazeX', '视线 X'], ['gazeY', '视线 Y']]
+                    .filter(([channel]) => current[channel].length > 0);
+                  const needsProbe = configured.filter(([channel]) => !verifiedSet.has(channel));
+                  const invalidConfigured = configured.filter(([channel]) => invalidSet.has(channel));
+                  const statusState = configured.length === 0
+                    ? 'none'
+                    : invalidConfigured.length > 0
+                      ? 'invalid'
+                      : needsProbe.length > 0
+                        ? 'unverified'
+                        : 'verified';
+                  const statusText = configured.length === 0
+                    ? '当前未配置显式映射，仍使用 VTS 候选名；行为不变。'
+                    : `${configured.map(([channel, label]) => `${label} → ${current[channel]}`).join(' · ')}`
+                      + (invalidConfigured.length > 0
+                        ? ` · 配置无效：${invalidConfigured.map(([channel]) => channel).join('、')} 不在 VTS 输入列表，未启用`
+                        : needsProbe.length > 0
+                          ? ' · 仍需验证（点「验证视线映射」实测后才算接通）'
+                          : ' · 已通过运行期验证');
+                  const channelRow = (channel, label) => settingsField(h, label,
+                    h('input', {
+                      style: styles.input,
+                      type: 'text',
+                      value: draft[channel] ?? '',
+                      placeholder: 'VTS 输入名，如 EyeRightX',
+                      disabled: busy !== '',
+                      'data-avatar-channel-map': channel,
+                      onChange: (event) => {
+                        setAvatarChannelMapDraft({ ...draft, [channel]: event.target.value });
+                      },
+                    }));
+                  const rollback = () => {
+                    const settled = status.avatar?.channelMap ?? {};
+                    setAvatarChannelMapDraft({
+                      gazeX: String(settled.gazeX ?? ''),
+                      gazeY: String(settled.gazeY ?? ''),
+                    });
+                  };
+                  const save = async () => {
+                    const result = await act({
+                      action: 'avatar.channelMap.set',
+                      gazeX: draft.gazeX ?? '',
+                      gazeY: draft.gazeY ?? '',
+                    }, 'avatar-channel-map');
+                    if (result?.ok === true) {
+                      setAvatarChannelMapDraft({
+                        gazeX: String(result.channelMap?.gazeX ?? ''),
+                        gazeY: String(result.channelMap?.gazeY ?? ''),
+                      });
+                      show('视线映射已保存，仍需运行期验证');
+                    } else {
+                      // 失败回滚：输入框回到宿主当前持久化的值，不停留在被拒绝的名字上。
+                      rollback();
+                    }
+                  };
+                  const clear = async () => {
+                    const result = await act({ action: 'avatar.channelMap.set', clear: true }, 'avatar-channel-map');
+                    if (result?.ok === true) {
+                      setAvatarChannelMapDraft({ gazeX: '', gazeY: '' });
+                      show('视线映射已清除');
+                    } else {
+                      rollback();
+                    }
+                  };
+                  return h('div', { style: { marginTop: 10 } },
+                    h('div', { style: styles.label }, '显式视线输入映射'),
+                    h('div', { style: styles.hint },
+                      '可选：把逻辑通道直接绑定到 VTS 输入名。只接受 VTS 已列出的输入；保存后仍需运行期验证。'),
+                    h('div', { style: styles.field },
+                      channelRow('gazeX', '视线 X 输入名'),
+                      channelRow('gazeY', '视线 Y 输入名')),
+                    settingsActions(h,
+                      h('button', {
+                        style: { ...styles.btnPrimary, ...(busy !== '' ? styles.off : {}) },
+                        disabled: busy !== '',
+                        onClick: save,
+                      }, '保存视线映射'),
+                      h('button', {
+                        style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
+                        disabled: busy !== '',
+                        onClick: clear,
+                      }, '清除视线映射')),
+                    h('div', {
+                      style: invalidConfigured.length > 0
+                        ? { ...styles.value, color: DANGER }
+                        : styles.hint,
+                      'data-avatar-channel-map-status': statusState,
+                    }, statusText),
                   );
                 })(),
               ),

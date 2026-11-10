@@ -3293,7 +3293,202 @@ export function apply(ctx, config) {
     }
     return vts;
   };
-  const avatarChannelMap = () => runtime.avatarChannelMap ?? config?.avatarChannelMap ?? {};
+  // ---- explicit VTS channel map (settings.avatar.channelMap) ---------------------------------
+  // Only gazeX/gazeY are exposed for now: these are the channels with a safe, read-only discovery
+  // path and a runtime probe. A stored value is an input NAME, never a model parameter or a path.
+  const AVATAR_CHANNEL_MAP_CHANNELS = Object.freeze(['gazeX', 'gazeY']);
+  const storedAvatarSettings = () => {
+    const avatar = readSettings().avatar;
+    return avatar !== null && typeof avatar === 'object' && !Array.isArray(avatar) ? avatar : {};
+  };
+  /** Trim and keep only non-empty string input names for the supported channels. */
+  const normalizeAvatarChannelMap = (raw) => {
+    const map = {};
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return map;
+    for (const channel of AVATAR_CHANNEL_MAP_CHANNELS) {
+      const value = raw[channel];
+      if (typeof value !== 'string') continue;
+      const name = value.trim();
+      if (name.length > 0) map[channel] = name;
+    }
+    return map;
+  };
+  /**
+   * The persisted map, or null when the key was never written. Presence matters: an explicitly
+   * stored `{}` (the user cleared both fields) must override a legacy config fallback.
+   */
+  const storedAvatarChannelMap = () => {
+    const stored = readSettings().avatar;
+    if (stored !== null && typeof stored === 'object' && !Array.isArray(stored)
+      && Object.prototype.hasOwnProperty.call(stored, 'channelMap')) {
+      return normalizeAvatarChannelMap(stored.channelMap);
+    }
+    return null;
+  };
+  /**
+   * Effective map used by discovery/runtime: the setting wins, legacy plugin config is fallback.
+   * The legacy config keeps its historical freedom (other channels/object entries); only
+   * settings.avatar.channelMap is restricted to the two gaze names.
+   */
+  const avatarChannelMap = () => {
+    const stored = storedAvatarChannelMap();
+    if (stored !== null) return stored;
+    return config?.avatarChannelMap ?? {};
+  };
+  /** Safe status projection: only the two input names, never a path or a raw settings object. */
+  const avatarChannelMapStatus = () => {
+    const map = avatarChannelMap();
+    return {
+      gazeX: typeof map.gazeX === 'string' ? map.gazeX : '',
+      gazeY: typeof map.gazeY === 'string' ? map.gazeY : '',
+    };
+  };
+  /**
+   * Every VTS input name this session knows right now. The live VTS list is preferred; a cached
+   * discovery is the fallback when VTS is offline (or its request fails). Names are compared
+   * case-insensitively, matching discovery's candidate rule.
+   */
+  const knownAvatarInputNames = async () => {
+    const names = [];
+    const seen = new Set();
+    const push = (value) => {
+      const name = String(value ?? '').trim();
+      if (name.length === 0) return;
+      const key = name.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      names.push(name);
+    };
+    const capability = runtime.avatarMotion ?? avatarMotionSnapshot();
+    for (const entry of Array.isArray(capability.channels) ? capability.channels : []) {
+      if (entry?.injectable === true) push(entry.inputName);
+    }
+    for (const entry of Object.values(capability.inputs ?? {})) {
+      if (typeof entry === 'string') push(entry);
+      else if (entry !== null && typeof entry === 'object') push(entry.inputName);
+    }
+    if (vts !== null && vts.ready === true) {
+      try {
+        const pool = await vts.listInputParameters();
+        for (const list of [pool?.defaultParameters, pool?.customParameters]) {
+          for (const entry of Array.isArray(list) ? list : []) push(entry?.name);
+        }
+      } catch {
+        /* the cached list is still a valid validation source */
+      }
+    }
+    return names;
+  };
+  /**
+   * The ONE explicit channelMap write (`avatar.channelMap.set`). It validates every non-empty name
+   * against the known VTS inputs before writing, preserves the other settings.avatar fields, and
+   * only then forces one discovery so the runtime sees the new declaration. An invalid name is
+   * rejected without touching settings or the running map. `clear:true` removes both channels.
+   */
+  const setAvatarChannelMap = async (body = {}) => {
+    const payload = body?.channelMap !== null && typeof body?.channelMap === 'object'
+      ? body.channelMap
+      : (body !== null && typeof body === 'object' ? body : {});
+    if (body?.channelMap !== undefined
+      && (body.channelMap === null || typeof body.channelMap !== 'object' || Array.isArray(body.channelMap))) {
+      return { ok: false, code: 'invalid-channel-map', error: 'channelMap 必须是对象' };
+    }
+    const payloadKeys = payload === body
+      ? AVATAR_CHANNEL_MAP_CHANNELS.filter((channel) => Object.prototype.hasOwnProperty.call(body, channel))
+      : Object.keys(payload);
+    for (const key of payloadKeys) {
+      if (!AVATAR_CHANNEL_MAP_CHANNELS.includes(key)) {
+        return {
+          ok: false,
+          code: 'unsupported-channel',
+          error: `不支持的通道：${key}（当前只支持 gazeX/gazeY）`,
+        };
+      }
+    }
+    const clear = body?.clear === true;
+    const current = storedAvatarChannelMap() ?? {};
+    const next = { ...current };
+    const provided = [];
+    if (clear) {
+      for (const channel of AVATAR_CHANNEL_MAP_CHANNELS) next[channel] = '';
+    } else {
+      for (const channel of AVATAR_CHANNEL_MAP_CHANNELS) {
+        if (!Object.prototype.hasOwnProperty.call(payload, channel)
+          || (payload === body && !Object.prototype.hasOwnProperty.call(body, channel))) continue;
+        const raw = payload[channel];
+        if (typeof raw !== 'string') {
+          return { ok: false, code: 'invalid-input-name', error: `${channel} 必须是字符串输入名` };
+        }
+        next[channel] = raw.trim();
+        provided.push(channel);
+      }
+    }
+
+    // Only newly supplied non-empty values need validation; untouched stored values are not
+    // re-litigated just because the model changed since they were written.
+    const requested = provided
+      .map((channel) => ({ channel, inputName: String(next[channel] ?? '').trim() }))
+      .filter((entry) => entry.inputName.length > 0);
+    if (requested.length > 0) {
+      const known = await knownAvatarInputNames();
+      const byLower = new Map(known.map((name) => [name.toLowerCase(), name]));
+      for (const entry of requested) {
+        const canonical = byLower.get(entry.inputName.toLowerCase());
+        if (canonical === undefined) {
+          return {
+            ok: false,
+            code: 'unknown-input',
+            channel: entry.channel,
+            error: `未知的 VTS 输入名：${entry.inputName}（需在 VTS 的 InputParameterList 中出现过）`,
+            knownInputs: known.slice(0, 50),
+            channelMap: avatarChannelMapStatus(),
+          };
+        }
+        next[entry.channel] = canonical;
+      }
+    }
+
+    const saved = normalizeAvatarChannelMap(next);
+    const avatar = { ...storedAvatarSettings(), channelMap: saved };
+    writeSettings({ avatar });
+    const effective = {
+      gazeX: saved.gazeX ?? '',
+      gazeY: saved.gazeY ?? '',
+    };
+    await log.emit('avatar.channelMap.set', {
+      channelMap: effective,
+      cleared: clear,
+    }).catch(() => {});
+    // Re-run discovery with the new declaration. A `force` call alone may join an already in-flight
+    // discovery that captured the PREVIOUS map (the cache/in-flight key is per model identity), so
+    // the first call is allowed to settle that request, and only a result that still does not
+    // reflect the saved names starts a second, forced discovery.
+    if (vts !== null && vts.ready === true) {
+      let result = await discoverAvatarCapabilities({ reason: 'channel-map' }).catch(() => null);
+      const expected = Object.entries(effective).filter(([, inputName]) => inputName.length > 0);
+      const expectedChannels = new Set(expected.map(([channel]) => channel));
+      const rows = Array.isArray(result?.channels) ? result.channels : [];
+      // A stale cache/in-flight result can still carry the PREVIOUS explicit map. Either a row no
+      // longer matches the saved name, or it still claims an explicit source that was just cleared.
+      const mismatched = rows.some((row) => (
+        row?.mappingSource === 'explicit' && !expectedChannels.has(row.channel)
+      )) || expected.some(([channel, inputName]) => {
+        const row = rows.find((entry) => entry.channel === channel);
+        return row === null || row === undefined
+          || row.mappingSource !== 'explicit'
+          || String(row.inputName ?? '').toLowerCase() !== inputName.toLowerCase();
+      });
+      if (mismatched) {
+        result = await discoverAvatarCapabilities({ force: true, reason: 'channel-map' }).catch(() => null);
+      }
+    }
+    return {
+      ok: true,
+      channelMap: effective,
+      effective: avatarChannelMapStatus(),
+      saved: true,
+    };
+  };
   /**
    * Hand the discovery result to the runtime. It takes over a channel only when discovery has an
    * `inputName` with `injectable:true`; an explicit `channel → inputName` config is probed first.
@@ -3396,6 +3591,14 @@ export function apply(ctx, config) {
     const mappingUnverified = channels
       .filter((entry) => entry.mappingUnverified === true)
       .map((entry) => entry.channel);
+    const mappingInvalid = channels
+      .filter((entry) => entry.mappingInvalid === true)
+      .map((entry) => entry.channel);
+    const mappingSources = Object.fromEntries(
+      channels
+        .filter((entry) => entry.mappingSource === 'explicit')
+        .map((entry) => [entry.channel, entry.mappingSource]),
+    );
     return {
       discovered: capability.discovered === true,
       ok: capability.ok === true,
@@ -3403,8 +3606,15 @@ export function apply(ctx, config) {
       socketOpen: vts?.connected === true,
       mapped: injectable,
       verified,
-      /** Runtime-probe results only: unchanged/failed gaze rows stay injectable but unverified. */
+      /**
+       * Injectable but not proven: an explicit mapping still awaiting its probe, or a
+       * changed:false/failed gaze probe. The channel itself is never removed.
+       */
       mappingUnverified,
+      /** Explicit channelMap names VTS did not list; the channel is not enabled through them. */
+      mappingInvalid,
+      /** channel → 'explicit' for a valid user-declared input (never auto-verified). */
+      mappingSources,
       unmapped: injectable.length > 0 || channels.length > 0
         ? channels.filter((entry) => entry.injectable !== true).map((entry) => entry.channel)
         : (capability.unmapped ?? []),
@@ -19355,8 +19565,9 @@ export function apply(ctx, config) {
       /**
        * Explicit gaze-mapping evidence, kept separate from `live2d.capabilities` (name/discovery
        * evidence): `lastAt:null, ok:null` means no probe has been run, not a failure.
+       * `channelMap` is the persisted explicit input names (safe view: no paths, no settings dump).
        */
-      avatar: { mapping: avatarMappingStatus() },
+      avatar: { mapping: avatarMappingStatus(), channelMap: avatarChannelMapStatus() },
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
@@ -19948,6 +20159,8 @@ export function apply(ctx, config) {
   }) },
 // One explicit user click proves (or fails to prove) the gaze mapping; never automatic/retried.
 { actions: ['avatar.mapping.probe'], handle: async () => probeAvatarGazeMapping() },
+// Explicit gaze input names (settings.avatar.channelMap); validated, persisted, then rediscovered.
+{ actions: ['avatar.channelMap.set'], handle: async (body) => setAvatarChannelMap(body) },
 { actions: ['vts.authorize'], handle: async (body) => vtsAuthorize(body) },
 { actions: subtitleActions, handle: createSubtitleSettingsActions({
     get ensureComponent() { return ensureComponent; },

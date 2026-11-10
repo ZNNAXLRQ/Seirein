@@ -9,11 +9,14 @@
  * names starts claiming "the avatar can do that":
  *
  *   injectable — the input exists in InputParameterListRequest, so a value can be sent at all;
- *   verified   — something says that input really drives this part of the model. Either the user
- *                declared the mapping, or the model's parameter list contains the partner
- *                parameter named by the explicit rule table below.
+ *   verified   — something says that input really drives this part of the model. Either the model's
+ *                parameter list contains the partner parameter named by the explicit rule table
+ *                below, or a completed runtime probe observed the target parameter change.
  *
  * Automatic name matching alone only ever produces a *candidate* (injectable, not verified).
+ * A user-declared explicit mapping (`channelMap`) selects the input name but is likewise only a
+ * candidate until the runtime probe proves it; a declared name VTS does not list is reported as
+ * `mappingInvalid`/`unknown-input` instead of being used.
  * Nothing here injects values — sending belongs to the motion stage (VtsClient.injectInputs).
  *
  * A third, runtime-only proof is optional: with `probeMappings:true` the caller supplies
@@ -120,6 +123,10 @@ const emptyCapabilities = () => ({
   mapped: [],
   verified: [],
   mappingUnverified: [],
+  /** Explicit channelMap entries whose input name was not in InputParameterListRequest. */
+  mappingInvalid: [],
+  /** channel → 'explicit' for a valid user-declared input; other channels stay absent. */
+  mappingSources: {},
   unmapped: [...CHANNEL_ORDER],
   model: { ok: false, source: '', count: 0, error: '' },
   parameterCount: { default: 0, custom: 0 },
@@ -184,6 +191,8 @@ function copyCapabilities(base) {
     mapped: [...base.mapped],
     verified: [...base.verified],
     mappingUnverified: [...(base.mappingUnverified ?? [])],
+    mappingInvalid: [...(base.mappingInvalid ?? [])],
+    mappingSources: { ...(base.mappingSources ?? {}) },
     unmapped: [...base.unmapped],
     declared: [...(base.declared ?? [])],
     model: { ...base.model },
@@ -247,8 +256,11 @@ function declaredInputName(channelMap, channel) {
  *   Optional Live2DParameterListRequest probe. Its parameter *names* feed `verified`: a channel
  *   whose target parameter exists can be confirmed when the input name follows the rule table.
  * @param {Record<string, string|{input?: string, name?: string}>} [options.channelMap]
- *   User-declared input per channel. A declaration is trusted (verified), because only the user
- *   knows which custom input they wired to which part of the model.
+ *   Explicit user-declared input per channel. A valid declaration wins over candidate names and is
+ *   reported as `mappingSource:'explicit'`, but it is NOT verified by itself: only a completed
+ *   runtime probe (`changed:true`) proves it. A name missing from InputParameterListRequest is
+ *   recorded in `mappingInvalid` with reason `unknown-input`; the channel then falls back to the
+ *   ordinary candidate search (still unverified) or stays unmapped.
  * @param {{emit?: Function}} [options.log] Event log, used for discovery lifecycle records.
  * @param {{modelId?: string, modelGeneration?: number, connectionGeneration?: number}} [options.identity]
  *   Identity this request is bound to. When given, the cache, the in-flight share and the commit
@@ -638,13 +650,21 @@ async function probeCapabilities({
     const presentTargets = targets.filter((name) => modelHas(name)).map((name) => modelByLower.get(normalizeName(name)));
     const declaredName = declaredInputName(channelMap, channel);
 
+    // A valid explicit mapping wins over every candidate name. An unknown explicit name is kept as
+    // evidence (`mappingInvalid`/`unknown-input`) but never silently enabled: the ordinary candidate
+    // search runs instead, and the resulting row stays unverified.
     let hit = null;
     let inputSource = '';
+    let explicit = false;
+    let mappingInvalid = false;
     if (declaredName.length > 0) {
       const found = byName.get(normalizeName(declaredName));
       if (found !== undefined) {
         hit = found;
         inputSource = 'declared';
+        explicit = true;
+      } else {
+        mappingInvalid = true;
       }
     }
     if (hit === null) {
@@ -657,6 +677,12 @@ async function probeCapabilities({
         }
       }
     }
+    const common = {
+      mappingSource: explicit ? 'explicit' : '',
+      mappingInvalid,
+      mappingInvalidReason: mappingInvalid ? 'unknown-input' : '',
+      declaredInputName: declaredName,
+    };
 
     if (hit === null) {
       return {
@@ -666,24 +692,34 @@ async function probeCapabilities({
         injectable: false,
         verified: false,
         mappingUnverified: false,
+        ...common,
         modelParams: presentTargets,
         min: 0,
         max: 1,
         defaultValue: 0,
         probe: null,
-        notes: declaredName.length > 0
-          ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里`
-          : '没有可注入输入匹配该通道',
+        notes: mappingInvalid
+          ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里（unknown-input），且没有候选输入可回退`
+          : declaredName.length > 0
+            ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里`
+            : '没有可注入输入匹配该通道',
       };
     }
 
     const matched = rules.find((entry) => normalizeName(hit.name) === normalizeName(entry.input)) ?? null;
-    const verified = inputSource === 'declared' || (matched !== null && presentTargets.length > 0);
-    const notes = inputSource === 'declared'
-      ? `用户显式映射 ${hit.name} → ${channel}`
-      : verified
-        ? `名称规则 ${hit.name} → ${matched.target}，且模型参数列表中存在 ${matched.target}；VTS 内部映射不可读，仍可能被改过`
-        : '自动名称匹配候选：名字可注入，但没有证据表明它驱动该部位';
+    // An explicit mapping is only evidence that the user picked a name — not proof that VTS wires
+    // it to the model. It stays unverified until a runtime probe says `changed:true`.
+    const verified = explicit === true
+      ? false
+      : mappingInvalid !== true && matched !== null && presentTargets.length > 0;
+    const mappingUnverified = explicit === true || (mappingInvalid === true && hit !== null);
+    const notes = explicit
+      ? `用户显式映射 ${hit.name} → ${channel}（mappingSource:explicit）；仍需运行期探测确认`
+      : mappingInvalid
+        ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里（unknown-input），回退候选 ${hit.name}；该候选仍需验证`
+        : verified
+          ? `名称规则 ${hit.name} → ${matched.target}，且模型参数列表中存在 ${matched.target}；VTS 内部映射不可读，仍可能被改过`
+          : '自动名称匹配候选：名字可注入，但没有证据表明它驱动该部位';
 
     return {
       channel,
@@ -691,7 +727,8 @@ async function probeCapabilities({
       inputSource,
       injectable: true,
       verified,
-      mappingUnverified: false,
+      mappingUnverified,
+      ...common,
       modelParams: presentTargets,
       min: hit.min,
       max: hit.max,
@@ -713,6 +750,14 @@ async function probeCapabilities({
   const mappingUnverified = channels
     .filter((entry) => entry.mappingUnverified === true)
     .map((entry) => entry.channel);
+  const mappingInvalid = channels
+    .filter((entry) => entry.mappingInvalid === true)
+    .map((entry) => entry.channel);
+  const mappingSources = Object.fromEntries(
+    channels
+      .filter((entry) => entry.mappingSource === 'explicit')
+      .map((entry) => [entry.channel, entry.mappingSource]),
+  );
   const unmapped = channels.filter((entry) => !entry.injectable).map((entry) => entry.channel);
 
   return commit({
@@ -723,6 +768,8 @@ async function probeCapabilities({
     mapped,
     verified,
     mappingUnverified,
+    mappingInvalid,
+    mappingSources,
     unmapped,
     model,
     parameterCount: { default: defaults.length, custom: customs.length },
