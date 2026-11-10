@@ -150,6 +150,46 @@ export const SHORT_ACTION_TRANSITION = Object.freeze({
 });
 
 
+// ---------------------------------------------------------------------------------------------
+// Phase 1 posture components — the independent slow layer the preset trajectories ride on
+// ---------------------------------------------------------------------------------------------
+//
+// A component is a SMALL, bounded head posture (natural / lean-left / lean-right / look-back) held
+// for one component window. It is folded into the SAME 1 Hz posture scheduler and the SAME
+// `state.motion.posture.target` / `startPostureTransition()` path as every other posture goal:
+// no second writer, no second timer. The high-frequency controller still interpolates the planned
+// transition at `computeHz`, so a component only CHOOSES a goal once per decision.
+//
+// Only the verified head channels are driven. Gaze / body / breath are deliberately absent: they
+// either have no idle write path (gaze/body) or are VTS-native (body/breath), so a component must
+// not claim them before a real-VTS probe exists.
+export const POSTURE_COMPONENT_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
+
+/** A component is held for this window. A persona may stretch/shrink it, always inside the band. */
+export const POSTURE_COMPONENT_MIN_MS = 10_000;
+export const POSTURE_COMPONENT_MAX_MS = 20_000;
+
+/**
+ * Semantic amplitude band of one component. ONE SEMANTIC UNIT = 30° (the writer's documented
+ * convention), so 0.15 = 4.5°. The cap is applied to the COMPONENT TARGET after the persona/status
+ * gain is known; this layer never multiplies a global "visibility" gain on top.
+ */
+export const POSTURE_COMPONENT_MIN_AMPLITUDE = 0.10;
+export const POSTURE_COMPONENT_MAX_AMPLITUDE = 0.15;
+
+/**
+ * The phase-1 component library. `headX/headY/headZ` are normalized shape weights: the selected
+ * amplitude (semantic units, ≤0.15) is converted to that axis's own pose unit through the live
+ * persona gain, so the target stays semantic-bounded instead of depending on a hard-coded scale.
+ */
+export const POSTURE_COMPONENTS = Object.freeze([
+  Object.freeze({ id: 'natural', label: '自然', headX: 0, headY: 0, headZ: 0 }),
+  Object.freeze({ id: 'lean-left', label: '左侧倾', headX: 0.22, headY: 0, headZ: 1 }),
+  Object.freeze({ id: 'lean-right', label: '右侧倾', headX: -0.22, headY: 0, headZ: -1 }),
+  Object.freeze({ id: 'look-back', label: '偏头/回看', headX: 1, headY: 0.18, headZ: 0.28 }),
+]);
+
+
 /** Intent kinds that count as a short response (they are the ones that may use B). */
 export const SHORT_ACTION_INTENTS = Object.freeze(['nod', 'tilt']);
 
@@ -459,8 +499,18 @@ const DEFAULT_CONFIG = Object.freeze({
   postureReach: POSTURE_REACH,
   /** A decision may choose NOT to move: the target is drawn at the current pose. */
   postureStillChance: 0.25,
-  /** Listening/thinking keeps its attention direction: most decisions hold or barely move. */
-  postureListenStillChance: 0.85,
+  /**
+   * Listening/thinking stays mostly quiet, but it is NOT a structural freeze: hold + still must
+   * leave a small legal move chance (see stepPostureDecision). A value of 1 would make `moves`
+   * unreachable no matter how long the state lasts.
+   */
+  postureListenStillChance: 0.55,
+  /**
+   * Component hold window. The phase-1 band is 10–20 s; a persona tempo/composure factor may
+   * stretch the draw inside that band (never outside it). An explicit host value pins the draw.
+   */
+  postureComponentMinMs: POSTURE_COMPONENT_MIN_MS,
+  postureComponentMaxMs: POSTURE_COMPONENT_MAX_MS,
   /** Base planned transition length; divided by persona tempo, then clamped to 1.2–1.8 s. */
   postureTransitionMs: POSTURE_TRANSITION.BASE_MS,
   /** Host-driven state (listening/thinking/speaking/waiting/tired); scales, never rewrites, style. */
@@ -850,12 +900,25 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const expressionRandom = createSeededRandom(
     `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:expression`,
   );
+  // The posture-component draw has its own seeded stream. Adding the layer must not shift the
+  // existing posture/base draw sequence a recorded idle curve or a test already pins.
+  const componentRandom = createSeededRandom(
+    `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:posture-component`,
+  );
   const postureHoldMinMs = Math.max(1000, finite(cfg.postureHoldMinMs, DEFAULT_CONFIG.postureHoldMinMs));
   const postureHoldMaxMs = Math.max(postureHoldMinMs, finite(cfg.postureHoldMaxMs, DEFAULT_CONFIG.postureHoldMaxMs));
   // P-139 stage 4 (A): an explicitly configured window is authority; only an unconfigured runtime
   // picks the lively 4–8 s variant. This keeps a tuning profile / test deterministic.
   const postureHoldConfigured = Object.prototype.hasOwnProperty.call(supplied, 'postureHoldMinMs')
     || Object.prototype.hasOwnProperty.call(supplied, 'postureHoldMaxMs');
+  const postureComponentMinMs = Math.max(
+    POSTURE_COMPONENT_MIN_MS,
+    Math.min(POSTURE_COMPONENT_MAX_MS, finite(cfg.postureComponentMinMs, POSTURE_COMPONENT_MIN_MS)),
+  );
+  const postureComponentMaxMs = Math.max(
+    postureComponentMinMs,
+    Math.min(POSTURE_COMPONENT_MAX_MS, finite(cfg.postureComponentMaxMs, POSTURE_COMPONENT_MAX_MS)),
+  );
   const decisionIntervalMs = 1000 / Math.max(0.1, Math.min(8, finite(cfg.decisionHz, DEFAULT_CONFIG.decisionHz)));
   const motionFollow = Math.max(0.05, finite(cfg.motionFollow, MOTION_LIMITS.FOLLOW_PER_SECOND));
   const motionMaxVelocity = Math.max(0.001, finite(cfg.motionMaxVelocity, MOTION_LIMITS.MAX_VELOCITY));
@@ -918,6 +981,18 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         stills: 0,
         lastDecision: null,
         lastTransition: null,
+        /**
+         * Phase 1 posture component: the independent slow pose the preset gestures ride on.
+         * `axes` are posture-target offsets (same units as `target`); `semantic` is the bounded
+         * 30°-unit value recorded at draw time. It is cleared by interrupt/relax and never copied
+         * from a preset's last frame.
+         */
+        component: null,
+        componentTransitions: 0,
+        lastComponentTransition: null,
+        componentHistory: [],
+        /** Set by relax/interrupt so a cleared component cannot silently revive mid-transition. */
+        componentPaused: false,
       },
       /** The one active planned transition (null while holding / drifting). */
       transition: null,
@@ -1126,6 +1201,29 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return styleTraitEffects(state.traits);
   }
 
+  /**
+   * The ONE idle gain chain (idleSwayScale × postureReach × persona amplitude, or a per-channel
+   * override). `advanceGenerators` and the posture-component target both read it, so a component
+   * can never invent a second amplitude convention.
+   */
+  function idleChannelSway(channel) {
+    const eff = state.effective ?? state.style;
+    const idleSwayScale = Math.max(0, finite(cfg.idleSwayScale, DEFAULT_CONFIG.idleSwayScale));
+    if (state.style.channels[channel]?.amplitude !== undefined) {
+      return idleSwayScale * styleChannelAmplitude(eff, channel);
+    }
+    const personaAmplitude = Math.max(0.2, Math.min(1.5, finite(state.style.amplitude, 1)));
+    const postureReach = Math.max(0, finite(cfg.postureReach, DEFAULT_CONFIG.postureReach));
+    return idleSwayScale * postureReach * styleChannelAmplitude(eff, channel) * personaAmplitude;
+  }
+
+  /** Semantic head units produced by ONE pose unit of `channel` under the current persona. */
+  function headSemanticGain(channel) {
+    const sway = idleChannelSway(channel);
+    const base = channel === 'headZ' ? 0.075 : channel === 'headY' ? 0.09 * 0.7 : 0.09;
+    return Math.max(0, base * sway);
+  }
+
   /** Re-derive both views from the current baseline style + version. */
   function applyDerivedDimensions() {
     const split = splitAvatarStyleDimensions(
@@ -1196,8 +1294,91 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   /**
+   * Fold one component's axis offsets into a raw posture goal. Components never replace the idle
+   * draw or the preset layer: they are a bounded head offset inside the ONE `posture.target`.
+   */
+  function targetWithComponent(base, component = null) {
+    const next = {};
+    for (const axis of MOTION_AXES) {
+      const offset = component?.axes?.[axis] ?? 0;
+      next[axis] = clampMotion(finite(base?.[axis], 0) + offset, 1);
+    }
+    return next;
+  }
+
+  /** One component draw: shape × semantic amplitude, converted through the live head gain. */
+  function drawPostureComponent(now) {
+    const pool = POSTURE_COMPONENTS;
+    const current = state.motion.posture.component;
+    let index = Math.floor(componentRandom() * pool.length) % pool.length;
+    if (current !== null && pool.length > 1 && pool[index].id === current.id) {
+      // A back-to-back repeat is not a new component hold: move to a different shape.
+      index = (index + 1 + Math.floor(componentRandom() * (pool.length - 1))) % pool.length;
+    }
+    const spec = pool[index];
+    const amplitude = POSTURE_COMPONENT_MIN_AMPLITUDE
+      + (POSTURE_COMPONENT_MAX_AMPLITUDE - POSTURE_COMPONENT_MIN_AMPLITUDE) * componentRandom();
+    const drawMs = postureComponentMinMs
+      + (postureComponentMaxMs - postureComponentMinMs) * componentRandom();
+    // A persona tempo/composure may stretch or shrink the hold, but the 10–20 s band is the
+    // contract: a slow persona never turns a component into a statue, a lively one never flickers.
+    const influenced = drawMs * Math.max(0.8, Math.min(1.2, (1 / postureTempo()) * traitEffects().hold));
+    const holdMs = Math.max(postureComponentMinMs, Math.min(postureComponentMaxMs, influenced));
+    const axes = {};
+    const semantic = {};
+    for (const channel of POSTURE_COMPONENT_CHANNELS) {
+      const gain = headSemanticGain(channel);
+      const shape = finite(spec[channel], 0);
+      const axis = gain > 1e-9 ? (shape * amplitude) / gain : 0;
+      axes[channel] = clampMotion(axis, 1);
+      // Record the semantic target AFTER the clamp as well: a clamped axis must not be reported as
+      // an amplitude it never reaches.
+      semantic[channel] = axes[channel] * gain;
+    }
+    return {
+      id: spec.id,
+      label: spec.label,
+      startedAt: now,
+      holdUntil: now + holdMs,
+      durationMs: holdMs,
+      amplitude,
+      channels: [...POSTURE_COMPONENT_CHANNELS],
+      axes,
+      semantic,
+      /** Filled every output frame by advanceGenerators (target/mixed/pose evidence). */
+      observed: null,
+    };
+  }
+
+  function recordPostureComponent(component) {
+    const history = state.motion.posture.componentHistory;
+    history.push({
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      durationMs: component.durationMs,
+      amplitude: component.amplitude,
+    });
+    while (history.length > 8) history.shift();
+  }
+
+  /** Select and install one component. `initial` only seeds the goal; every later swap is planned. */
+  function installPostureComponent(now, { initial = false } = {}) {
+    const motion = state.motion;
+    const component = drawPostureComponent(now);
+    motion.posture.component = component;
+    motion.posture.componentPaused = false;
+    recordPostureComponent(component);
+    const next = targetWithComponent(motion.posture.base, component);
+    if (initial) motion.posture.target = { ...next };
+    else startPostureTransition(next, now, { kind: 'component' });
+    return component;
+  }
+
+  /**
    * The planned-transition window for one cause (B / item 4): an idle re-draw keeps 1.2–1.8 s, a
-   * short response action lands in 0.8–1.2 s, a conversation-end relax decays over 2–4 s.
+   * short response action lands in 0.8–1.2 s, a conversation-end relax decays over 2–4 s. A
+   * component swap uses the same idle window; it is a slow posture decision, never a new writer.
    */
   function transitionWindow(kind) {
     if (kind === 'short') {
@@ -1224,6 +1405,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     motion.posture.target = { ...next };
     if (kind === 'short') motion.posture.shortTransitions += 1;
     else if (kind === 'relax') motion.posture.relaxTransitions += 1;
+    else if (kind === 'component') motion.posture.componentTransitions += 1;
     else motion.posture.transitions += 1;
     if (axes.length === 0) {
       motion.transition = null;
@@ -1267,9 +1449,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const delta = kind === 'tilt'
       ? { headX: 0.05 * persona * direction, headZ: 0.06 * persona * direction }
       : { headY: 0.045 * persona * direction, headZ: 0.015 * persona * direction };
-    const next = { ...motion.posture.base };
+    const next = targetWithComponent(motion.posture.base);
     for (const [axis, value] of Object.entries(delta)) {
-      next[axis] = clampMotion(finite(motion.posture.base[axis], 0) + value, 1);
+      next[axis] = clampMotion(finite(next[axis], 0) + value, 1);
     }
     const transition = startPostureTransition(next, now, {
       kind: 'short',
@@ -1287,12 +1469,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /** Keep every axis where it is for a new window: this is the explicit "choose not to move". */
   function chooseStillPosture(now) {
     const motion = state.motion;
-    const current = {};
+    const component = motion.posture.component;
+    const base = {};
+    const target = {};
     for (const axis of MOTION_AXES) {
-      current[axis] = finite(motion.axes[axis].current, 0) + (motionRandom() * 2 - 1) * 0.02;
+      // The observed axis already contains the component. Store the RAW base (observed − component)
+      // so the component is not applied twice when the next target is assembled.
+      const observed = finite(motion.axes[axis].current, 0) + (motionRandom() * 2 - 1) * 0.02;
+      const offset = component?.axes?.[axis] ?? 0;
+      base[axis] = clampMotion(observed - offset, 1);
+      target[axis] = clampMotion(base[axis] + offset, 1);
     }
-    motion.posture.target = current;
-    motion.posture.base = { ...current };
+    motion.posture.base = base;
+    motion.posture.target = target;
     motion.posture.stills += 1;
     motion.postureHolds += 1;
     motion.posture.lastDecision = 'still';
@@ -1309,8 +1498,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       motion.initialized = true;
       motion.lastDecisionAt = now;
       const initial = drawPostureTarget();
-      motion.posture.target = { ...initial };
       motion.posture.base = { ...initial };
+      // The first component is seeded into the same goal; it is not a transition.
+      installPostureComponent(now, { initial: true });
       rollPostureHold(now);
       // The first draw keeps the original slow tracker: a fresh avatar is never limp, and the
       // hold window starts before it arrives. Planned 1.2–1.8 s transitions apply to every LATER
@@ -1324,15 +1514,41 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (motion.decisionAccMs < decisionIntervalMs) return;
     // A long frame is one decision, never a burst of catch-up decisions.
     motion.decisionAccMs = Math.min(decisionIntervalMs, motion.decisionAccMs - decisionIntervalMs);
+    // A conversation-end relax owns the pose until its planned transition ends: a component swap
+    // must not overwrite that decay (the next normal move resumes the component layer).
+    if (motion.transition?.kind === 'relax') return;
+    // Never overwrite a planned transition mid-flight: the from-position is continuous but the
+    // velocity would step, and a component swap landing on top of an idle/short move is exactly
+    // the "no jump when actions are triggered back-to-back" case. The next 1 Hz gate retries.
+    if (motion.transition !== null) return;
+    // Component lifetime is checked on the SAME 1 Hz decision gate, BEFORE the posture-hold gate:
+    // a 60 s posture hold must not turn a 10–20 s component into a statue. `componentPaused` is
+    // set by relax/interrupt so a cleared component cannot silently revive mid-decay.
+    if (motion.posture.componentPaused !== true) {
+      const component = motion.posture.component;
+      if (component === null || now >= component.holdUntil) {
+        motion.postureDecisions += 1;
+        motion.lastDecisionAt = now;
+        motion.posture.lastDecision = 'component';
+        installPostureComponent(now);
+        return;
+      }
+    }
     if (now < motion.holdUntil) return;
     motion.postureDecisions += 1;
     motion.lastDecisionAt = now;
     const listening = state.status === 'listening' || state.status === 'thinking';
     const configuredHold = clamp01(finite(cfg.postureHoldChance, DEFAULT_CONFIG.postureHoldChance));
-    const holdChance = listening ? Math.max(configuredHold, 0.55) : configuredHold;
-    const stillChance = listening
+    // No artificial hold floor: the old `max(hold, .55)` combined with a large still chance made
+    // the move branch unreachable. Listening stays quiet because hold + still are high, not because
+    // a legal move is impossible.
+    const holdChance = configuredHold;
+    const rawStill = listening
       ? clamp01(finite(cfg.postureListenStillChance, DEFAULT_CONFIG.postureListenStillChance))
       : clamp01(finite(cfg.postureStillChance, DEFAULT_CONFIG.postureStillChance));
+    // Keep a small legal move branch even with a maximal still setting (listening/thinking only):
+    // standing still is still the likely outcome, but a long state is not structurally frozen.
+    const stillChance = listening ? Math.min(rawStill, Math.max(0, 0.9 - holdChance)) : rawStill;
     const roll = motionRandom();
     if (roll < holdChance) {
       // Hold the SAME target for another full window: not every decision is a re-draw.
@@ -1347,10 +1563,16 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     motion.postureSwitches += 1;
     motion.posture.lastDecision = 'moved';
+    // A move is the one place the component layer resumes after relax/interrupt.
+    if (motion.posture.componentPaused === true || motion.posture.component === null) {
+      motion.posture.component = drawPostureComponent(now);
+      recordPostureComponent(motion.posture.component);
+      motion.posture.componentPaused = false;
+    }
     const next = drawPostureTarget({ listening });
     motion.posture.base = { ...next };
     rollPostureHold(now);
-    startPostureTransition(next, now);
+    startPostureTransition(targetWithComponent(next), now);
   }
 
   /**
@@ -1440,7 +1662,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         motion.axes[axis].current = finite(transition.to[axis], 0);
         motion.axes[axis].velocity = 0;
       }
-      motion.posture.lastTransition = {
+      const completed = {
         kind: transition.kind ?? 'idle',
         startedAt: transition.startedAt,
         durationMs: transition.durationMs,
@@ -1450,6 +1672,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         maxAcceleration: transition.maxAcceleration,
         axes: [...transition.axes],
       };
+      // A component swap is its own cause and must not masquerade as an idle re-draw: the public
+      // `lastTransition` stays the idle/short/relax record existing consumers already read.
+      if (completed.kind === 'component') motion.posture.lastComponentTransition = completed;
+      else motion.posture.lastTransition = completed;
       motion.transition = null;
     }
     motion.frames += 1;
@@ -1475,6 +1701,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const base = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
     motion.relaxPlan = { startedAt: now, durationMs: duration, from: clamp01(motion.relax) };
     motion.posture.base = { ...base };
+    // A relax clears the component: the explicit decay owns the pose until it ends, and a cleared
+    // component is not revived behind the decay. A later normal move may select a fresh one.
+    motion.posture.component = null;
+    motion.posture.componentPaused = true;
     // The explicit relax owns the decay from here on: the implicit speech-end ramp must not fight it.
     motion.relaxStartedAt = null;
     const transition = startPostureTransition(base, now, { kind: 'relax', durationMs: duration });
@@ -1842,6 +2072,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       clearPresets('preset-disabled', { fadeMs: 0, at });
       state.presets.nextDecisionAt = null;
     } else {
+      // Enabling the preset executor replaces the discrete idle pool. Clear anything already
+      // queued by the old pool: an action sampled BEFORE the switch must never start afterwards.
+      state.idleAction.queue.length = 0;
+      state.idleAction.accMs = 0;
       state.presets.nextDecisionAt = (Number.isFinite(at) ? at : clockNow())
         + PRESET_EXECUTION.DECISION_MIN_MS;
     }
@@ -2541,7 +2775,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           * global * amplitudeScale * channelScale * jitter;
         if (profile.tilt === true) amount *= 0.75 + 0.55 * tilt;
         if (profile.kind === 'center') {
-          cancelOffsets[target] = naturalPresetPose(target) - actualPresetPose(target);
+          // A centre's offset is LIVE (state.idle − the current pose), evaluated on every output
+          // frame: freezing it at build time made a later start overshoot when another trajectory
+          // kept moving. `cancelOffsets` stays as an empty compatibility map.
         } else if (profile.kind === 'target') {
           const attention = state.motion.attention;
           const targetValue = attention.mode === 'user' && attention.verified === true
@@ -2670,7 +2906,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       return values;
     }
     if (stage.kind === 'center') {
-      for (const channel of stage.channels) values[channel] = finite(stage.cancelOffsets[channel], 0) * wave;
+      // LIVE offset: the correction is re-evaluated from the current natural baseline and the
+      // current pose on every frame. It is evidence only; the centre is applied as a bounded
+      // blend after arbitration (see presetFrame/tick) so the idle-base contribution is never
+      // double-counted or overshot.
+      const liveWave = clamp01(wave);
+      for (const channel of stage.channels) {
+        values[channel] = (naturalPresetPose(channel) - actualPresetPose(channel)) * liveWave;
+      }
       return values;
     }
     if (stage.kind === 'target') {
@@ -3131,12 +3374,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /**
    * Fold every active preset into the same additive pose frame the legacy intents use. Returns
    * additions only; the caller (intentFrame) still owns the single arbitration/compose path.
+   *
+   * `centers` is the one non-additive exception: a centre operation is a bounded blend back to the
+   * CURRENT natural baseline (`state.idle`, the active posture component included), applied after
+   * arbitration so the idle-base contribution is never double-counted/overshot. It is suppressed
+   * while another active preset owns the same channel: an old settle may never overwrite a newer
+   * action, and the newer action's exit→0 remains its own release.
    */
   function presetFrame(now) {
     const adds = { headX: 0, headY: 0, headZ: 0, browL: 0, browR: 0, bodyX: 0, bodyY: 0, bodyZ: 0 };
     const gaze = { x: 0, y: 0 };
+    const centers = Object.create(null);
     let eye = null;
-    if (state.presets.active.length === 0) return { adds, gaze, eye, active: 0 };
+    if (state.presets.active.length === 0) return { adds, gaze, eye, centers, active: 0 };
     for (let index = state.presets.active.length - 1; index >= 0; index -= 1) {
       const item = state.presets.active[index];
       const elapsed = now - item.startedAt;
@@ -3170,6 +3420,28 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         if (envelope === null) continue;
         const values = presetStageValues(stage, envelope.wave);
         let any = false;
+        if (stage.kind === 'center') {
+          // Centre: evidence is the LIVE natural-baseline correction; the actual blend happens
+          // after arbitration (see tick). A same-channel newer owner suppresses it completely.
+          for (const channel of Object.keys(values)) {
+            if (!item.channels.includes(channel)) continue;
+            const ownedByOther = state.presets.active.some((other) => other !== item
+              && other.done !== true && other.channels.includes(channel));
+            if (ownedByOther) {
+              values[channel] = 0;
+              continue;
+            }
+            let wave = clamp01(envelope.wave) * fade;
+            if (item.yieldChannels.has(channel)) wave *= yieldFade;
+            const target = naturalPresetPose(channel);
+            values[channel] = (target - actualPresetPose(channel)) * wave;
+            centers[channel] = { target, wave, presetId: item.presetId, actionId: item.actionId };
+            if (Math.abs(values[channel]) > 1e-4) any = true;
+          }
+          notePresetStage(item, stage, envelope.phase, values, now);
+          if (any) contributed = true;
+          continue;
+        }
         for (const [channel, value] of Object.entries(values)) {
           // Ownership: a channel this action already handed over is no longer its to write.
           if (!item.channels.includes(channel)) continue;
@@ -3203,7 +3475,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     adds.browR = presetClamp(adds.browR, 0.6);
     gaze.x = presetClamp(gaze.x, EXPRESSION_MOTION.MAX_GAZE);
     gaze.y = presetClamp(gaze.y, EXPRESSION_MOTION.MAX_GAZE);
-    return { adds, gaze, eye, active: state.presets.active.length };
+    return { adds, gaze, eye, centers, active: state.presets.active.length };
   }
 
   /**
@@ -4430,6 +4702,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       gaze,
       eyeOpen,
       eyeClose: preset.eye,
+      /** Non-additive centre blends, applied after arbitration in tick(). */
+      centers: preset.centers,
       expressionGaze: {
         x: finite(expression.gaze.x, 0) + finite(preset.gaze.x, 0),
         y: finite(expression.gaze.y, 0) + finite(preset.gaze.y, 0),
@@ -4552,13 +4826,6 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // persona's baseline amplitude raise the *goal* a posture may reach; a quiet persona (0.5)
     // still lands far below a lively one (1.4), while the status modifier keeps its own scale.
     const idleSwayScale = Math.max(0, finite(cfg.idleSwayScale, DEFAULT_CONFIG.idleSwayScale));
-    const personaAmplitude = Math.max(0.2, Math.min(1.5, finite(state.style.amplitude, 1)));
-    const postureReach = Math.max(0, finite(cfg.postureReach, DEFAULT_CONFIG.postureReach));
-    // A per-channel override is an ABSOLUTE amplitude (it already replaces the global one), so it
-    // keeps its old linear meaning. An unmentioned channel gets the P-139 reach and persona gain.
-    const channelSway = (channel) => idleSwayScale * (state.style.channels[channel]?.amplitude !== undefined
-      ? styleChannelAmplitude(eff, channel)
-      : postureReach * styleChannelAmplitude(eff, channel) * personaAmplitude);
     const speakingHead = frame.speaking ? SPEECH_HEAD_DAMP : 1;
     // B — speaking micro-motion: a continuous low-frequency pitch sway while the voice plays. The
     // phase uses REAL time (`idleMs`), NOT the tempo-scaled style clock, so persona tempo cannot
@@ -4584,12 +4851,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const speechMicro = (microDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT)
       * state.speechMicroGain * Math.sin(Math.PI * 2 * microHz * (state.idleMs / 1000));
     // Head base swing: the posture gain is 0.09 × sway × reach (≈±5° normal, ≈±10° lively).
-    const headXAmp = idleEnabled ? 0.09 * channelSway('headX') * speakingHead : 0;
-    const headYAmp = idleEnabled ? 0.09 * channelSway('headY') * 0.7 * speakingHead : 0;
-    const headZAmp = idleEnabled ? 0.075 * channelSway('headZ') : 0;
-    const bodyAmp = idleEnabled ? 0.03 * channelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
-    const gazeXAmp = 0.03 * channelSway('gazeX') * gazeDrift;
-    const gazeYAmp = 0.02 * channelSway('gazeY') * gazeDrift;
+    const headXAmp = idleEnabled ? 0.09 * idleChannelSway('headX') * speakingHead : 0;
+    const headYAmp = idleEnabled ? 0.09 * idleChannelSway('headY') * 0.7 * speakingHead : 0;
+    const headZAmp = idleEnabled ? 0.075 * idleChannelSway('headZ') : 0;
+    const bodyAmp = idleEnabled ? 0.03 * idleChannelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
+    const gazeXAmp = 0.03 * idleChannelSway('gazeX') * gazeDrift;
+    const gazeYAmp = 0.02 * idleChannelSway('gazeY') * gazeDrift;
     // Eye-open idle micro-motion is opt-in: `idleEye` (the switch that lets the eye channel be
     // written) or an explicit eye channel override. Otherwise the eye base stays exactly 1, so
     // expressions and blink tests keep their exact values.
@@ -4619,14 +4886,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const idle = {
       ...neutralPose(),
       gazeX: idleEnabled
-        ? gazeXAmp * axis('gazeX') + (thinking ? 0.05 * channelSway('gazeX') : 0) + finite(expressionGaze.x, 0)
+        ? gazeXAmp * axis('gazeX') + (thinking ? 0.05 * idleChannelSway('gazeX') : 0) + finite(expressionGaze.x, 0)
         : 0,
       gazeY: idleEnabled
-        ? gazeYAmp * axis('gazeY') + (thinking ? -0.02 * channelSway('gazeY') : 0) + finite(expressionGaze.y, 0)
+        ? gazeYAmp * axis('gazeY') + (thinking ? -0.02 * idleChannelSway('gazeY') : 0) + finite(expressionGaze.y, 0)
         : 0,
       // A thinking pause adds a shallow micro-nod; it is part of the same idle base, not a write.
       headX: headXAmp * axis('headX')
-        + (thinking ? 0.02 * channelSway('headX') * smoothNoise1(hash32(motionSeed, 'think'), t * 0.8) : 0)
+        + (thinking ? 0.02 * idleChannelSway('headX') * smoothNoise1(hash32(motionSeed, 'think'), t * 0.8) : 0)
         + motion.holdDrift.headX,
       headY: headYAmp * axis('headY') + motion.holdDrift.headY + speechMicro,
       headZ: headZAmp * axis('headZ') + motion.holdDrift.headZ,
@@ -4639,6 +4906,23 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       breath: 0.5,
     };
     state.idle = idle;
+    const activeComponent = motion.posture.component;
+    if (activeComponent !== null) {
+      // Evidence for the component layer: the pose-unit target, the semantic 30°-unit target, and
+      // the mixed head contribution after the persona/status gain (before the writer's own cap).
+      // The final published pose is attached by tick() after the spring, so this can be compared
+      // with the actual transport rows.
+      activeComponent.observed = {
+        at: state.lastAt,
+        target: { ...activeComponent.axes },
+        semantic: { ...activeComponent.semantic },
+        mixed: {
+          headX: headXAmp * finite(activeComponent.axes.headX, 0),
+          headY: headYAmp * finite(activeComponent.axes.headY, 0),
+          headZ: headZAmp * finite(activeComponent.axes.headZ, 0),
+        },
+      };
+    }
 
     return {
       blink: { factor: blinkResult.factor, baseline: expressionEye },
@@ -4783,12 +5067,36 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
       composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
     }
+    // Centre operations are a bounded blend to the CURRENT natural baseline (the active posture
+    // component included), applied AFTER the idle arbitration. Applying a frozen/live additive
+    // here instead would subtract the idle base twice and overshoot when another trajectory moved.
+    for (const [channel, entry] of Object.entries(intent.centers ?? {})) {
+      const wave = clamp01(finite(entry.wave, 0));
+      if (wave <= 0) continue;
+      const base = finite(composed[channel], 0);
+      const target = finite(entry.target, base);
+      const next = base + (target - base) * wave;
+      composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
+    }
     // The roll is held to the same 14° head budget as the other head channels on the SEMANTIC
     // pose, before the spring and long before the input value: the target itself is capped, so the
     // gesture keeps its smooth shape instead of being truncated on the wire.
     composed.headZ = clampHeadRoll(composed.headZ);
     const pose = applyDynamics(composed, frame, dt);
     publish(pose);
+    const activeComponent = state.motion.posture.component;
+    if (activeComponent?.observed) {
+      activeComponent.observed.idle = {
+        headX: state.idle.headX,
+        headY: state.idle.headY,
+        headZ: state.idle.headZ,
+      };
+      activeComponent.observed.pose = {
+        headX: pose.headX,
+        headY: pose.headY,
+        headZ: pose.headZ,
+      };
+    }
     notePresetComputed(pose);
     stepIdleActions(frame, dt, now);
     state.counters.computed += 1;
@@ -4849,6 +5157,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     for (const axis of SPRING_AXES) state.springs[axis] = { current: 0, velocity: 0 };
     state.gaze = { x: 0, y: 0, weight: 0 };
     state.lastSpeech = { index: -1, level: 0, speaking: false };
+    // A barge-in clears the posture component as well as the pose it was riding on. The target/base
+    // are reset so the old component goal cannot re-converge on the next tick; a later moved
+    // decision may select a fresh component, never resume the old one.
+    const motion = state.motion;
+    motion.posture.component = null;
+    motion.posture.componentPaused = true;
+    motion.posture.target = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
+    motion.posture.base = Object.fromEntries(MOTION_AXES.map((axis) => [axis, 0]));
+    motion.transition = null;
 
     if (state.pendingFrame.size > 0) state.counters.dropped += 1;
     const restFrame = {
@@ -5091,6 +5408,31 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   // ---- observation (spec §E.4) ----------------------------------------------------------
+  function postureComponentSnapshot() {
+    const component = state.motion.posture.component;
+    if (component === null) return null;
+    return {
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      holdUntil: component.holdUntil,
+      durationMs: component.durationMs,
+      remainingMs: Math.max(0, component.holdUntil - (state.lastAt ?? 0)),
+      amplitude: component.amplitude,
+      channels: [...component.channels],
+      target: { ...component.axes },
+      semantic: { ...component.semantic },
+      observed: component.observed === null ? null : {
+        at: component.observed.at,
+        target: { ...(component.observed.target ?? {}) },
+        semantic: { ...(component.observed.semantic ?? {}) },
+        mixed: { ...(component.observed.mixed ?? {}) },
+        idle: component.observed.idle === undefined ? null : { ...component.observed.idle },
+        pose: component.observed.pose === undefined ? null : { ...component.observed.pose },
+      },
+    };
+  }
+
   function snapshot() {
     const mapped = (Array.isArray(cfg.channels) ? cfg.channels : []).filter((channel) => CHANNELS.includes(channel));
     return {
@@ -5207,10 +5549,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           transitions: state.motion.posture.transitions,
           shortTransitions: state.motion.posture.shortTransitions,
           relaxTransitions: state.motion.posture.relaxTransitions,
+          componentTransitions: state.motion.posture.componentTransitions,
           stills: state.motion.posture.stills,
           lastDecision: state.motion.posture.lastDecision,
           lastTransition: state.motion.posture.lastTransition === null
             ? null : { ...state.motion.posture.lastTransition, axes: [...state.motion.posture.lastTransition.axes] },
+          component: postureComponentSnapshot(),
+          componentPaused: state.motion.posture.componentPaused,
+          componentHistory: state.motion.posture.componentHistory.map((entry) => ({ ...entry })),
+          lastComponentTransition: state.motion.posture.lastComponentTransition === null
+            ? null : {
+                ...state.motion.posture.lastComponentTransition,
+                axes: [...state.motion.posture.lastComponentTransition.axes],
+              },
         },
         transition: state.motion.transition === null ? null : {
           ...state.motion.transition,
