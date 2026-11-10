@@ -31,6 +31,7 @@ const WINDOW = { from: 1_000_000, to: 1_020_000 };
 const ELIGIBLE = Object.freeze({
   inScope: true,
   companion: true,
+  typedCompanion: true,
   subagent: false,
   visionEnabled: true,
   privacy: false,
@@ -70,9 +71,18 @@ function makeRuntime(analyze, events = []) {
 test('A1. typed/voice 陪伴轮都注入 understanding；non-companion/subagent/vision-off/privacy/无状态不注入', () => {
   assert.equal(understandingBlockAllowed({ ...ELIGIBLE, lane: 'voice', hasState: true }), true);
   assert.equal(understandingBlockAllowed({ ...ELIGIBLE, lane: 'typed', hasState: true }), true,
-    '文字陪伴轮也拿到后台理解');
+    '文字陪伴轮（含普通主 GUI typed）也拿到后台理解');
   assert.equal(understandingBlockAllowed({ ...ELIGIBLE, lane: null, hasState: true }), true,
     '不按 lane 限定的渲染路径仍可用');
+
+  // 身份按 lane 分开：voice 只认当天陪伴会话，typed 只认 typed companion；
+  // 其中一个为真不能借给另一个 lane。
+  assert.equal(understandingBlockAllowed({
+    ...ELIGIBLE, lane: 'voice', companion: false, typedCompanion: true, hasState: true,
+  }), false, 'voice lane 不接受 typed-only 身份');
+  assert.equal(understandingBlockAllowed({
+    ...ELIGIBLE, lane: 'typed', companion: true, typedCompanion: false, hasState: true,
+  }), false, 'typed lane 不接受 voice-only 身份');
 
   // lane 仍受限制：fastpath 与未知 lane 不走这个块。
   assert.equal(understandingBlockAllowed({ ...ELIGIBLE, lane: 'fastpath', hasState: true }), false);
@@ -80,7 +90,7 @@ test('A1. typed/voice 陪伴轮都注入 understanding；non-companion/subagent/
 
   const denied = [
     ['outside workspace', { inScope: false }],
-    ['not companion', { companion: false }],
+    ['not companion', { companion: false, typedCompanion: false }],
     ['subagent', { subagent: true }],
     ['vision off', { visionEnabled: false }],
     ['privacy', { privacy: true }],

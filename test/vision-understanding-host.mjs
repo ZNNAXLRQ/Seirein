@@ -347,7 +347,7 @@ async function waitFor(check, timeoutMs = 5_000) {
   }
 }
 
-test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed 非陪伴轮为空；失败 errorCode 可读且采集继续', async (t) => {
+test('真实采集：voice 与 typed 陪伴轮都注入 understanding，编码用途 typed 为空；失败 errorCode 可读且采集继续', async (t) => {
   const control = { mode: 'ok', forceTyped: false, allowSecond: false, takes: 0 };
   const app = await fixture(t, {
     // 用测试缝模拟“同一陪伴会话里的文字轮”：identity 仍是 companion，lane 改成 typed。
@@ -443,12 +443,14 @@ test('真实采集：voice 与 typed 陪伴轮都注入 understanding，typed �
   const typedText = understanding.text({ agent: companion() });
   assert.ok(typedText.includes('测试场景'), `typed 陪伴轮注入：${typedText}`);
 
-  // typed 但不是 companion：不注入。
+  // typed 但属于编码用途：仍被排除，不注入。
+  // 普通 GUI typed 已按新语义放行（见 test/vision-typed-companion.mjs）。
   const outsider = {
-    id: 'gui-typed-session',
-    session: { id: 'gui-typed-session', header: { cwd: workspace } },
+    id: 'coding-agent-session',
+    options: { purpose: 'coding' },
+    session: { id: 'coding-agent-session', header: { cwd: workspace } },
   };
-  assert.equal(understanding.text({ agent: outsider }), '', 'typed 非陪伴轮不注入');
+  assert.equal(understanding.text({ agent: outsider }), '', '编码用途 typed 不注入');
 
   // 第二份材料必须晚于证据窗口的 200 ms 同源去重间隔；25 ms tick 下仍处于 active tick。
   await delay(260);

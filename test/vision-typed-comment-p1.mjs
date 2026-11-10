@@ -8,7 +8,8 @@
  *   4. 无关闲聊不 attach，并留下机器可读的 skipped 原因；
  *   5. TTL/有界：30s 过期、每会话最多 N 条按轮记录；
  *   6. 语音轮保持 audioStartAt/audioEndAt 窗口语义；
- *   7. typed companion 门限制如实：非陪伴 typed 只记 `vision.comment.skipped`，不注入。
+ *   7. typed companion 门限制如实：普通 GUI typed 放行；编码用途（purpose:coding）等
+ *      非陪伴 typed 只记 `vision.comment.skipped`，不注入。
  *
  * 纯模块用假时钟；Host 用注入的 commentEvidence/understandingAnalyzer + stub sight，
  * 不碰屏幕、麦克风、ffmpeg、OBS 或真实模型。
@@ -501,9 +502,9 @@ test('7. typed companion pre-step：turn 绑定 + skipped not-companion 如实�
   assert.ok(handler !== undefined, 'Host 注册了 agent/pre-step');
   const next = async () => ({ kind: 'enter', messages: [] });
   const companionId = voiceSessionTarget({ root: app.root }).sessionId;
-  const agentFor = (id) => ({
+  const agentFor = (id, options = {}) => ({
     id,
-    options: {},
+    options,
     session: { id, header: { cwd: app.workspace } },
   });
   const message = (id, text) => [{
@@ -513,16 +514,18 @@ test('7. typed companion pre-step：turn 绑定 + skipped not-companion 如实�
     content: [{ type: 'text', text }],
   }];
 
-  // 非陪伴 typed：即使文本在指画面，也不 attach；只留下真实原因。
+  // 编码用途 typed（purpose:coding）：即使文本在指画面，也不 attach；只留下真实原因。
+  // 普通 GUI typed 已按新语义放行（见 test/vision-typed-companion.mjs），这里只固定排除用途。
+  const outsiderId = 'coding-agent-p1';
   await handler({
-    agent: agentFor('gui-typed-p1'),
+    agent: agentFor(outsiderId, { purpose: 'coding' }),
     turn: 1,
     step: 1,
     signal: new AbortController().signal,
     messages: message('typed-outsider-1', '这个表情好搞笑'),
   }, next);
-  assert.equal(app.commentEvidence.take('gui-typed-p1', { turnId: 1 }), null,
-    '非陪伴 typed 不得产生评论证据');
+  assert.equal(app.commentEvidence.take(outsiderId, { turnId: 1 }), null,
+    '编码用途 typed 不得产生评论证据');
   const skipped = await app.waitForEvent('vision.comment.skipped',
     (payload) => payload.reason === 'not-companion', 'not-companion skip');
   assert.equal(skipped.payload.turnId, 1);
@@ -559,8 +562,8 @@ test('7. typed companion pre-step：turn 绑定 + skipped not-companion 如实�
   assert.ok(typedText.includes('【视听证据｜本轮文字发送】'), typedText);
   assert.ok(typedText.includes('typed-sent'), typedText);
   assert.equal(typedText.includes('用户开口'), false);
-  const outsiderText = audiovisual.text({ agent: agentFor('gui-typed-p1') });
-  assert.equal(outsiderText, '', '非陪伴 typed 永远读不到评论证据');
+  const outsiderText = audiovisual.text({ agent: agentFor(outsiderId, { purpose: 'coding' }) });
+  assert.equal(outsiderText, '', '编码用途 typed 永远读不到评论证据');
 
   // 无关闲聊：同一 companion 的下一轮不 attach，也不复用上一轮记录。
   await handler({

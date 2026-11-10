@@ -381,9 +381,13 @@ test('3. 代理/维护轮不置位 companionSeen；真实陪伴轮置位并可�
     agent: app.companionAgent({ session: { id: app.companionId, header: { cwd: workspace, origin: 'subagent' } } }),
     turn: 1,
   });
-  // 编码代理：不同 session id，即使在工作区内。
+  // 编码代理：不同 session id、显式 coding 用途，即使在工作区内。
   await app.runPreStep({
-    agent: { id: 'coding-agent', options: {}, session: { id: 'coding-agent', header: { cwd: workspace } } },
+    agent: {
+      id: 'coding-agent',
+      options: { purpose: 'coding' },
+      session: { id: 'coding-agent', header: { cwd: workspace } },
+    },
     turn: 2,
   });
   // 摘要/后台维护轮：陪伴 id + purpose:compaction。

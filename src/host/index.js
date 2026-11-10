@@ -712,26 +712,34 @@ export const UNDERSTANDING_MAX_IMAGES = UNDERSTANDING_RUNTIME_DEFAULTS.maxFrames
  * 被动画面理解块的统一门禁。
  *
  * 与 recent / nonverbal / audiovisual 不同，understanding 不再是 voice lane 独占：
- * 同一陪伴会话里的文字轮也能看到后台已经理解出的画面。它仍然只属于陪伴上下文：
- * 必须 = 工作区内 + 陪伴 agent + 视觉组件开启 + 非隐私 + 非 subagent，并且确实有状态。
- * `lane = null` 表示“不按 lane 限定”（供理解文本渲染本身使用）；显式 lane 时只接受
- * voice / typed。fastpath 与任何未知 lane 都不注入。
+ * 同一陪伴会话里的文字轮、以及普通主 GUI 打字会话，也能看到后台已经理解出的画面。
+ * 它仍然只属于陪伴上下文：必须 = 工作区内 + 对应 lane 的陪伴 agent + 视觉组件开启 +
+ * 非隐私 + 非 subagent，并且确实有状态。
+ *
+ * `companion` 是 voice lane 的当天陪伴会话判定；`typedCompanion` 是 typed lane 的判定
+ * （当天陪伴会话 + 普通主 GUI 会话，仍排除子代理/编码/后台/压缩/摘要等）。
+ * `lane = null` 表示“不按 lane 限定”（供理解文本渲染本身使用），两种陪伴身份任一即可；
+ * 显式 lane 时只接受 voice / typed：voice 只认 `companion`，typed 只认 `typedCompanion`。
+ * fastpath 与任何未知 lane 都不注入。
  */
 export function understandingBlockAllowed({
   lane = null,
   inScope = false,
   companion = false,
+  typedCompanion = false,
   subagent = false,
   visionEnabled = false,
   privacy = false,
   hasState = false,
 } = {}) {
   if (subagent === true) return false;
-  if (inScope !== true || companion !== true) return false;
+  if (inScope !== true) return false;
   if (visionEnabled !== true || privacy === true) return false;
   if (hasState !== true) return false;
-  if (lane !== null && lane !== undefined && lane !== 'voice' && lane !== 'typed') return false;
-  return true;
+  if (lane === 'voice') return companion === true;
+  if (lane === 'typed') return typedCompanion === true;
+  if (lane === null || lane === undefined) return companion === true || typedCompanion === true;
+  return false;
 }
 
 /**
@@ -2930,8 +2938,9 @@ export function apply(ctx, config) {
     return null;
   };
   /**
-   * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁：workspace + 陪伴 agent + 视觉组件开启；
-   * 语音轮按 voice lane，文字轮按本轮 pre-step 记录的 kind。取用时只认本轮绑定：
+   * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁：workspace + 视觉组件开启 + 对应 lane 的
+   * 陪伴身份；语音轮仍只认当天陪伴会话（`isCompanionAgent`），文字轮认 typed companion
+   * （普通主 GUI 也算，仍排除子代理/编码/后台/压缩/摘要等）。取用时只认本轮绑定：
    * typed 轮绝不回退到上一条麦克风记录（`commentEvidence.render` 的 turnId 查询）。
    *
    * `commentEvidence` 在本函数之后才初始化（挂载时的证据窗口之后）：这里只能在函数体内引用，
@@ -2940,9 +2949,16 @@ export function apply(ctx, config) {
   const commentEvidenceForContext = (context) => {
     try {
       if (!inWorkspaceScope(context)) return '';
-      if (!isCompanionAgent(context?.agent)) return '';
       if (features.enabled('vision') !== true) return '';
       const agent = context?.agent;
+      const lane = contextLaneOf(context);
+      if (lane === 'voice') {
+        if (!isCompanionAgent(agent)) return '';
+      } else if (lane === 'typed') {
+        if (!isTypedCompanionAgent(agent)) return '';
+      } else {
+        return '';
+      }
       const id = typeof agent?.id === 'string' && agent.id.length > 0
         ? agent.id
         : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
@@ -2951,10 +2967,8 @@ export function apply(ctx, config) {
       const turn = Number.isSafeInteger(trackedTurn) ? trackedTurn : null;
       const kind = turn === null ? null : visionTurnKindOf(id, turn);
       const typedTurn = kind?.kind === 'typed';
-      const lane = contextLaneOf(context);
-      if (lane === 'fastpath') return '';
       // 没有本轮 kind 的旧渲染路径保持原 voice lane 门禁；typed 轮由 pre-step 的 kind 放行。
-      if (!typedTurn && lane !== 'voice') return '';
+      if (lane === 'typed' && !typedTurn) return '';
       let block = '';
       if (typedTurn) {
         block = commentEvidence.render(id, { turnId: turn });
@@ -2992,9 +3006,9 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * P-187 阶段 3：后台“按变化理解画面”的被动块。它只在陪伴上下文里渲染，但不再限定 voice lane：
-   * 同一陪伴会话里的文字轮也能看到已经理解出的画面。门禁与 ephemeral block 共用
-   * `understandingBlockAllowed`；无状态时 render() 返回 ''。
+   * P-187 阶段 3：后台“按变化理解画面”的被动块。它只在陪伴上下文里渲染：voice lane 只认
+   * 当天陪伴会话，typed lane 认 typed companion（同一陪伴会话里的文字轮、普通主 GUI 打字
+   * 会话）。门禁与 ephemeral block 共用 `understandingBlockAllowed`；无状态时 render() 返回 ''。
    *
    * `understanding` 与 `commentEvidence` 一样在本函数之后才初始化：这里只能在函数体内引用，
    * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
@@ -3002,15 +3016,22 @@ export function apply(ctx, config) {
   const understandingForContext = (context) => {
     try {
       if (!inWorkspaceScope(context)) return '';
-      if (!isCompanionAgent(context?.agent)) return '';
+      const agent = context?.agent;
+      const lane = contextLaneOf(context);
       let visionEnabled = false;
       try { visionEnabled = features.enabled('vision') === true; } catch { visionEnabled = false; }
       let privacy = true;
       try { privacy = vision.mode === 'privacy'; } catch { privacy = true; }
       if (!understandingBlockAllowed({
-        inScope: true, companion: true, subagent: false, visionEnabled, privacy, hasState: true,
+        lane,
+        inScope: true,
+        companion: isCompanionAgent(agent),
+        typedCompanion: isTypedCompanionAgent(agent),
+        subagent: false,
+        visionEnabled,
+        privacy,
+        hasState: true,
       })) return '';
-      const agent = context?.agent;
       const id = typeof agent?.id === 'string' && agent.id.length > 0
         ? agent.id
         : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
@@ -3030,25 +3051,30 @@ export function apply(ctx, config) {
     }
   };
   /**
-   * 当前动态观察：recent 对话 + 本轮视听证据 + 后台画面理解。recent/audiovisual 仍是 voice
-   * lane 独占；只有 understanding 跟随陪伴上下文进入 typed 轮。空值也是真实观察，不是“未知”。
+   * 当前动态观察：recent 对话 + 本轮视听证据 + 后台画面理解。recent 仍是 voice lane 独占；
+   * audiovisual 与 understanding 跟随对应 lane 的陪伴身份进入 typed 轮。空值也是真实观察，
+   * 不是“未知”。
    */
   const currentObservations = (context, lane) => {
     try {
       if (!inWorkspaceScope(context)) return { recent: '', audiovisual: '', understanding: '' };
-      let companion = false;
+      let voiceCompanion = false;
+      let typedCompanion = false;
       try {
-        companion = isCompanionAgent(context?.agent);
+        voiceCompanion = isCompanionAgent(context?.agent);
+        typedCompanion = isTypedCompanionAgent(context?.agent);
       } catch {
-        companion = false;
+        voiceCompanion = false;
+        typedCompanion = false;
       }
-      if (!companion) return { recent: '', audiovisual: '', understanding: '' };
       const voiceLane = lane === 'voice';
+      const laneCompanion = voiceLane ? voiceCompanion : (lane === 'typed' ? typedCompanion : false);
+      if (!laneCompanion) return { recent: '', audiovisual: '', understanding: '' };
       const understandingLane = voiceLane || lane === 'typed';
       return {
-        recent: voiceLane && features.enabled('hearing') ? dialogueSummary.render() : '',
+        recent: voiceLane && voiceCompanion && features.enabled('hearing') ? dialogueSummary.render() : '',
         // 语音轮与 typed 轮都由 commentEvidenceForContext 自己按本轮 kind/turn 门禁；
-        // 普通非陪伴 typed 会话仍在这里被 companion 门挡住。
+        // 普通非陪伴 typed 会话仍在这里被 typed companion 门挡住。
         audiovisual: commentEvidenceForContext(context),
         understanding: understandingLane ? understandingForContext(context) : '',
       };
@@ -3059,12 +3085,19 @@ export function apply(ctx, config) {
   const planContextLayers = (context, laneOverride = null, observed = undefined) => {
     const lane = laneOverride ?? contextLaneOf(context);
     const inScope = inWorkspaceScope(context);
-    let companion = false;
+    let voiceCompanion = false;
+    let typedCompanion = false;
     try {
-      companion = inScope && isCompanionAgent(context?.agent);
+      voiceCompanion = isCompanionAgent(context?.agent);
+      typedCompanion = isTypedCompanionAgent(context?.agent);
     } catch {
-      companion = false;
+      voiceCompanion = false;
+      typedCompanion = false;
     }
+    // Only the lane own identity may contribute observations; a voice-only companion is not
+    // automatically a typed companion (e.g. a maintenance turn with the companion id).
+    const companion = inScope
+      && ((lane === 'voice' && voiceCompanion) || (lane === 'typed' && typedCompanion));
     let profileText = '';
     try {
       const section = maintainProfile().promptSection();
@@ -3089,9 +3122,10 @@ export function apply(ctx, config) {
       ].filter((part) => typeof part === 'string' && part.trim().length > 0).join('\n\n')
       : '';
     const fixedText = inScope ? renderResources() : '';
-    // The dialogue / audiovisual observations and the nonverbal cue are companion-only (the same
-    // gate the prompt providers use); a typed session carries the shared environment facts only.
-    // Both raw observations are recorded on the plan so a request-side read can detect a move.
+    // The dialogue / nonverbal observations and the nonverbal cue stay voice-companion-only; the
+    // audiovisual and understanding blocks follow their own lane identity (voice companion or
+    // typed companion). A non-companion typed session still carries the shared environment facts.
+    // All raw observations are recorded on the plan so a request-side read can detect a move.
     const observations = observed !== null && typeof observed === 'object'
       ? {
         recent: typeof observed.recent === 'string' ? observed.recent : '',
@@ -3119,7 +3153,8 @@ export function apply(ctx, config) {
     const understandingBlock = understandingEphemeralBlock(understandingText, {
       lane,
       inScope,
-      companion,
+      companion: voiceCompanion,
+      typedCompanion,
       subagent: false,
       visionEnabled: understandingVisionEnabled,
       privacy: understandingPrivacy,
@@ -12171,7 +12206,8 @@ export function apply(ctx, config) {
   let continuousViewRetryAt = null;
   let continuousViewRetryAttempt = 0;
   /**
-   * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到非子代理、工作区内的真实 pre-step 时才置位。
+   * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到工作区内的真实 pre-step（当天陪伴会话，
+   * 或普通主 GUI typed 会话；子代理/编码/后台/压缩/摘要等排除）时才置位。
    * 它只门禁后台理解/主动回应，不再门禁持续采集；工具挂载、设置页、裸宿主 mount 都不会让它
    * 变成 true，所以状态里 capturing 与 companionSeen:false 可以同时出现。
    */
@@ -13301,21 +13337,54 @@ export function apply(ctx, config) {
    * failed preparation leaves the turn running and the first visual read captures normally.
    */
   /**
-   * 持续观看只认“真实陪伴轮”：必须是陪伴会话本身（`isCompanionAgent`），且不是子代理、
-   * 编码代理、摘要/后台维护轮。`isCompanionAgent` 已覆盖子代理与当日陪伴 id，这里把
-   * maintenance/background purpose 显式挡住，避免以后新增后台轮次时误置位 companionSessionSeen。
+   * 陪伴用途的排除规则：子代理、显式后台轮，以及压缩/摘要/维护/编码/画像/记忆等非对话
+   * 用途。普通主 GUI 会话的 purpose 为空（或 'assistant'），由 `isTypedCompanionAgent` 放行。
+   * 规则同时读 session header 的 purpose，兼容持久化会话没有 live options 的情况。
+   */
+  const COMPANION_EXCLUDED_PURPOSE = /^(?:compaction|summary|summarize|maintenance|background|digest|profile|memory|coding|agent|subagent)(?:[-_:].*)?$/u;
+  const isCompanionExcludedTurn = (agent) => {
+    try {
+      if (isSubagentAgent(agent)) return true;
+      if (agent?.options?.background === true) return true;
+      // An empty live purpose must not shadow a persisted session purpose.
+      const livePurpose = typeof agent?.options?.purpose === 'string'
+        ? agent.options.purpose.trim()
+        : '';
+      const purpose = String(livePurpose.length > 0 ? livePurpose : (agent?.session?.header?.purpose ?? ''))
+        .trim()
+        .toLowerCase();
+      return COMPANION_EXCLUDED_PURPOSE.test(purpose);
+    } catch {
+      return true; // an unreadable identity fails closed
+    }
+  };
+  /**
+   * 用户决定：普通 GUI 打字会话也算 companion，可接收画面理解/评论证据；但仍排除子代理、
+   * Coding/后台/压缩/摘要等。它与 `isCompanionAgent`（只认当天语音陪伴会话）分开，
+   * 语音观察/其它逻辑继续只认 `isCompanionAgent`，不受这次放宽影响。
+   *
+   * 这里只回答“身份是否属于 typed 陪伴”，lane 由调用方决定；workspace/vision/privacy
+   * 仍由各渲染门禁单独检查。
+   */
+  const isTypedCompanionAgent = (agent) => {
+    try {
+      if (isCompanionExcludedTurn(agent)) return false;
+      if (isCompanionAgent(agent)) return true;
+      const id = typeof agent?.id === 'string' && agent.id.length > 0
+        ? agent.id
+        : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
+      return id.length > 0;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * 持续观看只认“真实陪伴轮”：当天陪伴会话，或普通主 GUI typed 会话。子代理、编码、
+   * 摘要/后台维护轮仍被排除，避免它们误置位 companionSessionSeen。
    */
   const isCompanionEvidenceTurn = (agent) => {
     try {
-      if (isSubagentAgent(agent)) return false;
-      if (agent?.options?.background === true) return false;
-      const purpose = String(agent?.options?.purpose ?? agent?.session?.header?.purpose ?? '')
-        .trim()
-        .toLowerCase();
-      if (/^(?:compaction|summary|summarize|maintenance|background|digest|profile|memory)(?:[-_:].*)?$/u.test(purpose)) {
-        return false;
-      }
-      return isCompanionAgent(agent);
+      return isTypedCompanionAgent(agent);
     } catch {
       return false;
     }
