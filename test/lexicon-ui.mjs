@@ -156,6 +156,7 @@ const mount = (overrides = {}) => {
     dialog: null,
     pending: null,
     speakerId: 'spk-1',
+    confirmedSelfId: '',
     draft: lexicon.lexiconEmptyDraft(),
     ...overrides,
   };
@@ -211,6 +212,7 @@ const mount = (overrides = {}) => {
     dialog: state.dialog,
     pending: state.pending,
     speakerId: state.speakerId,
+    confirmedSelfId: state.confirmedSelfId,
     draft: state.draft,
   }, handlers);
   return { state, calls, render };
@@ -270,7 +272,7 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   const texts = textsOf(tree);
 
   assert.ok(texts.includes('待确认候选（3）'), 'the candidate header carries its count');
-  assert.ok(texts.includes('共享词库（1）'), 'the confirmed header carries its count');
+  assert.ok(texts.includes('全部词条（1）'), 'the confirmed header carries its count');
   assert.ok(texts.includes('向晚'), 'the candidate text is visible');
   assert.ok(texts.includes('林晚'), 'an assigned-but-unconfirmed candidate is visible too');
   assert.ok(texts.includes('专有名词'), 'the kind is labelled in Chinese');
@@ -298,14 +300,20 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   assert.ok(textsOf(wordRow).includes('公共库'), 'the library slot is visible');
   assert.ok(textsOf(wordRow).includes('用法：角色名'), 'the usage is visible');
   assert.equal(buttonOf(wordRow, '移到声纹库').props.disabled, true,
-    'move-to-voiceprint is disabled while the voiceprint library is not built');
-  assert.match(String(buttonOf(wordRow, '移到声纹库').props.title), /声纹库尚未建立/u);
+    'move-to-voiceprint is disabled while no confirmed self exists');
+  assert.match(String(buttonOf(wordRow, '移到声纹库').props.title), /已确认本人/u);
 
   const form = nodeOf(tree, 'data-lexicon-new-form', '1');
   assert.ok(form !== undefined, 'the manual add form is mounted');
   assert.equal(inputOf(form, (node) => node.props['data-lexicon-new-text'] === '1').props.value, '');
   assert.ok(nodesOf(form).some((node) => node.type === 'select'
     && node.props?.['data-lexicon-new-category'] === '1'), 'the category dropdown is present');
+  const librarySelect = nodesOf(form).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-new-library'] === '1');
+  assert.ok(librarySelect !== undefined, 'the new-entry library dropdown is present');
+  assert.equal(librarySelect.props.value, 'public', 'the manual default is the public library');
+  assert.equal(librarySelect.children.find((node) => node.props?.value === 'voiceprint').props.disabled,
+    true, 'the voiceprint option is disabled without a confirmed self');
   assert.ok(nodesOf(form).some((node) => node.type === 'input'
     && node.props?.['data-lexicon-new-usage'] === '1'), 'the usage field is present');
   assert.ok(nodesOf(form).some((node) => node.type === 'input'
@@ -314,8 +322,8 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
 
   const empty = mount().render();
   assert.ok(textsOf(empty).includes('没有待确认的候选'), 'empty unassigned has its own text');
-  assert.ok(textsOf(empty).includes('共享词库还是空的'), 'empty lexicon has its own text');
-  assert.ok(textsOf(empty).includes('待确认候选（0）') && textsOf(empty).includes('共享词库（0）'));
+  assert.ok(textsOf(empty).includes('词库还是空的'), 'empty lexicon has its own text');
+  assert.ok(textsOf(empty).includes('待确认候选（0）') && textsOf(empty).includes('全部词条（0）'));
 
   const loading = mount({ data: null }).render();
   assert.ok(textsOf(loading).includes('正在读取语言库…'), 'a null list renders the loading text');
@@ -444,9 +452,9 @@ test('2. 确认候选：speakerId 可选，有则带、无则不带；没有身�
 // ---------------------------------------------------------------------------------------------
 // 3. Edit dialog: prefill (spelling / wrong forms / context) and the save body
 // ---------------------------------------------------------------------------------------------
-test('3. 编辑弹窗：预填三字段/读音；保存走 lexicon.update 且不碰 status/wrongForms', async () => {
+test('3. 编辑弹窗：预填三字段/读音/库位；保存走 lexicon.update 且不碰 status/wrongForms', async () => {
   const entry = word({ reading: 'xiàng wǎn' });
-  const view = mount({ data: { unassigned: [], entries: [entry], error: '' } });
+  const view = mount({ confirmedSelfId: 'self-1', data: { unassigned: [], entries: [entry], error: '' } });
   const row = nodeOf(view.render(), 'data-lexicon-entry', 'word-1');
   assert.ok(row !== undefined);
   await buttonOf(row, '编辑').props.onClick();
@@ -464,6 +472,12 @@ test('3. 编辑弹窗：预填三字段/读音；保存走 lexicon.update 且不
     '角色名', 'the usage is prefilled');
   assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1').props.value,
     'xiàng wǎn', 'the optional reading is prefilled');
+  const librarySelect = nodesOf(dialog).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-dialog-library'] === '1');
+  assert.ok(librarySelect !== undefined, 'the edit dialog shows the library dropdown');
+  assert.equal(librarySelect.props.value, 'public', 'the current library is prefilled');
+  assert.equal(librarySelect.children.find((node) => node.props?.value === 'voiceprint').props.disabled,
+    false, 'a confirmed self makes the voiceprint slot selectable in edit');
   assert.ok(!nodesOf(dialog).some((node) => node.props?.['data-lexicon-remove-form'] !== undefined),
     'the main edit form no longer edits internal wrongForms');
 
@@ -479,6 +493,9 @@ test('3. 编辑弹窗：预填三字段/读音；保存走 lexicon.update 且不
     .props.onChange({ target: { value: '  角色别称  ' } });
   inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1')
     .props.onChange({ target: { value: 'xiàng wǎn wǎn' } });
+  nodesOf(dialog).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-dialog-library'] === '1')
+    .props.onChange({ target: { value: 'voiceprint' } });
   dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
 
   await buttonOf(dialog, '保存修改').props.onClick();
@@ -492,8 +509,13 @@ test('3. 编辑弹窗：预填三字段/读音；保存走 lexicon.update 且不
     category: 'character',
     usage: '角色别称',
     reading: 'xiàng wǎn wǎn',
+    library: 'voiceprint',
   }, 'the edit body matches lexicon.update and carries no status/wrongForms');
   assert.ok(!('status' in body) && !('wrongForms' in body), 'status is never sent by the main form');
+
+  // An untouched library is omitted, so a normal edit is not gated on a confirmed self.
+  const plain = lexicon.lexiconDialogOf(word({ library: 'voiceprint' }), 'edit');
+  assert.ok(!('library' in lexicon.lexiconSaveBody(plain, '')), 'unchanged library stays out of the body');
 
   console.log('[lexicon-ui 3] prefilled=向晚/person/角色名/xiàng wǎn body=', JSON.stringify(body));
 });
@@ -589,7 +611,7 @@ test('5. 失败分支：未接线/坏数据只显示「语言库不可用」，�
     true, 'an empty spelling cannot be saved');
 
   const noData = mount({ data: { entries: [], unassigned: [], error: undefined } }).render();
-  assert.ok(textsOf(noData).includes('共享词库还是空的'), 'an undefined error is not printed');
+  assert.ok(textsOf(noData).includes('词库还是空的'), 'an undefined error is not printed');
 
   console.log('[lexicon-ui 5] error=语言库不可用：LEXICON_UNAVAILABLE crash=no');
 });
@@ -645,6 +667,13 @@ test('6. 接线检查：设置页挂载、八个动作、手动添加/移动与�
     'ignore/remove share the same act() write path');
   assert.match(clientSource, /saveDialog: \(dialog, speakerId\) => void saveLexiconDialog\(dialog, speakerId\),/u,
     'the section passes the status-derived identity into the Panel save');
+  assert.match(clientSource,
+    /confirmedSelfId: String\(speakerEnroll\?\.list\?\.selfId \?\? ''\)\.trim\(\),/u,
+    'the voiceprint gate comes from enrollment\'s confirmed self, not a shadow match');
+  assert.match(clientSource, /data-lexicon-new-library/u,
+    'the manual add form can choose the library slot');
+  assert.match(clientSource, /data-lexicon-dialog-library/u,
+    'the edit dialog can move the entry between libraries');
   assert.match(clientSource, /const second = await act\(lexiconWrongFormsBody\(dialog, entryId\), 'lexicon-edit'\);/u,
     'a trimmed confirm dialog is followed by one edit call');
   assert.match(clientSource, /const body = lexiconAddBody\(draft\);/u,
@@ -902,10 +931,10 @@ test('9. 回归：confirm 失败不关闭；编辑成功只关一次；取消重
 // ---------------------------------------------------------------------------------------------
 // 10. Manual add form + library move + candidate delete
 // ---------------------------------------------------------------------------------------------
-test('10. 手动新建：三字段+读音请求体；库位移动；候选删除保留', async () => {
+test('10. 手动新建：三字段+读音+库位请求体；库位移动；候选删除保留', async () => {
   const view = mount({
     draft: {
-      text: '充电', category: 'expression',
+      text: '充电', category: 'expression', library: 'public',
       usage: '指陪我聊一会，不是给设备充电', reading: 'chōng diàn', error: '',
     },
     data: { unassigned: [], entries: [], error: '' },
@@ -922,7 +951,8 @@ test('10. 手动新建：三字段+读音请求体；库位移动；候选删除
     category: 'expression',
     usage: '指陪我聊一会，不是给设备充电',
     reading: 'chōng diàn',
-  }, 'the add body carries the three fields plus optional reading, no speakerId');
+    library: 'public',
+  }, 'the add body carries the three fields plus optional reading and the library slot');
   assert.equal(lexicon.lexiconCategoryLabel('expression'), '特殊表达');
   assert.equal(lexicon.lexiconLibraryLabel('public'), '公共库');
   assert.equal(lexicon.lexiconLibraryLabel('voiceprint'), '声纹库');
@@ -939,13 +969,47 @@ test('10. 手动新建：三字段+读音请求体；库位移动；候选删除
   select.props.onChange({ target: { value: 'term' } });
   assert.deepEqual(blank.calls.changeDraft.at(-1), { category: 'term' });
 
-  // Library move: public -> voiceprint is disabled until a voiceprint library exists; a stored
-  // voiceprint row can always be moved back to public.
+  // With a confirmed self the voiceprint slot is selectable, and the body carries it.
+  const ready = mount({
+    confirmedSelfId: 'self-1',
+    draft: {
+      text: '阿晚', category: 'person', library: 'voiceprint',
+      usage: '', reading: '', error: '',
+    },
+    data: { unassigned: [], entries: [], error: '' },
+  });
+  const readyForm = nodeOf(ready.render(), 'data-lexicon-new-form', '1');
+  const readyLibrary = nodesOf(readyForm).find((node) => node.type === 'select'
+    && node.props?.['data-lexicon-new-library'] === '1');
+  assert.equal(readyLibrary.props.value, 'voiceprint');
+  assert.equal(readyLibrary.children.find((node) => node.props?.value === 'voiceprint').props.disabled,
+    false, 'a confirmed self unlocks the voiceprint option');
+  await buttonOf(readyForm, '添加词条').props.onClick();
+  assert.equal(ready.calls.add[0].library, 'voiceprint');
+  assert.deepEqual(lexicon.lexiconAddBody(ready.calls.add[0]), {
+    action: 'lexicon.add',
+    text: '阿晚',
+    category: 'person',
+    usage: '',
+    reading: '',
+    library: 'voiceprint',
+  }, 'a voiceprint add names the personal library');
+
+  // A voiceprint row can always be moved back to public; moving a public row into voiceprint needs
+  // the confirmed self, so it stays disabled without one.
   const publicView = mount({ data: { unassigned: [], entries: [word()], error: '' } });
   const publicRow = nodeOf(publicView.render(), 'data-lexicon-entry', 'word-1');
   assert.equal(buttonOf(publicRow, '移到声纹库').props.disabled, true);
+  const readyMoveView = mount({
+    confirmedSelfId: 'self-1',
+    data: { unassigned: [], entries: [word()], error: '' },
+  });
+  const readyMoveRow = nodeOf(readyMoveView.render(), 'data-lexicon-entry', 'word-1');
+  await buttonOf(readyMoveRow, '移到声纹库').props.onClick();
+  assert.deepEqual(readyMoveView.calls.move, [['word-1', 'voiceprint']]);
   const voiceprintView = mount({
-    data: { unassigned: [], entries: [word({ library: 'voiceprint' })], error: '' },
+    confirmedSelfId: 'self-1',
+    data: { unassigned: [], entries: [word({ library: 'voiceprint', speakerId: 'self-1' })], error: '' },
   });
   const voiceprintRow = nodeOf(voiceprintView.render(), 'data-lexicon-entry', 'word-1');
   await buttonOf(voiceprintRow, '移到公共库').props.onClick();

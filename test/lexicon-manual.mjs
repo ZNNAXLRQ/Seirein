@@ -138,10 +138,10 @@ test('2. 三字段/类别/长度/库位校验；重复 key 返回 exists 且不�
   console.log('[2] validation=ok duplicate=', JSON.stringify(duplicate), 'rows=', store.listConfirmed().length);
 });
 
-test('3. update 只改字段不改 status；move 只改库位；remove 真删除', (t) => {
+test('3. update 只改字段不改 status；move 只改库位与归属；remove 真删除', (t) => {
   const root = tempRoot(t);
   const clock = () => new Date(T1);
-  const store = createLexiconStore({ root, clock });
+  const store = createLexiconStore({ root, clock, selfId: 'self-1' });
   const added = store.addEntry({ text: '充电', category: 'expression', usage: '旧用法' });
   const id = added.entry.id;
 
@@ -194,9 +194,17 @@ test('3. update 只改字段不改 status；move 只改库位；remove 真删除
   assert.equal(moved.ok, true);
   assert.equal(moved.entry.library, 'voiceprint');
   assert.equal(moved.entry.status, 'confirmed');
+  assert.equal(moved.entry.speakerId, 'self-1', 'voiceprint ownership is the confirmed self');
   assert.deepEqual(store.moveEntry({ id, library: 'private' }), { ok: false, reason: 'invalid-library' });
   assert.deepEqual(store.moveEntry({ id }), { ok: false, reason: 'invalid-library' });
   assert.deepEqual(store.moveEntry({ id: 'lex-99', library: 'public' }), { ok: false, reason: 'not-found' });
+
+  // Moving back to public clears the owner: the word is shared again and no stale speaker filter
+  // can hide it from another self.
+  const back = store.moveEntry({ id, library: 'public' });
+  assert.equal(back.ok, true);
+  assert.equal(back.entry.library, 'public');
+  assert.equal(back.entry.speakerId, null);
 
   const removed = store.remove({ id });
   assert.equal(removed.ok, true);

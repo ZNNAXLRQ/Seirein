@@ -2552,10 +2552,10 @@ window.__ModuleLoader__.load({
     }
 
     function lexiconEmptyDraft() {
-      return { text: '', category: 'person', usage: '', reading: '', error: '' };
+      return { text: '', category: 'person', library: 'public', usage: '', reading: '', error: '' };
     }
 
-    /** 新建词条请求体：只含主表单三字段 + 可选读音；公共库由宿主默认写死。 */
+    /** 新建词条请求体：主表单三字段 + 可选读音 + 库位（默认公共库）。 */
     function lexiconAddBody(draft) {
       return {
         action: 'lexicon.add',
@@ -2563,6 +2563,7 @@ window.__ModuleLoader__.load({
         category: String(draft?.category ?? ''),
         usage: String(draft?.usage ?? '').trim(),
         reading: String(draft?.reading ?? '').trim(),
+        library: String(draft?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public',
       };
     }
 
@@ -2609,6 +2610,7 @@ window.__ModuleLoader__.load({
         usage: String(entry?.usage ?? ''),
         reading: String(entry?.reading ?? ''),
         library: String(entry?.library ?? 'public'),
+        originalLibrary: String(entry?.library ?? 'public'),
         wrongForms: observed,
         observed,
         context: editing
@@ -2622,7 +2624,8 @@ window.__ModuleLoader__.load({
      * 弹窗 → 写入请求体（契约固定）：
      *   确认：{action:'lexicon.confirm', id|text, canonical?, speakerId?}（speakerId 可选：
      *   有才带，空字符串绝不进入请求体）
-     *   编辑：{action:'lexicon.edit', id, canonical, wrongForms, context}
+     *   编辑：{action:'lexicon.update', id, canonical, category, usage, reading, library?}
+     *   （library 只在用户真的换了库位时携带，避免普通编辑被声纹门槛拦住）
      */
     function lexiconSaveBody(dialog, speakerId) {
       const current = dialog ?? {};
@@ -2630,8 +2633,8 @@ window.__ModuleLoader__.load({
         .map((form) => String(form ?? '').trim())
         .filter((form) => form !== '');
       if (current.mode === 'edit') {
-        // 主表单走 lexicon.update：只改词/类别/用法/读音，status/kind/wrongForms 不在这里改。
-        return {
+        // 主表单走 lexicon.update：只改词/类别/用法/读音/库位，status/kind/wrongForms 不在这里改。
+        const body = {
           action: 'lexicon.update',
           id: String(current.id ?? ''),
           canonical: String(current.canonical ?? '').trim(),
@@ -2639,6 +2642,9 @@ window.__ModuleLoader__.load({
           usage: String(current.usage ?? '').trim(),
           reading: String(current.reading ?? '').trim(),
         };
+        const library = String(current.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public';
+        if (String(current.originalLibrary ?? 'public') !== library) body.library = library;
+        return body;
       }
       const body = { action: 'lexicon.confirm' };
       const speaker = String(speakerId ?? '').trim();
@@ -2746,9 +2752,11 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function lexiconSection(h, { data, busy, dialog, pending, speakerId, draft }, handlers) {
+    function lexiconSection(h, {
+      data, busy, dialog, pending, speakerId, confirmedSelfId, draft,
+    }, handlers) {
       const loading = data === null || data === undefined || data.loading === true;
-      // `entries` 是共享词库：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
+      // `entries` 是管理列表：只显示已确认的词条（契约给 status，旧形状没有时也接受）。
       const entries = (Array.isArray(data?.entries) ? data.entries : [])
         .filter((entry) => entry?.status === undefined || entry.status === 'confirmed');
       const unassigned = Array.isArray(data?.unassigned) ? data.unassigned : [];
@@ -2756,11 +2764,15 @@ window.__ModuleLoader__.load({
       const stopped = busy !== '';
       // 身份只是可选来源：没有也不影响确认，只在请求体里「有则带」。
       const selfId = String(speakerId ?? '');
-      // 声纹库在本阶段只保留库位值，没有建立任何声纹分库，所以入口禁用并说明。
-      const voiceprintReady = data?.voiceprintReady === true || data?.voiceprintLibrary?.ready === true;
+      // 声纹库只对“已确认本人”生效。这个 id 来自 enrollment 的确认条目，不是影子猜测或设置提示。
+      const voiceprintReady = String(confirmedSelfId ?? '').trim().length > 0;
       const newDraft = draft ?? lexiconEmptyDraft();
       const draftText = String(newDraft?.text ?? '');
       const draftCategory = String(newDraft?.category ?? '');
+      // 声纹不可用时，草稿里的 voiceprint 退回公共库，绝不提交一个会被宿主拒绝的库位。
+      const draftLibrary = voiceprintReady && String(newDraft?.library ?? '') === 'voiceprint'
+        ? 'voiceprint'
+        : 'public';
       const addBlocked = stopped
         || draftText.trim() === ''
         || !LEXICON_CATEGORY_LABEL[draftCategory];
@@ -2830,6 +2842,8 @@ window.__ModuleLoader__.load({
       const wordRow = (entry) => {
         const library = String(entry?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public';
         const targetLibrary = library === 'public' ? 'voiceprint' : 'public';
+        // Moving back to public is always available (it only releases ownership); moving into
+        // voiceprint needs a confirmed self.
         const targetReady = targetLibrary === 'public' || voiceprintReady;
         const forms = Array.isArray(entry?.wrongForms) ? entry.wrongForms : [];
         return h('div', {
@@ -2863,7 +2877,7 @@ window.__ModuleLoader__.load({
               'data-lexicon-move': targetLibrary,
               style: { ...styles.btn, ...(stopped || !targetReady ? styles.off : {}) },
               disabled: stopped || !targetReady,
-              title: targetReady ? '' : '声纹库尚未建立，暂时只能使用公共库',
+              title: targetReady ? '' : '声纹库只对已确认本人开放：请先完成本人声纹确认',
               onClick: () => void handlers.move(entry?.id, targetLibrary),
             }, targetLibrary === 'voiceprint' ? '移到声纹库' : '移到公共库'),
             isPending('remove', entry?.id)
@@ -2894,6 +2908,7 @@ window.__ModuleLoader__.load({
         : 'unknown';
       const dialogUsage = String(dialog?.usage ?? '');
       const dialogReading = String(dialog?.reading ?? '');
+      const dialogLibrary = String(dialog?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public';
       // 第一步（confirm）已生效、第二步（补存误识别形式）失败：保留内容，换成重试入口。
       const notice = String(dialog?.notice ?? '');
       const retryId = String(dialog?.retryId ?? '');
@@ -2909,8 +2924,8 @@ window.__ModuleLoader__.load({
             ? `编辑「${canonical || String(dialog?.text ?? '')}」`
             : `确认候选「${String(dialog?.text ?? '')}」`),
           h('div', { style: styles.hint }, editing
-            ? '修改词、类别、用法或读音；不改状态、不改写历史记录，也不影响库位。'
-            : '确认后这一条会进入共享词库，所有人说话时的识别与替换都可使用；声纹只是可选的来源标注，不是确认门槛。'),
+            ? '修改词、类别、用法、读音或库位；不改状态、不改写历史记录。公共库所有人可用，声纹库只对已确认本人生效。'
+            : '确认后这一条会进入公共词库，所有人说话时的识别与替换都可使用；声纹只是可选的来源标注，不是确认门槛。'),
           h('div', { style: styles.field },
             h('span', { style: styles.value }, editing ? '词或短语' : '正确写法'),
             h('input', {
@@ -2933,6 +2948,26 @@ window.__ModuleLoader__.load({
                   disabled: stopped,
                   onChange: (event) => handlers.changeDialog({ category: event.target.value }),
                 }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label))))
+            : null,
+          editing
+            ? h('div', { style: styles.field },
+                h('span', { style: styles.value }, '库位'),
+                h('select', {
+                  'data-lexicon-dialog-library': '1',
+                  style: styles.input,
+                  value: dialogLibrary,
+                  disabled: stopped,
+                  onChange: (event) => handlers.changeDialog({ library: event.target.value }),
+                },
+                  h('option', { key: 'public', value: 'public' }, '公共库（所有人可用）'),
+                  h('option', {
+                    key: 'voiceprint',
+                    value: 'voiceprint',
+                    disabled: !voiceprintReady,
+                  }, voiceprintReady ? '声纹库（仅本人可用）' : '声纹库（需先确认本人声纹）')),
+                h('div', { style: styles.hint }, voiceprintReady
+                  ? '声纹库词条只对已确认本人生效；移回公共库会清空归属。'
+                  : '尚无已确认本人声纹：只能使用公共库。'))
             : null,
           editing
             ? h('div', { style: styles.field },
@@ -3006,10 +3041,13 @@ window.__ModuleLoader__.load({
 
       return h('div', { 'data-settings-group': 'lexicon', style: styles.group },
         h('div', { style: styles.groupTitleRow },
-          h('span', { style: styles.groupTitle }, '共享词库'),
+          h('span', { style: styles.groupTitle }, '词库（公共 / 声纹）'),
           h('button', { style: styles.btn, disabled: stopped, onClick: handlers.refresh }, '刷新')),
-        h('div', { style: styles.hint }, '手动添加或从候选确认；词条进入所有人共享的词库，用于纠错与理解（v2 才接入召回/注入）。声纹不是添加或确认的门槛。'),
-        h('div', { style: styles.hint }, '自动提取候选默认关闭；已有候选仍可确认或删除。声纹库尚未建立：只能使用公共库，移到声纹库暂不可用。'),
+        h('div', { style: styles.hint }, '公共库：所有说话人都会使用；声纹库：只对已确认本人（enrollment.selfId）生效。声纹不是添加或确认公共词条的门槛。'),
+        h('div', { style: styles.hint }, voiceprintReady
+          ? '已确认本人声纹：声纹库可用，个人词条不会进入其他人的识别列表。'
+          : '尚未确认本人声纹：只能使用公共库，声纹库选项已禁用。'),
+        h('div', { style: styles.hint }, '自动提取候选默认关闭；已有候选仍可确认或删除。'),
         error === '' ? null : h('div', { style: { ...styles.hint, color: DANGER } }, `语言库不可用：${error}`),
         loading
           ? h('div', { style: styles.hint }, '正在读取语言库…')
@@ -3035,6 +3073,22 @@ window.__ModuleLoader__.load({
                     disabled: stopped,
                     onChange: (event) => handlers.changeDraft({ category: event.target.value }),
                   }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label)))),
+                h('div', { style: styles.field },
+                  h('span', { style: styles.value }, '库位'),
+                  h('select', {
+                    'data-lexicon-new-library': '1',
+                    style: styles.input,
+                    value: draftLibrary,
+                    disabled: stopped,
+                    onChange: (event) => handlers.changeDraft({ library: event.target.value }),
+                  },
+                    h('option', { key: 'public', value: 'public' }, '公共库（所有人可用）'),
+                    h('option', {
+                      key: 'voiceprint',
+                      value: 'voiceprint',
+                      disabled: !voiceprintReady,
+                    }, voiceprintReady ? '声纹库（仅本人可用）' : '声纹库（需先确认本人声纹）')),
+                  h('div', { style: styles.hint }, '声纹库只对已确认本人生效；未确认时请用公共库。')),
                 h('div', { style: styles.field },
                   h('span', { style: styles.value }, '用法（可留空）'),
                   h('input', {
@@ -3063,15 +3117,15 @@ window.__ModuleLoader__.load({
                     'data-lexicon-add': '1',
                     style: { ...styles.btnPrimary, ...(addBlocked ? styles.off : {}) },
                     disabled: addBlocked,
-                    onClick: () => void handlers.add(newDraft),
+                    onClick: () => void handlers.add({ ...newDraft, library: draftLibrary }),
                   }, '添加词条'))),
               h('div', { style: { ...styles.label, marginTop: 8 } }, `待确认候选（${unassigned.length}）`),
               unassigned.length === 0
                 ? h('div', { style: styles.hint }, '没有待确认的候选')
                 : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, unassigned.map(candidateRow)),
-              h('div', { style: { ...styles.label, marginTop: 10 } }, `共享词库（${entries.length}）`),
+              h('div', { style: { ...styles.label, marginTop: 10 } }, `全部词条（${entries.length}）`),
               entries.length === 0
-                ? h('div', { style: styles.hint }, '共享词库还是空的')
+                ? h('div', { style: styles.hint }, '词库还是空的')
                 : h('div', { style: { maxHeight: 220, overflowY: 'auto' } }, entries.map(wordRow))),
         dialog === null || dialog === undefined ? null : dialogNode,
       );
@@ -5948,7 +6002,7 @@ window.__ModuleLoader__.load({
         setLexiconDraft((current) => ({ ...current, ...patch, error: '' }));
       }, []);
 
-      /** 手动添加：不走候选、不需要声纹；成功后只清空表单并刷新列表。 */
+      /** 手动添加：不走候选、不需要声纹确认；库位随草稿提交，声纹位由宿主再次校验 selfId。 */
       const addLexiconEntry = useCallback(async (draft) => {
         const body = lexiconAddBody(draft);
         if (body.text === '') {
@@ -5965,7 +6019,7 @@ window.__ModuleLoader__.load({
         show(`已添加「${body.text}」`);
       }, [act, loadLexicon, show]);
 
-      /** 库位移动只改 library；声纹库尚无实现，入口在 UI 里禁用。 */
+      /** 库位移动只改 library；声纹位需要已确认本人，入口在 UI 里按 selfId 禁用。 */
       const moveLexicon = useCallback(async (id, library) => {
         const result = await act({ action: 'lexicon.move', id: String(id), library: String(library) }, 'lexicon-move');
         if (result?.ok !== true) return;
@@ -7847,6 +7901,9 @@ window.__ModuleLoader__.load({
             dialog: lexiconDialog,
             pending: lexiconPending,
             speakerId: lexiconSpeakerId(status),
+            // The voiceprint library unlocks only for enrollment's confirmed self, never for a
+            // shadow match or a settings hint.
+            confirmedSelfId: String(speakerEnroll?.list?.selfId ?? '').trim(),
             draft: lexiconDraft,
           }, {
             refresh: () => void loadLexicon(),

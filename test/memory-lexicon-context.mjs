@@ -325,9 +325,11 @@ test('5) both the voice and typed entries run the same local lexicon recall', as
     assert.equal(reads, 1, `${lane} entry reads the lexicon exactly once`);
   }
   // The host wires the store once and the pre-step serves both lanes; no speech-only branch exists.
+  // The effective view is per confirmed self: public + that self's own voiceprint entries only.
   const source = await readFile(new URL('../src/host/index.js', import.meta.url), 'utf8');
-  assert.match(source, /lexiconEntries: \(\) => lexiconStore\.listConfirmed\(\)/u,
-    'the host passes only the confirmed shared lexicon to the pre-step');
+  assert.match(source,
+    /lexiconEntries: \(\) => lexiconStore\.listActive\(\{ speakerId: lexiconSelfId\(\) \}\)/u,
+    'the host passes the active lexicon for the confirmed self to the pre-step');
   console.log('[5] voice and typed both inject');
 });
 

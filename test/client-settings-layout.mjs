@@ -409,3 +409,23 @@ test('12. 端到端渲染：14 张卡片都落进 12 个分区，分区内顺序
   assert.deepEqual(bySection.misc, ['misc'], '其他设置在最后');
   console.log(`12) cards=${cards.length} sections=${tree.length} memory=${bySection.memory.join(',')}`);
 });
+
+// ---- 7. explicit gaze-mapping probe entry ---------------------------------------------------
+test('13. 形象卡片：验证视线映射按钮 + 结果行，一次动作、无轮询、失败不清空其它状态', () => {
+  assert.equal((clientSource.match(/action: 'avatar\.mapping\.probe'/gu) ?? []).length, 1,
+    '形象卡片只有一处显式触发');
+  assert.ok(clientSource.includes("'验证视线映射'"), '按钮文案存在');
+  assert.ok(clientSource.includes('data-avatar-mapping'), '结果行有稳定标记');
+  assert.ok(clientSource.includes('status.avatar?.mapping'), '结果行读取 status.avatar.mapping');
+  for (const text of ['已连通', '未变化', '失败：']) {
+    assert.ok(clientSource.includes(text), `结果行能显示「${text}」`);
+  }
+  assert.doesNotMatch(
+    clientSource,
+    /action: 'avatar\.mapping\.probe'[\s\S]{0,300}?setInterval/u,
+    '验证按钮不新增轮询',
+  );
+  assert.equal((clientSource.match(/setInterval\(load, 3000\)/gu) ?? []).length, 1,
+    '全局轮询仍只有原有的那一个');
+  console.log('13) mappingButton=1 resultRow=1 poll=0');
+});

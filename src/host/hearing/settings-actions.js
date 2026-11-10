@@ -2,6 +2,7 @@
 
 import {
   LEXICON_CATEGORIES,
+  LEXICON_LIBRARIES,
   LEXICON_READING_MAX_CHARS,
   LEXICON_TEXT_MAX_CHARS,
   LEXICON_USAGE_MAX_CHARS,
@@ -321,10 +322,10 @@ export function createHearingSettingsActions(services) {
     error: '音频诊断保留尚未接线：需要 Host 提供 retention 存储',
   });
   /**
-   * The shared lexicon store the Host owns (one per plugin root). Every action here is a thin
-   * pass-through: the store decides the ambiguous/tombstone rules, and nothing is auto-confirmed
-   * by listing or by a candidate arriving from a transcript. A speakerId is optional provenance;
-   * it is never required to confirm.
+   * The lexicon store the Host owns (one per plugin root). Every action here is a thin
+   * pass-through: the store decides the ambiguous/tombstone/ownership rules, and nothing is
+   * auto-confirmed by listing or by a candidate arriving from a transcript. `public` is shared;
+   * `voiceprint` is personal and only written while a confirmed self exists.
    */
   const lexiconStore = () => services.lexiconStore ?? null;
   const LEXICON_UNAVAILABLE = Object.freeze({
@@ -332,6 +333,18 @@ export function createHearingSettingsActions(services) {
     code: 'LEXICON_UNAVAILABLE',
     error: '共享语言库尚未接线：需要 Host 提供 lexicon 存储',
   });
+  /**
+   * Validate the optional `library` argument before the store is called, so the refusal code is
+   * stable across store implementations: an unknown slot is `invalid-library`, and the personal
+   * slot without a confirmed self is `self-required` (`undefined` keeps the store's default slot).
+   */
+  const lexiconLibraryOf = (value) => {
+    if (value === undefined || value === null) return { ok: true, library: undefined };
+    if (typeof value !== 'string' || !LEXICON_LIBRARIES.includes(value)) {
+      return { ok: false, library: null };
+    }
+    return { ok: true, library: value };
+  };
   /**
    * Candidate → voiceprint depends on three host-owned pieces: the candidate store/actions, the
    * one shared SpeakerLibrary (`<root>/memory/speaker.db`) and the enrollment store. A missing one
@@ -458,6 +471,8 @@ export function createHearingSettingsActions(services) {
         // Pending candidates stay visible even when already attributed: `unassigned` keeps the
         // unassigned area AND the assigned-but-unconfirmed corrections (each carries
         // `assigned:true`), so neither row is lost; `candidates` is the same full pending set.
+        // `entries` is the administration view: every confirmed row, public and voiceprint. The
+        // per-speaker effective view is the store's `listActive()` and is not exposed here.
         const candidates = store.listCandidates();
         return { ok: true, entries: store.listConfirmed(), unassigned: candidates, candidates };
       }
@@ -494,15 +509,22 @@ export function createHearingSettingsActions(services) {
       case 'lexicon.add': {
         const store = lexiconStore();
         if (store === null) return LEXICON_UNAVAILABLE;
-        // Manual add is confirmed immediately and always writes the public library unless the
-        // caller explicitly names a valid slot. No speakerId/voiceprint is involved.
+        // Manual add is confirmed immediately. `public` is open to everyone; `voiceprint` is
+        // personal and therefore needs the confirmed self and writes that same speakerId.
+        const requested = lexiconLibraryOf(body.library);
+        if (requested.ok !== true) return { ok: false, reason: 'invalid-library' };
+        const selfId = enrollmentSelfId();
+        if (requested.library === 'voiceprint' && selfId === '') {
+          return { ok: false, reason: 'self-required' };
+        }
         const result = store.addEntry({
           text: body.text,
           canonical: body.canonical,
           category: body.category,
           usage: body.usage,
           reading: body.reading,
-          library: body.library,
+          library: requested.library,
+          speakerId: requested.library === 'voiceprint' ? selfId : undefined,
         });
         if (result.ok) {
           await services.log.emit('lexicon.added', {
@@ -516,6 +538,13 @@ export function createHearingSettingsActions(services) {
       case 'lexicon.update': {
         const store = lexiconStore();
         if (store === null) return LEXICON_UNAVAILABLE;
+        // The main edit form may also change the library; the same self gate applies as for move.
+        const requested = lexiconLibraryOf(body.library);
+        if (requested.ok !== true) return { ok: false, reason: 'invalid-library' };
+        const selfId = enrollmentSelfId();
+        if (requested.library === 'voiceprint' && selfId === '') {
+          return { ok: false, reason: 'self-required' };
+        }
         const result = store.updateEntry({
           id: body.id,
           text: body.text,
@@ -523,6 +552,8 @@ export function createHearingSettingsActions(services) {
           category: body.category,
           usage: body.usage,
           reading: body.reading,
+          library: requested.library,
+          speakerId: requested.library === 'voiceprint' ? selfId : undefined,
         });
         if (result.ok) {
           await services.log.emit('lexicon.updated', {
@@ -536,7 +567,19 @@ export function createHearingSettingsActions(services) {
       case 'lexicon.move': {
         const store = lexiconStore();
         if (store === null) return LEXICON_UNAVAILABLE;
-        const result = store.moveEntry({ id: body.id, library: body.library });
+        const requested = lexiconLibraryOf(body.library);
+        if (requested.ok !== true || requested.library === undefined) {
+          return { ok: false, reason: 'invalid-library' };
+        }
+        const selfId = enrollmentSelfId();
+        if (requested.library === 'voiceprint' && selfId === '') {
+          return { ok: false, reason: 'self-required' };
+        }
+        const result = store.moveEntry({
+          id: body.id,
+          library: requested.library,
+          speakerId: requested.library === 'voiceprint' ? selfId : undefined,
+        });
         if (result.ok) {
           await services.log.emit('lexicon.moved', {
             id: result.entry?.id ?? '',
@@ -1402,7 +1445,7 @@ export function parseWordCommand(rawInput) {
 export function createWordCommandDefinition({ store = null, log = null } = {}) {
   return Object.freeze({
     name: 'word',
-    description: '添加一条共享词库词条（公共库，可直接在设置页编辑）',
+    description: '添加一条公共词库词条（所有人可用，可直接在设置页编辑）',
     input: { hint: '词或短语 类别 "用法" [读音]' },
     async handler(invocation) {
       const parsed = parseWordCommand(invocation?.rawInput ?? '');
@@ -1441,7 +1484,7 @@ export function createWordCommandDefinition({ store = null, log = null } = {}) {
       const label = LEXICON_CATEGORY_LABELS[added.entry?.category] ?? added.entry?.category ?? '未知';
       return {
         kind: 'success',
-        text: `已加入公共词库：「${added.entry?.canonical || added.entry?.text || parsed.value.text}」（${label}）· ID ${added.entry?.id ?? ''}。可在 设置 → 记忆与人设 → 共享词库 中编辑或移动。`,
+        text: `已加入公共词库：「${added.entry?.canonical || added.entry?.text || parsed.value.text}」（${label}）· ID ${added.entry?.id ?? ''}。可在 设置 → 记忆与人设 → 词库 中编辑或移动。`,
       };
     },
   });

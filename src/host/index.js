@@ -1523,18 +1523,28 @@ function emitLexiconEvent(log, type, payload) {
  * `rawText`. Any failure is fail-open to the exact-corrected text.
  *
  * @param {unknown} text the refined ASR text used for delivery/subtitles
- * @param {{store?: {listConfirmed?: () => object[]}|null, log?: object|null,
- *   utteranceId?: string}} [options]
+ * @param {{store?: {listActive?: (options: {speakerId?: string}) => object[],
+ *   listConfirmed?: () => object[]}|null, log?: object|null,
+ *   utteranceId?: string, speakerId?: string}} [options] `speakerId` is the confirmed self id;
+ *   only that self's voiceprint rows plus the public library are read.
  * @returns {string}
  */
-export function applyVoiceLexiconCorrection(text, { store = null, log = null, utteranceId = '' } = {}) {
+export function applyVoiceLexiconCorrection(text, {
+  store = null,
+  log = null,
+  utteranceId = '',
+  speakerId = undefined,
+} = {}) {
   const raw = typeof text === 'string' ? text : '';
   if (raw.length === 0) return raw;
   const id = typeof utteranceId === 'string' ? utteranceId : '';
-  const exact = applyLexiconText(raw, { store, log, utteranceId: id });
-  if (store === null || typeof store.listConfirmed !== 'function') return exact;
+  const exact = applyLexiconText(raw, { store, log, utteranceId: id, speakerId });
+  if (store === null || (typeof store.listActive !== 'function'
+    && typeof store.listConfirmed !== 'function')) return exact;
   try {
-    const entries = store.listConfirmed();
+    const entries = typeof store.listActive === 'function'
+      ? store.listActive({ speakerId })
+      : store.listConfirmed();
     if (!Array.isArray(entries) || entries.length === 0) return exact;
     const recall = recallLexiconCandidates({ entries, text: exact, limit: 3 });
     // Ambiguity or a second plausible match means "not unique": leave the ASR text alone.
@@ -1806,9 +1816,27 @@ export function apply(ctx, config) {
     file: join(root, 'data', 'motion-presets.json'),
     log,
   });
+  // 声纹登记：`<root>/data/speaker-enrollment.json`。读取永不建文件，写入只由用户的
+  // speaker.enroll.confirm / reject / remove 触发；这里不自动确认、不自动拒绝任何条目。
+  const speakerEnrollmentStore = createSpeakerEnrollmentStore({ root, log });
+  /**
+   * The ONE identity a personal voiceprint belongs to and may hear: the explicitly confirmed self
+   * (`enrollment.selfId`). A shadow verdict or a settings hint is not a confirmation and must never
+   * unlock another speaker's private words.
+   */
+  const lexiconSelfId = () => {
+    try {
+      const confirmed = speakerEnrollmentStore.getConfirmedSelf();
+      return typeof confirmed?.speakerId === 'string' ? confirmed.speakerId.trim() : '';
+    } catch {
+      return '';
+    }
+  };
   // 个人语言库：`<root>/data/lexicon.json`。启动时读一次（缺文件时读取不会创建文件），
   // 之后每次动作/合并都重新读盘。这里不确认任何词；只有用户的 lexicon.confirm 动作才算数。
-  const lexiconStore = createLexiconStore({ root, log });
+  // `selfId` is lazy: a later enrollment confirmation changes what the voiceprint library means
+  // without recreating the store.
+  const lexiconStore = createLexiconStore({ root, log, selfId: lexiconSelfId });
   lexiconStore.list();
   // `/word` is a manual entry point into the public shared lexicon. The commands service is
   // optional (older/embedded hosts may not compose it), so registration is best-effort and its
@@ -1827,9 +1855,6 @@ export function apply(ctx, config) {
       }).catch(() => {});
     }
   }
-  // 声纹登记：`<root>/data/speaker-enrollment.json`。读取永不建文件，写入只由用户的
-  // speaker.enroll.confirm / reject / remove 触发；这里不自动确认、不自动拒绝任何条目。
-  const speakerEnrollmentStore = createSpeakerEnrollmentStore({ root, log });
   // Host-only version chain. It opens no handle and creates nothing on read; only an explicit
   // build/strengthen/rollback writes it.
   const speakerTemplateStore = createSpeakerTemplateStore({ root, log });
@@ -7800,10 +7825,12 @@ export function apply(ctx, config) {
     featureEnabled: () => features.enabled('memory'),
     displayChars: () => autoMemorySettings().maxChars,
     ledger: memoryTurnLedger,
-    // Lexicon v2 explanation context: confirmed shared-lexicon entries are recalled locally for
-    // this turn's text (voice and typed alike) and appended as their own reference block. It is
-    // read-only: no memory write, no reinforcement, no auto-replacement of the delivered text.
-    lexiconEntries: () => lexiconStore.listConfirmed(),
+    // Lexicon v2 explanation context: the ACTIVE lexicon for the confirmed self (public + that
+    // self's own voiceprint entries) is recalled locally for this turn's text (voice and typed
+    // alike) and appended as its own reference block. It is read-only: no memory write, no
+    // reinforcement, no auto-replacement of the delivered text, and another speaker's voiceprint
+    // rows are never even considered.
+    lexiconEntries: () => lexiconStore.listActive({ speakerId: lexiconSelfId() }),
     // P-59: the voice session is the dated companion session; every other in-scope session is
     // the typed entry. Per-layer budgets are opt-in through `contextBudgets`, so a deployment
     // without them keeps the legacy single-block cap unchanged.
@@ -9760,7 +9787,7 @@ export function apply(ctx, config) {
         category: { type: 'string', description: 'Lexicon category, as validated by the store.' },
         usage: { type: 'string', description: 'Short usage/meaning note, stored by the lexicon (never copied into memory).' },
         reading: { type: 'string', description: 'Optional reading/pronunciation.' },
-        library: { type: 'string', description: 'Target library at add time (public or the reserved voiceprint library).' },
+        library: { type: 'string', description: 'Target library at add time: public (shared by everyone) or voiceprint (only the confirmed self; requires a confirmed self).' },
         limit: { type: 'integer', minimum: 1, maximum: 10, description: 'Maximum query recall results (1-10).' },
       },
       required: ['action'],
@@ -14904,6 +14931,8 @@ export function apply(ctx, config) {
         store: lexiconStore,
         log,
         utteranceId: meta.utteranceId,
+        // Only the confirmed self's own voiceprint rows may join the public library here.
+        speakerId: lexiconSelfId(),
       });
       // The note reaches the agent (fast path or task session) before the transcript itself.
       const delivered = annotateTranscript(corrected, meta);
@@ -19334,8 +19363,10 @@ export function apply(ctx, config) {
       // Voice card switch: `voice.inputInterruptsReply` (settings.voice), default true (historical
       // barge-in behavior). The settings page reads this exact persisted value on every poll.
       voiceInputInterruptsReply: voiceInputInterruptsReply(),
-      // One authoritative self identity for the lexicon card: the explicit registration wins, a
-      // speaker-shadow match is only a fallback, and `source` says which one answered.
+      // Optional provenance for the confirm dialog: the explicit registration wins, a
+      // speaker-shadow match is only a fallback, and `source` says which one answered. This is NOT
+      // the voiceprint gate: the personal library uses the explicitly confirmed
+      // `speakerEnrollmentStore` selfId (see `lexiconSelfId`).
       lexicon: resolveSelfSpeakerId({ settings: readSettings(), shadow: speakerLastShadow }),
       // The 听觉 card's 音频保留 switch follows the persisted setting (default off), not a local
       // toggle; the clips themselves are read through `audio.retention.list`.

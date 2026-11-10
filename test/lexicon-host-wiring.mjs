@@ -577,7 +577,7 @@ test('6. 回归：候选/纠正语义、confirmed 提示形状、六个动作已
 
 // 7 ---------------------------------------------------------------------------
 
-test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提取关闭）', async (t) => {
+test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提取关闭；voiceprint 需 confirmed self）', async (t) => {
   const root = await newRoot();
   // Deliberately no `lexicon.autoCandidates`: manual management must not depend on it.
   const host = await mount(root);
@@ -611,10 +611,11 @@ test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提�
   assert.equal(updated.entry.status, 'confirmed');
   assert.equal(updated.entry.category, 'term');
 
+  // A voiceprint entry is personal and therefore requires an explicitly confirmed self. This
+  // mount never confirms one, so the move is refused and the word stays public.
   const moved = await host.action({ action: 'lexicon.move', id: added.entry.id, library: 'voiceprint' });
-  assert.equal(moved.ok, true);
-  assert.equal(moved.entry.library, 'voiceprint');
-  assert.equal(moved.entry.status, 'confirmed');
+  assert.deepEqual(moved, { ok: false, reason: 'self-required' },
+    'voiceprint move without a confirmed self is refused');
   assert.deepEqual(await host.action({ action: 'lexicon.move', id: added.entry.id, library: 'private' }),
     { ok: false, reason: 'invalid-library' });
 
@@ -625,7 +626,9 @@ test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提�
   assert.match(commandResult.text, /ID lex-2/u);
   const listed = await host.list();
   assert.deepEqual(listed.entries.map((entry) => [entry.canonical, entry.category, entry.library]).sort(),
-    [['充电', 'term', 'voiceprint'], ['麦克风', 'term', 'public']].sort());
+    [['充电', 'term', 'public'], ['麦克风', 'term', 'public']].sort());
+  assert.equal(listed.entries.find((entry) => entry.id === added.entry.id).speakerId, null,
+    'the refused voiceprint move did not change ownership');
 
   // The default-OFF extractor did not create anything from the spoken text in the same mount.
   host.say('向晚来了，向晚走了。');
@@ -634,6 +637,6 @@ test('7. 手动 add/update/move 动作与 /word 命令注册（默认自动提�
   assert.deepEqual(listed.entries.length, 2);
 
   console.log('[7] command=word added=', JSON.stringify(added.entry.id),
-    'updated-category=', updated.entry.category, 'moved=', moved.entry.library,
+    'updated-category=', updated.entry.category, 'moved=', moved.reason,
     'command-text=', JSON.stringify(commandResult.text));
 });

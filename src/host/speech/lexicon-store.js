@@ -4,8 +4,11 @@
  * The user's fixed rules (2026-11-10):
  *   - an ordinary transcript only ever produces a CANDIDATE; nothing is auto-confirmed;
  *   - only the user's confirm action turns a candidate into an effective word;
- *   - the lexicon is SHARED: a candidate is never partitioned by speaker, and a missing voiceprint
- *     identity is not a confirmation gate; speakerId is optional provenance when it is known;
+ *   - the PUBLIC library is shared: a candidate is never partitioned by speaker, and a missing
+ *     voiceprint identity is not a confirmation gate; speakerId is optional provenance there;
+ *   - the VOICEPRINT library is personal: an entry belongs to exactly one confirmed self
+ *     (`speakerId === selfId`), is written only while that self is confirmed, and never enters
+ *     another speaker's active view. Moving it back to public clears the owner;
  *   - a confirmed word can be listed, modified and deleted;
  *   - import/export is a v2 feature and is deliberately absent here.
  *
@@ -50,9 +53,10 @@
  * change a stored spelling: it can set canonical/wrongForms/context and stamps `editedAt`, and it
  * ignores id/kind/status so those can never be rewritten by an edit call.
  *
- * Stage B4 (ASR post-processing closed loop): `applyLexiconText()` applies only the CONFIRMED
- * entries (`listConfirmed()` → `lexiconHints()`) to the text that is delivered/subtitled. The raw
- * ASR result is never rewritten. `proper-noun` replaces whole words only (never a substring), a
+ * Stage B4 (ASR post-processing closed loop): `applyLexiconText()` applies only the elements the
+ * caller may hear: the active view (`listActive({speakerId})` → `lexiconHints()`) is the public
+ * library plus the current confirmed self's own voiceprint entries. The raw ASR result is never
+ * rewritten. `proper-noun` replaces whole words only (never a substring), a
  * `correction` is applied only where its stored context matches, and a failing store/rule leaves
  * the input byte-for-byte unchanged (fail-open). Each applied hit is reported as
  * `lexicon.applied {utteranceId, id, from, to, kind}` with truncated texts (debug only).
@@ -90,8 +94,10 @@ export const LEXICON_CATEGORIES = Object.freeze([
 ]);
 
 /**
- * Library slot of one entry. Only `public` is written today; `voiceprint` is reserved for a later
- * per-voiceprint library and has no special logic in this stage.
+ * Library slot of one entry:
+ *   - `public`: shared, effective for every speaker; `speakerId` is optional provenance only.
+ *   - `voiceprint`: personal, owned by `speakerId === selfId`; effective only for that confirmed
+ *     self and never for another speaker. A confirmed self is required to create/move into it.
  */
 export const LEXICON_LIBRARIES = Object.freeze(['public', 'voiceprint']);
 export const LEXICON_DEFAULT_LIBRARY = 'public';
@@ -186,6 +192,20 @@ function cleanLibrary(value) {
   return typeof value === 'string' && LEXICON_LIBRARIES.includes(value) ? value : null;
 }
 
+/**
+ * Normalize the optional confirmed-self source. A function is asked lazily (the enrollment store
+ * may confirm the self after this store was created); a fixed string is a convenience for tests
+ * and embedded hosts. Anything else means "no confirmed self".
+ */
+function normalizeSelfIdSource(value) {
+  if (typeof value === 'function') return value;
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const fixed = value.trim();
+    return () => fixed;
+  }
+  return () => '';
+}
+
 /** De-duplicated misrecognised forms; the same form in full/half width is one form. */
 function normalizeWrongForms(value) {
   if (!Array.isArray(value)) return null;
@@ -245,6 +265,9 @@ function allocateEntryId(state) {
  * @param {{emit?: (event: string, payload: object) => unknown}|null} [options.log] event sink;
  *   only `lexicon.store.corrupt` and `lexicon.store.changed` are emitted.
  * @param {() => (Date|number|string)} [options.clock] injected time source.
+ * @param {string|(() => string)} [options.selfId] the confirmed self identity
+ *   (`enrollment.getConfirmedSelf().speakerId`). A function is re-read on every write/list call, so
+ *   a later confirmation takes effect without recreating the store.
  * @returns {Readonly<{
  *   file: string,
  *   read: () => object,
@@ -261,9 +284,10 @@ function allocateEntryId(state) {
  *   listCandidates: () => object[],
  *   listUnassigned: () => object[],
  *   listConfirmed: () => object[],
+ *   listActive: (options?: {speakerId?: string}) => object[],
  * }>}
  */
-export function createLexiconStore({ root, log = null, clock = () => new Date() } = {}) {
+export function createLexiconStore({ root, log = null, clock = () => new Date(), selfId = null } = {}) {
   if (typeof root !== 'string' || root.trim().length === 0) {
     throw new TypeError('lexicon store: root is required');
   }
@@ -271,7 +295,31 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     throw new TypeError('lexicon store: clock must be a function');
   }
   const file = join(root, LEXICON_STORE_PATH);
+  const selfIdSource = normalizeSelfIdSource(selfId);
   let lastCorruption = '';
+
+  /** The store's currently confirmed self, or '' when none is confirmed. Never throws. */
+  const confirmedSelfId = () => {
+    try {
+      const value = selfIdSource();
+      return typeof value === 'string' ? value.trim() : '';
+    } catch {
+      return '';
+    }
+  };
+
+  /**
+   * Resolve the identity a library operation/list may use. A configured confirmed self is
+   * authoritative: an explicit different id is NOT that self and therefore gets no voiceprint
+   * access. Without a configured self, an explicit caller-supplied id is the caller's assertion of
+   * the confirmed self (the Host always passes `enrollment.selfId`).
+   */
+  const speakerFor = (speakerId) => {
+    const requested = typeof speakerId === 'string' ? speakerId.trim() : '';
+    const configured = confirmedSelfId();
+    if (configured !== '') return requested === '' || requested === configured ? configured : '';
+    return requested;
+  };
 
   const emit = (event, payload) => {
     // Debug logging must never change what the store does, so errors and rejections are swallowed.
@@ -416,14 +464,14 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
   };
 
   /**
-   * Manually add one shared word. It is confirmed immediately (the user typed it, so there is no
-   * candidate to confirm) and carries no speaker identity. The category is required here because
-   * only the user can classify a manually added word; `usage`/`reading` may be empty.
+   * Manually add one word. It is confirmed immediately (the user typed it, so there is no
+   * candidate to confirm). A `public` entry carries no speaker identity; a `voiceprint` entry is
+   * only allowed while a confirmed self exists and is written with `speakerId = selfId`.
    *
    * A duplicate key/canonical returns exactly `{ok:false, reason:'exists'}` and writes nothing.
    *
    * @param {{text?: string, canonical?: string, category?: string, usage?: string|null,
-   *   reading?: string|null, library?: string}} [options]
+   *   reading?: string|null, library?: string, speakerId?: string}} [options]
    * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
    */
   const addEntry = ({
@@ -433,6 +481,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     usage = undefined,
     reading = undefined,
     library = undefined,
+    speakerId = undefined,
   } = {}) => {
     const raw = canonical !== undefined ? canonical : text;
     const display = typeof raw === 'string' ? raw.trim() : '';
@@ -448,9 +497,15 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     if (libraryValue === null) return { ok: false, reason: 'invalid-library' };
     const key = lexiconKey(display);
     const state = read();
+    // A duplicate is refused before the ownership gate: no write happens either way, and the
+    // caller keeps the useful `exists` answer even for a voiceprint add whose self is missing.
     const duplicate = state.entries.find((entry) => entry?.key === key
       || (typeof entry?.canonical === 'string' && entry.canonical.length > 0 && lexiconKey(entry.canonical) === key));
     if (duplicate !== undefined) return { ok: false, reason: 'exists' };
+    const owner = libraryValue === 'voiceprint' ? speakerFor(speakerId) : '';
+    if (libraryValue === 'voiceprint' && owner === '') {
+      return { ok: false, reason: 'self-required' };
+    }
     const at = clockInstant(clock);
     const entry = {
       id: allocateEntryId(state),
@@ -467,7 +522,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       sourceIds: [],
       context: null,
       ambiguous: false,
-      speakerId: null,
+      speakerId: libraryValue === 'voiceprint' ? owner : null,
       assigned: true,
       at,
       confirmedAt: at,
@@ -481,16 +536,21 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
   };
 
   /**
-   * Edit a manually managed entry's identity text / category / usage / reading. The entry's
-   * status, kind, wrongForms, context and identity (id) are never rewritten here; in particular an
-   * update cannot confirm, reject or un-reject an entry. Renaming to another entry's key is refused
-   * with `exists` so the store keeps one row per normalized form.
+   * Edit a manually managed entry's identity text / category / usage / reading, and optionally
+   * its library. The entry's status, kind, wrongForms and identity (id) are never rewritten here;
+   * in particular an update cannot confirm, reject or un-reject an entry. Renaming to another
+   * entry's key is refused with `exists` so the store keeps one row per normalized form.
+   *
+   * A `library` change follows the same ownership rules as `moveEntry`: moving into `voiceprint`
+   * requires a confirmed self and reserves the entry for it, while moving back to `public` clears
+   * `speakerId`.
    *
    * `text` and `canonical` are two names for the same display form; when both are supplied
    * `canonical` wins. Changing it updates `text`, `canonical` and the normalized `key` together.
    *
    * @param {{id?: string, text?: string, canonical?: string, category?: string,
-   *   usage?: string|null, reading?: string|null}} [options]
+   *   usage?: string|null, reading?: string|null, library?: string,
+   *   speakerId?: string}} [options]
    * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
    */
   const updateEntry = ({
@@ -500,10 +560,12 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     category = undefined,
     usage = undefined,
     reading = undefined,
+    library = undefined,
+    speakerId = undefined,
   } = {}) => {
     if (id === undefined || id === null) return { ok: false, reason: 'id-required' };
     if (text === undefined && canonical === undefined && category === undefined
-      && usage === undefined && reading === undefined) {
+      && usage === undefined && reading === undefined && library === undefined) {
       return { ok: false, reason: 'no-editable-field' };
     }
     let display;
@@ -528,6 +590,11 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       readingValue = cleanReading(reading);
       if (readingValue === null) return { ok: false, reason: 'invalid-reading' };
     }
+    let libraryValue;
+    if (library !== undefined) {
+      libraryValue = cleanLibrary(library);
+      if (libraryValue === null) return { ok: false, reason: 'invalid-library' };
+    }
     const state = read();
     const entry = state.entries.find((item) => item?.id === String(id));
     if (entry === undefined) return { ok: false, reason: 'not-found' };
@@ -544,6 +611,23 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     if (categoryValue !== undefined) entry.category = categoryValue;
     if (usageValue !== undefined) entry.usage = usageValue;
     if (readingValue !== undefined) entry.reading = readingValue;
+    if (libraryValue !== undefined) {
+      const owner = speakerFor(speakerId);
+      if (libraryValue === 'voiceprint') {
+        if (owner === '') return { ok: false, reason: 'self-required' };
+        // A private row that already belongs to another self cannot be absorbed by this one.
+        // Moving it back to public is still allowed: that only releases the owner.
+        if (entry.library === 'voiceprint' && typeof entry.speakerId === 'string'
+          && entry.speakerId.length > 0 && entry.speakerId !== owner) {
+          return { ok: false, reason: 'not-owned' };
+        }
+        entry.library = 'voiceprint';
+        entry.speakerId = owner;
+      } else {
+        entry.library = 'public';
+        entry.speakerId = null;
+      }
+    }
     entry.editedAt = clockInstant(clock);
     save(state);
     emit('lexicon.store.changed', { op: 'update', id: entry.id });
@@ -551,14 +635,17 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
   };
 
   /**
-   * Move one entry between the public library and the reserved voiceprint library. This changes
-   * only `library`; status/identity/content stay untouched. The voiceprint slot has no matching
-   * logic in this stage, but the value is accepted so a later version can read the same file.
+   * Move one entry between the public library and the voiceprint library. Moving into
+   * `voiceprint` requires a confirmed self; the entry is then reserved for it
+   * (`speakerId = selfId`). Moving back to `public` clears the owner so no stale identity filters
+   * the now-shared word. Moving another self's private row INTO this self's voiceprint slot is
+   * refused with `not-owned`: one self can never absorb another self's private word (releasing it
+   * back to public remains possible).
    *
-   * @param {{id?: string, library?: string}} [options]
+   * @param {{id?: string, library?: string, speakerId?: string}} [options]
    * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
    */
-  const moveEntry = ({ id = undefined, library = undefined } = {}) => {
+  const moveEntry = ({ id = undefined, library = undefined, speakerId = undefined } = {}) => {
     if (id === undefined || id === null) return { ok: false, reason: 'id-required' };
     if (library === undefined) return { ok: false, reason: 'invalid-library' };
     const libraryValue = cleanLibrary(library);
@@ -567,7 +654,21 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
     const entry = state.entries.find((item) => item?.id === String(id));
     if (entry === undefined) return { ok: false, reason: 'not-found' };
     if (entry.status === LEXICON_STATUS.REJECTED) return { ok: false, reason: 'rejected' };
-    entry.library = libraryValue;
+    const owner = speakerFor(speakerId);
+    if (libraryValue === 'voiceprint') {
+      if (owner === '') return { ok: false, reason: 'self-required' };
+      // A private row that already belongs to another self cannot be absorbed by this one.
+      // Moving it back to public is still allowed: that only releases the owner.
+      if (entry.library === 'voiceprint' && typeof entry.speakerId === 'string'
+        && entry.speakerId.length > 0 && entry.speakerId !== owner) {
+        return { ok: false, reason: 'not-owned' };
+      }
+      entry.library = 'voiceprint';
+      entry.speakerId = owner;
+    } else {
+      entry.library = 'public';
+      entry.speakerId = null;
+    }
     save(state);
     emit('lexicon.store.changed', { op: 'move', id: entry.id });
     return { ok: true, entry: viewOf(state, entry.id) };
@@ -588,6 +689,25 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       return { ok: false, reason: 'invalid-context' };
     }
     const state = read();
+    // A voiceprint row's owner is its self, not whatever optional provenance a caller supplies.
+    // Confirming such a row keeps (or claims an unowned row for) that self and refuses another
+    // self's private row.
+    const wantedId = id === undefined || id === null ? '' : String(id);
+    const wantedKey = lexiconKey(text);
+    const target = state.entries.find((entry) => {
+      if (wantedId !== '') return entry?.id === wantedId;
+      if (typeof entry?.key === 'string' && entry.key === wantedKey) return true;
+      return typeof entry?.canonical === 'string' && entry.canonical.length > 0
+        && lexiconKey(entry.canonical) === wantedKey;
+    });
+    if (target?.library === 'voiceprint') {
+      const owner = speakerFor(speakerId);
+      if (owner === '') return { ok: false, reason: 'self-required' };
+      if (typeof target.speakerId === 'string' && target.speakerId.length > 0 && target.speakerId !== owner) {
+        return { ok: false, reason: 'not-owned' };
+      }
+      speakerId = owner;
+    }
     const result = confirmCandidate(state, { text, id, speakerId, canonical, now: clockInstant(clock) });
     if (result.ok !== true) return result;
     if (context !== undefined) {
@@ -682,7 +802,9 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
 
   /**
    * Every stored entry (candidate, confirmed and rejected tombstones), sorted by `at`.
-   * `listConfirmed()` is the shared lexicon; `listUnassigned()` is the pending candidate view.
+   * `listConfirmed()` is the administration view (every confirmed row, including every
+   * voiceprint owner); `listActive()` is the effective view for one speaker; `listUnassigned()` is
+   * the pending candidate view.
    */
   const list = () => {
     const state = read();
@@ -716,9 +838,30 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
       const state = read();
       return decorate(state, listUnassigned(state));
     },
+    /** Every confirmed row for administration; this is NOT the recognition view. */
     listConfirmed: () => {
       const state = read();
       return decorate(state, listEntries(state));
+    },
+    /**
+     * The effective confirmed words for one speaker: every `public` entry plus only the
+     * `voiceprint` entries owned by that same confirmed self. With no self id at all (no
+     * configured self and no explicit `speakerId`) the result is the public library only; a
+     * configured self that does not match an explicit `speakerId` also yields public only.
+     * Another self's private words never enter this list, and nothing is deleted or merged by
+     * reading it.
+     *
+     * @param {{speakerId?: string}} [options] the confirmed self id (enrollment.selfId)
+     * @returns {object[]}
+     */
+    listActive: ({ speakerId = undefined } = {}) => {
+      const state = read();
+      const views = decorate(state, listEntries(state));
+      const speaker = speakerFor(speakerId);
+      return views.filter((entry) => {
+        if (entry.library !== 'voiceprint') return true;
+        return speaker !== '' && entry.speakerId === speaker;
+      });
     },
   });
 }
@@ -729,7 +872,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date() 
  * transcript. A `correction` row is applicable only where its stored `context` still matches
  * (`replaceable`), so the caller must use `applyCorrection` rather than a whole-text replacement.
  *
- * @param {object[]} entries `listConfirmed()` output (or any confirmed entry views)
+ * @param {object[]} entries confirmed entry views (`listActive()` / `listConfirmed()` output)
  * @returns {Array<{id: string, kind: 'proper-noun'|'correction', canonical: string,
  *   wrongForms: string[], context: {before: string, after: string}|null, replaceable: boolean}>}
  */
@@ -928,6 +1071,22 @@ export function applyLexiconHints(text, hints = []) {
   return result;
 }
 
+/**
+ * The entries a recognition pass may use. The real store exposes `listActive({speakerId})`; a
+ * legacy/compatible store that only has `listConfirmed()` is still accepted (its result is treated
+ * as already-scoped by that caller), so old doubles and embedded callers keep working.
+ *
+ * @param {object|null} store
+ * @param {string} [speakerId] the confirmed self id (enrollment.selfId)
+ * @returns {object[]}
+ */
+function activeEntriesOf(store, speakerId = undefined) {
+  if (store === null || store === undefined) return [];
+  if (typeof store.listActive === 'function') return store.listActive({ speakerId });
+  if (typeof store.listConfirmed === 'function') return store.listConfirmed();
+  return [];
+}
+
 /** Debug logging for the applied/failed rows; a throwing or absent logger never breaks delivery. */
 function emitApplyEvent(log, event, payload) {
   try {
@@ -938,25 +1097,34 @@ function emitApplyEvent(log, event, payload) {
 }
 
 /**
- * The recognition post-processing point: apply the CONFIRMED shared lexicon to the text used
- * for delivery and subtitles, and report each hit as a debug `lexicon.applied` row.
+ * The recognition post-processing point: apply the effective lexicon for this speaker (public +
+ * their own voiceprint entries, via `listActive`) to the text used for delivery and subtitles, and
+ * report each hit as a debug `lexicon.applied` row.
  *
  * Fail-open: a missing/throwing store, a corrupt entry or a hint-building error returns the input
  * unchanged, so ASR delivery never depends on the lexicon. The raw ASR result is never rewritten
  * here; callers keep it as the archive/`rawText`.
  *
  * @param {unknown} text the delivered transcript (not the raw archive copy)
- * @param {{store?: {listConfirmed?: () => object[]}|null, log?: object|null,
- *   utteranceId?: string}} [options]
+ * @param {{store?: {listActive?: (options: {speakerId?: string}) => object[],
+ *   listConfirmed?: () => object[]}|null, log?: object|null, utteranceId?: string,
+ *   speakerId?: string}} [options] `speakerId` is the confirmed self id; other speakers' private
+ *   voiceprint rows are never applied.
  * @returns {string} the post-processed text, or `text` unchanged on any failure/no hit
  */
-export function applyLexiconText(text, { store = null, log = null, utteranceId = '' } = {}) {
+export function applyLexiconText(text, {
+  store = null,
+  log = null,
+  utteranceId = '',
+  speakerId = undefined,
+} = {}) {
   const source = typeof text === 'string' ? text : '';
   const id = typeof utteranceId === 'string' ? utteranceId : '';
   let result;
   try {
-    if (store === null || typeof store.listConfirmed !== 'function') return source;
-    result = applyLexiconHints(source, lexiconHints(store.listConfirmed()));
+    if (store === null || (typeof store.listActive !== 'function'
+      && typeof store.listConfirmed !== 'function')) return source;
+    result = applyLexiconHints(source, lexiconHints(activeEntriesOf(store, speakerId)));
   } catch (error) {
     emitApplyEvent(log, 'lexicon.apply.failed', { utteranceId: id, error: error?.message ?? String(error) });
     return source;
