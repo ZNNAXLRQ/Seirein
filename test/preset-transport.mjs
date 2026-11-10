@@ -167,8 +167,10 @@ test('3. 身体预设保持 native-owned：可映射也 hold，零 BODY 写入',
   await run(rig, 0, 2000);
   const bodyWrites = rig.frames.reduce((count, frame) => count
     + frame.entries.filter((entry) => entry.channel.startsWith('body')).length, 0);
-  assert.equal(bodyWrites, 0, 'body stays VTS-native: zero transport writes');
-  assert.equal(presetSnapshot(rig.runtime).starts, 0);
+  assert.ok(bodyWrites > 0,
+    'verified body channels participate in the base activity layer');
+  assert.equal(presetSnapshot(rig.runtime).starts, 0,
+    'the body preset itself remains native-owned; only the verified base layer writes');
   console.log(`[transport] bodyWrites=${bodyWrites} started=${started.started} nativeOwned=${capabilities.nativeOwned.join('|')}`);
 });
 

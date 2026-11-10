@@ -160,7 +160,7 @@ const hasChannel = (frames, channel) => framesWithChannel(frames, channel).lengt
 // ---------------------------------------------------------------------------------------------
 // 1. head + gaze coexist; an UNVERIFIED gaze is never written (head still is)
 // ---------------------------------------------------------------------------------------------
-test('1. 头部+gaze 组合：verified gaze 写出；未验证/native-possible 不写，body 不写', async (t) => {
+test('1. 头部+gaze 组合：verified gaze 写出；未验证/native-possible 不写；verified bodyX 走基础层', async (t) => {
   const verified = await makeRuntime({
     rows: rowsFor(['headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'bodyX']),
   });
@@ -178,8 +178,12 @@ test('1. 头部+gaze 组合：verified gaze 写出；未验证/native-possible �
   for (const channel of GAZE) {
     assert.ok(hasChannel(verified.fake.frames, channel), `${channel} is written when verified`);
   }
-  assert.equal(hasChannel(verified.fake.frames, 'bodyX'), false,
-    'bodyX is verified but the component layer never writes body');
+  assert.ok(hasChannel(verified.fake.frames, 'bodyX'),
+    'a verified bodyX is written by the phase-4 base layer, independent of the head/gaze components');
+  assert.equal(verified.runtime.snapshot().channels.bodyArms.writeChannels.includes('bodyX'), true,
+    'bodyX is in the verified body/arm write set');
+  assert.deepEqual(verified.runtime.snapshot().motion.posture.bodyArms.components.body.channels,
+    ['bodyX'], 'only the verified body channel is claimed by the body component');
 
   // Declared-but-unverified gaze: the head layer keeps writing, gaze is not in the write set.
   const unverified = await makeRuntime({

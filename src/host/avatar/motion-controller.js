@@ -160,9 +160,9 @@ export const SHORT_ACTION_TRANSITION = Object.freeze({
 // no second writer, no second timer. The high-frequency controller still interpolates the planned
 // transition at `computeHz`, so a component only CHOOSES a goal once per decision.
 //
-// Only the verified head channels are driven. Gaze / body / breath are deliberately absent: they
-// either have no idle write path (gaze/body) or are VTS-native (body/breath), so a component must
-// not claim them before a real-VTS probe exists.
+// The HEAD component only claims the verified head channels. Body/arm components are a separate
+// layer (see the phase-4 section): they have their own streams, windows and verified gate, so
+// neither layer can silently claim the other's channels just because a model happens to map them.
 //
 // WHICH component is drawn is persona-weighted (see `postureComponentWeights`): the persona is a
 // soft probability bias, not a fixed template, and the existing no-repeat rule still applies.
@@ -255,8 +255,8 @@ export const POSTURE_COMPONENTS = Object.freeze([
 // ---------------------------------------------------------------------------------------------
 //
 // Scope (explicit, do not over-read this layer):
-//   - this is a HEAD + GAZE component combination, NOT a body/arm implementation;
-//   - body/breath stay VTS-native and are never written by the component layer;
+//   - this is the HEAD + GAZE component layer; body/shoulder/arm components are phase 4 below;
+//   - breath stays VTS-native, and the gaze component never writes body/arm channels;
 //   - this plugin still does not start/stop VTS's own idle animation, so the native idle may
 //     coexist and which one wins visually is unverified;
 //   - real visual appearance has NOT been verified on a real VTS model.
@@ -298,6 +298,188 @@ export const POSTURE_GAZE_COMPONENTS = Object.freeze([
   // shape (own hold window, own anti-repeat slot), not "no component".
   Object.freeze({ id: 'gaze-center', label: '中心/少动', gazeX: 0, gazeY: 0 }),
 ]);
+
+
+// ---------------------------------------------------------------------------------------------
+// Phase 4 — generic BODY / SHOULDER / ARM / HAND capability
+// ---------------------------------------------------------------------------------------------
+//
+// The three layers every model is offered, independent of whether the current model maps them:
+//
+//   base       a slow, tiny body + shoulder/arm/hand drift on the SAME 30 Hz tick as breathing
+//              and the head sway (no second timer). A channel whose mapping is not verified is
+//              simply never written — the generator still exists, the transport refuses the row.
+//   component  one independent held pose per CATEGORY (body posture / shoulder posture / arm &
+//              hand posture), each with its own window and seeded draw. It rides on the base, so
+//              the base keeps moving while a component is held. A gesture yields the component
+//              contribution locally (the same INTENT_IDLE_RATIO rule the head layer uses).
+//   expression `wave` / `spread` / `shrug` (plus the existing nod/tilt/surprise). Missing the
+//              semantic core (an arm for a wave, a shoulder for a shrug) is reported as
+//              `unsupported`; a head-only project can never fake a wave with a head roll.
+//
+// Everything is semantic: 1 unit = 30° for body/arm angles under the writer's documented
+// convention, and the writer maps the value through the verified input's own min/max. Direction
+// (which sign raises an arm) is model-specific and is therefore TRUE-MACHINE UNVERIFIED; only the
+// verified mapping and the clamp/rate limits are proven here.
+export const BODY_ARM_CHANNELS = Object.freeze([
+  'bodyX',
+  'bodyY',
+  'bodyZ',
+  'shoulderL',
+  'shoulderR',
+  'armL',
+  'armR',
+  'handL',
+  'handR',
+]);
+
+/**
+ * Per-channel semantic safety limits. Body angles share the ±30° body-input convention (±1);
+ * shoulders and hands are deliberately narrower because their model parameters differ wildly.
+ * The writer still applies the input's own min/max, so this is a semantic budget, not a range.
+ */
+export const BODY_ARM_CHANNEL_LIMITS = Object.freeze({
+  bodyX: 1,
+  bodyY: 1,
+  bodyZ: 1,
+  shoulderL: 0.7,
+  shoulderR: 0.7,
+  armL: 1,
+  armR: 1,
+  handL: 0.8,
+  handR: 0.8,
+});
+
+/**
+ * Base-activity span in DEGREES for the channels this layer newly drives. bodyX is deliberately 0:
+ * the existing posture controller already supplies the bodyX base sway (`bodyAmp × axis('bodyX')`),
+ * so adding it again would double the roll. 1 semantic unit = 30°.
+ */
+export const BODY_ARM_BASE_DEGREES = Object.freeze({
+  bodyX: 0,
+  bodyY: 0.35,
+  bodyZ: 0.55,
+  shoulderL: 0.30,
+  shoulderR: 0.30,
+  armL: 0.45,
+  armR: 0.45,
+  handL: 0.30,
+  handR: 0.30,
+});
+
+/** One semantic step a single frame may move a non-spring body/arm channel (≈1.8° at 30 Hz). */
+export const BODY_ARM_MAX_STEP = 0.06;
+
+export const BODY_ARM_COMPONENT_MIN_MS = 8_000;
+export const BODY_ARM_COMPONENT_MAX_MS = 16_000;
+export const BODY_ARM_COMPONENT_MIN_AMPLITUDE = 0.12;
+export const BODY_ARM_COMPONENT_MAX_AMPLITUDE = 0.40;
+
+/** Independent component categories: one hold each, never one shared head/body vector. */
+export const BODY_ARM_COMPONENT_CATEGORIES = Object.freeze({
+  body: Object.freeze(['bodyX', 'bodyY', 'bodyZ']),
+  shoulder: Object.freeze(['shoulderL', 'shoulderR']),
+  arm: Object.freeze(['armL', 'armR', 'handL', 'handR']),
+});
+
+/**
+ * Shape library. Weights are normalized semantic ratios inside the drawn amplitude, so the same
+ * shape is usable on a model that maps only one of its channels. Missing channels are dropped at
+ * draw time; the remaining ones still form a recognisable pose.
+ */
+export const BODY_ARM_COMPONENTS = Object.freeze({
+  body: Object.freeze([
+    Object.freeze({ id: 'weight-left', label: '重心左移', bodyX: -0.80, bodyY: 0.10, bodyZ: -0.50 }),
+    Object.freeze({ id: 'weight-right', label: '重心右移', bodyX: 0.80, bodyY: 0.10, bodyZ: 0.50 }),
+    Object.freeze({ id: 'lean-back', label: '后靠', bodyX: 0, bodyY: -0.80, bodyZ: 0.15 }),
+    Object.freeze({ id: 'lean-forward', label: '前倾', bodyX: 0, bodyY: 0.80, bodyZ: -0.10 }),
+    Object.freeze({ id: 'side-left', label: '左侧身', bodyX: -0.30, bodyY: 0, bodyZ: 0.90 }),
+    Object.freeze({ id: 'side-right', label: '右侧身', bodyX: 0.30, bodyY: 0, bodyZ: -0.90 }),
+  ]),
+  shoulder: Object.freeze([
+    Object.freeze({ id: 'shoulder-drop-left', label: '左肩放松', shoulderL: -0.85, shoulderR: -0.10 }),
+    Object.freeze({ id: 'shoulder-drop-right', label: '右肩放松', shoulderL: -0.10, shoulderR: -0.85 }),
+    Object.freeze({ id: 'shoulder-raise-left', label: '左肩抬起', shoulderL: 0.85, shoulderR: 0.10 }),
+    Object.freeze({ id: 'shoulder-raise-right', label: '右肩抬起', shoulderL: 0.10, shoulderR: 0.85 }),
+    Object.freeze({ id: 'shoulder-level', label: '双肩平放', shoulderL: 0, shoulderR: 0 }),
+  ]),
+  arm: Object.freeze([
+    Object.freeze({ id: 'arms-rest', label: '手臂自然下垂', armL: -0.30, armR: -0.30, handL: -0.10, handR: -0.10 }),
+    Object.freeze({ id: 'arm-left-open', label: '左臂张开', armL: 0.85, armR: -0.10, handL: 0.40 }),
+    Object.freeze({ id: 'arm-right-open', label: '右臂张开', armL: -0.10, armR: 0.85, handL: 0.40 }),
+    Object.freeze({ id: 'both-arms-open', label: '双臂张开', armL: 0.70, armR: 0.70, handL: 0.25, handR: 0.25 }),
+    Object.freeze({ id: 'hands-fold', label: '手收拢', armL: -0.20, armR: -0.20, handL: -0.50, handR: -0.50 }),
+  ]),
+});
+
+/**
+ * Semantic targets of the body/arm expressions. `core` is the KEY part: without any of it the
+ * action is `unsupported` (never silently remapped onto the head). The rest are companions that
+ * are simply skipped when unverified — a one-armed model can still wave with that arm.
+ */
+export const BODY_ARM_INTENT_TARGETS = Object.freeze({
+  wave: Object.freeze(['armL', 'armR', 'handL', 'handR', 'shoulderL', 'shoulderR']),
+  spread: Object.freeze(['armL', 'armR', 'handL', 'handR', 'shoulderL', 'shoulderR']),
+  shrug: Object.freeze(['shoulderL', 'shoulderR', 'armL', 'armR']),
+});
+
+export const BODY_ARM_GESTURES = Object.freeze({
+  wave: Object.freeze({
+    label: '挥手',
+    core: Object.freeze(['armL', 'armR']),
+    amplitude: 0.55,
+    durationMs: 960,
+    armGain: 1,
+    handGain: 0.9,
+    shoulderGain: 0.30,
+  }),
+  spread: Object.freeze({
+    label: '摊手',
+    core: Object.freeze(['armL', 'armR']),
+    amplitude: 0.50,
+    durationMs: 900,
+    armGain: 0.9,
+    handGain: 0.55,
+    shoulderGain: 0.20,
+  }),
+  shrug: Object.freeze({
+    label: '耸肩',
+    core: Object.freeze(['shoulderL', 'shoulderR']),
+    amplitude: 0.50,
+    durationMs: 820,
+    armGain: 0.25,
+    handGain: 0.10,
+    shoulderGain: 1,
+  }),
+});
+
+/** Delivery variants for the new expressions (same seed discipline as the four legacy kinds). */
+export const BODY_ARM_INTENT_VARIANTS = Object.freeze({
+  wave: Object.freeze([
+    Object.freeze({ id: 'wave-small', amplitude: 0.92, duration: 0.94 }),
+    Object.freeze({ id: 'wave-wide', amplitude: 1.10, duration: 1.08 }),
+  ]),
+  spread: Object.freeze([
+    Object.freeze({ id: 'spread-small', amplitude: 0.92, duration: 0.98 }),
+    Object.freeze({ id: 'spread-wide', amplitude: 1.08, duration: 1.10 }),
+  ]),
+  shrug: Object.freeze([
+    Object.freeze({ id: 'shrug-light', amplitude: 0.90, duration: 0.94 }),
+    Object.freeze({ id: 'shrug-deep', amplitude: 1.08, duration: 1.08 }),
+  ]),
+});
+
+/** The intent channel table including the body/arm expressions (legacy entries unchanged). */
+export const intentTargetsFor = (kind) => INTENT_CHANNEL_TARGETS[String(kind ?? '')]
+  ?? BODY_ARM_INTENT_TARGETS[String(kind ?? '')]
+  ?? undefined;
+
+/** Channel targets for one intent, profile included (confused brows only apply to the legacy tilt). */
+export const intentChannelsForAny = (kind, profile = null) => (
+  INTENT_CHANNEL_TARGETS[String(kind ?? '')] === undefined
+    ? [...(BODY_ARM_INTENT_TARGETS[String(kind ?? '')] ?? [])]
+    : intentChannelsFor(kind, profile)
+);
 
 
 // ---------------------------------------------------------------------------------------------
@@ -569,11 +751,11 @@ export const OCCASIONAL_ACTION = Object.freeze({
 const HEAD_ACTIVITY_EPSILON = 1e-6;
 
 /**
- * Phase 2 scope (explicit): this layer only OBSERVES the activity that already exists and reports
- * channel ownership. It is NOT the "two base libraries" (continuous idle + full gesture) and it
- * does NOT add a body/arm writer. VTS's own idle animation stays ON: this plugin never calls
- * Start/StopIdleAnimation, so a native blink/breath/head motion can coexist with these writes and
- * which one wins visually is unproven until a real-VTS check.
+ * Phase 2 scope (explicit): this observability block only REPORTS the activity that already exists
+ * and the channel ownership. The phase-4 body/arm writer is a separate, verified-only layer; it
+ * never turns this evidence into a second writer. VTS's own idle animation stays ON: this plugin
+ * never calls Start/StopIdleAnimation, so a native blink/breath/head/arm motion can coexist with
+ * these writes and which one wins visually is unproven until a real-VTS check.
  */
 
 
@@ -916,6 +1098,17 @@ const DEFAULT_CONFIG = Object.freeze({
    * sets it through `setComponentGazeVerified()` from `gazeX`+`gazeY` verified bindings only.
    */
   componentGazeVerified: false,
+  /**
+   * Verified body/arm channels (bodyX/Y/Z, shoulderL/R, armL/R, handL/R). Empty by default: a pure
+   * controller must not claim a body/arm channel before the facade has proved the mapping. The
+   * runtime sets this from its verified takeover set on every mapping change.
+   */
+  bodyArmVerified: null,
+  /** Independent body / shoulder / arm component hold windows (own band, not the head band). */
+  bodyComponentMinMs: BODY_ARM_COMPONENT_MIN_MS,
+  bodyComponentMaxMs: BODY_ARM_COMPONENT_MAX_MS,
+  /** Per-frame semantic step for the non-spring body/arm channels (position/velocity bound). */
+  bodyArmMaxStep: BODY_ARM_MAX_STEP,
   /** Base planned transition length; divided by persona tempo, then clamped to 1.2–1.8 s. */
   postureTransitionMs: POSTURE_TRANSITION.BASE_MS,
   /** Host-driven state (listening/thinking/speaking/waiting/tired); scales, never rewrites, style. */
@@ -1345,6 +1538,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const gazeComponentRandom = createSeededRandom(
     `${cfg.seed === undefined ? 'default' : String(cfg.seed)}:gaze-component`,
   );
+  // Body / shoulder / arm components keep INDEPENDENT streams: adding a third component layer must
+  // not shift the head/gaze trajectory (or the base posture) an existing recording already pins.
+  const bodyComponentRandom = Object.freeze({
+    body: createSeededRandom(`${cfg.seed === undefined ? 'default' : String(cfg.seed)}:body-component`),
+    shoulder: createSeededRandom(`${cfg.seed === undefined ? 'default' : String(cfg.seed)}:shoulder-component`),
+    arm: createSeededRandom(`${cfg.seed === undefined ? 'default' : String(cfg.seed)}:arm-component`),
+  });
   const postureHoldMinMs = Math.max(1000, finite(cfg.postureHoldMinMs, DEFAULT_CONFIG.postureHoldMinMs));
   const postureHoldMaxMs = Math.max(postureHoldMinMs, finite(cfg.postureHoldMaxMs, DEFAULT_CONFIG.postureHoldMaxMs));
   // P-139 stage 4 (A): an explicitly configured window is authority; only an unconfigured runtime
@@ -1373,6 +1573,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       POSTURE_GAZE_COMPONENT_MAX_MS,
     )),
   );
+  const bodyComponentMinMs = Math.max(
+    BODY_ARM_COMPONENT_MIN_MS,
+    Math.min(BODY_ARM_COMPONENT_MAX_MS, finite(
+      cfg.bodyComponentMinMs,
+      BODY_ARM_COMPONENT_MIN_MS,
+    )),
+  );
+  const bodyComponentMaxMs = Math.max(
+    bodyComponentMinMs,
+    Math.min(BODY_ARM_COMPONENT_MAX_MS, finite(
+      cfg.bodyComponentMaxMs,
+      BODY_ARM_COMPONENT_MAX_MS,
+    )),
+  );
+  const bodyArmMaxStep = Math.max(0.001, finite(cfg.bodyArmMaxStep, BODY_ARM_MAX_STEP));
   const decisionIntervalMs = 1000 / Math.max(0.1, Math.min(8, finite(cfg.decisionHz, DEFAULT_CONFIG.decisionHz)));
   const motionFollow = Math.max(0.05, finite(cfg.motionFollow, MOTION_LIMITS.FOLLOW_PER_SECOND));
   const motionMaxVelocity = Math.max(0.001, finite(cfg.motionMaxVelocity, MOTION_LIMITS.MAX_VELOCITY));
@@ -1490,6 +1705,31 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         gazeComponentPaused: false,
         /** Verified + ownership gate. False by default; the facade sets it from verified bindings. */
         componentGazeVerified: cfg.componentGazeVerified === true,
+        /**
+         * Phase 4: the generic body/shoulder/arm/hand layer. `verified` is the ONLY gate; the
+         * generators always exist, but a channel outside this set contributes 0 and is never
+         * sent. The three components are independent holds with their own streams and windows.
+         */
+        bodyArms: {
+          verified: new Set(
+            (Array.isArray(cfg.bodyArmVerified) ? cfg.bodyArmVerified : [])
+              .map((channel) => String(channel))
+              .filter((channel) => BODY_ARM_CHANNELS.includes(channel)),
+          ),
+          components: { body: null, shoulder: null, arm: null },
+          transitions: { body: 0, shoulder: 0, arm: 0 },
+          history: { body: [], shoulder: [], arm: [] },
+          lastTransition: { body: null, shoulder: null, arm: null },
+          paused: false,
+          /** Per-frame evidence: base / component / mixed / clamped values (read-only). */
+          base: {},
+          component: {},
+          mixed: {},
+          clamped: {},
+          /** Last expression refused for a missing semantic core, and the session count. */
+          lastUnsupported: null,
+          unsupported: 0,
+        },
       },
       /**
        * Phase 3 unified arbitration evidence (read-only). The newest values describe the last frame
@@ -1717,6 +1957,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   const clampBipolarChannel = (channel, value) => (HEAD_CHANNEL_DEGREE_LIMITS[channel] === undefined
     ? clampSigned(value)
     : clampHeadAxis(channel, value));
+
+  /** Semantic clamp for one body/arm channel; an unknown channel falls back to the signed range. */
+  const clampBodyArm = (channel, value) => clampMotion(
+    value,
+    BODY_ARM_CHANNEL_LIMITS[channel] ?? 1,
+  );
+  /** True for the new body/arm channels (bipolar in VTS's semantic space). */
+  const isBodyArmChannel = (channel) => BODY_ARM_CHANNEL_LIMITS[channel] !== undefined;
+  /** One final semantic clamp shared by every writer path. */
+  const clampSemanticChannel = (channel, value) => {
+    if (isBodyArmChannel(channel)) return clampBodyArm(channel, value);
+    return isBidirectional(channel) ? clampBipolarChannel(channel, value) : clamp01(value);
+  };
+  const bodyArmVerified = (channel) => state.motion.posture.bodyArms.verified.has(channel);
 
   /** Current persona tempo (baseline × state modifier): the rhythm used for hold/transition. */
   function postureTempo() {
@@ -2086,15 +2340,224 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     posture.componentPaused = true;
     posture.gazeComponent = null;
     posture.gazeComponentPaused = true;
+    pauseBodyArmComponents();
+  }
+
+  // ---- phase 4: body / shoulder / arm components and base activity ------------------------
+  /** Channels of one category that the facade has proved injectable AND verified. */
+  function bodyArmCategoryChannels(category) {
+    return BODY_ARM_COMPONENT_CATEGORIES[category].filter(bodyArmVerified);
+  }
+
+  /**
+   * Draw one held body/shoulder/arm component. A category with no verified channel draws nothing
+   * (the layer exists, but there is no honest target). Missing individual channels are dropped,
+   * so a one-armed model still gets a one-armed pose instead of an unsupported whole category.
+   */
+  function drawBodyArmComponent(category, now) {
+    const allowed = bodyArmCategoryChannels(category);
+    if (allowed.length === 0) return null;
+    const gate = state.motion.posture.bodyArms;
+    const current = gate.components[category] ?? null;
+    const stream = bodyComponentRandom[category];
+    const spec = drawWeightedComponent({
+      pool: BODY_ARM_COMPONENTS[category],
+      weights: null,
+      currentId: current === null ? null : current.id,
+      rand: stream,
+    });
+    const bias = personaComponentBias(state.traits, state.style.expression);
+    const drawnAmplitude = BODY_ARM_COMPONENT_MIN_AMPLITUDE
+      + (BODY_ARM_COMPONENT_MAX_AMPLITUDE - BODY_ARM_COMPONENT_MIN_AMPLITUDE)
+      * Math.pow(stream(), bias.amplitudeExponent);
+    const drawMs = bodyComponentMinMs + (bodyComponentMaxMs - bodyComponentMinMs) * stream();
+    const influenced = drawMs * (0.82 + 0.18 * bias.holdFactor);
+    const holdMs = Math.max(bodyComponentMinMs, Math.min(bodyComponentMaxMs, influenced));
+    const semantic = {};
+    const targetDegrees = {};
+    const saturated = {};
+    const channels = [];
+    for (const channel of allowed) {
+      const weight = finite(spec[channel], 0);
+      const raw = weight * drawnAmplitude;
+      const value = clampBodyArm(channel, raw);
+      semantic[channel] = value;
+      targetDegrees[channel] = value * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+      saturated[channel] = Math.abs(raw) > (BODY_ARM_CHANNEL_LIMITS[channel] ?? 1) + 1e-9;
+      channels.push(channel);
+    }
+    const amplitude = channels.reduce(
+      (max, channel) => Math.max(max, Math.abs(semantic[channel])),
+      0,
+    );
+    return {
+      category,
+      id: spec.id,
+      label: spec.label,
+      startedAt: now,
+      holdUntil: now + holdMs,
+      durationMs: holdMs,
+      amplitudeChart: drawnAmplitude,
+      amplitude,
+      channels,
+      semantic,
+      targetDegrees,
+      targetDegreesBasis: 'semantic-30deg-per-unit (verified-channel-only)',
+      saturated,
+      observed: null,
+    };
+  }
+
+  function recordBodyArmComponent(category, component) {
+    const gate = state.motion.posture.bodyArms;
+    gate.history[category].push({
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      durationMs: component.durationMs,
+      amplitude: component.amplitude,
+      channels: [...component.channels],
+    });
+    if (gate.history[category].length > 8) gate.history[category].shift();
+  }
+
+  /** Install one category component; the rate limiter below is the natural hand-off. */
+  function installBodyArmComponent(category, now) {
+    const gate = state.motion.posture.bodyArms;
+    const previous = gate.components[category];
+    const component = drawBodyArmComponent(category, now);
+    gate.components[category] = component;
+    if (component === null) return null;
+    recordBodyArmComponent(category, component);
+    if (previous !== null) {
+      gate.transitions[category] += 1;
+      const from = { ...previous.semantic };
+      const to = { ...component.semantic };
+      let maxDelta = 0;
+      for (const channel of BODY_ARM_COMPONENT_CATEGORIES[category]) {
+        maxDelta = Math.max(maxDelta, Math.abs(finite(to[channel], 0) - finite(from[channel], 0)));
+      }
+      gate.lastTransition[category] = {
+        at: now,
+        from,
+        to,
+        maxDelta,
+        maxStep: bodyArmMaxStep,
+        /** Frames needed by the writer-side rate limiter for the largest component axis. */
+        expectedFrames: maxDelta <= 0 ? 0 : Math.ceil(maxDelta / bodyArmMaxStep),
+      };
+    }
+    return component;
+  }
+
+  /**
+   * Component lifetime on EVERY frame (independent of the 1 Hz head decision gate). Each category
+   * keeps its own 8–16 s hold; a hold never freezes the base layer because base is generated
+   * separately below.
+   */
+  function stepBodyArmComponents(now) {
+    const gate = state.motion.posture.bodyArms;
+    if (gate.paused === true) return;
+    for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+      const component = gate.components[category];
+      if (component !== null && now < component.holdUntil) continue;
+      installBodyArmComponent(category, now);
+    }
+  }
+
+  /** Drop every body/arm component (interrupt / relax) and freeze the layer until a normal move. */
+  function pauseBodyArmComponents() {
+    const gate = state.motion.posture.bodyArms;
+    gate.components = { body: null, shoulder: null, arm: null };
+    gate.paused = true;
+    gate.component = {};
+    gate.mixed = {};
+  }
+
+  function resumeBodyArmComponents() {
+    state.motion.posture.bodyArms.paused = false;
+  }
+
+  /**
+   * The tiny continuous base movement of one verified body/arm channel. It is a deterministic
+   * noise lattice (same style clock as the head sway), never a new timer; a channel outside the
+   * verified set contributes exactly 0.
+   */
+  function bodyArmBaseSemantic(channel, t) {
+    if (!bodyArmVerified(channel)) return 0;
+    const degrees = finite(BODY_ARM_BASE_DEGREES[channel], 0);
+    if (!(degrees > 0)) return 0;
+    const seed = hash32(motionSeed, `body-arm:${channel}`);
+    const frequency = 0.030 + (seed % 61) / 1000; // 0.030–0.090 Hz: a slow sway, no jitter
+    const phase = ((seed % 360) / 180) * Math.PI;
+    const drift = smoothNoise1(seed, t * frequency + 1.7);
+    const tremor = Math.sin(Math.PI * 2 * (0.10 + (seed % 7) / 100) * t + phase);
+    return (degrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT) * (0.72 * drift + 0.28 * tremor);
+  }
+
+  /**
+   * Compose the base + held component values for every body/arm channel. The result is the idle
+   * BASE the existing expresssion arbitration yields against; it is never a second writer.
+   */
+  function composeBodyArmLayer(t, { idleEnabled, speaking, modifier, idleSwayScale }) {
+    const gate = state.motion.posture.bodyArms;
+    const base = {};
+    const component = {};
+    const mixed = {};
+    const clamped = {};
+    for (const channel of BODY_ARM_CHANNELS) {
+      if (!bodyArmVerified(channel) || idleEnabled !== true) {
+        base[channel] = 0;
+        component[channel] = 0;
+        mixed[channel] = 0;
+        clamped[channel] = false;
+        continue;
+      }
+      const speakingScale = speaking ? 0.8 : 1;
+      const rawBase = bodyArmBaseSemantic(channel, t)
+        * Math.max(0, idleSwayScale) * finite(modifier?.amplitude, 1) * speakingScale;
+      let componentValue = 0;
+      for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+        const held = gate.components[category];
+        if (held === null) continue;
+        componentValue += finite(held.semantic[channel], 0);
+      }
+      const raw = rawBase + componentValue;
+      base[channel] = rawBase;
+      component[channel] = componentValue;
+      mixed[channel] = clampBodyArm(channel, raw);
+      clamped[channel] = Math.abs(mixed[channel] - raw) > 1e-9;
+    }
+    gate.base = base;
+    gate.component = component;
+    gate.mixed = mixed;
+    gate.clamped = clamped;
+    for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+      const held = gate.components[category];
+      if (held === null) continue;
+      held.observed = {
+        at: state.lastAt,
+        category,
+        semantic: { ...held.semantic },
+        mixed: Object.fromEntries(held.channels.map((channel) => [channel, mixed[channel]])),
+        base: Object.fromEntries(held.channels.map((channel) => [channel, base[channel]])),
+        clamped: Object.fromEntries(held.channels.map((channel) => [channel, clamped[channel]])),
+      };
+    }
+    return { base, component, mixed, clamped };
   }
 
   /** True while either independent component owns the channel (release/ownership arbitration). */
   function componentOwnsChannel(channel) {
     const posture = state.motion.posture;
     if (POSTURE_COMPONENT_CHANNELS.includes(channel) && posture.component !== null) return true;
-    return POSTURE_GAZE_COMPONENT_CHANNELS.includes(channel)
+    if (POSTURE_GAZE_COMPONENT_CHANNELS.includes(channel)
       && posture.componentGazeVerified === true
-      && posture.gazeComponent !== null;
+      && posture.gazeComponent !== null) return true;
+    // Phase 4: a verified body/arm channel is owned by the continuous base/component layer. An old
+    // expression release must not force a 0 over it when its envelope ends; the next base frame is
+    // already the correct baseline.
+    return BODY_ARM_CHANNELS.includes(channel) && bodyArmVerified(channel);
   }
 
   /**
@@ -2295,6 +2758,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (motion.posture.componentGazeVerified === true && motion.posture.gazeComponentPaused === true) {
       installGazeComponent(now);
     }
+    // A normal move is also the one place the body/shoulder/arm component layer resumes after an
+    // interrupt/relax (it never revives inside the decay window).
+    if (motion.posture.bodyArms.paused === true) resumeBodyArmComponents();
     const next = drawPostureTarget({ listening });
     motion.posture.base = { ...next };
     rollPostureHold(now);
@@ -4813,7 +5279,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    * seeded draw unchanged.
    */
   function pickIntentVariant(kind, { deep = false } = {}) {
-    const list = INTENT_VARIANTS[kind] ?? INTENT_VARIANTS.nod;
+    const list = INTENT_VARIANTS[kind] ?? BODY_ARM_INTENT_VARIANTS[kind] ?? INTENT_VARIANTS.nod;
     if (deep === true) {
       const chosen = list.reduce((best, item) => (item.amplitude > best.amplitude ? item : best), list[0]);
       state.variant.last[kind] = chosen.id;
@@ -4854,20 +5320,65 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    */
   function intent(kind, { channels = null, at = undefined, generation = null, profile = null, response = false } = {}) {
     const action = String(kind ?? '');
-    const targets = INTENT_CHANNEL_TARGETS[action];
+    const targets = intentTargetsFor(action);
     if (targets === undefined) {
       recordEvent('avatar.intent.invalid', { kind: action });
-      return { ok: false, reason: 'unknown-intent', kind: action, supported: [...INTENT_KINDS] };
+      return {
+        ok: false,
+        reason: 'unknown-intent',
+        kind: action,
+        supported: [...INTENT_KINDS, ...Object.keys(BODY_ARM_INTENT_TARGETS)],
+      };
     }
     const gestureProfile = isMotionProfile(profile) ? String(profile) : null;
-    const wanted = intentChannelsFor(action, gestureProfile);
+    const wanted = intentChannelsForAny(action, gestureProfile);
+    const bodyGesture = BODY_ARM_GESTURES[action] ?? null;
     const allowed = Array.isArray(channels) && channels.length > 0
       ? wanted.filter((channel) => channels.includes(channel))
       : [...wanted];
-    if (allowed.length === 0) {
-      recordEvent('avatar.intent.skipped', { kind: action, reason: 'unmapped', channels: [...wanted] });
-      return { ok: false, reason: 'unmapped', kind: action, skipped: [...wanted] };
+    // A body/arm expression needs its semantic CORE. Without any of it the action is refused as
+    // `unsupported`; it is never silently replaced by a head gesture that happens to be mapped.
+    if (bodyGesture !== null) {
+      const coreAvailable = bodyGesture.core.filter((channel) => allowed.includes(channel));
+      if (coreAvailable.length === 0) {
+        const missing = bodyGesture.core.filter((channel) => !allowed.includes(channel));
+        state.motion.posture.bodyArms.unsupported += 1;
+        state.motion.posture.bodyArms.lastUnsupported = {
+          kind: action,
+          at: Number.isFinite(at) ? at : clockNow(),
+          reason: 'missing-core',
+          missingChannels: [...missing],
+          availableChannels: [...allowed],
+        };
+        recordEvent('avatar.intent.unsupported', {
+          kind: action,
+          reason: 'missing-core',
+          missingChannels: missing,
+          availableChannels: allowed,
+        });
+        return {
+          ok: false,
+          reason: 'unsupported',
+          kind: action,
+          supported: false,
+          missingChannels: [...missing],
+          availableChannels: [...allowed],
+          skipped: wanted.filter((channel) => !allowed.includes(channel)),
+        };
+      }
     }
+    if (allowed.length === 0) {
+      const reason = bodyGesture === null ? 'unmapped' : 'unsupported';
+      recordEvent('avatar.intent.skipped', { kind: action, reason, channels: [...wanted] });
+      return { ok: false, reason, kind: action, skipped: [...wanted] };
+    }
+    const partial = bodyGesture !== null
+      ? wanted.some((channel) => bodyGesture.core.includes(channel) && !allowed.includes(channel))
+        || wanted.some((channel) => !allowed.includes(channel))
+      : false;
+    const missingChannels = bodyGesture === null
+      ? []
+      : wanted.filter((channel) => !allowed.includes(channel));
     const now = Number.isFinite(at) ? at : clockNow();
     const scaled = effectiveStyle();
     const dims = state.dimensions;
@@ -4875,9 +5386,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const occasional = gestureProfile !== null;
     const variant = pickIntentVariant(action, { deep: occasional });
     const application = STYLE_DIMENSION_APPLICATION;
-    const baseDurationMs = action === 'surprise'
-      ? Math.round(520 / scaled.tempo)
-      : Math.round(scaled.nodDurationMs / scaled.tempo);
+    const baseDurationMs = bodyGesture !== null
+      ? Math.round(bodyGesture.durationMs / scaled.tempo)
+      : action === 'surprise'
+        ? Math.round(520 / scaled.tempo)
+        : Math.round(scaled.nodDurationMs / scaled.tempo);
     // All six PLAN dimensions reach the gesture through `effects`: expression/composure lengthen
     // or shorten the active phase, and the seeded variant adds its own delivery difference.
     const durationScale = (application.durationBase + application.durationSpan * dims.softness)
@@ -4891,13 +5404,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const durationMs = gestureProfile === 'conclusion'
       ? Math.max(plannedDurationMs, 640)
       : plannedDurationMs;
-    const baseAmplitude = action === 'nod'
-      ? 0.35 * scaled.nodAmplitude * scaled.amplitude
-      : action === 'tilt'
-        ? 0.24 * scaled.nodAmplitude * scaled.amplitude
-        : action === 'surprise'
-          ? 0.55 * scaled.expressiveness
-          : 0.16 * scaled.amplitude;
+    const baseAmplitude = bodyGesture !== null
+      ? bodyGesture.amplitude * scaled.amplitude
+      : action === 'nod'
+        ? 0.35 * scaled.nodAmplitude * scaled.amplitude
+        : action === 'tilt'
+          ? 0.24 * scaled.nodAmplitude * scaled.amplitude
+          : action === 'surprise'
+            ? 0.55 * scaled.expressiveness
+            : 0.16 * scaled.amplitude;
     const amplitudeScale = (application.amplitudeBase + application.amplitudeSpan * dims.liveliness)
       * (1 - application.restraintCap * dims.restraint)
       * effects.amplitude
@@ -4996,6 +5511,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       channels: allowed,
       styleVersion: state.styleVersion,
       startedAt: now,
+      /** Body/arm expression evidence: a partial mapping still runs, never claims full support. */
+      supported: bodyGesture !== null,
+      partial,
+      missingChannels,
+      semanticCore: bodyGesture === null ? [] : [...bodyGesture.core],
     };
   }
 
@@ -5434,7 +5954,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    *   lookAtUser → gaze override only; no head axis is invented
    */
   function intentFrame(now) {
-    const adds = { headX: 0, headY: 0, headZ: 0, browL: 0, browR: 0, bodyX: 0, bodyY: 0, bodyZ: 0 };
+    const adds = {
+      headX: 0, headY: 0, headZ: 0, browL: 0, browR: 0, bodyX: 0, bodyY: 0, bodyZ: 0,
+      shoulderL: 0, shoulderR: 0, armL: 0, armR: 0, handL: 0, handR: 0,
+    };
     let gaze = null;
     let eyeOpen = null;
     const eff = state.effective ?? effectiveStyle();
@@ -5531,12 +6054,44 @@ export function createBehaviorRuntime({ config = {} } = {}) {
             ? { ...state.motion.attention.target }
             : { x: 0, y: 0 };
         }
+      } else if (BODY_ARM_GESTURES[item.kind] !== undefined) {
+        // Body/arm expression on the SAME additive fold. Only the mapped channels participate;
+        // the semantic core was already checked in intent(), so this branch never turns a missing
+        // arm into a head motion. Direction is model-specific (true machine unverified).
+        const spec = BODY_ARM_GESTURES[item.kind];
+        const side = item.sign >= 0 ? 'R' : 'L';
+        // A wave always RAISES the chosen arm (the side itself comes from the sign); a two-sided
+        // spread/shrug alternates its whole direction, so the second repeat is not identical.
+        const direction = item.kind === 'wave' ? 1 : item.sign;
+        const addArm = (channel, ratio) => {
+          if (!has(channel)) return;
+          adds[channel] += clampBodyArm(channel, amount * ratio * direction * channelScale(channel));
+        };
+        if (item.kind === 'wave') {
+          addArm(`arm${side}`, spec.armGain);
+          // Two clear hand oscillations inside the envelope: a wave is not a static raise.
+          const wavePhase = Math.sin(progress * Math.PI * 4);
+          addArm(`hand${side}`, spec.handGain * wavePhase);
+          addArm(`shoulder${side}`, spec.shoulderGain * 0.5);
+        } else if (item.kind === 'spread') {
+          addArm('armL', spec.armGain);
+          addArm('armR', spec.armGain);
+          addArm('handL', spec.handGain * (0.4 + 0.6 * envelope));
+          addArm('handR', spec.handGain * (0.4 + 0.6 * envelope));
+          addArm('shoulderL', spec.shoulderGain);
+          addArm('shoulderR', spec.shoulderGain);
+        } else if (item.kind === 'shrug') {
+          addArm('shoulderL', spec.shoulderGain);
+          addArm('shoulderR', spec.shoulderGain);
+          addArm('armL', spec.armGain);
+          addArm('armR', spec.armGain);
+        }
       }
     }
     // Autonomous expressions ride the same additive fold, after the explicit gestures. Their gaze
     // offset stays separate: it is added to the idle base, so an explicit attention target wins.
     const expression = expressionFrame(now);
-    for (const channel of Object.keys(adds)) adds[channel] += expression.adds[channel];
+    for (const channel of Object.keys(adds)) adds[channel] += finite(expression.adds[channel], 0);
     // Motion presets are symbolic trajectories on the SAME additive fold. They are never rewritten
     // into nod/tilt/lookAtUser intents: the operations keep their own order, channels and timing.
     const preset = presetFrame(now);
@@ -5785,6 +6340,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       headY: componentHeadCapped.headY - componentHeadRaw.headY,
       headZ: componentHeadCapped.headZ - componentHeadRaw.headZ,
     };
+    // Phase 4 base + held body/shoulder/arm components. `bodyX` deliberately keeps the existing
+    // posture base below; this layer contributes its component on top (its own base span is 0).
+    const bodyArmLayer = composeBodyArmLayer(t, {
+      idleEnabled,
+      speaking: frame.speaking === true,
+      modifier,
+      idleSwayScale,
+    });
     const idle = {
       ...neutralPose(),
       gazeX: idleEnabled
@@ -5805,9 +6368,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       browL: 0,
       browR: 0,
       mouth: 0,
-      bodyX: bodyAmp * axis('bodyX'),
-      bodyY: 0,
-      bodyZ: 0,
+      bodyX: bodyAmp * axis('bodyX') + finite(bodyArmLayer.mixed.bodyX, 0),
+      bodyY: finite(bodyArmLayer.mixed.bodyY, 0),
+      bodyZ: finite(bodyArmLayer.mixed.bodyZ, 0),
+      shoulderL: finite(bodyArmLayer.mixed.shoulderL, 0),
+      shoulderR: finite(bodyArmLayer.mixed.shoulderR, 0),
+      armL: finite(bodyArmLayer.mixed.armL, 0),
+      armR: finite(bodyArmLayer.mixed.armR, 0),
+      handL: finite(bodyArmLayer.mixed.handL, 0),
+      handR: finite(bodyArmLayer.mixed.handR, 0),
       breath: 0.5,
     };
     state.idle = idle;
@@ -5929,6 +6498,22 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // the 14° roll guarantee is enforced on the semantic pose, never by truncating the input value.
     pose.headZ = clampHeadRoll(pose.headZ);
 
+    // Body/shoulder/arm: a semantic clamp on EVERY channel, plus a per-frame position step for the
+    // channels that have no spring. The step is the layer's velocity bound; a component swap can
+    // therefore never snap (a full 0.40 semantic move takes ≈7 frames at 30 Hz, ≈230 ms).
+    for (const channel of BODY_ARM_CHANNELS) {
+      if (SPRING_AXES.includes(channel)) {
+        pose[channel] = clampBodyArm(channel, finite(pose[channel], 0));
+        continue;
+      }
+
+      pose[channel] = approachBounded(
+        finite(prev?.[channel], 0),
+        clampBodyArm(channel, finite(pose[channel], 0)),
+        bodyArmMaxStep,
+      );
+    }
+
     // Brows: slope limit ≤ 6 / s, so an emotion cannot snap them.
     const browStep = LIMITS.BROW_SLOPE_PER_SECOND * dt;
     pose.browL = clampSigned(approachBounded(prev?.browL, pose.browL, browStep));
@@ -5991,6 +6576,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     maybeScheduleOccasional(now);
     // Autonomous preset boundary: the low-frequency idle draw. A hold result writes nothing.
     maybeAutoPreset(now);
+    // Phase 4: body/shoulder/arm component lifetime runs on every frame (own windows, own streams);
+    // its hold never pauses the base layer generated in advanceGenerators().
+    stepBodyArmComponents(now);
     const intent = intentFrame(now);
     state.lastIntentFrame = intent;
     state.expressionGaze = intent.expressionGaze ?? { x: 0, y: 0 };
@@ -6017,6 +6605,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     const generators = advanceGenerators(dt, frame);
     const composed = composeChannels(frame, generators, ARBITRATION);
+    // Body/shoulder/arm channels outside the legacy CHANNELS table are part of the SAME composed
+    // pose (and therefore the same spring/rate limiter and the same single writer below).
+    for (const channel of BODY_ARM_CHANNELS) {
+      if (CHANNELS.includes(channel)) continue;
+      composed[channel] = finite(generators.idle?.[channel], 0);
+    }
+
     // Explicit action priority (same-frame, not a plain sum): on a channel an active gesture
     // drives, the idle micro-motion may only contribute INTENT_IDLE_RATIO of the gesture
     // magnitude. The gesture is added AFTER that limit, so it is never cancelled or diluted;
@@ -6040,9 +6635,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         // Micro-expression only: it is ADDED to the live idle base (and held component). It must
         // not invoke the gesture yield rule, which would replace the whole base with 0.2×0.1°.
         const microNext = finite(composed[channel], 0) + value;
-        composed[channel] = isBidirectional(channel)
-          ? clampBipolarChannel(channel, microNext)
-          : clamp01(microNext);
+        composed[channel] = clampSemanticChannel(channel, microNext);
         if (componentBefore !== 0) {
           headConflicts.push({
             channel,
@@ -6061,9 +6654,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const cap = INTENT_IDLE_RATIO * Math.abs(value);
       const idlePart = Math.max(-cap, Math.min(cap, idleBase));
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
-      composed[channel] = isBidirectional(channel)
-        ? clampBipolarChannel(channel, next)
-        : clamp01(next);
+      composed[channel] = clampSemanticChannel(channel, next);
       if (componentBefore !== 0) {
         const retained = Math.abs(idleBase) > 1e-12 ? idlePart / idleBase : 0;
         // The arbitration replaces the WHOLE idle contribution (base swing + component) with one
@@ -6125,9 +6716,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const base = finite(composed[channel], 0);
       const target = finite(entry.target, base);
       const next = base + (target - base) * wave;
-      composed[channel] = isBidirectional(channel)
-        ? clampBipolarChannel(channel, next)
-        : clamp01(next);
+      composed[channel] = clampSemanticChannel(channel, next);
     }
     // The roll is held to the model's own ±90° range on the SEMANTIC pose, before the spring and
     // long before the input value: headX/headY keep their ±30° range, so a lean cannot be truncated
@@ -6234,6 +6823,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       breath: { active: state.intent.flags?.breathing !== false, value: 0.5, rest: 0.5 },
     };
     const pose = composeChannels(restFrame, restGenerators, ARBITRATION);
+    // A hard stop publishes an explicit rest value on the body/arm channels instead of letting the
+    // rate limiter drift the old gesture out (the old generation is invalidated by the facade).
+    for (const channel of BODY_ARM_CHANNELS) pose[channel] = 0;
     state.idle = restGenerators.idle;
     publish(pose);
     return { token: state.playbackToken, turnId: state.turnId, reason: state.lastInterruptReason };
@@ -6565,6 +7157,37 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
   }
 
+  /** One body/shoulder/arm component as a read-only view (independent per category). */
+  function bodyArmComponentSnapshot(category) {
+    const gate = state.motion.posture.bodyArms;
+    const component = gate.components[category];
+    if (component === null) return null;
+    return {
+      category,
+      id: component.id,
+      label: component.label,
+      startedAt: component.startedAt,
+      holdUntil: component.holdUntil,
+      durationMs: component.durationMs,
+      remainingMs: Math.max(0, component.holdUntil - (state.lastAt ?? 0)),
+      amplitude: component.amplitude,
+      channels: [...component.channels],
+      semantic: { ...component.semantic },
+      targetSemantic: { ...component.semantic },
+      targetDegrees: { ...component.targetDegrees },
+      targetDegreesBasis: component.targetDegreesBasis,
+      saturated: { ...component.saturated },
+      observed: component.observed === null ? null : {
+        at: component.observed.at,
+        category: component.observed.category,
+        semantic: { ...component.observed.semantic },
+        mixed: { ...component.observed.mixed },
+        base: { ...component.observed.base },
+        clamped: { ...component.observed.clamped },
+      },
+    };
+  }
+
   /**
    * Phase 3 gaze-component snapshot. `value`/`semantic` are the bounded semantic target; `degrees`
    * is the 30°-equivalent annotation (NOT a measured eye rotation); `mixed` is the share that
@@ -6625,6 +7248,70 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (!next) posture.gazeComponent = null;
     recordEvent('avatar.motion.component.gaze-gate', { verified: next, changed });
     return { verified: next, changed, component: posture.gazeComponent !== null };
+  }
+
+  /**
+   * Phase 4 body/arm gate. The facade passes exactly the channels whose mapping it has verified
+   * (never a candidate). On a narrowing gate every component that lost all its channels is
+   * dropped immediately; the next frame re-draws only what the new model can really drive.
+   */
+  function setBodyArmVerified(channels) {
+    const gate = state.motion.posture.bodyArms;
+    const next = new Set(
+      (Array.isArray(channels) ? channels : [])
+        .map((channel) => String(channel))
+        .filter((channel) => BODY_ARM_CHANNELS.includes(channel)),
+    );
+    let changed = next.size !== gate.verified.size;
+    if (!changed) {
+      for (const channel of next) {
+        if (!gate.verified.has(channel)) { changed = true; break; }
+      }
+    }
+    gate.verified = next;
+    if (changed) {
+      for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+        const component = gate.components[category];
+        if (component === null) continue;
+        const kept = component.channels.filter((channel) => next.has(channel));
+        if (kept.length === 0) {
+          gate.components[category] = null;
+          continue;
+        }
+        if (kept.length !== component.channels.length) {
+          // Keep the still-verified part of the pose; a channel that lost its proof is removed from
+          // the component itself, not only zeroed at mix time.
+          for (const channel of component.channels) {
+            if (next.has(channel)) continue;
+            delete component.semantic[channel];
+            delete component.targetDegrees[channel];
+            delete component.saturated[channel];
+          }
+          component.channels = kept;
+          component.amplitude = kept.reduce(
+            (max, channel) => Math.max(max, Math.abs(finite(component.semantic[channel], 0))),
+            0,
+          );
+        }
+      }
+      if (gate.paused === false) {
+        for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+          const component = gate.components[category];
+          if (component === null) installBodyArmComponent(category, state.lastAt ?? 0);
+        }
+      }
+    }
+    recordEvent('avatar.motion.body-arm-gate', {
+      verified: [...next],
+      changed,
+      channels: [...BODY_ARM_CHANNELS],
+    });
+    return {
+      verified: [...next],
+      changed,
+      components: Object.fromEntries(Object.keys(BODY_ARM_COMPONENT_CATEGORIES)
+        .map((category) => [category, gate.components[category]?.id ?? null])),
+    };
   }
 
   function snapshot() {
@@ -6793,6 +7480,56 @@ export function createBehaviorRuntime({ config = {} } = {}) {
               * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT,
             gazeMinMs: postureGazeComponentMinMs,
             gazeMaxMs: postureGazeComponentMaxMs,
+            bodyArmSemanticMin: BODY_ARM_COMPONENT_MIN_AMPLITUDE,
+            bodyArmSemanticMax: BODY_ARM_COMPONENT_MAX_AMPLITUDE,
+            bodyArmMinMs: bodyComponentMinMs,
+            bodyArmMaxMs: bodyComponentMaxMs,
+            bodyArmMaxStep,
+          },
+          /**
+           * Phase 4 generic body/shoulder/arm layer: the verified channel gate, the three
+           * independent component holds, the base/component/mixed per-frame evidence and the last
+           * unsupported expression. `verified` is the only channel set this layer may write.
+           */
+          bodyArms: {
+            channels: [...BODY_ARM_CHANNELS],
+            verified: [...state.motion.posture.bodyArms.verified],
+            base: { ...state.motion.posture.bodyArms.base },
+            component: { ...state.motion.posture.bodyArms.component },
+            mixed: { ...state.motion.posture.bodyArms.mixed },
+            clamped: { ...state.motion.posture.bodyArms.clamped },
+            components: {
+              body: bodyArmComponentSnapshot('body'),
+              shoulder: bodyArmComponentSnapshot('shoulder'),
+              arm: bodyArmComponentSnapshot('arm'),
+            },
+            paused: state.motion.posture.bodyArms.paused === true,
+            transitions: { ...state.motion.posture.bodyArms.transitions },
+            history: {
+              body: state.motion.posture.bodyArms.history.body.map((entry) => ({ ...entry })),
+              shoulder: state.motion.posture.bodyArms.history.shoulder.map((entry) => ({ ...entry })),
+              arm: state.motion.posture.bodyArms.history.arm.map((entry) => ({ ...entry })),
+            },
+            lastTransition: {
+              body: state.motion.posture.bodyArms.lastTransition.body === null
+                ? null : { ...state.motion.posture.bodyArms.lastTransition.body },
+              shoulder: state.motion.posture.bodyArms.lastTransition.shoulder === null
+                ? null : { ...state.motion.posture.bodyArms.lastTransition.shoulder },
+              arm: state.motion.posture.bodyArms.lastTransition.arm === null
+                ? null : { ...state.motion.posture.bodyArms.lastTransition.arm },
+            },
+            unsupported: state.motion.posture.bodyArms.unsupported,
+            lastUnsupported: state.motion.posture.bodyArms.lastUnsupported === null
+              ? null : {
+                  ...state.motion.posture.bodyArms.lastUnsupported,
+                  missingChannels: [...(state.motion.posture.bodyArms.lastUnsupported.missingChannels ?? [])],
+                  availableChannels: [...(state.motion.posture.bodyArms.lastUnsupported.availableChannels ?? [])],
+                },
+            limits: { ...BODY_ARM_CHANNEL_LIMITS },
+            baseDegrees: { ...BODY_ARM_BASE_DEGREES },
+            /** Real VTS arm direction/visual result has NOT been verified on a machine. */
+            visualVerified: false,
+            directionBasis: 'semantic positive = raise/open; which VTS sign raises a given arm is TRUE-MACHINE UNVERIFIED',
           },
         },
         transition: state.motion.transition === null ? null : {
@@ -6912,6 +7649,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     setBaseActivityEnabled,
     /** Phase 3: verified+plugin gate for the gaze component (both gazeX and gazeY). */
     setComponentGazeVerified,
+    /** Phase 4: the verified body/arm channel gate (bodyX/Y/Z, shoulder/arm/hand L/R). */
+    setBodyArmVerified,
     setIdleActions,
     intent,
     // Motion preset execution: selection, execution, interruption and the proof-bearing state.

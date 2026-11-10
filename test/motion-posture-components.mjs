@@ -10,7 +10,7 @@
  *
  * Channel ownership assumed by this suite (and by the implementation):
  *   plugin-controlled : headX / headY / headZ (and head-centred idle writes)
- *   VTS-native        : bodyX/Y/Z, breath (the controller never drives body; breath has its own row)
+ *   native-possible   : bodyX/Y/Z (phase 4 writes only a VERIFIED body channel; breath has its own row)
  *   not idle-written  : gazeX / gazeY, browL / browR (intent/expression/preset only)
  *   opt-in            : eyeOpenL / eyeOpenR (host.idleEye)
  * An explicit gaze channelMap is configuration only; it still needs a runtime probe before it can
@@ -36,7 +36,9 @@ const ALL_CHANNELS = Object.freeze([
 ]);
 const ALL_FAMILIES = [...new Set(PRESETS.map((preset) => preset.family))];
 const HEAD_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
-const UNVERIFIED_IDLE_CHANNELS = Object.freeze(['gazeX', 'gazeY', 'browL', 'browR', 'bodyX', 'bodyY', 'bodyZ']);
+// BodyX is now a verified base-activity channel (phase 4); the remaining entries still have no
+// continuous idle writer in this suite.
+const UNVERIFIED_IDLE_CHANNELS = Object.freeze(['gazeX', 'gazeY', 'browL', 'browR', 'bodyY', 'bodyZ']);
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -435,7 +437,7 @@ test('6. head-center 重叠不过冲、结束确实回基线（不回零点/旧�
 // ---------------------------------------------------------------------------------------------
 // 7. channel ownership: only verified head channels; body/gaze stay idle-unwritten
 // ---------------------------------------------------------------------------------------------
-test('7. 组件只驱动 headX/Y/Z；body/gaze 无 idle 行，breath 走独立行', async () => {
+test('7. 组件只驱动 headX/Y/Z；已验证 bodyX 走基础层，未映射 gaze/brow/bodyY/Z 无 idle 行', async () => {
   const rig = await makeIdleRuntime({ config: { presetExecution: false } });
   rig.fake.frames.length = 0;
   for (let at = 0; at <= 8_000; at += DT) await rig.tick(at);
@@ -448,6 +450,8 @@ test('7. 组件只驱动 headX/Y/Z；body/gaze 无 idle 行，breath 走独立�
     assert.ok(hasChannel(rig.fake.frames, channel), `${channel} has idle rows`);
   }
   assert.ok(hasChannel(rig.fake.frames, 'breath'), 'breath still has its own verified row');
+  assert.ok(hasChannel(rig.fake.frames, 'bodyX'),
+    'a verified bodyX is now a continuous base-activity row (phase 4), never part of the head component');
   for (const channel of UNVERIFIED_IDLE_CHANNELS) {
     assert.equal(hasChannel(rig.fake.frames, channel), false, `${channel} is not in the idle write set`);
   }

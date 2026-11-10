@@ -102,7 +102,31 @@ export {
   toInputValue,
 } from './dynamics.js';
 export { composeChannels } from './mixer.js';
-import { DEFAULT_CONFIG, PRESET_EVENT_FOR_PHASE, createBehaviorRuntime } from './motion-controller.js';
+import {
+  BODY_ARM_CHANNELS,
+  BODY_ARM_CHANNEL_LIMITS,
+  BODY_ARM_GESTURES,
+  BODY_ARM_INTENT_TARGETS,
+  BODY_ARM_MAX_STEP,
+  DEFAULT_CONFIG,
+  PRESET_EVENT_FOR_PHASE,
+  createBehaviorRuntime,
+  intentChannelsForAny,
+  intentTargetsFor,
+} from './motion-controller.js';
+export {
+  BODY_ARM_CHANNELS,
+  BODY_ARM_CHANNEL_LIMITS,
+  BODY_ARM_COMPONENTS,
+  BODY_ARM_COMPONENT_CATEGORIES,
+  BODY_ARM_COMPONENT_MAX_MS,
+  BODY_ARM_COMPONENT_MIN_MS,
+  BODY_ARM_GESTURES,
+  BODY_ARM_INTENT_TARGETS,
+  BODY_ARM_MAX_STEP,
+  intentChannelsForAny,
+  intentTargetsFor,
+} from './motion-controller.js';
 export {
   MOTION_DECISION_HZ,
   POSTURE_HOLD_MIN_MS,
@@ -756,6 +780,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     pending: null,
     pendingSince: null,
     generation: 0,
+    /** Body/arm expressions refused for a missing semantic core (read-only evidence). */
+    unsupported: 0,
+    lastUnsupported: null,
     /** Conversation identity: `intentEvent({sessionId, turnId})` replaces it (turn switch). */
     sessionId: 0,
     turnId: 0,
@@ -1079,6 +1106,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     skipped: [],
     unverified: [],
   };
+  /**
+   * Phase 4 body/arm channels. They are deliberately kept OUT of the legacy CHANNELS/status list
+   * (those tables are a compatibility contract), but they share the SAME binding map and the SAME
+   * one-writer output path. Only a verified binding can enter `bodyArmParamMap`.
+   */
+  const BODY_ARM_SET = new Set(BODY_ARM_CHANNELS);
+  const EXTENDED_CHANNELS = Object.freeze([...CHANNELS, ...BODY_ARM_CHANNELS]);
+  const bodyArmState = { skipped: [], unverified: [] };
+  /** Verified body/arm rows the ONE writer may emit; empty means the layer writes nothing. */
+  let bodyArmParamMap = [];
+  const bodyArmStats = { writes: 0, skipped: 0, lastAt: null, lastChannels: [] };
   const channelEventAt = new Map();
   let pendingChannelConfig = null;
   const IDLE_SUPPRESSED_LOG_MS = 5000;
@@ -1329,6 +1367,33 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
+   * Append the verified body/arm rows to the SAME frame being built by the one writer. This never
+   * creates a second output path: `written` is the frame-wide one-input-per-frame set, so a body
+   * channel already emitted by the idle/intent loop is not repeated. Channels without a verified
+   * binding simply have no row.
+   */
+  function appendBodyArmEntries({ entries, written, pose, at, speaking = false }) {
+    const channels = [];
+    for (const item of bodyArmParamMap) {
+      if (item.inputName === '') continue;
+      if (written.has(item.inputName)) continue;
+      if (speaking && isMouthOwnedInput(item.inputName)) continue;
+      const raw = pose?.[item.channel];
+      if (!Number.isFinite(raw)) continue;
+      const value = bodyArmWriteValue(item, raw);
+      const inputValue = writeInputValue(item, item.channel, value);
+      entries.push({ input: item.inputName, value: inputValue, channel: item.channel });
+      written.add(item.inputName);
+      channels.push(item.channel);
+    }
+    if (channels.length > 0) {
+      bodyArmStats.writes += channels.length;
+      bodyArmStats.lastAt = at;
+      bodyArmStats.lastChannels = [...channels];
+    }
+  }
+
+  /**
    * Build the input rows for one interpolated pose. This uses the same verified map, the same
    * mouth-priority rule and the same intent/idle limiters as the legacy idle flush, so switching
    * output paths can never introduce a second writer for one input.
@@ -1378,6 +1443,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       noteComponentWrite(channel, semanticValue, inputValue, at);
       written.add(binding.inputName);
     }
+    // Phase 4 body/shoulder/arm: the same frame, the same written-input set. A verified channel is
+    // driven continuously (base + held component), not only while an expression is active.
+    appendBodyArmEntries({ entries, written, pose, at, speaking });
     // Breath rides the same single-slot frame; with no verified channel it adds nothing.
     const breath = breathEntry(pose.breath, at);
     if (breath !== null && !written.has(breath.input)) entries.push(breath);
@@ -1806,7 +1874,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * persona style: it stays with VTS. `mouth` is controlled but not style-driven.
    */
   const statusChannels = () => {
-    const controlled = CHANNELS.filter((channel) => channelState.bindings.get(channel)?.verified === true);
+    const controlled = EXTENDED_CHANNELS.filter((channel) => channelState.bindings.get(channel)?.verified === true);
     const effective = inner.snapshot().style?.effective ?? {};
     const effectiveAmplitude = {};
     for (const channel of controlled) {
@@ -1823,6 +1891,22 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       /** Last runtime probe verdict per channel (`changed:true` is the only proof). */
       probe: probeEvidenceView(),
       effectiveAmplitude,
+      /**
+       * Phase 4 body/arm capability view. `writeChannels` is exactly the verified subset the ONE
+       * writer may emit; `controlled` above already includes those same channels.
+       */
+      bodyArms: {
+        channels: [...BODY_ARM_CHANNELS],
+        controlled: controlled.filter((channel) => BODY_ARM_SET.has(channel)),
+        writeChannels: bodyArmParamMap
+          .filter((item) => item.inputName !== '')
+          .map((item) => item.channel),
+        skipped: [...bodyArmState.skipped],
+        unverified: [...bodyArmState.unverified],
+        writes: bodyArmStats.writes,
+        lastAt: bodyArmStats.lastAt,
+        lastChannels: [...bodyArmStats.lastChannels],
+      },
     };
   };
 
@@ -1902,7 +1986,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function discoveredChannelIndex(rawChannels) {
     const index = new Map();
     const add = (channel, entry) => {
-      if (!CHANNELS.includes(channel) || entry === null || entry === undefined) return;
+      if (!EXTENDED_CHANNELS.includes(channel) || entry === null || entry === undefined) return;
       if (entry.injectable !== true) return;
       const binding = channelBinding(channel, entry);
       if (binding !== null) index.set(channel, binding);
@@ -1925,14 +2009,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function configuredChannelConfig() {
     const channels = [];
     for (const [channel, entry] of Object.entries(userConfig.inputs ?? {})) {
-      if (!CHANNELS.includes(channel) || entry === null || entry === undefined) continue;
+      if (!EXTENDED_CHANNELS.includes(channel) || entry === null || entry === undefined) continue;
       const binding = channelBinding(channel, entry);
       if (binding === null) continue;
       channels.push({ ...binding, inputSource: 'config-input', injectable: entry?.injectable !== false });
     }
     const channelMap = { ...(userConfig.channelMap ?? {}) };
     for (const [channel, entry] of Object.entries(userConfig.idleParams ?? {})) {
-      if (!CHANNELS.includes(channel) || entry === null || entry === undefined) continue;
+      if (!EXTENDED_CHANNELS.includes(channel) || entry === null || entry === undefined) continue;
       const binding = channelBinding(channel, entry);
       if (binding === null) continue;
       if (asInputName(channelMap[channel]) === '') channelMap[channel] = binding.inputName;
@@ -1959,6 +2043,33 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         : { channel, inputName: '' };
     });
     idleSkipAt.clear();
+  }
+
+  /**
+   * The body/arm writer sees verified bindings only. Each row carries the input's own min/max so
+   * the semantic value is mapped through the real discovered range, never a guessed ±1.
+   */
+  function refreshBodyArmParamMap() {
+    bodyArmParamMap = BODY_ARM_CHANNELS.map((channel) => {
+      const binding = channelState.bindings.get(channel);
+      return binding?.verified === true
+        ? {
+            channel,
+            inputName: binding.inputName,
+            min: binding.min,
+            max: binding.max,
+            defaultValue: binding.defaultValue,
+            gain: binding.gain ?? null,
+          }
+        : { channel, inputName: '' };
+    });
+  }
+
+  /** Push the verified body/arm channel set to the controller; it never sees a candidate row. */
+  function syncBodyArmGate() {
+    return inner.setBodyArmVerified(
+      bodyArmParamMap.filter((item) => item.inputName !== '').map((item) => item.channel),
+    );
   }
 
   /** A mouth binding is only used by the writer while it is controlled; unverified stays closed. */
@@ -2027,14 +2138,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const next = new Map();
     const skipped = [];
     const unverified = [];
+    const bodySkipped = [];
+    const bodyUnverified = [];
     const pending = [];
-    for (const channel of CHANNELS) {
+    for (const channel of EXTENDED_CHANNELS) {
       const explicitName = asInputName(explicit[channel]);
       const candidate = discovered.get(channel) ?? null;
       if (explicitName !== '') {
         if (candidate === null
           || candidate.inputName.toLowerCase() !== explicitName.toLowerCase()) {
-          unverified.push(channel);
+          if (BODY_ARM_SET.has(channel)) bodyUnverified.push(channel);
+          else unverified.push(channel);
           noteChannelEvent('avatar.channel.unverified', channel,
             candidate === null ? 'not-injectable' : 'mismatch', { input: explicitName });
           continue;
@@ -2050,11 +2164,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         const verified = candidate.verified === true;
         next.set(channel, { ...candidate, explicit: false, verified });
         if (!verified) {
-          unverified.push(channel);
+          if (BODY_ARM_SET.has(channel)) bodyUnverified.push(channel);
+          else unverified.push(channel);
           noteChannelEvent('avatar.channel.unverified', channel, 'not-verified', { input: candidate.inputName });
         }
       } else {
-        skipped.push(channel);
+        if (BODY_ARM_SET.has(channel)) bodySkipped.push(channel);
+        else skipped.push(channel);
         noteChannelEvent('avatar.channel.skipped', channel, 'unmapped');
       }
     }
@@ -2065,15 +2181,24 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         binding.verified = true;
         noteChannelEvent('avatar.channel.verified', binding.channel, 'probe-accepted', { input: binding.inputName });
       } else {
-        unverified.push(binding.channel);
+        if (BODY_ARM_SET.has(binding.channel)) bodyUnverified.push(binding.channel);
+        else unverified.push(binding.channel);
         noteChannelEvent('avatar.channel.unverified', binding.channel, outcome.reason, { input: binding.inputName });
       }
     }
     channelState.bindings = next;
-    channelState.skipped = CHANNELS.filter((channel) => skipped.includes(channel));
-    channelState.unverified = CHANNELS.filter((channel) => unverified.includes(channel));
+    // The legacy `channels.skipped/unverified` tables keep listing the body channels (bodyX/Y/Z
+    // are part of CHANNELS); the body/arm view below adds the new shoulder/arm/hand rows.
+    channelState.skipped = CHANNELS.filter((channel) => skipped.includes(channel)
+      || (BODY_ARM_SET.has(channel) && bodySkipped.includes(channel)));
+    channelState.unverified = CHANNELS.filter((channel) => unverified.includes(channel)
+      || (BODY_ARM_SET.has(channel) && bodyUnverified.includes(channel)));
+    bodyArmState.skipped = BODY_ARM_CHANNELS.filter((channel) => bodySkipped.includes(channel));
+    bodyArmState.unverified = BODY_ARM_CHANNELS.filter((channel) => bodyUnverified.includes(channel));
     channelState.initialized = true;
     refreshIdleParamMap();
+    refreshBodyArmParamMap();
+    syncBodyArmGate();
     syncChannelMouth();
     // The discrete pool depends on the verified set: recompute it (and record it once) here.
     refreshIdleActionPool('channels');
@@ -2514,9 +2639,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     channelState.bindings.clear();
     channelState.skipped = [];
     channelState.unverified = [];
+    bodyArmState.skipped = [];
+    bodyArmState.unverified = [];
     channelEventAt.clear();
     // A disconnected runtime controls nothing; a reconnect re-verifies the mappings it is given.
     idleParamMap = normalizeIdleParams(null);
+    refreshBodyArmParamMap();
+    // No verified channels = no body/arm layer: close the gate with the takeover set.
+    syncBodyArmGate();
     idleSkipAt.clear();
     // No verified channels = no gaze component: close the gate with the takeover set.
     inner.setComponentGazeVerified(false);
@@ -2650,6 +2780,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       && IDLE_WRITE_CHANNELS.includes(entry.channel)
       && (host.idleEye === true || !entry.channel.startsWith('eyeOpen')));
     if (writable) return 'param';
+    // A body/arm-only mapping is still a continuous parameter engine, even when no head/eye
+    // channel is writable: the body/arm rows travel through the same idle/motion writer.
+    if (bodyArmParamMap.some((entry) => entry.inputName !== '')) return 'param';
     return installedIdleActions().length > 0 ? 'hotkey' : 'none';
   }
 
@@ -2967,20 +3100,56 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     const kind = String(action ?? '');
     const time = Number.isFinite(at) ? at : undefined;
-    if (INTENT_CHANNEL_TARGETS[kind] === undefined) {
+    if (intentTargetsFor(kind) === undefined) {
       return fail(
         AVATAR_ERROR_CODES.INVALID_ARGUMENT,
         `unknown intent: ${kind}`,
-        { supported: [...INTENT_KINDS] },
+        { supported: [...INTENT_KINDS, ...Object.keys(BODY_ARM_INTENT_TARGETS)] },
         { record: false },
       );
     }
     const gestureProfile = isMotionProfile(profile) ? String(profile) : null;
-    const targets = intentChannelsFor(kind, gestureProfile);
+    const targets = intentChannelsForAny(kind, gestureProfile);
+    const bodyGesture = BODY_ARM_GESTURES[kind] ?? null;
     const controlled = statusChannels().controlled;
     const requested = Array.isArray(channels) && channels.length > 0 ? channels : [...targets];
     const available = targets.filter((channel) => requested.includes(channel) && controlled.includes(channel));
     const skipped = targets.filter((channel) => !available.includes(channel));
+    // A body/arm expression must have its semantic core. No arm for a wave is `unsupported`, never
+    // a silent fallback to the head channels that happen to be mapped.
+    if (bodyGesture !== null) {
+      const coreAvailable = bodyGesture.core.filter((channel) => available.includes(channel));
+      if (coreAvailable.length === 0) {
+        const missingChannels = bodyGesture.core.filter((channel) => !available.includes(channel));
+        intentState.unsupported += 1;
+        intentState.lastUnsupported = {
+          kind,
+          at: time ?? clockNow(),
+          reason: 'missing-core',
+          missingChannels: [...missingChannels],
+          availableChannels: [...available],
+        };
+        recordIdleEvent('avatar.intent.unsupported', {
+          kind,
+          reason: 'missing-core',
+          missingChannels,
+          availableChannels: available,
+        });
+        return fail(
+          AVATAR_ERROR_CODES.UNMAPPED,
+          `intent ${kind} needs ${bodyGesture.core.join('/')}; the model maps no core channel`,
+          {
+            kind,
+            reason: 'unsupported',
+            supported: false,
+            missingChannels,
+            availableChannels: [...available],
+            skipped,
+          },
+          { record: false },
+        );
+      }
+    }
     if (available.length === 0) {
       recordIdleEvent('avatar.intent.skipped', { kind, reason: 'unmapped', channels: skipped });
       return fail(
@@ -3119,7 +3288,27 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function writeInputValue(entry, channel, value) {
     return HEAD_ANGLE_CHANNELS.has(channel)
       ? toHeadInputValue(entry, value)
-      : toInputValue(entry, value, { bidirectional: isBidirectional(channel) });
+      : toInputValue(entry, value, { bidirectional: isBidirectional(channel) || BODY_ARM_SET.has(channel) });
+  }
+
+  /**
+   * One bounded write for a body/arm channel: clamp to the layer's semantic limit, then move from
+   * the previous written value by at most `bodyArmStep` (a per-frame velocity bound). The semantic
+   * → input conversion still uses the verified entry's own min/max, so a model with a mirrored or
+   * asymmetric arm range is respected instead of being forced onto ±1.
+   */
+  const BODY_ARM_WRITE_MAX_STEP = Math.max(BODY_ARM_MAX_STEP, 0.12);
+  function bodyArmWriteValue(item, raw) {
+    const channel = item.channel;
+    const limit = BODY_ARM_CHANNEL_LIMITS[channel] ?? 1;
+    const next = Math.max(-limit, Math.min(limit, finite(raw, 0)));
+    const previous = idleLastValue.get(channel) ?? 0;
+    const step = Math.max(0.02, Math.min(BODY_ARM_WRITE_MAX_STEP, host.idleMaxStep));
+    const bounded = previous + Math.max(-step, Math.min(step, next - previous));
+    if (Math.abs(bounded - previous) > IDLE_FLOOR_EPSILON) idleFloor.changed = true;
+    idleLastValue.set(channel, bounded);
+    noteActionWrite(channel, bounded, { limitHit: next !== finite(raw, 0) });
+    return bounded;
   }
 
   /**
@@ -5015,8 +5204,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const early = idleSource === 'param' ? null : inner.snapshot();
     const snap = early ?? inner.snapshot();
     const intentChannels = new Set(snap.intents?.channels ?? []);
-    // Breath is written on its own verified row even when no idle channel or intent is active.
-    if (idleSource !== 'param' && intentChannels.size === 0 && breathBinding() === null) return;
+    // Breath is written on its own verified row even when no idle channel or intent is active, and
+    // the verified body/arm base layer is also a continuous writer in its own right.
+    const bodyArmWritable = bodyArmParamMap.some((item) => item.inputName !== '');
+    if (idleSource !== 'param' && intentChannels.size === 0 && breathBinding() === null
+      && bodyArmWritable !== true) return;
     // The ONLY full pause: an explicit `flags.idle === false` still skips every idle frame.
     if (snap.intent?.flags?.idle === false) {
       if (at - lastIdleSuppressedAt >= interval) {
@@ -5127,6 +5319,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       noteComponentWrite(channel, value, inputValue, at);
       writtenInputs.add(binding.inputName);
     }
+    // Phase 4 body/shoulder/arm rows: the pending frame carries only the legacy channel table, so
+    // the writer reads the current composed pose from the same snapshot instead of a second store.
+    appendBodyArmEntries({ entries, written: writtenInputs, pose: snap.pose, at, speaking });
     // Breath is appended last: it never owns another channel's input and never replaces an idle row.
     const breath = breathEntry(frame.get('breath'), at);
     if (breath !== null && !writtenInputs.has(breath.input)) {
@@ -5872,13 +6067,30 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         mappingEvidence: m.hasInput,
       };
     };
-    const body = () => ({
-      source: 'vts-native',
-      owner: 'vts-native',
-      verified: false,
-      status: 'native',
-      nativePossible: true,
-    });
+    const body = (channel) => {
+      const m = mapped(channel);
+      return {
+        source: m.verified ? 'plugin' : 'vts-native',
+        owner: m.verified ? 'plugin-base' : 'vts-native',
+        layer: 'body-arm-base',
+        verified: m.verified,
+        status: m.verified ? 'plugin' : 'native',
+        nativePossible: true,
+      };
+    };
+    const arm = (channel) => {
+      const m = mapped(channel);
+      return {
+        // `source` is the aggregate channel class: only the `arms` rollup reports the class as
+        // unsupported, so the legacy ownership table keeps its exact `unsupported: ['arms']` shape.
+        source: m.verified ? 'plugin' : 'vts-native',
+        owner: m.verified ? 'plugin' : 'unsupported',
+        layer: 'body-arm-base',
+        verified: m.verified,
+        status: m.verified ? 'plugin' : (m.hasInput ? 'unverified' : 'unsupported'),
+        nativePossible: false,
+      };
+    };
     const breathVerified = breathBinding() !== null;
     // Blink ownership mirrors the EFFECTIVE writer: the layer is always generated, but only a
     // plugin-owned blink (explicit request + both eyes verified) injects eye rows. The default
@@ -5916,16 +6128,31 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       },
       gazeX: gaze('gazeX'),
       gazeY: gaze('gazeY'),
-      bodyX: body(),
-      bodyY: body(),
-      bodyZ: body(),
-      arms: {
-        source: 'unsupported',
-        owner: 'unsupported',
-        verified: false,
-        status: 'unsupported',
-        nativePossible: false,
-      },
+      bodyX: body('bodyX'),
+      bodyY: body('bodyY'),
+      bodyZ: body('bodyZ'),
+      shoulderL: arm('shoulderL'),
+      shoulderR: arm('shoulderR'),
+      armL: arm('armL'),
+      armR: arm('armR'),
+      handL: arm('handL'),
+      handR: arm('handR'),
+      /**
+       * Backward-compatible aggregate: `plugin` when at least one shoulder/arm/hand channel is
+       * verified, otherwise `unsupported`. The individual channels above carry the real detail.
+       */
+      arms: (() => {
+        const limbChannels = ['shoulderL', 'shoulderR', 'armL', 'armR', 'handL', 'handR'];
+        const verified = limbChannels.filter((channel) => mapped(channel).verified);
+        return {
+          source: verified.length > 0 ? 'plugin' : 'unsupported',
+          owner: verified.length > 0 ? 'plugin' : 'unsupported',
+          verified: verified.length > 0,
+          status: verified.length > 0 ? 'plugin' : 'unsupported',
+          nativePossible: false,
+          channels: verified,
+        };
+      })(),
     };
     const bySource = (source) => Object.entries(entries)
       .filter(([, entry]) => entry.source === source)
@@ -6035,7 +6262,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       /** Current intent patch, including `lastVariant` from the stage-3 replacement draw. */
       intent: innerSnap.intent,
       status: innerSnap.status,
-      intents: innerSnap.intents,
+      intents: {
+        ...innerSnap.intents,
+        /** Body/arm expressions refused for a missing semantic core (never head-substituted). */
+        unsupported: intentState.unsupported,
+        lastUnsupported: intentState.lastUnsupported === null ? null : {
+          ...intentState.lastUnsupported,
+          missingChannels: [...intentState.lastUnsupported.missingChannels],
+          availableChannels: [...intentState.lastUnsupported.availableChannels],
+        },
+      },
       /** Takeover view: only verified mappings are controlled; nothing else is ever injected. */
       channels: statusChannels(),
       idleParams: {
@@ -6178,7 +6414,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
          * is not verified. `gazeVerified` is the plugin-ownership gate (both gaze axes).
          */
         components: {
-          scope: 'phase3-head+gaze',
+          scope: 'phase3-head+gaze + phase4-body-arm',
           head: innerSnap.motion?.posture?.component ?? null,
           gaze: innerSnap.motion?.posture?.gazeComponent ?? null,
           gazeVerified: innerSnap.motion?.posture?.componentGazeVerified === true,
@@ -6189,7 +6425,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           arbitration: innerSnap.motion?.arbitration ?? null,
           /** target / mixed / sent / sendResult layered evidence (head + verified gaze). */
           evidence: componentEvidenceView(),
-          bodyWritten: false,
+          /**
+           * Phase 4 generic body/shoulder/arm layer: independent held components, the verified
+           * channel gate and the base/component mixing evidence. `bodyWritten` only means a
+           * verified body/arm row was emitted; the real visual result is TRUE-MACHINE UNVERIFIED.
+           */
+          bodyArms: innerSnap.motion?.posture?.bodyArms ?? null,
+          bodyWritten: bodyArmStats.lastAt !== null,
           nativeIdleOwned: false,
           visualVerified: false,
         },
