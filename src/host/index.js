@@ -1923,7 +1923,7 @@ export function apply(ctx, config) {
   // Read the machine once at startup so ASR thread counts and decode limits fit this computer
   // instead of a hardcoded guess.
   const tuning = detectTuning();
-  void log.emit('system.tuning', tuning);
+  void log.emit('system.tuning', tuning).catch(() => {});
 
   // Runtime-adjustable settings that should survive restarts but are not static config.
   const settingsFile = join(root, 'data', 'settings.json');
@@ -4592,7 +4592,7 @@ export function apply(ctx, config) {
       if (avatarStyleBooted !== true) {
         avatarStyleBooted = true;
         void log.emit('avatar.style.boot', { reason: 'avatar-connected' }).catch(() => {});
-        void refreshAvatarStyle({ reason: 'avatar-connected' });
+        void refreshAvatarStyle({ reason: 'avatar-connected' }).catch(() => {});
       }
     }
     return result;
@@ -5176,7 +5176,7 @@ export function apply(ctx, config) {
     if (avatarStyleRefreshTimer !== null) clearTimeout(avatarStyleRefreshTimer);
     avatarStyleRefreshTimer = setTimeout(() => {
       avatarStyleRefreshTimer = null;
-      void refreshAvatarStyle();
+      void refreshAvatarStyle().catch(() => {});
     }, 1500);
     avatarStyleRefreshTimer.unref?.();
   };
@@ -5575,7 +5575,7 @@ export function apply(ctx, config) {
   };
   const AVATAR_STYLE_IDLE_TIRED_MS = TIRED_DEFAULTS.idleTimeoutMs;
   const avatarStyleHousekeeping = () => {
-    void refreshAvatarStyle();
+    void refreshAvatarStyle().catch(() => {});
     const snap = avatarRuntime?.snapshot();
     if (snap === undefined) return;
     const now = Date.now();
@@ -5636,7 +5636,7 @@ export function apply(ctx, config) {
       }
     }
   };
-  const avatarStyleBoot = setTimeout(() => void refreshAvatarStyle(), 25_000);
+  const avatarStyleBoot = setTimeout(() => void refreshAvatarStyle().catch(() => {}), 25_000);
   avatarStyleBoot.unref?.();
   // 60 s: a background organize round (timer-driven, not a settings action) still refreshes the
   // style; the persona version comparison makes every unchanged tick free.
@@ -5711,7 +5711,7 @@ export function apply(ctx, config) {
     const client = vtsClient();
     if (client.ready) {
       // Not forced: only fills in when this process has never discovered anything yet.
-      void discoverAvatarCapabilities({ reason: 'already-connected' });
+      void discoverAvatarCapabilities({ reason: 'already-connected' }).catch(() => {});
       // A socket that is already authenticated still needs the runtime attached to it.
       await ensureAvatarRuntimeConnected();
       refreshAvatarIdleActions();
@@ -5736,7 +5736,7 @@ export function apply(ctx, config) {
       await ensureAvatarRuntimeConnected();
       refreshAvatarIdleActions();
       // A new model may have a different mapping, so a fresh connect always re-discovers.
-      void discoverAvatarCapabilities({ force: true, reason: 'connect' });
+      void discoverAvatarCapabilities({ force: true, reason: 'connect' }).catch(() => {});
       return result;
     } catch (error) {
       return { ok: false, error: error?.message ?? String(error) };
@@ -8401,16 +8401,21 @@ export function apply(ctx, config) {
     if (result.faded > 0 || result.moved > 0) await log.emit('memory.maintain', result);
     return result;
   };
+  // Background maintenance must never become an unhandled rejection: the host's fail-loud
+  // handler disposes the whole root context on one, which would abort startup after 04:00.
+  const runMemoryMaintainSafely = () => runMemoryMaintain().catch((error) => {
+    void log.emit('memory.maintain.failed', { error: error?.message ?? String(error) }).catch(() => {});
+  });
 
   // Capacity-driven, so the check is periodic but the action is rare: nothing happens until
   // the memory table actually grows past a band.
   const memoryTimer = setInterval(() => {
-    void runMemoryMaintain();
+    runMemoryMaintainSafely();
   }, 15 * 60 * 1000);
   memoryTimer.unref?.();
   ctx.effect(() => () => clearInterval(memoryTimer));
   const memoryBootTimer = setTimeout(() => {
-    void runMemoryMaintain();
+    runMemoryMaintainSafely();
   }, 10_000);
   memoryBootTimer.unref?.();
   // Teardown closes the database; a one-shot that outlived its plugin would reopen it. Cancel it
@@ -8481,12 +8486,17 @@ export function apply(ctx, config) {
     writeMemoryState({ lastRollover: today });
     await log.emit('session.rollover', { date: today, chars: digest.length, mode: 'prompt' });
   };
+  // At 04:00 the startup call runs immediately. A rollover read/write failure is a background
+  // bookkeeping failure, not a reason to tear down the host: catch it before fail-loud sees it.
+  const checkRolloverSafely = () => checkRollover().catch((error) => {
+    void log.emit('session.rollover.failed', { error: error?.message ?? String(error) }).catch(() => {});
+  });
   const rolloverTimer = setInterval(() => {
-    if (pendingRollover === null) void checkRollover();
+    if (pendingRollover === null) checkRolloverSafely();
   }, 60 * 1000);
   rolloverTimer.unref?.();
   ctx.effect(() => () => clearInterval(rolloverTimer));
-  void checkRollover();
+  checkRolloverSafely();
 
   // The day digest rides the target assistant session's first request, not a turn of its own.
   // Dedupe survives a plugin reload: keys are the rollover bookkeeping file's own lines, one per
@@ -8623,7 +8633,7 @@ export function apply(ctx, config) {
   });
   if (typeof ctx.on === 'function') {
     ctx.effect(() => ctx.on('session/event', (session, event) => {
-      void autoMemoryRecorder.handle(session, event);
+      void autoMemoryRecorder.handle(session, event).catch(() => {});
     }));
   }
 
