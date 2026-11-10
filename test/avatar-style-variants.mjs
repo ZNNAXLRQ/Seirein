@@ -27,7 +27,10 @@ import {
 } from '../src/host/avatar/style.js';
 import { styleTraitEffects } from '../src/host/avatar/motion-config.js';
 import { createPresetSelector } from '../src/host/avatar/preset-selector.js';
-import { createBehaviorRuntime } from '../src/host/avatar/motion-controller.js';
+import {
+  PRESET_OPERATION_DEGREE_RANGES,
+  createBehaviorRuntime,
+} from '../src/host/avatar/motion-controller.js';
 import { OPERATIONS, RECIPES } from '../src/host/avatar/presets/index.js';
 
 const ALL_CHANNELS = Object.freeze([...new Set(Object.values(OPERATIONS).flat())]);
@@ -329,8 +332,18 @@ test('5. the selected delivery variant reaches the trajectory, and persona dimen
 
   const quiet = run(QUIET_STYLE);
   const lively = run(LIVELY_STYLE);
-  assert.ok(lively.peak > quiet.peak * 2,
-    `the expressive persona produces a larger preset peak (${lively.peak} vs ${quiet.peak})`);
+  // `idle-tilt` is a `head-tilt` operation, whose planned angle is deliberately bounded by the
+  // 13–18° per-operation band: the persona positions the target INSIDE that band instead of
+  // scaling one shared semantic number, so a 2× peak ratio is not reachable (18/13 ≈ 1.38 is the
+  // maximum). Assert the real contract: the quiet persona sits near the floor, the expressive one
+  // near the ceiling, and the expressive peak is visibly larger.
+  const tiltBand = PRESET_OPERATION_DEGREE_RANGES['head-tilt'];
+  assert.ok(lively.peak >= (tiltBand.max - 1) / 30,
+    `the expressive persona reaches the top of the head-tilt band (${(lively.peak * 30).toFixed(2)}° of ${tiltBand.max}°)`);
+  assert.ok(quiet.peak <= (tiltBand.min + 1) / 30,
+    `the quiet persona stays near the bottom of the head-tilt band (${(quiet.peak * 30).toFixed(2)}° of ${tiltBand.min}°)`);
+  assert.ok(lively.peak > quiet.peak * 1.25,
+    `the expressive persona produces a visibly larger preset peak (${lively.peak} vs ${quiet.peak})`);
   assert.ok(quiet.holdMs > lively.holdMs,
     `the composed persona holds longer (${quiet.holdMs}ms vs ${lively.holdMs}ms)`);
   assert.ok(quiet.started.durationMs > lively.started.durationMs,

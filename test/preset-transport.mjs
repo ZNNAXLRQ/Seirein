@@ -26,7 +26,7 @@ function rowsFor(names, overrides = {}) {
 }
 
 /** Fake transport: every frame the ONE writer builds is captured with the tick time. */
-function makeRig({ motionWrites = false } = {}) {
+function makeRig({ motionWrites = false, idleSwayScale = 0 } = {}) {
   let clock = 0;
   const frames = [];
   const transport = {
@@ -50,7 +50,7 @@ function makeRig({ motionWrites = false } = {}) {
       flushIntervalMs: 1,
       idleWriteHz: 8,
       idleActions: [],
-      idleSwayScale: 0,
+      idleSwayScale,
       motionWrites,
       motionOutputHz: 30,
       presetExecution: true,
@@ -156,9 +156,11 @@ test('2. 纯眉毛预设真的写到 transport', async () => {
     + `committed=${JSON.stringify(trace.output.committed)}`);
 });
 
-test('3. 身体预设保持 native-owned：可映射也 hold，零 BODY 写入', async () => {
+test('3. 身体预设仍 native-owned；自动身体基础层只在开启待机摆动时写入', async () => {
+  // (a) The rig runs with `idleSwayScale: 0` (explicit "no automatic idle sway"). bodyX IS
+  // available and verified, and the body preset still holds (the executor never drives it), but
+  // the automatic body/arm base layer is OFF by the same switch as the head idle writer.
   const rig = makeRig();
-  // bodyX IS available on this model, and the executor still refuses to drive it.
   await connect(rig, rowsFor(['headX', 'bodyX']));
   const started = rig.runtime.preset({ state: 'idle', event: 'idle', recipe: 'idle-lean', seed: 0 });
   assert.equal(started.started, false);
@@ -169,11 +171,24 @@ test('3. 身体预设保持 native-owned：可映射也 hold，零 BODY 写入',
   await run(rig, 0, 2000);
   const bodyWrites = rig.frames.reduce((count, frame) => count
     + frame.entries.filter((entry) => entry.channel.startsWith('body')).length, 0);
-  assert.ok(bodyWrites > 0,
-    'verified body channels participate in the base activity layer');
+  assert.equal(bodyWrites, 0,
+    'idleSwayScale:0 stops the automatic body layer (the preset itself writes no body channel)');
   assert.equal(presetSnapshot(rig.runtime).starts, 0,
-    'the body preset itself remains native-owned; only the verified base layer writes');
-  console.log(`[transport] bodyWrites=${bodyWrites} started=${started.started} nativeOwned=${capabilities.nativeOwned.join('|')}`);
+    'the body preset itself remains native-owned');
+
+  // (b) With automatic idle sway enabled, a verified body channel is a real continuous writer:
+  // the phase-4 base/component layer participates without any preset starting.
+  const swayRig = makeRig({ idleSwayScale: 1.2 });
+  await connect(swayRig, rowsFor(['headX', 'bodyX']));
+  await run(swayRig, 0, 2000);
+  const swayBodyWrites = swayRig.frames.reduce((count, frame) => count
+    + frame.entries.filter((entry) => entry.channel.startsWith('body')).length, 0);
+  assert.ok(swayBodyWrites > 0,
+    'a verified body channel participates in the automatic base activity when idle sway is on');
+  assert.equal(presetSnapshot(swayRig.runtime).starts, 0,
+    'the automatic base layer is not a preset action');
+  console.log(`[transport] bodyWrites(off)=${bodyWrites} bodyWrites(on)=${swayBodyWrites}`
+    + ` started=${started.started} nativeOwned=${capabilities.nativeOwned.join('|')}`);
 });
 
 test('4. 多通道预设：每个通道都出现在 transport 写集合', async () => {

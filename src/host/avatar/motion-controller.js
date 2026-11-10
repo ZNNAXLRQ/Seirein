@@ -4690,7 +4690,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       // The settle cancels exactly the action's OWN temporary offset (never the spring lag or the
       // live base). A normal exit already reached 0; a cancel/eviction is where it is non-zero.
       const offset = finite(contribution[channel], 0);
-      const velocity = finite(contributionVelocity[channel], 0);
+      // A COMPLETED action already ran its stage exit to zero, so the last active frame carries a
+      // near-zero offset plus a possibly large exit velocity. Feeding that velocity into the
+      // quintic asks it to travel a near-zero distance at high speed, which visibly swings the
+      // channel past the baseline before landing (observed as a ~3° headZ overshoot after an
+      // idle-sway). The exit IS the deceleration; a completed tail starts from rest. A real
+      // cancel/interrupt still keeps the velocity that physically existed at the cut.
+      const velocity = reason === 'completed' ? 0 : finite(contributionVelocity[channel], 0);
       const durationMs = presetSettleDurationMs(offset, velocity);
       if (durationMs <= 0) continue;
       // The settle owns the channel now: an old expression release must not force a second 0 tail.

@@ -134,8 +134,12 @@ test('1. 无 preset / hold / no-candidates：blink、breath、headMotion 都持�
     assert.ok(activity.breathCycles >= 2, `${label}: breathCycles ${activity.breathCycles} grew`);
     assert.ok(activity.headMotionMs > 5_000,
       `${label}: headMotionMs ${activity.headMotionMs} grew through the 10 s window`);
-    assert.ok(activity.headMotionMs <= 10_000 + DT,
-      `${label}: headMotionMs ${activity.headMotionMs} never exceeds real time`);
+    // The measured run starts at t=0, so `lastAt` IS the real elapsed time: the hold case adds the
+    // 200 ms warm-up and the 233 ms gap before the resumed frame loop, and the plain/no-candidate
+    // cases run 0→10 s. Comparing against a hard-coded 10 s would fail a real 10.2 s window; one
+    // synthetic first-frame dt is the only allowed lead (the counter starts before elapsed time 0).
+    assert.ok(activity.headMotionMs <= activity.lastAt + DT,
+      `${label}: headMotionMs ${activity.headMotionMs} never exceeds real time ${activity.lastAt}`);
     assert.equal(activity.state, 'running', `${label}: base activity is running`);
     assert.ok(Number.isFinite(activity.lastAt), `${label}: lastAt is a real timestamp`);
   }

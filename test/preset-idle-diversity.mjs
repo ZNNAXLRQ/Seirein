@@ -16,7 +16,11 @@ import assert from 'node:assert/strict';
 
 import { PRESETS, OPERATIONS } from '../src/host/avatar/presets/index.js';
 import { createPresetSelector } from '../src/host/avatar/preset-selector.js';
-import { createBehaviorRuntime } from '../src/host/avatar/motion-controller.js';
+import {
+  HEAD_CHANNEL_DEGREE_LIMITS,
+  PRESET_OPERATION_DEGREE_RANGES,
+  createBehaviorRuntime,
+} from '../src/host/avatar/motion-controller.js';
 
 const ALL_CHANNELS = Object.freeze([
   'headX', 'headY', 'headZ', 'gazeX', 'gazeY', 'eyeOpenL', 'eyeOpenR',
@@ -470,8 +474,14 @@ test('F1. idle-sway leans on headZ with a small headX companion, asymmetrically 
   assert.ok(maxZ > 0.25, `one side lean ${maxZ.toFixed(4)} pose units`);
   assert.ok(minZ < -0.15, `the other side lean ${minZ.toFixed(4)} pose units`);
   assert.ok(maxZ - minZ > 0.50, `peak-to-peak headZ ${(maxZ - minZ).toFixed(4)} is clearly visible`);
-  assert.ok(peakZ <= 14 / 30 + 1e-6,
-    `headZ peak ${peakZ.toFixed(4)} stays under the shared 14° cap (${(peakZ * 30).toFixed(2)}°)`);
+  // The 14° cap belongs to the EXPRESSION layer (thinking/listening micro-motion). A deliberate
+  // idle-sway preset uses the headZ axis's own semantic range and its 18–28° operation band, so it
+  // is intentionally NOT limited by headX/headY's expression budget.
+  const swayBand = PRESET_OPERATION_DEGREE_RANGES['head-sway'];
+  assert.ok(peakZ <= swayBand.max / 30 + 1e-6,
+    `headZ peak ${(peakZ * 30).toFixed(2)}° stays inside the head-sway ${swayBand.min}–${swayBand.max}° band`);
+  assert.ok(peakZ <= HEAD_CHANNEL_DEGREE_LIMITS.headZ / 30 + 1e-6,
+    `headZ peak ${(peakZ * 30).toFixed(2)}° stays inside the independent ±${HEAD_CHANNEL_DEGREE_LIMITS.headZ}° roll range`);
   assert.ok(peakX < peakZ * 0.5, `headX ${peakX.toFixed(4)} follows headZ ${peakZ.toFixed(4)} instead of leading`);
 
   const ratio = peakX / Math.max(1e-6, peakZ);

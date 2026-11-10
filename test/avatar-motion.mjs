@@ -1271,22 +1271,28 @@ test('24. P-139 过渡：单次 1.2–1.8 s，相邻帧 ≤ 速度界、二阶�
     },
   });
   const seen = new Map();
-  let previous = null;
-  let previousPrevious = null;
+  // Smoothness is a property of every actual channel trajectory, not of `max(|headX|,|headY|,|headZ|)`:
+  // that max has a kink whenever the dominant axis changes, so its second difference is not an
+  // acceleration and can spike even when each axis is C². Track each axis separately.
+  const previous = { headX: null, headY: null, headZ: null };
+  const previousPrevious = { headX: null, headY: null, headZ: null };
   let maxDelta = 0;
   let maxSecond = 0;
   for (let at = 0; at <= 30_000; at += DT) {
     const pose = runtime.tick(at);
     const motion = runtime.snapshot().motion;
-    // Smoothness is about the FINAL head pose, not the internal axis offset: a component's
-    // large internal offset is multiplied by the live per-axis gain before it becomes degrees.
-    const value = Math.max(Math.abs(pose.headX), Math.abs(pose.headY), Math.abs(pose.headZ));
-    if (previous !== null) maxDelta = Math.max(maxDelta, Math.abs(value - previous));
-    if (previousPrevious !== null) {
-      maxSecond = Math.max(maxSecond, Math.abs(value - 2 * previous + previousPrevious));
+    for (const axis of ['headX', 'headY', 'headZ']) {
+      const value = pose[axis];
+      if (previous[axis] !== null) {
+        maxDelta = Math.max(maxDelta, Math.abs(value - previous[axis]));
+      }
+      if (previousPrevious[axis] !== null) {
+        maxSecond = Math.max(maxSecond,
+          Math.abs(value - 2 * previous[axis] + previousPrevious[axis]));
+      }
+      previousPrevious[axis] = previous[axis];
+      previous[axis] = value;
     }
-    previousPrevious = previous;
-    previous = value;
     const last = motion.posture.lastTransition;
     if (last !== null && !seen.has(last.startedAt)) seen.set(last.startedAt, last);
   }
@@ -1298,7 +1304,7 @@ test('24. P-139 过渡：单次 1.2–1.8 s，相邻帧 ≤ 速度界、二阶�
     assert.ok(entry.durationMs >= 1200 && entry.durationMs <= 1800,
       `planned transition was ${entry.durationMs} ms (expected 1200–1800)`);
   }
-  // A visible 5–12° component lands over 1.2–1.8 s; the final pose step stays well under 1.5°/frame
+  // A visible 5–12° component lands over 1.2–1.8 s; every per-axis step stays well under 1.5°/frame
   // at 30 Hz (the old internal-axis bound is no longer meaningful after per-axis gain cancellation).
   const velocityBound = 0.05;
   const accelerationBound = 0.01;

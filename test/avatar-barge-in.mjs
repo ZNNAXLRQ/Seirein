@@ -461,6 +461,10 @@ async function mountHost(t, { extra = {} } = {}) {
     langs: { speech: 'zh', subtitle: 'zh' },
     typedReply: { voice: true },
     voice: { chunking: true },
+    // This fake VTS has no model-parameter readback, so the startup mapping probe cannot prove a
+    // channel. Opt out (the explicit setting, not a fake) so the discovery-verified head rows stay
+    // controllable — otherwise the probe correctly unverifies them and no gesture can run.
+    avatar: { verifyMappingsOnStartup: false },
   }));
   hostState.onUpdate = null;
   hostState.players = [];
