@@ -4202,10 +4202,13 @@ export function apply(ctx, config) {
   );
   /** Synchronous, path-free projection for `/assistant/status.avatar.mapping`. */
   const avatarMappingStatus = () => (avatarMappingProbe === null
-    ? { lastAt: null, ok: null, channels: {}, unverified: [] }
+    ? { lastAt: null, ok: null, stale: false, staleReason: '', discarded: [], channels: {}, unverified: [] }
     : {
         lastAt: avatarMappingProbe.lastAt,
         ok: avatarMappingProbe.ok,
+        stale: avatarMappingProbe.stale === true,
+        staleReason: String(avatarMappingProbe.staleReason ?? ''),
+        discarded: [...(avatarMappingProbe.discarded ?? [])],
         channels: copyMappingChannels(avatarMappingProbe.channels),
         unverified: [...avatarMappingProbe.unverified],
       });
@@ -4282,11 +4285,47 @@ export function apply(ctx, config) {
     const unverified = (Array.isArray(result?.mappingUnverified) ? result.mappingUnverified : [])
       .map((channel) => String(channel));
     const ok = result?.ok === true;
-    avatarMappingProbe = { lastAt: at, ok, channels, unverified };
+    const stale = result?.stale === true;
+    const staleReason = String(result?.staleReason ?? result?.discarded ?? '');
+    // A stale probe must be visible in the host log/status without exposing before/after values.
+    // Only channel names and the short machine reason are projected; raw measurements stay in the
+    // runtime debug payload.
+    const discardedChannels = Object.fromEntries(
+      Object.entries(result?.discardedChannels ?? {})
+        .filter(([, row]) => row !== null && typeof row === 'object')
+        .map(([channel, row]) => [channel, {
+          inputName: String(row.inputName ?? ''),
+          reason: String(row.reason ?? row.discarded ?? ''),
+        }]),
+    );
+    avatarMappingProbe = {
+      lastAt: at,
+      ok,
+      stale,
+      staleReason,
+      discarded: [...(Array.isArray(result?.discarded) ? result.discarded.map(String) : [])],
+      discardedChannels,
+      channels,
+      unverified,
+    };
     applyGazeProbeToCapabilities({ channels, unverified });
-    await log.emit('avatar.mapping.probe', { ok, channels, unverified, at }).catch(() => {});
+    await log.emit('avatar.mapping.probe', {
+      ok,
+      stale,
+      staleReason,
+      discarded: avatarMappingProbe.discarded,
+      channels,
+      unverified,
+      at,
+    }).catch(() => {});
     return {
       ok,
+      stale,
+      staleReason,
+      discarded: [...avatarMappingProbe.discarded],
+      discardedChannels: Object.fromEntries(
+        Object.entries(discardedChannels).map(([channel, row]) => [channel, { ...row }]),
+      ),
       at,
       lastAt: at,
       channels: copyMappingChannels(channels),

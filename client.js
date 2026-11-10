@@ -7356,6 +7356,13 @@ window.__ModuleLoader__.load({
             if (record === null || record.lastAt === null || record.lastAt === undefined) {
               return { state: 'none', text: '尚未验证（点按钮实测）' };
             }
+            if (record.stale === true) {
+              const reason = String(record.staleReason ?? '');
+              return {
+                state: 'stale',
+                text: `旧探测已丢弃${reason === '' ? '' : `（${reason}）`}；当前映射未被修改`,
+              };
+            }
             const entries = Object.entries(record.channels ?? {});
             if (record.ok === false) {
               const reason = entries
