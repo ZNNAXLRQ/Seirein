@@ -733,7 +733,7 @@ async function probeCapabilities({
           ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里（unknown-input），且没有候选输入可回退`
           : declaredName.length > 0
             ? `显式配置的输入 ${declaredName} 不在 InputParameterListRequest 里`
-            : '没有可注入输入匹配该通道',
+            : '未找到可注入输入或匹配的模型参数；这不证明模型没有该部位，可能只是命名或发现规则不匹配',
       };
     }
 
