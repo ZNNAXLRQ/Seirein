@@ -434,7 +434,10 @@ export function createVoiceCompaction({
         note('voice.compaction.preset.conflict', { presetId, source, reason: audit.reason });
         return presetState;
       }
-      presetState = { status: 'reused', source, registered: false, error: null, reason: null, at: Date.now() };
+      presetState = {
+        status: 'reused', source, registered: false, error: null, reason: null,
+        at: Date.now(), nativeTools: definition?.nativeTools === true,
+      };
       note('voice.compaction.preset.reused', { presetId, source, plugins: audit.plugins });
       return presetState;
     };
