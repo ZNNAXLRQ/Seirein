@@ -244,7 +244,12 @@ test('5. 探测超时后迟到完成不得重新暂停写入', async () => {
   });
   const runtime = createAvatarRuntime({
     transport,
-    config: { autoTickMs: 0, gazeProbeTimeoutMs: 40 },
+    config: {
+      autoTickMs: 0,
+      gazeProbeTimeoutMs: 40,
+      flushIntervalMs: 1,
+      idleParams: { headX: { inputName: 'FaceAngleX', min: -30, max: 30 } },
+    },
   });
   try {
     assert.equal((await runtime.connect()).ok, true);
@@ -259,6 +264,10 @@ test('5. 探测超时后迟到完成不得重新暂停写入', async () => {
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(transport.probeActive, false,
       'the late transport completion did not re-lock writes');
+    runtime.tick(1000);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(transport.writes.length > 0,
+      'motion writes (the real transport) resume after the timeout');
   } finally {
     runtime.dispose();
   }
