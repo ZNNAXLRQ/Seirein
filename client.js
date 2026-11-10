@@ -3260,7 +3260,7 @@ window.__ModuleLoader__.load({
     });
     const SPEAKER_ENROLL_MISSING_RE = /not implemented|unknown action|unsupported|未实现|不支持/iu;
     const SPEAKER_ENROLL_RECORD_HINT =
-      '需要宿主支持录制；现在请先在语音页说 3 句话（3–5 秒）自动收集样本，再点「刷新」。';
+      '现在不再需要专门「说三句话」：开启听觉页的「声纹影子」后，正常说话会自动进入下方候选；试听、勾选后点「建立基础声纹」才生效。';
     const SPEAKER_ENROLL_CONFIRM_NOTICE =
       '已确认：之后只用于词库与新增记忆归属，不用于拒收/打断。';
 
@@ -3864,7 +3864,7 @@ window.__ModuleLoader__.load({
         view.loading ? h('div', { style: styles.hint }, '正在读取声纹候选…') : null,
         view.available && view.count === 0 && !view.loading
           ? h('div', { style: styles.hint },
-              '还没有声纹候选：先在语音页对着麦克风说几句话（3–5 秒），再点「刷新」。')
+              '还没有声纹候选：先在听觉页开启「声纹影子」，正常说话会自动收集；不需要专门说三句话。')
           : null,
         view.available
           ? h('div', { style: { marginTop: 6 } },
@@ -4035,16 +4035,9 @@ window.__ModuleLoader__.load({
               h('div', { style: { ...styles.label, fontWeight: 600 } }, `条目（${view.entries.length}）`),
               view.empty
                 ? h('div', { style: styles.hint },
-                    '还没有登记条目：点下面的「登记我的声纹」，或在语音页说 3 句话自动收集。')
+                    '还没有登记条目：开启声纹影子后正常说话，候选会出现在下方；确认建立后才有本人声纹。')
                 : view.entries.map(entryRow))
           : null,
-        h('div', { style: { ...styles.row, marginTop: 10 } },
-          h('span', { style: styles.value }, '登记我的声纹（对着麦克风说 3–5 秒）'),
-          h('button', {
-            style: { ...styles.btnPrimary, ...(locked ? styles.off : {}) },
-            disabled: locked,
-            onClick: () => props?.onRecord?.(),
-          }, '登记我的声纹')),
         h('div', { style: styles.hint }, SPEAKER_ENROLL_RECORD_HINT),
         h('div', { style: { marginTop: 10 } },
           h('div', { style: { ...styles.label, fontWeight: 600 } }, '影子观测（只记录）'),

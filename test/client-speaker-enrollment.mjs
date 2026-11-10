@@ -289,12 +289,11 @@ test('3. 确认成功文案：之后只用于词库与新增记忆归属，不�
   assert.deepEqual(calls.remove, [], 'rendering never removes');
   assert.equal(calls.record, 0, 'rendering never starts a recording');
 
-  // [登记我的声纹]：提示录 3–5 秒；录制接口缺失时明确说「需要宿主支持录制」。
-  assert.ok(textsOf(tree).includes(api.SPEAKER_ENROLL_RECORD_HINT), 'the record hint is on the card');
-  assert.match(api.SPEAKER_ENROLL_RECORD_HINT, /需要宿主支持录制/u);
-  assert.match(api.SPEAKER_ENROLL_RECORD_HINT, /请先在语音页说 3 句话/u);
-  await buttonOf(tree, '登记我的声纹').props.onClick();
-  assert.equal(calls.record, 1, 'one click = one record request');
+  // 旧「登记我的声纹」按钮已移除：日常候选 + 显式确认是唯一入口。
+  assert.ok(textsOf(tree).includes(api.SPEAKER_ENROLL_RECORD_HINT), 'the candidate hint is on the card');
+  assert.match(api.SPEAKER_ENROLL_RECORD_HINT, /声纹影子|候选/u);
+  assert.doesNotMatch(api.SPEAKER_ENROLL_RECORD_HINT, /说 3 句话/u);
+  assert.equal(textsOf(tree).includes('登记我的声纹'), false, 'no dedicated recording button');
 
   await buttonOf(tree, '确认').props.onClick();
   assert.deepEqual(calls.confirm, ['self-lin'], 'one click = one confirm call');
