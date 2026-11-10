@@ -148,18 +148,6 @@ function truncateResponse(value, max = 400) {
   return raw.length > max ? `${raw.slice(0, max)}…` : raw;
 }
 
-/**
- * Model parameter names worth probing when Live2DParameterListRequest is unavailable. These are
- * Live2D parameters, not injectable VTS inputs — used only to report what the model has.
- */
-const KNOWN_MODEL_PARAMETERS = [
-  'ParamAngleX', 'ParamAngleY', 'ParamAngleZ',
-  'ParamEyeBallX', 'ParamEyeBallY', 'ParamEyeLOpen', 'ParamEyeROpen',
-  'ParamBrowLY', 'ParamBrowRY', 'ParamMouthOpenY', 'ParamMouthForm',
-  'ParamBodyAngleX', 'ParamBodyAngleY', 'ParamBodyAngleZ', 'ParamBreath',
-  'ParamHairFront', 'ParamHairSide', 'ParamHairBack',
-];
-
 /** Tolerate the camelCase / PascalCase spellings older and newer VTS builds use. */
 const collectModelParameters = (list) =>
   (Array.isArray(list) ? list : [])
@@ -2160,10 +2148,12 @@ export class VtsClient {
   /**
    * The current model's Live2D parameters. Informational only: whether an input drives them is
    * decided by the user's parameter mapping inside VTS, not by the API.
+   *
+   * `Live2DParameterListRequest` is the only official read: VTS has no `GetParameterValues`
+   * message, so there is deliberately no fallback that sends an unsupported name.
    * Never throws — the caller treats a failure as "not adapted".
    */
-  async listModelParameters({ names = [] } = {}) {
-    let firstError = '';
+  async listModelParameters() {
     try {
       const data = unwrap(await this.request('Live2DParameterListRequest', {}), 'Live2DParameterListRequest');
       const parameters = collectModelParameters(
@@ -2172,36 +2162,18 @@ export class VtsClient {
       if (parameters.length > 0) {
         return { ok: true, source: 'Live2DParameterListRequest', parameters, error: '' };
       }
-      firstError = 'Live2DParameterListRequest returned no parameters';
-    } catch (error) {
-      firstError = error?.message ?? String(error);
-    }
-    // Older VTS builds: ask for the values of the parameters we already know about.
-    const probe = (Array.isArray(names) && names.length > 0 ? names : KNOWN_MODEL_PARAMETERS)
-      .filter((name) => typeof name === 'string' && name.length > 0);
-    try {
-      const data = unwrap(
-        await this.request('GetParameterValues', { parameterNames: probe }),
-        'GetParameterValues',
-      );
-      const parameters = collectModelParameters(
-        data.parameterValues ?? data.parameters ?? data.live2DModelParameters,
-      );
-      if (parameters.length > 0) {
-        return { ok: true, source: 'GetParameterValues', parameters, error: '' };
-      }
       return {
         ok: false,
         source: '',
         parameters: [],
-        error: firstError || 'GetParameterValues returned no parameters',
+        error: 'Live2DParameterListRequest returned no parameters',
       };
     } catch (error) {
       return {
         ok: false,
         source: '',
         parameters: [],
-        error: firstError || (error?.message ?? String(error)),
+        error: error?.message ?? String(error),
       };
     }
   }
@@ -2210,6 +2182,10 @@ export class VtsClient {
   /**
    * Read the current values of model parameters, keyed by the requested name. A parameter VTS did
    * not answer with is `null`; transport/API failures reject (the probe below catches them).
+   *
+   * The official protocol exposes values through `Live2DParameterListRequest`; there is no
+   * `GetParameterValues` message, so an unsupported-name fallback would only turn every probe into
+   * an APIError. The whole current-model list is returned, then narrowed to `parameterNames`.
    */
   async readParameterValues(parameterNames) {
     const names = (Array.isArray(parameterNames) ? parameterNames : [parameterNames])
@@ -2218,13 +2194,17 @@ export class VtsClient {
     const values = Object.fromEntries(names.map((name) => [name, null]));
     if (names.length === 0) return values;
     const data = unwrap(
-      await this.request('GetParameterValues', { parameterNames: names }),
-      'GetParameterValues',
+      await this.request('Live2DParameterListRequest', {}),
+      'Live2DParameterListRequest',
     );
-    const list = collectModelParameters(
-      data.parameterValues ?? data.parameters ?? data.live2DModelParameters,
-    );
-    const byName = new Map(list.map((entry) => [normalizeName(entry.name), entry.value]));
+    const list = data.live2DModelParameters ?? data.live2DParameters ?? data.parameters;
+    const byName = new Map();
+    for (const entry of Array.isArray(list) ? list : []) {
+      const entryName = normalizeName(entry?.name ?? entry?.id);
+      if (entryName.length === 0) continue;
+      const value = Number(entry?.value);
+      byName.set(entryName, Number.isFinite(value) ? value : null);
+    }
     for (const name of names) {
       const value = byName.get(normalizeName(name));
       if (Number.isFinite(value)) values[name] = value;

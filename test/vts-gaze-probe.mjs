@@ -4,11 +4,13 @@
  * Run: node --test test/vts-gaze-probe.mjs
  *
  * The fake here is a `client.request` stub, not a WebSocket server: every VTS answer the probe
- * consumes (GetParameterValues, InjectParameterDataRequest) is exercised through the real
+ * consumes (Live2DParameterListRequest, InjectParameterDataRequest) is exercised through the real
  * VtsClient.probeInputMapping() code path, including its 80 ms wait, its frame-loop pause flag and
- * its best-effort restore to 0. The capability test drives the real discoverCapabilities() with a
- * stub probe function, so the rule under test is "only changed:true keeps verified; a failed probe
- * marks the channel mappingUnverified but never removes it".
+ * its best-effort restore to 0. The stub rejects every unsupported message with `Unknown message
+ * type`, so the removed (non-existent) GetParameterValues fallback cannot pass silently.
+ * The capability test drives the real discoverCapabilities() with a stub probe function, so the
+ * rule under test is "only changed:true keeps verified; a failed probe marks the channel
+ * mappingUnverified but never removes it".
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -27,8 +29,10 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 /**
  * A client whose transport is a request stub. `mapped:false` models an input that VTS accepts but
  * whose value does not reach any model parameter (the exact false positive a name rule produces).
+ * The only legitimate read is Live2DParameterListRequest; anything else is an Unknown message type
+ * APIError, exactly like VTS.
  */
-function createProbeClient({ mapped = true, failOn = '', values = {} } = {}) {
+function createProbeClient({ mapped = true, failOn = '', apiErrorOn = '', values = {} } = {}) {
   const client = new VtsClient({ tokenPath: 'unused-token.json' });
   // `connected` is a getter over socket.readyState; a plain OPEN sentinel is enough because every
   // request is served by the stub below and no real socket is created.
@@ -44,12 +48,23 @@ function createProbeClient({ mapped = true, failOn = '', values = {} } = {}) {
       error.code = 'PROBE_TEST_TIMEOUT';
       throw error;
     }
-    if (messageType === 'GetParameterValues') {
+    if (apiErrorOn === messageType) {
       return {
-        messageType: 'GetParameterValuesResponse',
+        messageType: 'APIError',
+        data: { errorID: 100, message: `${messageType} failed: model is not loaded` },
+      };
+    }
+    if (messageType === 'Live2DParameterListRequest') {
+      return {
+        messageType: 'Live2DParameterListResponse',
         data: {
-          parameterValues: (Array.isArray(data.parameterNames) ? data.parameterNames : [])
-            .map((name) => ({ name, value: params[name] ?? null })),
+          live2DModelParameters: Object.entries(params).map(([name, value]) => ({
+            name,
+            value,
+            min: -1,
+            max: 1,
+            defaultValue: 0,
+          })),
         },
       };
     }
@@ -62,7 +77,10 @@ function createProbeClient({ mapped = true, failOn = '', values = {} } = {}) {
       }
       return { messageType: 'InjectParameterDataResponse', data: {} };
     }
-    throw new Error(`unexpected request ${messageType}`);
+    return {
+      messageType: 'APIError',
+      data: { errorID: 100, message: `Unknown message type: ${messageType}` },
+    };
   };
 
   return { client, requests, params };
@@ -89,6 +107,15 @@ test('1. before/after 参数变化 → changed:true', async () => {
   assert.ok(Math.abs(result.after.ParamEyeBallX - 0.5) < 1e-9);
   assert.ok(result.delta.ParamEyeBallX > 0.01, `delta ${result.delta.ParamEyeBallX} exceeds the threshold`);
   assert.equal(result.error, '');
+  assert.equal(fake.requests.filter((entry) => entry.messageType === 'Live2DParameterListRequest').length, 2,
+    'both before and after values came from the official Live2DParameterListRequest');
+  assert.equal(fake.requests.some((entry) => entry.messageType === 'GetParameterValues'), false,
+    'the non-existent GetParameterValues message is never sent');
+  // The fake rejects unsupported messages the way VTS does; a fallback would surface this as a
+  // failed read instead of silently continuing.
+  const unsupported = await fake.client.request('GetParameterValues', {});
+  assert.equal(unsupported.messageType, 'APIError');
+  assert.match(unsupported.data.message, /Unknown message type/u);
   console.log(`     changed=${result.changed} before=${result.before.ParamEyeBallX}`
     + ` after=${result.after.ParamEyeBallX} delta=${result.delta.ParamEyeBallX}`);
 });
@@ -127,9 +154,9 @@ test('3. 探测结束后恢复 input=0（after 之后）', async () => {
 
   const sent = fake.requests.map((entry) => entry.messageType);
   assert.deepEqual(sent, [
-    'GetParameterValues',
+    'Live2DParameterListRequest',
     'InjectParameterDataRequest',
-    'GetParameterValues',
+    'Live2DParameterListRequest',
     'InjectParameterDataRequest',
   ], 'read → inject → read → restore');
   const sentInjections = injections(fake.requests);
@@ -143,8 +170,8 @@ test('3. 探测结束后恢复 input=0（after 之后）', async () => {
 // ---------------------------------------------------------------------------------------------
 // 4. timeouts / VTS errors / no connection never throw
 // ---------------------------------------------------------------------------------------------
-test('4. 超时/错误安全返回 ok:false，不抛异常', async () => {
-  const readFailure = createProbeClient({ failOn: 'GetParameterValues' });
+test('4. 超时/API 错误/错误响应安全返回 ok:false，不抛异常', async () => {
+  const readFailure = createProbeClient({ failOn: 'Live2DParameterListRequest' });
   const readResult = await readFailure.client.probeInputMapping({
     inputName: 'EyeRightX',
     parameterNames: ['ParamEyeBallX'],
@@ -153,6 +180,16 @@ test('4. 超时/错误安全返回 ok:false，不抛异常', async () => {
   assert.match(readResult.error, /timed out/u);
   assert.equal(readResult.changed, false);
   assert.equal(injections(readFailure.requests).length, 0, 'no injection after a failed before-read');
+
+  const apiFailure = createProbeClient({ apiErrorOn: 'Live2DParameterListRequest' });
+  const apiResult = await apiFailure.client.probeInputMapping({
+    inputName: 'EyeRightX',
+    parameterNames: ['ParamEyeBallX'],
+  });
+  assert.equal(apiResult.ok, false, 'an APIError read is reported as data');
+  assert.match(apiResult.error, /model is not loaded/u);
+  assert.equal(apiResult.changed, false);
+  assert.equal(injections(apiFailure.requests).length, 0, 'no injection after a failed API read');
 
   const injectFailure = createProbeClient({ failOn: 'InjectParameterDataRequest' });
   const injectResult = await injectFailure.client.probeInputMapping({
@@ -179,8 +216,8 @@ test('4. 超时/错误安全返回 ok:false，不抛异常', async () => {
   const invalid = await disconnected.probeInputMapping({ inputName: '', parameterNames: [] });
   assert.equal(invalid.ok, false);
   assert.match(invalid.error, /inputName/u);
-  console.log(`     read=${readResult.error.slice(0, 40)} inject=${injectResult.error.slice(0, 40)}`
-    + ` offline=${offline.error} invalid=${invalid.error}`);
+  console.log(`     read=${readResult.error.slice(0, 40)} api=${apiResult.error.slice(0, 40)}`
+    + ` inject=${injectResult.error.slice(0, 40)} offline=${offline.error} invalid=${invalid.error}`);
 });
 
 // ---------------------------------------------------------------------------------------------

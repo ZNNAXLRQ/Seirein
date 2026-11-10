@@ -215,6 +215,14 @@ async function createFakeVts() {
     messageType: `${String(request.messageType).replace(/Request$/u, '')}Response`,
     data,
   });
+  // VTS answers an unsupported message with APIError, not with a fake success response.
+  const respondApiError = (socket, request, message) => send(socket, {
+    apiName: 'VTubeStudioPublicAPI',
+    apiVersion: '1.0',
+    requestID: request.requestID,
+    messageType: 'APIError',
+    data: { errorID: 100, message },
+  });
 
   wss.on('connection', (socket) => {
     socket.on('message', (raw) => {
@@ -253,8 +261,20 @@ async function createFakeVts() {
         case 'Live2DParameterListRequest':
           respond(socket, request, {
             live2DModelParameters: [
-              { name: 'ParamEyeBallX', min: -1, max: 1, defaultValue: 0 },
-              { name: 'ParamEyeBallY', min: -1, max: 1, defaultValue: 0 },
+              {
+                name: 'ParamEyeBallX',
+                value: state.params.ParamEyeBallX,
+                min: -1,
+                max: 1,
+                defaultValue: 0,
+              },
+              {
+                name: 'ParamEyeBallY',
+                value: state.params.ParamEyeBallY,
+                min: -1,
+                max: 1,
+                defaultValue: 0,
+              },
             ],
           });
           return;
@@ -263,13 +283,6 @@ async function createFakeVts() {
           respond(socket, request, {
             subscribedEventCount: 1,
             subscribedEvents: [eventName],
-          });
-          return;
-        }
-        case 'GetParameterValues': {
-          const names = Array.isArray(request.data?.parameterNames) ? request.data.parameterNames : [];
-          respond(socket, request, {
-            parameterValues: names.map((name) => ({ name, value: state.params[name] ?? 0 })),
           });
           return;
         }
@@ -283,7 +296,7 @@ async function createFakeVts() {
           return;
         }
         default:
-          respond(socket, request, {});
+          respondApiError(socket, request, `Unknown message type: ${request.messageType}`);
       }
     });
   });
@@ -397,12 +410,13 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
   }, 5000, 50);
   assert.equal(ready, true, 'discovery handed both gaze channels to the runtime');
 
-  // Discovery (the default path) is read-only: no probe readings before the explicit click.
-  assert.equal(
-    fake.requests.filter((entry) => entry.messageType === 'GetParameterValues').length,
-    0,
-    'capability discovery did not probe the mapping automatically',
-  );
+  // Discovery (the default path) is read-only: it reads the model parameter list once, and it does
+  // not keep reading values (the probe's before/after pattern) until the explicit click.
+  const reads = () => fake.requests.filter((entry) => entry.messageType === 'Live2DParameterListRequest').length;
+  const readsAfterDiscovery = reads();
+  await sleep(120);
+  assert.equal(reads(), readsAfterDiscovery,
+    'capability discovery did not run an automatic parameter-value probe');
   const beforeStatus = await host.status();
   assert.deepEqual(beforeStatus.avatar.mapping, {
     lastAt: null,
@@ -411,6 +425,7 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
     unverified: [],
   }, 'no probe record yet');
 
+  const readsBeforeAction = reads();
   const result = await host.callRoute('/assistant/action', { body: { action: 'avatar.mapping.probe' } });
   assert.equal(result.ok, true, `probe action completed (${result.error ?? ''})`);
   assert.equal(result.channels.gazeX.changed, true);
@@ -445,12 +460,11 @@ test('4. 宿主 action/status：显式触发一次、事件仅结果字段、默
   assert.equal(JSON.stringify(event.payload).includes(host.root), false);
 
   // Exactly one click = one measurement pass; status reads never re-probe.
-  const reads = () => fake.requests.filter((entry) => entry.messageType === 'GetParameterValues').length;
-  const afterActionReads = reads();
+  const afterActionReads = reads() - readsBeforeAction;
   assert.equal(afterActionReads, 4, 'two channels × before/after reads, no retry inside one click');
   await sleep(120);
   await host.status();
-  assert.equal(reads(), afterActionReads, 'status/action did not retry or poll the probe');
+  assert.equal(reads() - readsBeforeAction, afterActionReads, 'status/action did not retry or poll the probe');
 
   console.log(`4) lastAt=${result.lastAt} changed=${result.channels.gazeX.changed ? 'gazeX' : ''}`
     + `${result.channels.gazeY.changed ? ',gazeY' : ''} unverified=${result.unverified.join(',')}`

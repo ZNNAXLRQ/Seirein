@@ -562,6 +562,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * motion pump) so a probe can never race a frame started by the facade. It is always cleared.
    */
   let gazeProbeActive = false;
+  /**
+   * Sequence of explicit gaze probes that actually started measuring. A newer probe supersedes an
+   * older one: the older probe's late result may not overwrite the evidence of the newer probe.
+   */
+  let gazeProbeSeq = 0;
 
   // The core reads `inputs` at write time, so this object can be mutated after connect() when a
   // transport discovers the model's input map. `mouthInput` itself is always null here; the
@@ -1850,6 +1855,72 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
+   * Element-wise equality for a captured target parameter list. Order is part of the capture: a
+   * re-discovery that reorders the same names is a new mapping generation anyway.
+   */
+  function sameNameList(left, right) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Why a finished gaze probe may no longer describe the live mapping. The connection epoch, the
+   * mapping generation and every probed channel's input/model parameters are captured before the
+   * measurement; any drift means the late evidence belongs to a mapping that is no longer current.
+   */
+  function gazeProbeStaleReason(captured) {
+    if (state.disposed === true) return 'disposed';
+    if (state.connected !== true) return 'disconnected';
+    if (state.generation !== captured.generation
+      || state.connectionGeneration !== captured.connectionGeneration) {
+      return 'connection-changed';
+    }
+    if (gazeProbeSeq !== captured.probeSeq) return 'superseded';
+    if (channelApplySeq !== captured.mappingGeneration) return 'mapping-changed';
+    for (const [channel, target] of captured.channels) {
+      const binding = channelState.bindings.get(channel);
+      if (binding === undefined) return 'binding-changed';
+      if (binding.inputName !== target.inputName) return 'binding-changed';
+      const modelParams = Array.isArray(binding.modelParams) ? binding.modelParams : [];
+      if (!sameNameList(modelParams, target.modelParams)) return 'binding-changed';
+    }
+    return '';
+  }
+
+  /**
+   * A late probe keeps its diagnostic data under `discardedChannels`, but exposes no applicable
+   * evidence: an empty `channels`/`mappingUnverified` can never verify or unverify anything.
+   */
+  function discardGazeProbeResult(result, reason) {
+    const discardedChannels = {};
+    for (const [channel, row] of Object.entries(result?.channels ?? {})) {
+      discardedChannels[channel] = {
+        inputName: String(row?.inputName ?? ''),
+        parameterNames: (Array.isArray(row?.parameterNames) ? row.parameterNames : [])
+          .map((name) => String(name)),
+        changed: row?.changed === true,
+        delta: row?.delta !== null && typeof row?.delta === 'object' ? { ...row.delta } : {},
+        error: String(row?.error ?? ''),
+      };
+    }
+    return {
+      ...result,
+      ok: false,
+      stale: true,
+      staleReason: reason,
+      discarded: reason,
+      applied: false,
+      channels: {},
+      mappingUnverified: [],
+      discardedChannels,
+      error: String(result?.error ?? '') || `mapping probe discarded: ${reason}`,
+    };
+  }
+
+  /**
    * Explicit production entry: prove `gazeX`/`gazeY` at runtime by injecting one value and reading
    * the target model parameters before/after. This is never called by discovery or a timer.
    *
@@ -1860,7 +1931,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * `changed:false`, a timeout or an error marks it unverified but NEVER removes the binding.
    *
    * Expected failures are data: the method never throws and always returns the public shape
-   * `{ok, channels:{gazeX,gazeY}, mappingUnverified, at, error}`.
+   * `{ok, channels:{gazeX,gazeY}, mappingUnverified, at, error}`. A result whose captured
+   * connection/mapping/target no longer matches is returned with `stale:true` and
+   * `discarded:<reason>` instead; it carries no applicable channel evidence.
    */
   async function probeGazeMapping() {
     const at = () => new Date(clockNow()).toISOString();
@@ -1895,6 +1968,19 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       : (typeof userConfig.probeInputMapping === 'function' ? userConfig.probeInputMapping : null);
     if (probe === null) return failure('probeInputMapping 不可用');
 
+    // Capture the exact context this measurement is evidence for. A mapping/connection change
+    // while the probe runs (or a newer probe) invalidates the result before it is written back.
+    const captured = {
+      generation: state.generation,
+      connectionGeneration: state.connectionGeneration,
+      mappingGeneration: channelApplySeq,
+      probeSeq: (gazeProbeSeq += 1),
+      channels: new Map(rows.map((row) => [row.channel, {
+        inputName: row.inputName,
+        modelParams: [...row.modelParams],
+      }])),
+    };
+
     const previousProbeActive = transportProbeActive();
     let result;
     try {
@@ -1922,6 +2008,18 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       if (frameWritesPaused() !== true) pumpMotion();
     }
     if (result === null || result === undefined) result = failure('gaze mapping probe failed');
+
+    // Stale evidence is thrown away before it can touch verified/controlled or mark a channel
+    // unverified. A newer result (or the mapping/connection it belongs to) wins.
+    const staleReason = gazeProbeStaleReason(captured);
+    if (staleReason !== '') {
+      appendLog('debug', 'avatar.mapping.probe.discarded', {
+        event: 'avatar.mapping.probe.discarded',
+        reason: staleReason,
+        channels: rows.map((row) => row.channel),
+      });
+      return discardGazeProbeResult(result, staleReason);
+    }
 
     // Apply the evidence to the takeover set. The binding is updated in place, never removed: a
     // diagnostic failure means "not proven", not "the eye channel cannot be driven".
@@ -4755,6 +4853,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     connectionOwner = 0;
     state.connected = true;
     state.generation += 1;
+    // A connection is a new mapping generation too: a probe started on the old socket (or before
+    // its mappings were re-applied) can never be mistaken for evidence about this one.
+    channelApplySeq += 1;
     // Phase 2: a fresh connection opens the observation gate (unless the motion gate is locked);
     // the next tick advances the counters.
     inner.setBaseActivityEnabled(motionLocked !== true);

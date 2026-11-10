@@ -223,6 +223,14 @@ async function createFakeVts() {
     messageType: `${String(request.messageType).replace(/Request$/u, '')}Response`,
     data,
   });
+  // VTS answers an unsupported message with APIError, not with a fake success response.
+  const respondApiError = (socket, request, message) => send(socket, {
+    apiName: 'VTubeStudioPublicAPI',
+    apiVersion: '1.0',
+    requestID: request.requestID,
+    messageType: 'APIError',
+    data: { errorID: 100, message },
+  });
 
   wss.on('connection', (socket) => {
     socket.on('message', (raw) => {
@@ -253,18 +261,29 @@ async function createFakeVts() {
           respond(socket, request, { defaultParameters: INPUTS, customParameters: [] });
           return;
         case 'Live2DParameterListRequest':
-          respond(socket, request, { live2DModelParameters: MODEL_PARAMS });
+          respond(socket, request, {
+            live2DModelParameters: [
+              {
+                name: 'ParamEyeBallX',
+                value: state.params.ParamEyeBallX,
+                min: -1,
+                max: 1,
+                defaultValue: 0,
+              },
+              {
+                name: 'ParamEyeBallY',
+                value: state.params.ParamEyeBallY,
+                min: -1,
+                max: 1,
+                defaultValue: 0,
+              },
+            ],
+          });
           return;
         case 'EventSubscriptionRequest':
           respond(socket, request, {
             subscribedEventCount: 1,
             subscribedEvents: [String(request.data?.eventName ?? 'ModelLoadedEvent')],
-          });
-          return;
-        case 'GetParameterValues':
-          respond(socket, request, {
-            parameterValues: (Array.isArray(request.data?.parameterNames) ? request.data.parameterNames : [])
-              .map((name) => ({ name, value: state.params[name] ?? 0 })),
           });
           return;
         case 'InjectParameterDataRequest':
@@ -274,7 +293,7 @@ async function createFakeVts() {
           respond(socket, request, {});
           return;
         default:
-          respond(socket, request, {});
+          respondApiError(socket, request, `Unknown message type: ${request.messageType}`);
       }
     });
   });
