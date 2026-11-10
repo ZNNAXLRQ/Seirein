@@ -108,17 +108,29 @@ export function hasVoiceNativeTools(definition) {
  * @param {object|null} standard - registry definition of the standard preset.
  * @returns {object} base when no standard rows exist, otherwise a merged declaration.
  */
-export function mergeVoicePresetWithNativeTools(base, standard) {  const source = Array.isArray(standard?.plugins) ? standard.plugins : [];
-  const native = source.filter((row) => {
-    if (row === null || typeof row !== 'object') return false;
+export function mergeVoicePresetWithNativeTools(base, standard) {
+  const source = Array.isArray(standard?.plugins) ? standard.plugins : [];
+  const excluded = (row) => {
+    if (row === null || typeof row !== 'object') return true;
     const id = typeof row.id === 'string' ? row.id : '';
-    const name = typeof row.name === 'string' ? row.name : '';
-    return !VOICE_NATIVE_EXCLUDED_IDS.includes(id)
-      && !name.includes('/dsh-persona')
-      && !name.includes('/dsh-agent-instructions')
-      && !name.includes('/dsh-plan-mode')
-      && !name.includes('/dsh-compaction-');
-  });
+    const name = packageNameOf(row);
+    return VOICE_NATIVE_EXCLUDED_IDS.includes(id)
+      || name.includes('/dsh-persona')
+      || name.includes('/dsh-agent-instructions')
+      || name.includes('/dsh-plan-mode')
+      || name.includes('/dsh-compaction-');
+  };
+  // Recursive: a persona row must be removed even when a release renames or nests its group.
+  // All other row keys (disabled, isolate, config) are copied so group semantics survive.
+  const filterRow = (row) => {
+    if (excluded(row)) return null;
+    const copy = { ...row };
+    if (Array.isArray(row.config)) {
+      copy.config = row.config.map(filterRow).filter((entry) => entry !== null);
+    }
+    return copy;
+  };
+  const native = source.map(filterRow).filter((row) => row !== null);
   if (native.length === 0) return base;
   return {
     ...base,
@@ -184,42 +196,70 @@ const packageNameOf = (row) => (typeof row?.name === 'string' ? row.name.trim() 
  * @returns {{compatible: boolean, reason: string, plugins: string[], missing: string[], extras: string[]}}
  */
 export function assessVoiceCompactionPreset(definition, { allowNativeTools = false } = {}) {
-  const nativeComposition = allowNativeTools === true && hasVoiceNativeTools(definition);
-  const leaves = [];
   const extras = [];
-  const addExtra = (value) => {
-    if (!nativeComposition) extras.push(value);
-  };
+  const leaves = [];
+  const addExtra = (value) => extras.push(value);
   for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
     if (definition?.[key] !== undefined) addExtra(`preset:${key}`);
   }
   if (!Array.isArray(definition?.plugins)) {
     return { compatible: false, reason: '无法读取 preset 定义内容（缺少 plugins）', plugins: [], missing: [], extras };
   }
-  const walk = (list, depth) => {
-    if (!Array.isArray(list) || depth > 4) return;
+
+  const hasExtraKeys = (row, label) => {
+    for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
+      if (row?.[key] !== undefined) addExtra(`${label}:${key}`);
+    }
+  };
+  const compactionGroups = [];
+  const nativeGroups = [];
+  const otherTop = [];
+  for (const row of definition.plugins) {
+    if (row === null || typeof row !== 'object') {
+      addExtra('插件:?');
+      continue;
+    }
+    hasExtraKeys(row, 'plugin');
+    if (row.id === 'compaction' && row.group === true) compactionGroups.push(row);
+    else if (row.id === 'seirein-native-tools' && row.group === true) nativeGroups.push(row);
+    else otherTop.push(row);
+  }
+  // The marker only marks the inherited group; every other top-level row is still audited.
+  for (const row of otherTop) addExtra(`插件:${packageNameOf(row) || row.id || '?'}`);
+  if (compactionGroups.length !== 1) addExtra('compaction-group-count');
+  if (nativeGroups.length > 1) addExtra('native-group-count');
+  if (nativeGroups.length > 0 && allowNativeTools !== true) addExtra('native-tools-not-allowed');
+
+  const walk = (list, depth, { native = false } = {}) => {
+    if (!Array.isArray(list) || depth > 6) return;
     for (const row of list) {
       if (row === null || typeof row !== 'object') {
         addExtra('插件:?');
         continue;
       }
+      hasExtraKeys(row, native ? 'native' : 'plugin');
       if (row.group === true) {
-        for (const key of VOICE_COMPACTION_EXTRA_KEYS) {
-          if (row[key] !== undefined) addExtra(`group:${key}`);
-        }
-        walk(row.config, depth + 1);
+        walk(row.config, depth + 1, { native });
         continue;
       }
       const name = packageNameOf(row);
       if (name.length === 0) {
-        const label = typeof row.id === 'string' && row.id.length > 0 ? row.id : '?';
-        addExtra(`插件:${label}(无包名)`);
+        addExtra(`插件:${typeof row.id === 'string' && row.id.length > 0 ? row.id : '?'}(无包名)`);
+        continue;
+      }
+      if (native) {
+        if (name.includes('/dsh-persona') || name.includes('/dsh-agent-instructions')
+          || name.includes('/dsh-plan-mode') || name.includes('/dsh-compaction-')) {
+          addExtra(`native:${name}`);
+        }
         continue;
       }
       leaves.push(name);
     }
   };
-  walk(definition.plugins, 0);
+  for (const group of compactionGroups) walk(group.config, 1);
+  for (const group of nativeGroups) walk(group.config, 1, { native: true });
+
   const allowed = new Set([...VOICE_COMPACTION_REQUIRED_PLUGINS, ...VOICE_COMPACTION_OPTIONAL_PLUGINS]);
   const missing = VOICE_COMPACTION_REQUIRED_PLUGINS.filter((name) => !leaves.includes(name));
   for (const name of leaves) {
@@ -428,7 +468,7 @@ export function createVoiceCompaction({
     }
 
     /** Reuse only an audited-compatible declaration; anything else is an explicit conflict. */
-    const adoptExisting = (record) => {
+    const adoptExisting = (record, standard = null) => {
       // The registry record wraps the definition; auditing the wrapper would always see a missing
       // `plugins` and misreport a fully compatible preset as a conflict.
       const definition = definitionOf(record);
@@ -446,17 +486,30 @@ export function createVoiceCompaction({
         note('voice.compaction.preset.conflict', { presetId, source, reason: audit.reason });
         return presetState;
       }
+      const nativeTools = hasVoiceNativeTools(definition);
       presetState = {
         status: 'reused', source, registered: false, error: null, reason: null,
-        at: Date.now(), nativeTools: hasVoiceNativeTools(definition),
+        at: Date.now(),
+        nativeTools,
+        nativeToolsSource: nativeTools ? 'reused-standard' : 'compaction-only',
+        // Reuse never re-reads standard. A compact-only declaration is therefore visibly behind
+        // the current standard definition; a reused native declaration cannot prove its version.
+        nativeToolsStale: nativeTools ? null : standard !== null,
       };
-      note('voice.compaction.preset.reused', { presetId, source, plugins: audit.plugins });
+      note('voice.compaction.preset.reused', {
+        presetId, source, plugins: audit.plugins,
+        nativeTools, nativeToolsStale: presetState.nativeToolsStale,
+      });
       return presetState;
     };
 
     const run = (async () => {
       const existing = await readExisting(presets);
-      if (existing !== undefined) return adoptExisting(existing);
+      if (existing !== undefined) {
+        let standardRecord = null;
+        try { standardRecord = await readPresetById(presets, 'standard'); } catch { standardRecord = null; }
+        return adoptExisting(existing, definitionOf(standardRecord));
+      }
       if (typeof presets.register !== 'function') {
         presetState = {
           status: 'failed',
@@ -489,11 +542,14 @@ export function createVoiceCompaction({
         presetState = {
           status: 'registered', source: 'registered', registered: true,
           error: null, reason: null, at: Date.now(), nativeTools,
+          nativeToolsSource: nativeTools ? 'standard-live' : 'compaction-only',
+          nativeToolsStale: false,
         };
         note('voice.compaction.preset.registered', {
           presetId,
           source: 'registered',
           nativeTools,
+          nativeToolsSource: presetState.nativeToolsSource,
           plugins: Array.isArray(effective?.plugins) ? effective.plugins.length : 0,
         });
       } catch (error) {

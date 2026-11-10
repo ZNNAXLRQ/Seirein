@@ -76,6 +76,29 @@ test('audit accepts a marked native composition but still rejects arbitrary extr
     plugins: [...VOICE_COMPACTION_PRESET.plugins, { id: 'x', name: '@deepseek-ai/dsh-tool-fs' }],
   };
   assert.equal(assessVoiceCompactionPreset(arbitrary).compatible, false);
+  const tampered = {
+    ...merged,
+    permissions: { allow: ['*'] },
+    plugins: [...merged.plugins, { id: 'other', name: '@deepseek-ai/dsh-tool-pwsh' }],
+  };
+  assert.equal(assessVoiceCompactionPreset(tampered, { allowNativeTools: true }).compatible, false);
+});
+
+test('recursive filter removes a persona hidden in a renamed nested group', () => {
+  const nested = {
+    id: 'standard', plugins: [{
+      id: 'renamed-wrapper', group: true,
+      config: [{
+        id: 'inner', group: true,
+        config: [{ id: 'persona', name: '@deepseek-ai/dsh-persona' }],
+      }, { id: 'tool-todo', name: '@deepseek-ai/dsh-tool-todo' }],
+    }],
+  };
+  const merged = mergeVoicePresetWithNativeTools(VOICE_COMPACTION_PRESET, nested);
+  assert.equal(hasVoiceNativeTools(merged), true);
+  const serialized = JSON.stringify(merged);
+  assert.equal(serialized.includes('dsh-persona'), false);
+  assert.equal(serialized.includes('dsh-tool-todo'), true);
 });
 
 test('registration reads the standard preset at runtime and registers the merged declaration', async () => {
@@ -122,3 +145,25 @@ test('without a standard definition the compaction-only fallback still registers
   assert.equal(state.nativeTools, false);
   assert.deepEqual(registered.plugins.map((row) => row.id), ['compaction']);
 });
+
+test('an existing compaction-only declaration is reported as stale instead of silently upgraded', async () => {
+  const presets = {
+    definitions: new Map([
+      ['seirein-voice', { config: VOICE_COMPACTION_PRESET }],
+      ['standard', { config: standard }],
+    ]),
+    has(id) { return this.definitions.has(id); },
+    async register() { throw new Error('reuse must not register'); },
+  };
+  const engine = createVoiceCompaction({
+    getService: (name) => (name === 'agentPresets' ? presets : undefined),
+    presetDefinition: VOICE_COMPACTION_PRESET,
+    now: () => 1,
+  });
+  const state = await engine.ensurePreset(presets);
+  assert.equal(state.status, 'reused');
+  assert.equal(state.nativeTools, false);
+  assert.equal(state.nativeToolsSource, 'compaction-only');
+  assert.equal(state.nativeToolsStale, true);
+});
+
