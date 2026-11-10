@@ -174,13 +174,55 @@ export const POSTURE_COMPONENT_MAX_MS = 20_000;
 
 /**
  * Semantic amplitude band of one component. ONE SEMANTIC UNIT = 30° (the writer's documented
- * convention), so 0.12–0.15 = 3.6–4.5°. The band is deliberately kept close to the cap: the
+ * convention), so 0.15–0.40 = 4.5–12°. The band is deliberately kept close to the cap: the
  * component target must still be recognisable after the live persona/status gain is folded in.
  * The cap is applied to the COMPONENT TARGET after the gain is known; this layer never multiplies a
  * global "visibility" gain on top of the instant output (base micro-motion stays as light as before).
  */
-export const POSTURE_COMPONENT_MIN_AMPLITUDE = 0.12;
-export const POSTURE_COMPONENT_MAX_AMPLITUDE = 0.15;
+export const POSTURE_COMPONENT_MIN_AMPLITUDE = 0.15;
+export const POSTURE_COMPONENT_MAX_AMPLITUDE = 0.40;
+
+/**
+ * Trial degree targets per component axis, BEFORE the live persona gain is cancelled. These are
+ * the starting points, not a universal standard: ordinary posture is 5–12°, a deliberate lean or
+ * look-back is allowed to sit near the top of that band. headX and headZ deliberately use
+ * different values: a yaw turn and a roll lean are not the same physical motion.
+ *
+ * The per-axis model range is applied separately (`HEAD_CHANNEL_DEGREE_LIMITS`), never by reusing
+ * headX's ±30° range for headZ.
+ */
+export const POSTURE_COMPONENT_DEGREE_BANDS = Object.freeze({
+  natural: Object.freeze({
+    headX: Object.freeze({ min: 1, max: 2 }),
+    headY: Object.freeze({ min: 0, max: 0 }),
+    headZ: Object.freeze({ min: 5, max: 8 }),
+  }),
+  'lean-left': Object.freeze({
+    headX: Object.freeze({ min: 1, max: 3 }),
+    headY: Object.freeze({ min: 0, max: 0 }),
+    headZ: Object.freeze({ min: 8, max: 12 }),
+  }),
+  'lean-right': Object.freeze({
+    headX: Object.freeze({ min: -3, max: -1 }),
+    headY: Object.freeze({ min: 0, max: 0 }),
+    headZ: Object.freeze({ min: -12, max: -8 }),
+  }),
+  'look-back': Object.freeze({
+    headX: Object.freeze({ min: 8, max: 12 }),
+    headY: Object.freeze({ min: 0, max: 3 }),
+    headZ: Object.freeze({ min: 2, max: 5 }),
+  }),
+});
+
+/**
+ * Per-axis safety ranges for head angles. headX/headY are the documented ±30° VTS tracking
+ * ranges; headZ (FaceAngleZ) is ±90° and must NOT be clamped by the yaw/pitch budget.
+ */
+export const HEAD_CHANNEL_DEGREE_LIMITS = Object.freeze({
+  headX: 30,
+  headY: 30,
+  headZ: 90,
+});
 
 /**
  * A component target is expressed as a pose-unit offset inserted into the SAME `posture.target` the
@@ -190,8 +232,8 @@ export const POSTURE_COMPONENT_MAX_AMPLITUDE = 0.15;
  * POSTURE_COMPONENT_MAX_AMPLITUDE. `POSTURE_COMPONENT_TARGET_LIMIT` is the post-add bound for the
  * combined base + component goal (base stays in ±1, so it only leaves room for the offset).
  */
-export const POSTURE_COMPONENT_AXIS_LIMIT = 64;
-export const POSTURE_COMPONENT_TARGET_LIMIT = 72;
+export const POSTURE_COMPONENT_AXIS_LIMIT = 1024;
+export const POSTURE_COMPONENT_TARGET_LIMIT = 1100;
 
 /**
  * The phase-1 component library. `headX/headY/headZ` are normalized shape weights: the selected
@@ -520,10 +562,11 @@ export const OCCASIONAL_ACTION = Object.freeze({
 
 /**
  * Phase 2 base activity: one head-channel change below this (pose units, 1 = 30°) is not counted as
- * "the head really moved". 1e-4 ≈ 0.003°, well under one rendered pixel of head rotation, but
- * above floating-point noise on a held/zero curve.
+ * "the head really moved". 1e-6 ≈ 0.00003°, well under one rendered pixel of head rotation, but
+ * above floating-point noise on a held/zero curve. It is deliberately small enough that the slow
+ * continuous drift counts as real base activity in status.
  */
-const HEAD_ACTIVITY_EPSILON = 1e-4;
+const HEAD_ACTIVITY_EPSILON = 1e-6;
 
 /**
  * Phase 2 scope (explicit): this layer only OBSERVES the activity that already exists and reports
@@ -576,15 +619,15 @@ export const EXPRESSION_MOTION = Object.freeze({
 
 
 /**
- * The 14° head budget in SEMANTIC units (1 unit = 30°). Every head channel shares it; the roll is
- * the one axis whose VTS input range is far wider (±90), so a composed roll could otherwise ask for
- * 30°+ on the wire. It is capped HERE, on the semantic pose, before the writer: the input layer is
- * never used as the clamp.
+ * The head-roll safety bound in SEMANTIC units (1 unit = 30°). This is the model's own ±90° roll
+ * range, deliberately separate from the 14° expression budget: a preset lean may use the roll's
+ * real range while an expression stays small. It is capped HERE, on the semantic pose, before the
+ * writer: the input layer is never used as the clamp.
  */
-const HEAD_ROLL_CAP = EXPRESSION_MOTION.MAX_HEAD_DEGREES / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+const HEAD_ROLL_CAP = HEAD_CHANNEL_DEGREE_LIMITS.headZ / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
 
 
-/** Clamp a semantic head-roll value to the shared 14° head budget. */
+/** Clamp a semantic head-roll value to the model's ±90° roll range. */
 const clampHeadRoll = (value) => Math.max(-HEAD_ROLL_CAP, Math.min(HEAD_ROLL_CAP, finite(value, 0)));
 
 
@@ -704,8 +747,8 @@ const applyVisibleFloor = (raw, floor, ratio = INTENT_VISIBILITY.FLOOR_RATIO) =>
  * idle sway, so `idleSwayScale: 0` (an explicit "no idle sway") stays exactly still.
  */
 export const HOLD_MICRO_DRIFT = Object.freeze({
-  DEGREES: 1,
-  FREQUENCY_HZ: 0.05,
+  DEGREES: 1.1,
+  FREQUENCY_HZ: 0.04,
 });
 
 
@@ -936,7 +979,7 @@ export const PRESET_SWAY = Object.freeze({
   /** Fallback when the model verifies no headZ: keep a small yaw-only sway, never the full nominal. */
   YAW_ONLY_SCALE: 0.5,
   /**
-   * Planned roll peak. The final semantic pose still has the shared 14° cap; leaving room for the
+   * Planned roll peak. The final semantic pose still has the ±90° roll safety bound; leaving room for the
    * idle micro-motion (same 0.2 arbitration ratio as the occasional roll) keeps the sway smooth
    * instead of flat-topping at the clamp.
    */
@@ -959,11 +1002,24 @@ export const PRESET_SWAY = Object.freeze({
 });
 
 /**
- * One symbolic operation → the trajectory the executor generates. `amount` is in semantic pose
- * units at persona amplitude 1 (one unit = 30° for head channels); it is scaled by the persona
- * style and the room left in the chosen direction at execution time. Nothing here is a VTS
- * parameter name and nothing asserts a visible minimum.
+ * Human-visible degree targets for complete head operations. These are TRIAL starting points,
+ * not a universal standard: an ordinary preset lands in 10–20°, while a lean / look-back /
+ * expressive operation is allowed a larger, per-operation band instead of one shared 45° figure.
+ * `headX` and `headZ` are separate axes with separate safety ranges; the executor still applies
+ * model headroom and records the final target it could really plan.
  */
+export const PRESET_OPERATION_DEGREE_RANGES = Object.freeze({
+  'head-turn': Object.freeze({ min: 14, max: 20 }),
+  'head-tilt': Object.freeze({ min: 13, max: 18 }),
+  'head-lower': Object.freeze({ min: 13, max: 18 }),
+  'head-lift': Object.freeze({ min: 13, max: 18 }),
+  nod: Object.freeze({ min: 13, max: 18 }),
+  'double-nod': Object.freeze({ min: 13, max: 18 }),
+  shake: Object.freeze({ min: 14, max: 22 }),
+  /** A deliberate lean: larger than ordinary, still bounded by the roll's own range. */
+  'head-sway': Object.freeze({ min: 18, max: 28 }),
+});
+
 const PRESET_OPERATION_PROFILE = Object.freeze({
   'head-turn': Object.freeze({ kind: 'move', amount: 0.42, sign: 0, active: 'TURN_ACTIVE_MS' }),
   'head-tilt': Object.freeze({ kind: 'move', amount: 0.34, sign: 0, tilt: true, active: 'TILT_ACTIVE_MS' }),
@@ -1066,6 +1122,10 @@ function presetPlannedStages(stages) {
     holdMs: Math.round(stage.holdMs),
     exitMs: Math.round(stage.exitMs),
     amplitude: presetStageAmplitude(stage),
+    /** Planned signed target angles; headX/headZ use their own ranges. */
+    targetDegrees: { ...(stage.degreeTargets ?? {}) },
+    degreeClamps: Object.fromEntries(Object.entries(stage.degreeClamps ?? {})
+      .map(([channel, entry]) => [channel, { ...entry }])),
   }));
 }
 
@@ -1102,6 +1162,9 @@ function clonePresetTrace(trace) {
         ...stage,
         channels: [...(stage.channels ?? [])],
         phases: [...(stage.phases ?? [])],
+        targetDegrees: { ...(stage.targetDegrees ?? {}) },
+        degreeClamps: Object.fromEntries(Object.entries(stage.degreeClamps ?? {})
+          .map(([channel, entry]) => [channel, { ...entry }])),
       })),
       channels: [...(trace.output?.channels ?? [])],
       droppedChannels: [...(trace.output?.droppedChannels ?? [])],
@@ -1111,6 +1174,7 @@ function clonePresetTrace(trace) {
       })),
       /** The controller's own pose (never a commit) and the rows the sender really built. */
       computed: { ...(trace.output?.computed ?? {}) },
+      computedDegrees: { ...(trace.output?.computedDegrees ?? {}) },
       /**
        * Sender evidence, FIVE phases that may never masquerade as each other:
        * prepared → assembled, attempted → transport call started, committed → `ok:true` acknowledged,
@@ -1585,6 +1649,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   // ---- unified continuous posture controller --------------------------------------------
   const clampMotion = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
 
+  /**
+   * One per-axis pose clamp. headX/headY stay in the documented ±30° range, headZ uses its own
+   * ±90° range, and every other bipolar channel keeps ±1. This is applied wherever the composed
+   * pose is finalised, so a preset lean is not truncated by the yaw budget.
+   */
+  const clampHeadAxis = (channel, value) => {
+    const limit = HEAD_CHANNEL_DEGREE_LIMITS[channel] === undefined
+      ? 1
+      : HEAD_CHANNEL_DEGREE_LIMITS[channel] / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+    return clampMotion(value, limit);
+  };
+  const clampBipolarChannel = (channel, value) => (HEAD_CHANNEL_DEGREE_LIMITS[channel] === undefined
+    ? clampSigned(value)
+    : clampHeadAxis(channel, value));
+
   /** Current persona tempo (baseline × state modifier): the rhythm used for hold/transition. */
   function postureTempo() {
     const effective = state.effective ?? state.style;
@@ -1615,7 +1694,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /** Semantic head units produced by ONE pose unit of `channel` under the current persona. */
   function headSemanticGain(channel) {
     const sway = idleChannelSway(channel);
-    const base = channel === 'headZ' ? 0.075 : channel === 'headY' ? 0.09 * 0.7 : 0.09;
+    const base = channel === 'headZ' ? 0.018 : channel === 'headY' ? 0.034 : 0.025;
     return Math.max(0, base * sway);
   }
 
@@ -1715,11 +1794,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       rand: componentRandom,
     });
     const bias = personaComponentBias(state.traits, state.style.expression);
-    // The amplitude stays inside the SAME 0.12–0.15 semantic band; the exponent only biases where
-    // inside it the draw lands (a soft/tender/composed persona leans low, a lively/playful high).
-    const amplitude = POSTURE_COMPONENT_MIN_AMPLITUDE
-      + (POSTURE_COMPONENT_MAX_AMPLITUDE - POSTURE_COMPONENT_MIN_AMPLITUDE)
-        * Math.pow(componentRandom(), bias.amplitudeExponent);
+    // The exponent only biases WHERE inside the explicit band the draw lands (a soft/tender/
+    // composed persona leans low, a lively/playful one high). Quiet never drops below the band's
+    // visible floor, and lively is still allowed to be visibly larger.
+    const personaPosition = clamp01(0.5 + (1 - bias.amplitudeExponent) * 0.45);
+    const degreeJitter = (componentRandom() - 0.5) * 0.08;
+    const position = clamp01(personaPosition + degreeJitter);
     const drawMs = postureComponentMinMs
       + (postureComponentMaxMs - postureComponentMinMs) * componentRandom();
     // A persona tempo/composure may stretch or shrink the hold, but the 10–20 s band is the
@@ -1727,16 +1807,27 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const influenced = drawMs * Math.max(0.8, Math.min(1.2,
       (1 / postureTempo()) * traitEffects().hold * bias.holdFactor));
     const holdMs = Math.max(postureComponentMinMs, Math.min(postureComponentMaxMs, influenced));
+    const bands = POSTURE_COMPONENT_DEGREE_BANDS[spec.id] ?? {};
     const axes = {};
     const semantic = {};
     const targetDegrees = {};
     const saturated = {};
+    let amplitude = 0;
     for (const channel of POSTURE_COMPONENT_CHANNELS) {
       const gain = headSemanticGain(channel);
-      const shape = finite(spec[channel], 0);
-      const requested = gain > 1e-9 ? (shape * amplitude) / gain : 0;
-      // A quiet/tired persona has a tiny per-axis gain, so reaching a 0.12–0.15 semantic target
-      // needs an internal offset above 1. The bound only stops a near-zero gain from exploding; the
+      const band = bands[channel] ?? { min: 0, max: 0 };
+      const channelLimit = HEAD_CHANNEL_DEGREE_LIMITS[channel];
+      // A negative band (right lean) must shrink in MAGNITUDE for a quiet persona: interpolate
+      // from its smaller magnitude end (-8°) toward its larger one (-12°), not from -12° to -8°.
+      const bandDegrees = band.min < 0
+        ? band.max + (band.min - band.max) * position
+        : band.min + (band.max - band.min) * position;
+      const desiredDegrees = Math.max(-channelLimit, Math.min(channelLimit, bandDegrees));
+      const requested = gain > 1e-9
+        ? (desiredDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT) / gain
+        : 0;
+      // A quiet/tired persona has a tiny per-axis gain, so reaching a 5–12° target needs an
+      // internal offset above 1. The bound only stops a near-zero gain from exploding; the
       // published TARGET is the semantic value below (≤ the component cap), never this offset.
       axes[channel] = clampMotion(requested, POSTURE_COMPONENT_AXIS_LIMIT);
       saturated[channel] = Math.abs(requested) > POSTURE_COMPONENT_AXIS_LIMIT + 1e-9;
@@ -1747,7 +1838,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       // target angle BEFORE any transport-specific normalisation (the facade annotates the verified
       // input range separately and marks it unknown when no verified mapping exists).
       targetDegrees[channel] = semantic[channel] * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+      amplitude = Math.max(amplitude, Math.abs(semantic[channel]));
     }
+    amplitude = Math.min(POSTURE_COMPONENT_MAX_AMPLITUDE, amplitude);
     return {
       id: spec.id,
       label: spec.label,
@@ -1761,6 +1854,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       targetSemantic: { ...semantic },
       targetDegrees,
       targetDegreesBasis: 'semantic-30deg-per-unit (mapping-unverified)',
+      /** The explicit trial bands this draw used, for status/evidence readers. */
+      degreeBands: bands,
       axisLimit: POSTURE_COMPONENT_AXIS_LIMIT,
       saturated,
       /** Filled every output frame by advanceGenerators (target/mixed/pose evidence). */
@@ -1788,8 +1883,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     motion.posture.componentPaused = false;
     recordPostureComponent(component);
     const next = targetWithComponent(motion.posture.base, component);
-    if (initial) motion.posture.target = { ...next };
-    else startPostureTransition(next, now, { kind: 'component' });
+    // The initial draw must ALSO arrive through the 1.2–1.8 s planned path. Setting the target
+    // directly would leave the rate-limited hold tracker (0.115/s) to crawl toward a multi-axis
+    // component offset for tens of seconds — the exact "component looks frozen" case.
+    startPostureTransition(next, now, { kind: 'component' });
     return component;
   }
 
@@ -2043,7 +2140,6 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       // The first draw keeps the original slow tracker: a fresh avatar is never limp, and the
       // hold window starts before it arrives. Planned 1.2–1.8 s transitions apply to every LATER
       // re-draw, so "initial" is not counted as a transition.
-      motion.transition = null;
       motion.posture.lastDecision = 'initial';
       return;
     }
@@ -3117,6 +3213,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         samples: [],
         /** Controller-computed pose only; it is NEVER copied into `committed`. */
         computed: {},
+        /** The same controller pose in the writer's 30°-per-semantic-unit convention. */
+        computedDegrees: {},
         /** Rows this frame assembled for the preset: parameters, NOT evidence of a send. */
         prepared: {},
         preparedFrames: 0,
@@ -3133,6 +3231,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         /** Requested channels the sender refused, with its reason (e.g. `shared-input`). */
         skippedByTransport: {},
         peak: 0,
+        /** Peak of the controller's planned stage values, converted to the 30°-unit convention. */
+        peakDegrees: 0,
         reason: '',
       },
       visible: {
@@ -3258,6 +3358,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       + STYLE_DIMENSION_APPLICATION.amplitudeSpan * liveliness)
       * (1 - STYLE_DIMENSION_APPLICATION.restraintCap * restraint)
       * effects.amplitude * variantAmount;
+    // Persona position inside an explicit degree band. 0.55 is the quiet floor of the existing
+    // amplitude chain and 1.35 the lively top, so a quiet persona sits near the band's visible
+    // minimum while a lively one approaches the maximum. This is a position, not a hidden global
+    // gain: the actual angle stays inside the per-operation band below.
+    const degreePosition = clamp01((amplitudeScale - 0.55) / 0.80);
     const unstable = timing.release === 'unhurried';
     const holdScale = (timing.hold === 'lingering' ? PRESET_EXECUTION.HOLD_LINGER_MS : PRESET_EXECUTION.HOLD_MIN_MS)
       * effects.hold * variantHold;
@@ -3273,10 +3378,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const channels = presetOperationChannels(op, selection, context);
       if (channels.length === 0) { droppedOps.push(op); continue; }
       const channelAmounts = {};
+      const degreeTargets = {};
+      const degreeClamps = {};
       const cancelOffsets = {};
       const targetOffsets = {};
       const channel = channels[0];
       const sign = choosePresetSign(op, profile, channel === 'eyeOpenL' ? 'headY' : channel);
+      const degreeRange = PRESET_OPERATION_DEGREE_RANGES[op] ?? null;
       // Experimental global gain: gestures only, never the gaze operations (eye movement is tuned
       // separately) and never another layer's amount.
       const gestureGain = profile.gaze === undefined
@@ -3316,6 +3424,36 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         const swayRatio = profile.kind !== 'sway' || target !== 'headX'
           ? 1
           : (channels.includes('headZ') ? PRESET_SWAY.HEAD_X_RATIO : PRESET_SWAY.YAW_ONLY_SCALE);
+        // Head operations use the explicit degree band, never one shared semantic scalar. headX
+        // and headZ keep their own model ranges (30° vs 90°); the headroom check records a real
+        // per-channel clamp instead of silently shrinking the whole gesture.
+        if (degreeRange !== null && HEAD_CHANNEL_DEGREE_LIMITS[target] !== undefined) {
+          const channelLimit = HEAD_CHANNEL_DEGREE_LIMITS[target];
+          const position = clamp01(degreePosition * channelScale);
+          let desiredDegrees = degreeRange.min
+            + (degreeRange.max - degreeRange.min) * position;
+          if (profile.tilt === true) desiredDegrees *= 0.75 + 0.55 * tilt;
+          desiredDegrees *= jitter * swayRatio;
+          desiredDegrees = Math.max(degreeRange.min * swayRatio,
+            Math.min(degreeRange.max * swayRatio, desiredDegrees));
+          const actualDegrees = actualPresetPose(target) * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+          const availableDegrees = Math.max(0, sign > 0
+            ? channelLimit - actualDegrees
+            : channelLimit + actualDegrees);
+          const plannedDegrees = Math.min(desiredDegrees, availableDegrees);
+          channelAmounts[target] = sign * (plannedDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT);
+          degreeTargets[target] = sign * plannedDegrees;
+          if (plannedDegrees + 1e-9 < desiredDegrees) {
+            degreeClamps[target] = {
+              desiredDegrees: sign * desiredDegrees,
+              plannedDegrees: sign * plannedDegrees,
+              channelLimit,
+              actualDegrees,
+              reason: availableDegrees <= 1e-9 ? 'no-headroom' : 'model-headroom',
+            };
+          }
+          continue;
+        }
         let amount = profile.amount * swayRatio * gestureGain
           * global * amplitudeScale * channelScale * jitter;
         if (profile.tilt === true) amount *= 0.75 + 0.55 * tilt;
@@ -3379,6 +3517,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         lastWriteAt: null,
         peak: 0,
         channelAmounts,
+        /** Planned signed head targets in degrees (separate headX/headZ ranges). */
+        degreeTargets,
+        /** Per-channel headroom/model-range clamps, or empty when the band was fully planned. */
+        degreeClamps,
         cancelOffsets,
         targetOffsets,
         sway: swayPlan,
@@ -3485,6 +3627,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         firstWriteAt: null,
         lastWriteAt: null,
         peak: 0,
+        peakDegrees: 0,
+        targetDegrees: { ...(stage.degreeTargets ?? {}) },
+        degreeClamps: Object.fromEntries(Object.entries(stage.degreeClamps ?? {})
+          .map(([channel, entry]) => [channel, { ...entry }])),
       };
     }
     const record = trace.output.stages[stage.index];
@@ -3521,7 +3667,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       }
     }
     if (Math.abs(peak) > Math.abs(record.peak)) record.peak = peak;
+    record.peakDegrees = Math.abs(record.peak) * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
     trace.output.peak = Math.max(trace.output.peak, Math.abs(peak));
+    trace.output.peakDegrees = trace.output.peak * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
   }
 
   function finishPresetTrace(item, now, { interrupted = false } = {}) {
@@ -3538,6 +3686,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       kind: interrupted ? 'interrupted' : 'completed',
       channels: [...trace.output.channels],
       peak: trace.output.peak,
+      peakDegrees: trace.output.peakDegrees,
       at: now,
     });
     return trace;
@@ -3749,6 +3898,10 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       firstWriteAt: null,
       lastWriteAt: null,
       peak: 0,
+      peakDegrees: 0,
+      targetDegrees: { ...(stage.degreeTargets ?? {}) },
+      degreeClamps: Object.fromEntries(Object.entries(stage.degreeClamps ?? {})
+        .map(([channel, entry]) => [channel, { ...entry }])),
     }));
     trace.output.droppedChannels = [...(selection.droppedChannels ?? [])];
     trace.output.reason = 'running';
@@ -4062,6 +4215,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       for (const channel of item.channels) {
         if (!Number.isFinite(pose[channel])) continue;
         item.trace.output.computed[channel] = pose[channel];
+        if (HEAD_CHANNEL_DEGREE_LIMITS[channel] !== undefined || channel.startsWith('gaze')) {
+          item.trace.output.computedDegrees = item.trace.output.computedDegrees ?? {};
+          item.trace.output.computedDegrees[channel] = pose[channel]
+            * OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+        }
       }
     }
   }
@@ -5450,9 +5608,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const speechMicro = (microDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT)
       * state.speechMicroGain * Math.sin(Math.PI * 2 * microHz * (state.idleMs / 1000));
     // Head base swing: the posture gain is 0.09 × sway × reach (≈±5° normal, ≈±10° lively).
-    const headXAmp = idleEnabled ? 0.09 * idleChannelSway('headX') * speakingHead : 0;
-    const headYAmp = idleEnabled ? 0.09 * idleChannelSway('headY') * 0.7 * speakingHead : 0;
-    const headZAmp = idleEnabled ? 0.075 * idleChannelSway('headZ') : 0;
+    const headXAmp = idleEnabled ? 0.025 * idleChannelSway('headX') * speakingHead : 0;
+    const headYAmp = idleEnabled ? 0.034 * idleChannelSway('headY') * speakingHead : 0;
+    const headZAmp = idleEnabled ? 0.018 * idleChannelSway('headZ') : 0;
     const bodyAmp = idleEnabled ? 0.03 * idleChannelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
     const gazeXAmp = 0.03 * idleChannelSway('gazeX') * gazeDrift;
     const gazeYAmp = 0.02 * idleChannelSway('gazeY') * gazeDrift;
@@ -5476,8 +5634,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // attention direction the posture already holds, so a hold never reads as "looking away".
     const driftUnit = idleEnabled ? HOLD_MICRO_DRIFT.DEGREES / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT
       * Math.min(1, idleSwayScale) * modifier.amplitude : 0;
-    const drift = (name) => (name === 'headX' ? 0 : driftUnit * (name === 'headZ' ? 1 : speakingHead)
-      * smoothNoise1(hash32(motionSeed, `drift:${name}`), t * HOLD_MICRO_DRIFT.FREQUENCY_HZ + 1.3));
+    const drift = (name) => driftUnit * (name === 'headZ' ? 1 : speakingHead)
+      * smoothNoise1(hash32(motionSeed, `drift:${name}`), t * HOLD_MICRO_DRIFT.FREQUENCY_HZ + 1.3);
     motion.holdDrift = { headX: drift('headX'), headY: drift('headY'), headZ: drift('headZ') };
     // Expression gaze (thinking looks up, listening recentres) is part of the idle base: an
     // explicit attention target still overrides it in applyDynamics.
@@ -5499,7 +5657,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const componentGazeY = yieldGaze(gazeComponent?.value?.gazeY, expressionGaze.y);
     // Phase 3 per-channel cap on the HEAD component AFTER the live persona/status gain is known.
     // `headSemanticGain()` froze the axis at draw time, but a later status/style switch can change
-    // the gain; without this second cap the SAME component could grow past 0.15 semantic. The
+    // the gain; without this second cap the SAME component could grow past 0.40 semantic. The
     // excess is subtracted from the idle base, so base drift is preserved while the component never
     // exceeds its budget. Evidence records the capped contribution, not the un-capped request.
     const headComponentAxes = motion.posture.component?.axes ?? null;
@@ -5654,12 +5812,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const next = stepSpringAxis({
         current: state.springs[axis].current,
         velocity: state.springs[axis].velocity,
-        target: clampSigned(finite(pose[axis], 0)),
+        target: clampHeadAxis(axis, finite(pose[axis], 0)),
         dt,
         ...params,
       });
       state.springs[axis] = next;
-      pose[axis] = clampSigned(next.current);
+      pose[axis] = clampHeadAxis(axis, next.current);
     }
     // A damped spring can still overshoot its (already capped) target by a fraction of a degree;
     // the 14° roll guarantee is enforced on the semantic pose, never by truncating the input value.
@@ -5769,7 +5927,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const cap = INTENT_IDLE_RATIO * Math.abs(value);
       const idlePart = Math.max(-cap, Math.min(cap, idleBase));
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
-      composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
+      composed[channel] = isBidirectional(channel)
+        ? clampBipolarChannel(channel, next)
+        : clamp01(next);
       const componentBefore = finite(headComponent?.observed?.mixed?.[channel], 0);
       if (componentBefore !== 0) {
         const retained = Math.abs(idleBase) > 1e-12 ? idlePart / idleBase : 0;
@@ -5832,11 +5992,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       const base = finite(composed[channel], 0);
       const target = finite(entry.target, base);
       const next = base + (target - base) * wave;
-      composed[channel] = isBidirectional(channel) ? clampSigned(next) : clamp01(next);
+      composed[channel] = isBidirectional(channel)
+        ? clampBipolarChannel(channel, next)
+        : clamp01(next);
     }
-    // The roll is held to the same 14° head budget as the other head channels on the SEMANTIC
-    // pose, before the spring and long before the input value: the target itself is capped, so the
-    // gesture keeps its smooth shape instead of being truncated on the wire.
+    // The roll is held to the model's own ±90° range on the SEMANTIC pose, before the spring and
+    // long before the input value: headX/headY keep their ±30° range, so a lean cannot be truncated
+    // by the yaw budget while still never exceeding the roll input's real range.
     composed.headZ = clampHeadRoll(composed.headZ);
     const pose = applyDynamics(composed, frame, dt);
     publish(pose);

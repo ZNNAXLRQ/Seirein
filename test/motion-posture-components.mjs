@@ -196,15 +196,15 @@ test('2. 完整动作结束后连续 idle 帧仍写 headX/Y/Z/breath（exit→0�
     assert.ok(hasChannel(rig.fake.frames, channel), `${channel} continues after the action`);
   }
   const headZ = framesWithChannel(rig.fake.frames, 'headZ').map((entry) => entry.value);
-  assert.ok(Math.max(...headZ.map(Math.abs)) < 0.18 * 30 + 1e-6,
-    'the post-action frame is the idle baseline, not the old preset peak');
+  assert.ok(Math.max(...headZ.map(Math.abs)) < 18 + 1e-6,
+    'the post-action frame is the idle/component baseline, not the old preset peak');
   rig.runtime.dispose();
 });
 
 // ---------------------------------------------------------------------------------------------
 // 3. component hold band + semantic amplitude cap
 // ---------------------------------------------------------------------------------------------
-test('3. 组件保持 POSTURE_COMPONENT_MIN_MS–MAX_MS，语义幅度 ≤0.15（30°单位）', () => {
+test('3. 组件保持 POSTURE_COMPONENT_MIN_MS–MAX_MS，语义幅度 ≤0.40（30°单位）', () => {
   const runtime = createBehaviorRuntime({
     config: behaviorConfig({
       postureHoldMinMs: 60_000,
@@ -413,7 +413,13 @@ test('6. head-center 重叠不过冲、结束确实回基线（不回零点/旧�
   }
   const sideTrace = action.snapshot().motion.presets.recent
     .find((entry) => entry.selection.presetId === side.presetId);
-  sidePeak = sideTrace?.output?.peak ?? Math.max(...rawDiffs.map((value) => Math.abs(value)));
+  // The observed side excursion, not only the trajectory's own peak: the base/component is part
+  // of the actual action-vs-control difference, so a larger (but still legal) base must not look
+  // like an overshoot introduced by the centre operation.
+  sidePeak = Math.max(
+    sideTrace?.output?.peak ?? 0,
+    ...rawDiffs.map((value) => Math.abs(value)),
+  );
   const finalDiff = Math.abs(action.snapshot().pose.headX - control.snapshot().pose.headX);
   assert.ok(finalDiff < 1e-3, `the pose returned to the current baseline (${finalDiff})`);
   assert.ok(maxPast <= sidePeak + 0.03,
@@ -451,15 +457,15 @@ test('7. 组件只驱动 headX/Y/Z；body/gaze 无 idle 行，breath 走独立�
     .flatMap((channel) => framesWithChannel(rig.fake.frames, channel))
     .map((entry) => Math.abs(entry.value));
   assert.ok(headWrites.length > 0);
-  assert.ok(Math.max(...headWrites) <= 0.18 * 30 + 1e-6,
-    `actual head writes stay inside the idle writer cap (${Math.max(...headWrites).toFixed(2)}°)`);
+  assert.ok(Math.max(...headWrites) <= 18 + 1e-6,
+    `actual head writes stay inside the default idle head budget (${Math.max(...headWrites).toFixed(2)}°)`);
   rig.runtime.dispose();
 });
 
 // ---------------------------------------------------------------------------------------------
 // 8. 0.15 semantic bound holds across personas and statuses
 // ---------------------------------------------------------------------------------------------
-test('8. 0.15 语义上界：默认/活泼/安静人设、idle/listening 均不越界', () => {
+test('8. 0.40 语义上界：默认/活泼/安静人设、idle/listening 均不越界', () => {
   const styles = [
     { label: 'default', style: null },
     { label: 'lively', style: { amplitude: 1.35, tempo: 1.35, nodAmplitude: 1.3, expressiveness: 1.4, tiltChance: 0.4, nodDurationMs: 350 } },
@@ -486,7 +492,7 @@ test('8. 0.15 语义上界：默认/活泼/安静人设、idle/listening 均不�
             const value = Math.abs(component.semantic[channel]);
             maxSemantic = Math.max(maxSemantic, value);
             assert.ok(value <= POSTURE_COMPONENT_MAX_AMPLITUDE + 1e-9,
-              `${entry.label}/${status}/${channel} semantic ${value} ≤ 0.15`);
+              `${entry.label}/${status}/${channel} semantic ${value} ≤ ${POSTURE_COMPONENT_MAX_AMPLITUDE}`);
           }
         }
       }

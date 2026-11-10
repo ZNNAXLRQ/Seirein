@@ -186,10 +186,20 @@ const DEFAULT_HOST_CONFIG = Object.freeze({
    * style only tunes amplitude/rhythm/step. The default stays 4 Hz.
    */
   idleWriteHzMax: 8,
-  /** Semantic cap per head axis; on a ±30° input range this is ±5.4° (was ±3°). */
-  idleAmplitude: 0.18,
-  /** Largest semantic change allowed between two consecutive idle-written frames (anti-jitter). */
-  idleMaxStep: 0.03,
+  /**
+   * Semantic cap per head axis. 0.6 = ±18° on the documented ±30° tracking range; headZ keeps
+   * its own ±90° conversion, so this is a shared semantic budget, not a shared angle. The old
+   * 0.18 (±5.4°) truncated every visible component/preset at the wire and produced flat-topped
+   * send curves; a host may still override it (including 0 for a completely still idle layer).
+   */
+  idleAmplitude: 0.6,
+  /**
+   * Largest semantic change allowed between two consecutive idle-written frames (anti-jitter).
+   * The default idle cadence is 4 Hz, so 0.12 = 3.6°/write (14.4°/s on a ±30° head input): enough
+   * for a 10–20° preset to arrive inside its active phase instead of being rate-limited into a
+   * "frozen" tail. A host may lower it for a calmer display.
+   */
+  idleMaxStep: 0.12,
   /** Eye-open idle writes are opt-in: off by default so blink/idle cannot fight each other. */
   idleEye: false,
   /**
@@ -2985,7 +2995,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   /**
    * Style-scaled write cap for the P-139 posture. At the normal persona (amplitude ≤ 1) this is
    * exactly 1, so the configured idleAmplitude/idleMaxStep stay unchanged. A lively persona may
-   * reach the larger posture it drew; without this the old ±5.4° cap would truncate the goal.
+   * reach the larger posture it drew; without this the per-persona cap would truncate the goal.
    */
   function postureWriteScale(snap) {
     const amplitude = Math.max(0.2, Math.min(1.5, finite(snap?.style?.baseline?.amplitude, 1)));

@@ -30,8 +30,9 @@ import { createAvatarRuntime } from '../src/host/avatar/avatarRuntime.js';
 
 const DT = 1000 / 30;
 const HEAD = Object.freeze(['headX', 'headY', 'headZ']);
-/** Same light caps the phase-3 pose-target suite pins for the base layer. */
-const BASE_CAPS = Object.freeze({ headX: 0.22, headY: 0.19, headZ: 0.19 });
+/** Base micro-motion bounds for the trial: 1.5–4.5° peak-to-peak, never a 10° forced swing. */
+const BASE_P2P_MIN = 1.5;
+const BASE_P2P_MAX = 4.5;
 /**
  * The natural target must stay above this equivalent angle so it is a real goal rather than a
  * numerical trace. This is the writer's 30°-per-unit convention, NOT a measured real-head angle;
@@ -87,7 +88,7 @@ function observeNatural(seed, toMs = 9_000) {
 // ---------------------------------------------------------------------------------------------
 // 1. natural is a real, small, constant non-zero target — not an all-zero long hold
 // ---------------------------------------------------------------------------------------------
-test('1. natural 选中：targetSemantic 非零且 ≤0.15，保持恒定，角度可换算', () => {
+test('1. natural 选中：targetSemantic 非零且 ≤0.40，保持恒定，角度可换算', () => {
   const seed = naturalFirstSeed();
   const { frames } = observeNatural(seed);
   assert.ok(frames.length > 100, `enough natural frames (${frames.length})`);
@@ -151,38 +152,44 @@ test('1. natural 选中：targetSemantic 非零且 ≤0.15，保持恒定，角�
 // ---------------------------------------------------------------------------------------------
 // 2. the base micro-motion is still light: the component offset is not a global gain/floor
 // ---------------------------------------------------------------------------------------------
-test('2. natural 期间基础微动仍轻：基底贡献在既有上限内且持续运动', () => {
+test('2. natural 期间基础微动持续：60s 峰峰值约 1.5–4.5°，不是固定住十几秒', () => {
   const seed = naturalFirstSeed();
-  const { frames } = observeNatural(seed);
-  const baseMax = { headX: 0, headY: 0, headZ: 0 };
+  const runtime = createBehaviorRuntime({ config: naturalConfig(seed) });
   const baseMin = { headX: Number.POSITIVE_INFINITY, headY: Number.POSITIVE_INFINITY, headZ: Number.POSITIVE_INFINITY };
   const baseHigh = { headX: Number.NEGATIVE_INFINITY, headY: Number.NEGATIVE_INFINITY, headZ: Number.NEGATIVE_INFINITY };
+  let samples = 0;
 
-  for (const { component } of frames) {
+  for (let at = 0; at <= 60_000; at += DT) {
+    runtime.tick(at);
+    const component = runtime.snapshot().motion.posture.component;
     assert.ok(component?.observed !== null && component?.observed !== undefined,
       'per-frame target/mixed/idle evidence exists');
+    // A component swap is interpolated over 1.2–1.8 s; during it `idle` still carries the previous
+    // component while `mixed` already names the new one, so do not read that window as base motion.
+    if (at - component.startedAt < 2_000) continue;
+    samples += 1;
     for (const channel of HEAD) {
       // `idle` is the composed idle base (base swing + drift + component). Removing the component
       // share leaves the base micro-motion this fix must NOT have raised.
       const base = (component.observed.idle?.[channel] ?? 0) - (component.observed.mixed?.[channel] ?? 0);
-      baseMax[channel] = Math.max(baseMax[channel], Math.abs(base));
       baseMin[channel] = Math.min(baseMin[channel], base);
       baseHigh[channel] = Math.max(baseHigh[channel], base);
     }
   }
 
+  assert.ok(samples > 1_000, `enough settled base frames (${samples})`);
   for (const channel of HEAD) {
-    assert.ok(baseMax[channel] <= BASE_CAPS[channel],
-      `base ${channel} stays light (${baseMax[channel].toFixed(4)} = ${(baseMax[channel] * 30).toFixed(2)}° `
-      + `≤ ${(BASE_CAPS[channel] * 30).toFixed(2)}°)`);
-    assert.ok(baseHigh[channel] - baseMin[channel] > 0.005,
-      `base ${channel} keeps moving during the natural hold (${(baseHigh[channel] - baseMin[channel]).toFixed(4)})`);
+    const p2p = (baseHigh[channel] - baseMin[channel]) * 30;
+    assert.ok(p2p >= BASE_P2P_MIN,
+      `base ${channel} keeps moving (${p2p.toFixed(2)}° p2p ≥ ${BASE_P2P_MIN}°)`);
+    assert.ok(p2p <= BASE_P2P_MAX,
+      `base ${channel} stays light (${p2p.toFixed(2)}° p2p ≤ ${BASE_P2P_MAX}°)`);
   }
-  assert.ok(baseMax.headX > 0 && baseMax.headY > 0 && baseMax.headZ > 0,
+  assert.ok(Math.abs(baseHigh.headX) > 0 && Math.abs(baseHigh.headY) > 0 && Math.abs(baseHigh.headZ) > 0,
     'the base layer is present on every axis');
 
-  const baseDegrees = HEAD.map((channel) => (baseMax[channel] * 30).toFixed(2)).join('/');
-  console.log(`[natural-base] baseMax headX/Y/Z=${baseDegrees}° (caps 6.6/5.7/5.7°), base still moving`);
+  const baseDegrees = HEAD.map((channel) => ((baseHigh[channel] - baseMin[channel]) * 30).toFixed(2)).join('/');
+  console.log(`[natural-base] 60s baseP2P headX/Y/Z=${baseDegrees}° (trial 1.5–4.5°), base still moving`);
 });
 
 // ---------------------------------------------------------------------------------------------

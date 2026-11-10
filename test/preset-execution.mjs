@@ -232,7 +232,7 @@ test('6. 风格字段有真实消费者：tiltChance 改偏头分布，gazeHabit
   assert.ok(wanderingDwell > directDwell, `wandering dwell ${wanderingDwell} > direct ${directDwell}`);
 });
 
-test('7. 无统一可见性下限：安静人设静止时不被强行驱动，动作幅度不被抬到下限', () => {
+test('7. 动作目标有可辨下限，但不是每帧 floor；安静人设静止时不被强行驱动', () => {
   assert.equal(Object.prototype.hasOwnProperty.call(PRESET_EXECUTION, 'VISIBLE_FLOOR'), false);
   const still = makeRuntime({
     enabled: true,
@@ -254,7 +254,10 @@ test('7. 无统一可见性下限：安静人设静止时不被强行驱动，�
   run(quiet, 0, 1800);
   const trace = presetSnapshot(quiet).lastTrace;
   assert.ok(trace.output.peak > 0, 'a quiet persona still expresses');
-  assert.ok(trace.output.peak < 0.08, `no visible floor was applied: peak ${trace.output.peak}`);
+  // The target itself has a visible 10–20° band (a planned head goal, not a per-frame floor); the
+  // hold/still branch above still writes nothing.
+  assert.ok(trace.output.peakDegrees >= 10 - 1e-6 && trace.output.peakDegrees <= 20 + 1e-6,
+    `quiet head target ${trace.output.peakDegrees.toFixed(2)}° is inside the visible 10–20° band`);
 });
 
 test('8. trace 三层存在；channels=[] 时带有明确原因', () => {
@@ -786,7 +789,7 @@ test('17. start 事件带幅度/时长/阶段，并已放开宿主白名单', ()
   assert.match(source, /message === 'avatar\.preset\.start'/u);
 });
 
-test('17b. 全局手势增益只放大 preset nominal：idle/speaking 手势变大，眼动保持原样', () => {
+test('17b. head 目标固定为显式度数带：全局增益不覆盖它，眼动保持原样', () => {
   function gestureProbe(gain, recipe, state, event) {
     const runtime = makeRuntime({
       enabled: true,
@@ -814,13 +817,18 @@ test('17b. 全局手势增益只放大 preset nominal：idle/speaking 手势变�
     const legacy = gestureProbe(1, recipe, state, event);
     const amplified = gestureProbe(PRESET_GESTURE_GAIN, recipe, state, event);
     assert.equal(amplified.start.stages[0].op, 'head-turn');
-    assert.ok(amplified.start.amplitude > legacy.start.amplitude * 1.45,
-      `${recipe}: planned ${legacy.start.amplitude.toFixed(4)} → ${amplified.start.amplitude.toFixed(4)}`);
-    assert.ok(amplified.peak > legacy.peak * 1.4,
-      `${recipe}: output peak ${legacy.peak.toFixed(4)} → ${amplified.peak.toFixed(4)}`);
-    console.log(`[gain] ${recipe} planned ${legacy.start.amplitude.toFixed(4)} → `
-      + `${amplified.start.amplitude.toFixed(4)} (x${(amplified.start.amplitude / legacy.start.amplitude).toFixed(2)}), `
-      + `peak ${legacy.peak.toFixed(4)} → ${amplified.peak.toFixed(4)}`);
+    // Head operations now read an explicit degree band; a hidden global multiplier must not
+    // silently push them past 10–20°. The old experimental gain stays for non-head nominal work.
+    const legacyDegrees = Math.abs(legacy.start.stages[0].targetDegrees.headX);
+    const amplifiedDegrees = Math.abs(amplified.start.stages[0].targetDegrees.headX);
+    assert.ok(legacyDegrees >= 12 - 1e-6 && legacyDegrees <= 20 + 1e-6,
+      `${recipe}: planned ${legacyDegrees.toFixed(2)}° is inside the 12–20° band`);
+    assert.ok(Math.abs(amplifiedDegrees - legacyDegrees) < 1e-9,
+      `${recipe}: gain must not change the head target (${legacyDegrees}° vs ${amplifiedDegrees}°)`);
+    assert.ok(Math.abs(amplified.peak - legacy.peak) < 1e-9,
+      `${recipe}: output peak unchanged ${legacy.peak.toFixed(4)}`);
+    console.log(`[gain] ${recipe} head target held at ${legacyDegrees.toFixed(2)}° `
+      + `(gain ${PRESET_GESTURE_GAIN} ignored for explicit degrees)`);
   }
 
   // Eye movement is explicitly NOT part of this experiment: its nominal stays bit-identical.
