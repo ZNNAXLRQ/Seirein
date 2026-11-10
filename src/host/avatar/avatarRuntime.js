@@ -91,6 +91,10 @@ export {
   CONFUSED_BROW_CHANNELS,
 } from './motion-config.js';
 import { toHeadInputValue, toInputValue } from './dynamics.js';
+import {
+  PROBE_TIMEOUT_MS,
+  probeGazeMapping as probeGazeChannels,
+} from './avatarMotion.js';
 export {
   HEAD_DEGREES_PER_POSE_UNIT,
   createBlinkState,
@@ -215,6 +219,11 @@ const DEFAULT_HOST_CONFIG = Object.freeze({
    * arrives (and unless it resolves true) the single-flight gate stays CLOSED.
    */
   motionCancelWaitMs: 500,
+  /**
+   * Hard timeout for ONE explicit gaze-mapping probe. A transport that never answers is reported as
+   * `ok:false` instead of hanging the caller; the probe is never retried automatically.
+   */
+  gazeProbeTimeoutMs: PROBE_TIMEOUT_MS,
   /** A live mouth sender keeps idle suppressed this long after its last write. */
   idleSpeechHoldMs: 500,
   /**
@@ -365,6 +374,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     motionCancelWaitMs: Number.isFinite(userConfig.motionCancelWaitMs) && userConfig.motionCancelWaitMs >= 0
       ? Math.min(30_000, userConfig.motionCancelWaitMs)
       : DEFAULT_HOST_CONFIG.motionCancelWaitMs,
+    /** One explicit gaze probe never waits forever; the caller always gets a result object. */
+    gazeProbeTimeoutMs: Number.isFinite(userConfig.gazeProbeTimeoutMs) && userConfig.gazeProbeTimeoutMs > 0
+      ? Math.min(30_000, userConfig.gazeProbeTimeoutMs)
+      : DEFAULT_HOST_CONFIG.gazeProbeTimeoutMs,
     idleSpeechHoldMs: Number.isFinite(userConfig.idleSpeechHoldMs) && userConfig.idleSpeechHoldMs >= 0
       ? userConfig.idleSpeechHoldMs : DEFAULT_HOST_CONFIG.idleSpeechHoldMs,
     /** One discrete action at a time: the next candidate waits for the running one to end. */
@@ -502,6 +515,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   let motionEpoch = 0;
   let motionLocked = false;
   let motionLockReason = '';
+  /**
+   * True only while `probeGazeMapping()` measures. The transport's own `probeActive` already holds
+   * the 30 Hz frame loop; this mirror also holds every runtime-owned write path (idle, mouth,
+   * motion pump) so a probe can never race a frame started by the facade. It is always cleared.
+   */
+  let gazeProbeActive = false;
 
   // The core reads `inputs` at write time, so this object can be mutated after connect() when a
   // transport discovers the model's input map. `mouthInput` itself is always null here; the
@@ -1010,7 +1029,36 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   // ---- transport boundary ----------------------------------------------------------------
+  /** Read the transport's existing probe flag without letting a broken getter break a frame. */
+  function transportProbeActive() {
+    try {
+      return transport !== null && transport !== undefined && transport.probeActive === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Pause/resume runtime-owned writes. The transport's `probeActive` is the same flag its frame
+   * loop already honours (VtsClient), so setting it here cannot introduce a second pause concept.
+   */
+  function setGazeProbeActive(active) {
+    const next = active === true;
+    gazeProbeActive = next;
+    try {
+      if (transport !== null && transport !== undefined && 'probeActive' in transport) {
+        transport.probeActive = next;
+      }
+    } catch {
+      // A read-only transport flag is fine: the facade-local mirror still holds our own writers.
+    }
+  }
+
+  /** True while any probe (ours or the transport's) is measuring: no runtime frame may start. */
+  const frameWritesPaused = () => gazeProbeActive || transportProbeActive();
+
   function writeThroughTransport(frame) {
+    if (frameWritesPaused()) return { ok: true, skipped: true, paused: true };
     const payload = { input: frame.input, value: frame.value };
     if (frame.channel !== undefined) payload.channel = frame.channel;
     if (frame.probe === true) payload.probe = true;
@@ -1256,7 +1304,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
 
   /** Send the one staged frame. A slow send is skipped; the newest frame waits in the slot. */
   function pumpMotion() {
-    if (motionPump.inFlight || motionPump.skipped || motionLocked || state.disposed || state.connected !== true) return;
+    if (motionPump.inFlight || motionPump.skipped || motionLocked || state.disposed
+      || state.connected !== true || frameWritesPaused()) return;
     const frame = motionPump.slot;
     if (frame === null) return;
     motionPump.slot = null;
@@ -1383,7 +1432,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
 
   /** Stage the newest pose. An existing unsent slot is overwritten and counted as dropped. */
   function submitMotionFrame(pose, at) {
-    if (host.motionWrites !== true || motionLocked || state.disposed || state.connected !== true) return;
+    if (host.motionWrites !== true || motionLocked || state.disposed || state.connected !== true
+      || frameWritesPaused()) return;
     // Interpolation rate: the host may tick faster than the configured output cadence, but the
     // transport sees at most `motionOutputHz` attempts. 1 ms of tolerance keeps exact 30 Hz grids
     // from being halved by floating-point jitter.
@@ -1532,6 +1582,11 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       // Keep the discovery verdict: injectable only means the input exists, not that it drives
       // this channel. A row without `verified:true` stays a candidate.
       verified: entry?.verified === true,
+      // Target parameters are the evidence an explicit gaze probe can read before/after. They are
+      // informational only; the writer never injects a model parameter name as an input.
+      modelParams: (Array.isArray(entry?.modelParams) ? entry.modelParams : [])
+        .map((name) => String(name ?? '').trim())
+        .filter((name) => name.length > 0),
     };
   };
 
@@ -1733,6 +1788,102 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       return { ok: true, code: null, connected: false, channels: statusChannels() };
     }
     return applyChannelMappings(pendingChannelConfig.channels, pendingChannelConfig.channelMap);
+  }
+
+  /**
+   * Explicit production entry: prove `gazeX`/`gazeY` at runtime by injecting one value and reading
+   * the target model parameters before/after. This is never called by discovery or a timer.
+   *
+   * It runs only while this runtime is connected AND at least one current gaze binding has both an
+   * input name and target model parameters. Every runtime-owned write path is paused for the whole
+   * measurement; after the finally block the transport's existing `probeActive` flag is restored and
+   * a motion frame held in the slot is pumped. `changed:true` keeps/marks the channel verified;
+   * `changed:false`, a timeout or an error marks it unverified but NEVER removes the binding.
+   *
+   * Expected failures are data: the method never throws and always returns the public shape
+   * `{ok, channels:{gazeX,gazeY}, mappingUnverified, at, error}`.
+   */
+  async function probeGazeMapping() {
+    const at = () => new Date(clockNow()).toISOString();
+    const failure = (errorTextValue) => ({
+      ok: false,
+      channels: {},
+      mappingUnverified: [],
+      at: at(),
+      error: String(errorTextValue ?? ''),
+    });
+    if (state.disposed === true) return failure('avatar runtime has been disposed');
+    if (state.connected !== true) return failure('VTube Studio 未连接');
+
+    const rows = [];
+    for (const channel of ['gazeX', 'gazeY']) {
+      const binding = channelState.bindings.get(channel);
+      if (binding === undefined) continue;
+      rows.push({
+        channel,
+        inputName: binding.inputName,
+        modelParams: Array.isArray(binding.modelParams) ? binding.modelParams : [],
+      });
+    }
+    const hasTarget = rows.some((row) => String(row.inputName ?? '').trim().length > 0
+      && Array.isArray(row.modelParams) && row.modelParams.length > 0);
+    if (!hasTarget) {
+      return failure('没有可探测的视线映射（需要已发现的 gazeX/gazeY 输入与模型参数）');
+    }
+
+    const probe = typeof transport?.probeInputMapping === 'function'
+      ? (request) => transport.probeInputMapping(request)
+      : (typeof userConfig.probeInputMapping === 'function' ? userConfig.probeInputMapping : null);
+    if (probe === null) return failure('probeInputMapping 不可用');
+
+    const previousProbeActive = transportProbeActive();
+    let result;
+    try {
+      setGazeProbeActive(true);
+      result = await probeGazeChannels({
+        channels: rows,
+        probeInputMapping: async (request) => {
+          // Re-assert before every call: VtsClient clears its own flag in its finally block, so the
+          // whole two-channel operation would otherwise re-open the frame loop between channels.
+          setGazeProbeActive(true);
+          try {
+            return await probe(request);
+          } finally {
+            setGazeProbeActive(true);
+          }
+        },
+        timeoutMs: host.gazeProbeTimeoutMs,
+        now: clockNow,
+      });
+    } catch (error) {
+      result = failure(errorText(error));
+    } finally {
+      // Restore the exact prior flag (another probe may already be running), then resume the pump.
+      setGazeProbeActive(previousProbeActive);
+      if (frameWritesPaused() !== true) pumpMotion();
+    }
+    if (result === null || result === undefined) result = failure('gaze mapping probe failed');
+
+    // Apply the evidence to the takeover set. The binding is updated in place, never removed: a
+    // diagnostic failure means "not proven", not "the eye channel cannot be driven".
+    let applied = false;
+    const unverified = new Set(channelState.unverified);
+    for (const [channel, row] of Object.entries(result.channels ?? {})) {
+      const binding = channelState.bindings.get(channel);
+      if (binding === undefined) continue;
+      binding.verified = row?.changed === true;
+      binding.mappingUnverified = row?.changed !== true;
+      if (binding.verified) unverified.delete(channel);
+      else unverified.add(channel);
+      applied = true;
+    }
+    if (applied) {
+      channelState.unverified = CHANNELS.filter((channel) => unverified.has(channel));
+      refreshIdleParamMap();
+      refreshIdleActionPool('gaze-probe');
+      refreshPresetCapabilities();
+    }
+    return result;
   }
 
   // ---- listeners + timer -----------------------------------------------------------------
@@ -3865,6 +4016,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    */
   function maybeFlushIdleParams(at) {
     if (state.disposed === true || state.connected !== true || motionLocked) return;
+    // An explicit mapping probe owns the model parameters while it measures: skip this due frame
+    // entirely (no lastIdleWriteAt advance), so the next tick after the probe sends normally.
+    if (frameWritesPaused()) return;
     // Single-flight: a frame that comes due while the previous send is unsettled is discarded,
     // not queued. The next tick stages the newest pose, so a slow transport can never backlog.
     if (flushingIdle) {
@@ -4111,7 +4265,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   function maybeFlushMouth(pose, at) {
-    if (state.connected !== true || flushing) return;
+    if (state.connected !== true || flushing || frameWritesPaused()) return;
     const snap = inner.snapshot();
     if (snap.mouth.active !== true || snap.mouth.mode !== 'envelope') return;
     if (at - lastFlushAt < host.flushIntervalMs) return;
@@ -4935,6 +5089,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     setMouthInput,
     setIdleParams,
     setChannelMappings,
+    /** Explicit, non-automatic gazeX/gazeY mapping proof; pauses all facade writes while it runs. */
+    probeGazeMapping,
     setStyle,
     setStatus,
     setIntent,

@@ -3368,6 +3368,9 @@ export function apply(ctx, config) {
       ? channels.filter((entry) => entry.injectable === true).map((entry) => entry.channel)
       : Object.keys(inputs).filter((channel) => inputs[channel] !== null && inputs[channel] !== undefined);
     const verified = channels.filter((entry) => entry.verified === true).map((entry) => entry.channel);
+    const mappingUnverified = channels
+      .filter((entry) => entry.mappingUnverified === true)
+      .map((entry) => entry.channel);
     return {
       discovered: capability.discovered === true,
       ok: capability.ok === true,
@@ -3375,6 +3378,8 @@ export function apply(ctx, config) {
       socketOpen: vts?.connected === true,
       mapped: injectable,
       verified,
+      /** Runtime-probe results only: unchanged/failed gaze rows stay injectable but unverified. */
+      mappingUnverified,
       unmapped: injectable.length > 0 || channels.length > 0
         ? channels.filter((entry) => entry.injectable !== true).map((entry) => entry.channel)
         : (capability.unmapped ?? []),
@@ -3715,6 +3720,24 @@ export function apply(ctx, config) {
     ),
     // One batched idle frame keeps the per-parameter request count at 10 Hz instead of 70 Hz.
     writeFrame: (entries) => injectAvatarParameters(entries),
+    /**
+     * Explicit gaze-mapping evidence. The runtime calls this only from the user-triggered
+     * `avatar.mapping.probe` action; discovery never opts into it. VtsClient.probeInputMapping
+     * already pauses its 30 Hz frame loop with its own `probeActive` flag.
+     */
+    probeInputMapping: (request) => vtsClient().probeInputMapping(request),
+    /**
+     * Bridge the SAME `probeActive` flag VtsClient's frame loop already honours. A probe action
+     * holds it for the whole gazeX+gazeY measurement, then restores the prior value; releasing it
+     * also pumps a frame VtsClient parked while measuring.
+     */
+    get probeActive() { return vts?.probeActive === true; },
+    set probeActive(value) {
+      const client = vts;
+      if (client === null) return;
+      client.probeActive = value === true;
+      if (value !== true && client.pendingFrame !== null) void client.pumpFrames();
+    },
   };
 
   const ensureAvatarRuntime = () => {
@@ -3807,6 +3830,120 @@ export function apply(ctx, config) {
       }
     }
     return result;
+  };
+
+  // ---- explicit gaze-mapping proof (never automatic) -------------------------------------
+  /**
+   * Last user-triggered gaze-mapping probe, as the status contract expects:
+   * `{lastAt, ok, channels, unverified}`. `null` before the first click; no discovery path writes it.
+   */
+  let avatarMappingProbe = null;
+  const copyMappingChannels = (channels) => Object.fromEntries(
+    Object.entries(channels ?? {})
+      .filter(([, row]) => row !== null && typeof row === 'object')
+      .map(([channel, row]) => [channel, {
+        inputName: String(row.inputName ?? ''),
+        parameterNames: [...(Array.isArray(row.parameterNames) ? row.parameterNames : [])]
+          .map((name) => String(name ?? '')),
+        changed: row.changed === true,
+        delta: row.delta !== null && typeof row.delta === 'object' ? { ...row.delta } : {},
+        error: String(row.error ?? ''),
+      }]),
+  );
+  /** Synchronous, path-free projection for `/assistant/status.avatar.mapping`. */
+  const avatarMappingStatus = () => (avatarMappingProbe === null
+    ? { lastAt: null, ok: null, channels: {}, unverified: [] }
+    : {
+        lastAt: avatarMappingProbe.lastAt,
+        ok: avatarMappingProbe.ok,
+        channels: copyMappingChannels(avatarMappingProbe.channels),
+        unverified: [...avatarMappingProbe.unverified],
+      });
+  /**
+   * Keep the discovery view honest after a manual probe: `changed:true` is verified, everything
+   * else is mappingUnverified, while the injectable channel itself is never removed.
+   */
+  const applyGazeProbeToCapabilities = (probe) => {
+    const capability = runtime.avatarMotion;
+    if (capability === null || capability === undefined || !Array.isArray(capability.channels)) return;
+    let touched = false;
+    for (const [channel, row] of Object.entries(probe.channels ?? {})) {
+      const entry = capability.channels.find((candidate) => candidate.channel === channel);
+      if (entry === undefined) continue;
+      const nextProbe = {
+        ok: String(row.error ?? '').length === 0,
+        changed: row.changed === true,
+        error: String(row.error ?? ''),
+        ...(Object.keys(row.delta ?? {}).length > 0 ? { delta: { ...row.delta } } : {}),
+      };
+      entry.verified = row.changed === true;
+      entry.mappingUnverified = row.changed !== true;
+      entry.probe = nextProbe;
+      // `inputs[channel]` is a separate copy from `channels[]`; keep both projections equal.
+      const inputEntry = capability.inputs?.[channel];
+      if (inputEntry !== null && inputEntry !== undefined && typeof inputEntry === 'object') {
+        inputEntry.verified = entry.verified;
+        inputEntry.mappingUnverified = entry.mappingUnverified;
+        inputEntry.probe = { ...nextProbe, ...(nextProbe.delta === undefined ? {} : { delta: { ...nextProbe.delta } }) };
+      }
+      touched = true;
+    }
+    if (touched !== true) return;
+    capability.verified = capability.channels
+      .filter((entry) => entry.verified === true)
+      .map((entry) => entry.channel);
+    capability.mappingUnverified = capability.channels
+      .filter((entry) => entry.mappingUnverified === true)
+      .map((entry) => entry.channel);
+  };
+  /**
+   * The ONE explicit production entry (`avatar.mapping.probe` action). It calls the runtime only,
+   * records the result projection (never a path or page text), emits one `avatar.mapping.probe`
+   * event and never retries. A missing/disposed runtime is a safe failure, not a throw.
+   */
+  const probeAvatarGazeMapping = async () => {
+    const current = avatarRuntime;
+    let result;
+    if (current === null || current.snapshot().disposed === true) {
+      result = {
+        ok: false,
+        channels: {},
+        mappingUnverified: [],
+        at: new Date().toISOString(),
+        error: '形象运行时未启动',
+      };
+    } else {
+      try {
+        result = await current.probeGazeMapping();
+      } catch (error) {
+        result = {
+          ok: false,
+          channels: {},
+          mappingUnverified: [],
+          at: new Date().toISOString(),
+          error: error?.message ?? String(error),
+        };
+      }
+    }
+    const at = typeof result?.at === 'string' && result.at.length > 0
+      ? result.at
+      : new Date().toISOString();
+    const channels = copyMappingChannels(result?.channels);
+    const unverified = (Array.isArray(result?.mappingUnverified) ? result.mappingUnverified : [])
+      .map((channel) => String(channel));
+    const ok = result?.ok === true;
+    avatarMappingProbe = { lastAt: at, ok, channels, unverified };
+    applyGazeProbeToCapabilities({ channels, unverified });
+    await log.emit('avatar.mapping.probe', { ok, channels, unverified, at }).catch(() => {});
+    return {
+      ok,
+      at,
+      lastAt: at,
+      channels: copyMappingChannels(channels),
+      unverified: [...unverified],
+      mappingUnverified: [...unverified],
+      error: String(result?.error ?? ''),
+    };
   };
 
   /** Idempotent teardown; the disposed instance stays readable from status. */
@@ -19186,6 +19323,11 @@ export function apply(ctx, config) {
       versions: { ...(status?.versions ?? {}), ...baseline.versions },
       live2d: { ...(status?.live2d ?? {}), ...vtsAuth },
       vtsAuth,
+      /**
+       * Explicit gaze-mapping evidence, kept separate from `live2d.capabilities` (name/discovery
+       * evidence): `lastAt:null, ok:null` means no probe has been run, not a failure.
+       */
+      avatar: { mapping: avatarMappingStatus() },
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
@@ -19773,6 +19915,8 @@ export function apply(ctx, config) {
     get vtsConnect() { return vtsConnect; },
     get writeSettings() { return writeSettings; }
   }) },
+// One explicit user click proves (or fails to prove) the gaze mapping; never automatic/retried.
+{ actions: ['avatar.mapping.probe'], handle: async () => probeAvatarGazeMapping() },
 { actions: ['vts.authorize'], handle: async (body) => vtsAuthorize(body) },
 { actions: subtitleActions, handle: createSubtitleSettingsActions({
     get ensureComponent() { return ensureComponent; },

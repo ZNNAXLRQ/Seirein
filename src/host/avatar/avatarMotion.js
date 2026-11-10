@@ -47,6 +47,8 @@ export const CHANNEL_ORDER = [
 export const PROBE_CHANNEL_ORDER = Object.freeze(['gazeX', 'gazeY']);
 /** Diagnostic injection value; gaze tracking inputs are normalised to -1..1. */
 export const PROBE_VALUE = 0.5;
+/** Upper bound for ONE explicit probe call; a transport that never settles becomes safe data. */
+export const PROBE_TIMEOUT_MS = 5000;
 
 /**
  * Candidate *input* names per channel, most specific first. Matching is an exact, case-insensitive
@@ -400,6 +402,161 @@ async function probeChannelMappings({ channels, probeMappings, probeInputMapping
     });
   }
   return '';
+}
+
+/** A probe/diagnostic failure is data: never let an unexpected rejection escape the caller. */
+const probeErrorText = (error) => String(error?.message ?? error ?? 'unknown error');
+
+/** Keep only numeric/null values: a probe result is evidence, never a page of transport payload. */
+function sanitizeProbeDelta(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const delta = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (value === null) {
+      delta[String(name)] = null;
+    } else if (Number.isFinite(Number(value))) {
+      delta[String(name)] = Number(value);
+    }
+  }
+  return delta;
+}
+
+/**
+ * Run one probe with a hard timeout. The timeout never rejects and never leaves an unhandled
+ * rejection behind: a late settlement is simply ignored after the safe failure was returned.
+ */
+function probeWithTimeout(probeInputMapping, request, timeoutMs) {
+  const call = Promise.resolve()
+    .then(() => probeInputMapping(request))
+    .then(
+      (value) => ({ timedOut: false, value, error: '' }),
+      (error) => ({ timedOut: false, value: null, error: probeErrorText(error) }),
+    );
+  let timer = null;
+  const timeout = new Promise((resolve) => {
+    if (!(Number.isFinite(timeoutMs) && timeoutMs > 0)) return;
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([call, timeout]).then((settled) => {
+    if (timer !== null) clearTimeout(timer);
+    if (settled?.timedOut === true) {
+      return {
+        ok: false,
+        changed: false,
+        delta: {},
+        error: `mapping probe timed out after ${timeoutMs} ms`,
+      };
+    }
+    if (settled?.error) return { ok: false, changed: false, delta: {}, error: settled.error };
+    return settled?.value;
+  });
+}
+
+/**
+ * Explicit gaze-mapping probe. It is deliberately a pure operation over caller-supplied channel
+ * rows: no cache is touched, no discovery runs and no value is written outside `probeInputMapping`
+ * (normally `VtsClient.probeInputMapping`, which already pauses its frame loop while measuring).
+ *
+ * A row qualifies only when it has a concrete `inputName` and at least one `modelParams` target.
+ * Only `changed:true` from a completed probe is evidence; an unchanged/failed/timeout probe keeps
+ * the channel in `channels` and lists it in `mappingUnverified`. The result contains no paths,
+ * page text or raw transport payload.
+ *
+ * @param {object} options
+ * @param {object[]|{channels?: object[]}} options.channels Capability rows (or a capability snapshot).
+ * @param {(input: {inputName: string, parameterNames: string[], value: number}) => Promise<object>}
+ *   options.probeInputMapping
+ * @param {number} [options.probeValue=0.5]
+ * @param {number} [options.timeoutMs=5000]
+ * @param {() => number} [options.now]
+ * @returns {Promise<{ok: boolean, channels: object, mappingUnverified: string[], at: string,
+ *   error: string}>}
+ */
+export async function probeGazeMapping({
+  channels = [],
+  probeInputMapping = undefined,
+  probeValue = PROBE_VALUE,
+  timeoutMs = PROBE_TIMEOUT_MS,
+  now = Date.now,
+} = {}) {
+  const readAt = () => {
+    const value = typeof now === 'function' ? Number(now()) : Date.now();
+    return new Date(Number.isFinite(value) ? value : Date.now()).toISOString();
+  };
+  const rows = Array.isArray(channels)
+    ? channels
+    : (Array.isArray(channels?.channels) ? channels.channels : []);
+
+  const candidates = [];
+  const seen = new Set();
+  for (const entry of rows) {
+    const channel = String(entry?.channel ?? '');
+    if (!PROBE_CHANNEL_ORDER.includes(channel) || seen.has(channel)) continue;
+    if (entry?.injectable === false) continue;
+    const inputName = String(entry?.inputName ?? '').trim();
+    const parameterNames = (Array.isArray(entry?.modelParams) ? entry.modelParams : [])
+      .map((name) => String(name ?? '').trim())
+      .filter((name) => name.length > 0);
+    if (inputName.length === 0 || parameterNames.length === 0) continue;
+    seen.add(channel);
+    candidates.push({ channel, inputName, parameterNames });
+  }
+
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      channels: {},
+      mappingUnverified: [],
+      at: readAt(),
+      error: '没有可探测的视线映射（需要已发现的 gazeX/gazeY 输入与模型参数）',
+    };
+  }
+  if (typeof probeInputMapping !== 'function') {
+    return {
+      ok: false,
+      channels: {},
+      mappingUnverified: [],
+      at: readAt(),
+      error: 'probeInputMapping 不可用',
+    };
+  }
+
+  const value = Number.isFinite(Number(probeValue)) ? Number(probeValue) : PROBE_VALUE;
+  const resultChannels = {};
+  const mappingUnverified = [];
+  let ok = true;
+  let firstError = '';
+
+  for (const candidate of candidates) {
+    const outcome = await probeWithTimeout(probeInputMapping, {
+      inputName: candidate.inputName,
+      parameterNames: [...candidate.parameterNames],
+      value,
+    }, timeoutMs);
+    const completed = outcome !== null && typeof outcome === 'object' && outcome.ok !== false
+      && outcome.timedOut !== true;
+    const changed = completed && outcome.changed === true;
+    const error = String(outcome?.error ?? '') || (completed ? '' : 'mapping probe failed');
+    if (!completed) ok = false;
+    if (error.length > 0 && firstError.length === 0) firstError = error;
+    resultChannels[candidate.channel] = {
+      inputName: candidate.inputName,
+      parameterNames: [...candidate.parameterNames],
+      changed,
+      delta: sanitizeProbeDelta(outcome?.delta),
+      error,
+    };
+    if (!changed) mappingUnverified.push(candidate.channel);
+  }
+
+  return {
+    ok: ok && candidates.length > 0,
+    channels: resultChannels,
+    mappingUnverified,
+    at: readAt(),
+    error: firstError,
+  };
 }
 
 /** Probe one capability map; caching, identity verification and lifecycle events belong to the caller. */

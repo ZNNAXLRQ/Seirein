@@ -7174,6 +7174,31 @@ window.__ModuleLoader__.load({
           const socketOpen = l.socketOpen === true;
           const hotkeys = l.hotkeys ?? [];
           const expressions = l.expressions ?? [];
+          // 视线映射的显式验证结果只来自 status.avatar.mapping（一次动作一条记录，不轮询）。
+          // 没有记录 = 还没验证，不是失败；失败也不隐藏/清空其它已发现通道。
+          const mappingView = (() => {
+            const record = status.avatar?.mapping ?? null;
+            if (record === null || record.lastAt === null || record.lastAt === undefined) {
+              return { state: 'none', text: '尚未验证（点按钮实测）' };
+            }
+            const entries = Object.entries(record.channels ?? {});
+            if (record.ok === false) {
+              const reason = entries
+                .map(([, row]) => String(row?.error ?? ''))
+                .find((text) => text.length > 0)
+                ?? (entries.length === 0 ? 'VTS 未连接或没有可探测的视线参数' : '探测失败');
+              return { state: 'failed', text: `失败：${reason}` };
+            }
+            const changed = entries.filter(([, row]) => row?.changed === true).map(([name]) => name);
+            const unchanged = entries.filter(([, row]) => row?.changed !== true).map(([name]) => name);
+            if (entries.length > 0 && unchanged.length === 0) {
+              return { state: 'connected', text: `已连通：${changed.join('、')}` };
+            }
+            return {
+              state: 'unchanged',
+              text: `未变化：${unchanged.join('、') || '视线通道'}（注入后参数未变）`,
+            };
+          })();
           return settingsCard(h, 'avatar', '形象与动作',
               settingsGroup(h, 'vts', 'VTS 连接与表情',
                 line('VTS', ready
@@ -7328,6 +7353,22 @@ window.__ModuleLoader__.load({
                         },
                       }, '重新探测'),
                       h('span', { style: styles.hint }, caps?.error ? `探测失败：${caps.error}` : ''),
+                    ),
+                    h('div', { style: { ...styles.row, marginTop: 6 } },
+                      h('button', {
+                        style: { ...styles.btn, ...(busy !== '' ? styles.off : {}) },
+                        disabled: busy !== '',
+                        title: ready
+                          ? '注入一个测试值，检查视线输入是否真的驱动模型参数（只执行一次）'
+                          : 'VTS 未连接：点击会返回失败原因，不影响其它设置',
+                        onClick: () => act({ action: 'avatar.mapping.probe' }, 'avatar-mapping'),
+                      }, '验证视线映射'),
+                      h('span', {
+                        style: mappingView.state === 'failed'
+                          ? { ...styles.value, color: DANGER }
+                          : styles.hint,
+                        'data-avatar-mapping': mappingView.state,
+                      }, mappingView.text),
                     ),
                     h('div', { style: styles.hint }, '「可注入」只说明值能发出去；「已验证」才说明有证据它驱动该部位。模型是否响应取决于 VTS 内的参数映射。'),
                   );
