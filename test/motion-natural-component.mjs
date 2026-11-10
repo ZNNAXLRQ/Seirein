@@ -154,7 +154,15 @@ test('1. natural 选中：targetSemantic 非零且 ≤0.40，保持恒定，角�
 // ---------------------------------------------------------------------------------------------
 test('2. natural 期间基础微动持续：60s 峰峰值约 1.5–4.5°，不是固定住十几秒', () => {
   const seed = naturalFirstSeed();
-  const runtime = createBehaviorRuntime({ config: naturalConfig(seed) });
+  // The base posture must re-draw on its own rhythm, otherwise a pinned 60 s hold would only
+  // reveal the hold drift and the assertion would not measure the base activity layer at all.
+  const runtime = createBehaviorRuntime({
+    config: naturalConfig(seed, {
+      postureHoldMinMs: 12_000,
+      postureHoldMaxMs: 12_000,
+      postureHoldChance: 0,
+    }),
+  });
   const baseMin = { headX: Number.POSITIVE_INFINITY, headY: Number.POSITIVE_INFINITY, headZ: Number.POSITIVE_INFINITY };
   const baseHigh = { headX: Number.NEGATIVE_INFINITY, headY: Number.NEGATIVE_INFINITY, headZ: Number.NEGATIVE_INFINITY };
   let samples = 0;

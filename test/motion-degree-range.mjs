@@ -214,7 +214,16 @@ test('1. 姿态组件目标 5–12°：natural/lean/look-back 分轴，headX 与
 // 2. base micro-motion: 60 s continuous, 1.5–4.5° peak-to-peak, no restart at component swaps
 // ---------------------------------------------------------------------------------------------
 test('2. 基础层 60s 连续：峰峰值约 2–4°，组件保持期间仍变化，drift 不重置', () => {
-  const runtime = createBehaviorRuntime({ config: behaviorConfig() });
+  // The base layer must be sampled while it actually re-draws its own posture: a pinned 60 s hold
+  // would only measure the hold drift (or, worse, the component offset's slow factor). The
+  // component window stays 10 s, so several components are held while the base keeps moving.
+  const runtime = createBehaviorRuntime({
+    config: behaviorConfig({
+      postureHoldMinMs: 12_000,
+      postureHoldMaxMs: 12_000,
+      postureHoldChance: 0,
+    }),
+  });
   const min = { headX: Infinity, headY: Infinity, headZ: Infinity };
   const max = { headX: -Infinity, headY: -Infinity, headZ: -Infinity };
   let maxDriftStep = 0;

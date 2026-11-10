@@ -701,6 +701,17 @@ export const SPEECH_MICRO_MOTION = Object.freeze({
 
 
 /**
+ * A channel `add` below this semantic size (0.05 = 1.5°) is an autonomous micro-expression
+ * (thinking nod / gaze drift / weight shift), not a gesture. The same-channel yield rule
+ * (`INTENT_IDLE_RATIO`) is meant for a GESTURE: applying it to a 0.1° expression erased the whole
+ * idle base and a deliberately held 10° component for the expression window (the observed "idle
+ * collapses to ~0" case), so a micro-expression is added instead of replacing the idle layer.
+ * Plain intents are floored at ≥4°, presets at ≥10°, so only autonomous micro-motion lands here.
+ */
+export const IDLE_YIELD_MIN_GESTURE = 0.05;
+
+
+/**
  * The visible floor, converted from the primary-axis semantics into the intent's own amplitude
  * scalar. A nod's scalar IS its headY amplitude; a tilt's headX is `amplitude × yawRatio`, so the
  * scalar has to be divided by both the variant's yaw ratio and the channel's style scale. Only
@@ -762,6 +773,32 @@ export const RELAX_PLAN = Object.freeze({
 
 /** Gain on the idle posture curve with a normal persona (amplitude 1); see advanceGenerators. */
 export const POSTURE_REACH = 1.5;
+
+
+/**
+ * BASE ACTIVITY — the idle layer's OWN amplitude, in DEGREES (peak from the posture centre at
+ * status `idle`, persona amplitude 1 and `idleSwayScale` 1). This is deliberately separate from
+ * the component target degrees (`POSTURE_COMPONENT_DEGREE_BANDS`): a held component asks for its
+ * own 5–12°, while the base sway keeps its much smaller span underneath it. One layer must never
+ * be derived from the other, and neither is a "global visibility gain".
+ *
+ * The span is what a normal persona should visibly do while idle: headX ≈ 1.8° p2p, headY ≈ 3°
+ * p2p, headZ ≈ 2° p2p once the hold drift is added. These are trial values, not measured angles
+ * (the writer's convention is 1 semantic unit = 30°).
+ */
+export const BASE_ACTIVITY_DEGREES = Object.freeze({
+  headX: 0.9,
+  headY: 1.6,
+  headZ: 0.9,
+});
+
+/**
+ * Persona amplitude (0.2–1.5) → base-activity multiplier. The base layer is not a gesture: a
+ * quiet persona must still move visibly, and a lively one may move a little more. The mapping is
+ * applied ONCE (the old chain multiplied the persona amplitude twice, so a 0.45 persona kept only
+ * 0.2 of its base sway). Ordering is preserved: quiet < normal < lively.
+ */
+export const BASE_ACTIVITY_PERSONA_SCALE = Object.freeze({ MIN: 0.8, MAX: 1.0 });
 
 
 /** C² ease for a planned posture transition: both ends have zero velocity and acceleration. */
@@ -1693,26 +1730,51 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   /**
-   * The ONE idle gain chain (idleSwayScale × postureReach × persona amplitude, or a per-channel
-   * override). `advanceGenerators` and the posture-component target both read it, so a component
-   * can never invent a second amplitude convention.
+   * The ONE balanced base-activity multiplier: the host's `idleSwayScale`, the persona amplitude
+   * (mapped ONCE into a gentle 0.8–1.0 visibility band), the configured `postureReach` (still a
+   * host knob, normalised by its default) and the status/relax scale exactly once. There is no
+   * second `style.amplitude` factor here: the old chain multiplied the persona amplitude twice and
+   * a 0.45 persona ended with 0.2 of the base span.
+   *
+   * This function NEVER carries a component target: `headBaseSemantic()` supplies the base span,
+   * and the component target is its own explicit degree value on the component draw.
    */
   function idleChannelSway(channel) {
-    const eff = state.effective ?? state.style;
     const idleSwayScale = Math.max(0, finite(cfg.idleSwayScale, DEFAULT_CONFIG.idleSwayScale));
-    if (state.style.channels[channel]?.amplitude !== undefined) {
-      return idleSwayScale * styleChannelAmplitude(eff, channel);
-    }
-    const personaAmplitude = Math.max(0.2, Math.min(1.5, finite(state.style.amplitude, 1)));
-    const postureReach = Math.max(0, finite(cfg.postureReach, DEFAULT_CONFIG.postureReach));
-    return idleSwayScale * postureReach * styleChannelAmplitude(eff, channel) * personaAmplitude;
+    const reach = Math.max(0, finite(cfg.postureReach, DEFAULT_CONFIG.postureReach))
+      / Math.max(1e-6, POSTURE_REACH);
+    const baseline = styleChannelAmplitude(state.style, channel);
+    const amplitude = Math.max(0.2, Math.min(1.5, finite(baseline, 1)));
+    const personaT = clamp01((amplitude - 0.2) / 1.3);
+    const persona = BASE_ACTIVITY_PERSONA_SCALE.MIN
+      + (BASE_ACTIVITY_PERSONA_SCALE.MAX - BASE_ACTIVITY_PERSONA_SCALE.MIN) * personaT;
+    // Status/relax enter ONCE through the effective style: effective = baseline × modifier × relax.
+    const effective = styleChannelAmplitude(state.effective ?? state.style, channel);
+    const stateScale = baseline > 1e-9 ? clamp01(effective / baseline) : 1;
+    return idleSwayScale * reach * persona * stateScale;
   }
 
-  /** Semantic head units produced by ONE pose unit of `channel` under the current persona. */
-  function headSemanticGain(channel) {
-    const sway = idleChannelSway(channel);
-    const base = channel === 'headZ' ? 0.018 : channel === 'headY' ? 0.034 : 0.025;
-    return Math.max(0, base * sway);
+  /**
+   * The base activity span of one head axis in SEMANTIC units (1 = 30°). This is the generated
+   * sway amplitude, NOT a component target: a component's 5–12° requirement is expressed directly
+   * in degrees on its own draw and never multiplies this value to change its size.
+   */
+  function headBaseSemantic(channel) {
+    const degrees = BASE_ACTIVITY_DEGREES[channel] ?? 0;
+    return (degrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT) * idleChannelSway(channel);
+  }
+
+  /**
+   * Pose-unit offset that makes ONE component target ride the shared posture-axis trajectory.
+   * This is a CANCELLATION of the base gain, not a second amplitude convention: the component's
+   * own target stays the explicit semantic degree value. A later gain/status change is bounded by
+   * the per-frame semantic cap in `advanceGenerators`; the explicit degree value remains the
+   * target of record.
+   */
+  function componentPoseOffset(channel, targetSemantic) {
+    const gain = headBaseSemantic(channel);
+    if (!(gain > 1e-9)) return 0;
+    return finite(targetSemantic, 0) / gain;
   }
 
   /** Re-derive both views from the current baseline style + version. */
@@ -1787,11 +1849,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /**
    * Fold one component's axis offsets into a raw posture goal. Components never replace the idle
    * draw or the preset layer: they are a bounded head offset inside the ONE `posture.target`.
+   *
+   * `component === undefined` means "the component currently held": a base posture re-draw or a
+   * short response action must ride ON TOP of the held component, not silently wipe it from the
+   * target (the component lifetime owns its own 10–20 s window). Passing an explicit component
+   * (including `null`) still overrides, which is how a fresh draw installs itself.
    */
-  function targetWithComponent(base, component = null) {
+  function targetWithComponent(base, component = undefined) {
+    const active = component === undefined ? state.motion.posture.component : component;
     const next = {};
     for (const axis of MOTION_AXES) {
-      const offset = component?.axes?.[axis] ?? 0;
+      const offset = active?.axes?.[axis] ?? 0;
       // The component offset may exceed one pose unit when it cancels a quiet persona's tiny
       // per-axis gain; the semantic cap is applied later to the contribution, not to this internal
       // offset. The base itself is still drawn inside ±1.
@@ -1831,7 +1899,6 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const saturated = {};
     let amplitude = 0;
     for (const channel of POSTURE_COMPONENT_CHANNELS) {
-      const gain = headSemanticGain(channel);
       const band = bands[channel] ?? { min: 0, max: 0 };
       const channelLimit = HEAD_CHANNEL_DEGREE_LIMITS[channel];
       // A negative band (right lean) must shrink in MAGNITUDE for a quiet persona: interpolate
@@ -1840,17 +1907,20 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         ? band.max + (band.min - band.max) * position
         : band.min + (band.max - band.min) * position;
       const desiredDegrees = Math.max(-channelLimit, Math.min(channelLimit, bandDegrees));
-      const requested = gain > 1e-9
-        ? (desiredDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT) / gain
-        : 0;
-      // A quiet/tired persona has a tiny per-axis gain, so reaching a 5–12° target needs an
-      // internal offset above 1. The bound only stops a near-zero gain from exploding; the
-      // published TARGET is the semantic value below (≤ the component cap), never this offset.
+      // The component's AMPLITUDE is this explicit semantic target; it is never re-derived from
+      // the base sway gain. The pose-unit offset only lets the target ride the shared posture
+      // transition (a cancellation of the base gain), so a quiet persona no longer needs an
+      // enormous offset and a loud one is not amplified past its declared degrees.
+      const targetSemantic = desiredDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT;
+      const requested = componentPoseOffset(channel, targetSemantic);
       axes[channel] = clampMotion(requested, POSTURE_COMPONENT_AXIS_LIMIT);
       saturated[channel] = Math.abs(requested) > POSTURE_COMPONENT_AXIS_LIMIT + 1e-9;
-      // Record the semantic target AFTER both clamps as well: an axis that never reaches its target
-      // must not be reported as an amplitude it did not produce.
-      semantic[channel] = axes[channel] * gain;
+      // The published target is the component's own semantic value, after the explicit degree
+      // band clamp. The live gain is cancelled by the pose-unit offset, and a later gain/status
+      // change is bounded by the per-frame semantic cap in advanceGenerators (never by an
+      // arbitrary global multiplier here).
+      semantic[channel] = clampMotion(targetSemantic,
+        POSTURE_COMPONENT_MAX_AMPLITUDE);
       // The writer's documented head convention is 1 semantic unit = 30°. This is the semantic
       // target angle BEFORE any transport-specific normalisation (the facade annotates the verified
       // input range separately and marks it unknown when no verified mapping exists).
@@ -2247,13 +2317,24 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return axis.current;
   }
 
-  /** Target = held posture + slow amplitude drift + continuous micro-noise (no fixed sine). */
+  /**
+   * Target = held posture + slow amplitude drift + continuous micro-noise (no fixed sine).
+   *
+   * The slow drift and the micro-noise belong to the BASE activity layer only. They multiply the
+   * base goal, never the component offset: the component target is already an explicit semantic
+   * value, and multiplying its (typically much larger) pose-unit offset by the same ±18% drift
+   * used to turn one 10° lean into a ~1–2° mechanical wander while the real base sway stayed
+   * invisible. Keeping the offset out of the multiplier is what makes `idle − component` a
+   * truthful base-activity measurement.
+   */
   function motionTarget(axis, tSeconds) {
     const held = finite(state.motion.posture.target[axis], 0);
+    const base = finite(state.motion.posture.base[axis], 0);
+    const componentOffset = held - base;
     const salt = hash32(motionSeed, axis);
     const slow = 0.82 + 0.18 * smoothNoise1(salt, tSeconds * 0.07 + 1.7);
     const micro = 0.09 * smoothNoise1(salt, tSeconds * 0.55 + 3.1);
-    return held * slow + micro;
+    return componentOffset + base * slow + micro;
   }
 
   /**
@@ -5630,10 +5711,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     );
     const speechMicro = (microDegrees / OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT)
       * state.speechMicroGain * Math.sin(Math.PI * 2 * microHz * (state.idleMs / 1000));
-    // Head base swing: the posture gain is 0.09 × sway × reach (≈±5° normal, ≈±10° lively).
-    const headXAmp = idleEnabled ? 0.025 * idleChannelSway('headX') * speakingHead : 0;
-    const headYAmp = idleEnabled ? 0.034 * idleChannelSway('headY') * speakingHead : 0;
-    const headZAmp = idleEnabled ? 0.018 * idleChannelSway('headZ') : 0;
+    // Head base swing: the base activity span is its OWN explicit degree target (see
+    // BASE_ACTIVITY_DEGREES), not a component-derived gain. Speech damps the base sway, while the
+    // held component keeps its own degrees via the per-frame correction below.
+    const headXAmp = idleEnabled ? headBaseSemantic('headX') * speakingHead : 0;
+    const headYAmp = idleEnabled ? headBaseSemantic('headY') * speakingHead : 0;
+    const headZAmp = idleEnabled ? headBaseSemantic('headZ') : 0;
     const bodyAmp = idleEnabled ? 0.03 * idleChannelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
     const gazeXAmp = 0.03 * idleChannelSway('gazeX') * gazeDrift;
     const gazeYAmp = 0.02 * idleChannelSway('gazeY') * gazeDrift;
@@ -5678,11 +5761,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
     const componentGazeX = yieldGaze(gazeComponent?.value?.gazeX, expressionGaze.x);
     const componentGazeY = yieldGaze(gazeComponent?.value?.gazeY, expressionGaze.y);
-    // Phase 3 per-channel cap on the HEAD component AFTER the live persona/status gain is known.
-    // `headSemanticGain()` froze the axis at draw time, but a later status/style switch can change
-    // the gain; without this second cap the SAME component could grow past 0.40 semantic. The
-    // excess is subtracted from the idle base, so base drift is preserved while the component never
-    // exceeds its budget. Evidence records the capped contribution, not the un-capped request.
+    // The component's own semantic target is fixed at draw time. The posture axis carries it as a
+    // cancellation offset, so the delivered share is `headAmp × offset`; cap that share at the
+    // component budget. The correction is subtracted from the idle base, so base drift is
+    // preserved while the component never exceeds its budget. `mixed` records the share really
+    // delivered; the explicit target degrees stay available on the component itself.
     const headComponentAxes = motion.posture.component?.axes ?? null;
     const componentHeadRaw = {
       headX: headXAmp * finite(headComponentAxes?.headX, 0),
@@ -5947,13 +6030,40 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     for (const [channel, value] of Object.entries(intent.adds)) {
       if (value === 0) continue;
       const idleBase = finite(generators.idle?.[channel], 0);
+      const componentBefore = finite(headComponent?.observed?.mixed?.[channel], 0);
+      const presetIds = state.presets.active
+        .filter((item) => item.done !== true && item.channels.includes(channel))
+        .map((item) => item.presetId);
+      // An autonomous micro-expression (no preset owner) never invokes the gesture yield rule. A
+      // preset's ramp edge is still a GESTURE: it keeps the existing INTENT_IDLE_RATIO contract.
+      if (Math.abs(value) < IDLE_YIELD_MIN_GESTURE && presetIds.length === 0) {
+        // Micro-expression only: it is ADDED to the live idle base (and held component). It must
+        // not invoke the gesture yield rule, which would replace the whole base with 0.2×0.1°.
+        const microNext = finite(composed[channel], 0) + value;
+        composed[channel] = isBidirectional(channel)
+          ? clampBipolarChannel(channel, microNext)
+          : clamp01(microNext);
+        if (componentBefore !== 0) {
+          headConflicts.push({
+            channel,
+            gesture: value,
+            idleBase,
+            componentBefore,
+            componentAfter: componentBefore,
+            yieldScale: 1,
+            idleScale: 1,
+            micro: true,
+            presetIds,
+          });
+        }
+        continue;
+      }
       const cap = INTENT_IDLE_RATIO * Math.abs(value);
       const idlePart = Math.max(-cap, Math.min(cap, idleBase));
       const next = finite(composed[channel], 0) - idleBase + idlePart + value;
       composed[channel] = isBidirectional(channel)
         ? clampBipolarChannel(channel, next)
         : clamp01(next);
-      const componentBefore = finite(headComponent?.observed?.mixed?.[channel], 0);
       if (componentBefore !== 0) {
         const retained = Math.abs(idleBase) > 1e-12 ? idlePart / idleBase : 0;
         // The arbitration replaces the WHOLE idle contribution (base swing + component) with one
