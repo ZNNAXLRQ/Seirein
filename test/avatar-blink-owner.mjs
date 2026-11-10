@@ -171,6 +171,9 @@ test('2. plugin + 已验证：idleEye=true、blink.owner=plugin、blinkSent 实�
   const eyeRows = rig.fake.frames.flat().filter((entry) => entry.channel === 'eyeOpenL'
     || entry.channel === 'eyeOpenR');
   assert.ok(eyeRows.length > 0, 'the transport really received eye-open rows');
+  const minEye = Math.min(...eyeRows.map((entry) => Number(entry.value)));
+  assert.ok(minEye < 0.2,
+    `a plugin blink really closes the eyelid instead of the old 0.95 floor (min=${minEye})`);
   console.log(`[blink 2] owner=${snap.blink.owner} idleEye=${snap.idleParams.eye}`
     + ` generated=${snap.blink.generated} sent=${snap.blink.sent} eyeRows=${eyeRows.length}`);
 });

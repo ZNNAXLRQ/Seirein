@@ -3382,9 +3382,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // Single taken-over channel: raise the micro-motion to a perceptible amplitude. The gain is
     // applied BEFORE the cap and the idleMaxStep limiter, so the motion grows, the jitter does not.
     const alive = idlePool.aliveChannel === item.channel ? ALIVE_FALLBACK_GAIN : 1;
-    const amplitude = (eye
-      ? Math.min(0.05, host.idleAmplitude / 4)
-      : host.idleAmplitude * grow) * alive;
+    const amplitude = eye
+      ? 1
+      : host.idleAmplitude * grow * alive;
     const speechScale = Math.max(0, Math.min(1, finite(scale, 1)));
     let next = raw * gain * alive * speechScale;
     // Motion floor: replace a completely still curve with previous ± one minimal nudge. The step
@@ -3396,10 +3396,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     const beforeCap = next;
     next = eye
-      ? Math.min(1, Math.max(1 - amplitude, next))
+      ? Math.min(1, Math.max(0, next))
       : Math.max(-amplitude, Math.min(amplitude, next));
     const previous = idleLastValue.get(item.channel) ?? (eye ? 1 : 0);
-    const step = host.idleMaxStep * (eye ? 1 : grow);
+    // A plugin blink is not the slow idle-eye micro-motion: its 75 ms close needs a full step.
+    // VTS-owned eyes are excluded from the write set, so this cannot fight native blinking.
+    const step = eye
+      ? (host.idleEye === true ? 1 : host.idleMaxStep)
+      : host.idleMaxStep * grow;
     const bounded = step > 0
       ? previous + Math.max(-step, Math.min(step, next - previous))
       : next;
