@@ -62,7 +62,8 @@
 import { lexiconKey } from './lexicon-candidates.js';
 import { recallLexiconCandidates } from './lexicon-recall.js';
 import {
-  LEXICON_CATEGORIES,
+  LEXICON_CATEGORY_MAX_CHARS,
+  LEXICON_DEFAULT_CATEGORY,
   LEXICON_LIBRARIES,
   LEXICON_READING_MAX_CHARS,
   LEXICON_TEXT_MAX_CHARS,
@@ -148,8 +149,9 @@ function stableReason(result, fallback = 'store-failed') {
 
 /**
  * Project one stored entry (or a recall hit) onto the safe view. Unknown/absent fields get the
- * same conservative defaults the store itself uses; nothing from the store's internal shape is
- * spread into the result.
+ * same conservative defaults the store itself uses; a custom free-text category is preserved
+ * instead of being collapsed to `unknown`; nothing from the store's internal shape is spread into
+ * the result.
  *
  * @param {unknown} entry
  * @returns {{id: string, text: string, canonical: string, category: string, usage: string,
@@ -160,11 +162,12 @@ function safeEntry(entry) {
   const id = typeof entry.id === 'string'
     ? entry.id
     : (typeof entry.id === 'number' && Number.isFinite(entry.id) ? String(entry.id) : '');
+  const category = text(entry.category);
   const view = {
     id,
     text: typeof entry.text === 'string' ? entry.text : '',
     canonical: typeof entry.canonical === 'string' ? entry.canonical : '',
-    category: LEXICON_CATEGORIES.includes(entry.category) ? entry.category : 'unknown',
+    category: category.length > 0 ? category : LEXICON_DEFAULT_CATEGORY,
     usage: typeof entry.usage === 'string' ? entry.usage : '',
     reading: typeof entry.reading === 'string' ? entry.reading : '',
     library: LEXICON_LIBRARIES.includes(entry.library) ? entry.library : 'public',
@@ -469,8 +472,11 @@ function proposal(call) {
   const display = requestedDisplay(call);
   if (display.length === 0) return {ok: false, reason: 'text-required'};
   if (exceeds(display, LEXICON_TEXT_MAX_CHARS)) return {ok: false, reason: 'text-too-long'};
-  if (call.category !== undefined && !LEXICON_CATEGORIES.includes(call.category)) {
-    return {ok: false, reason: 'invalid-category'};
+  if (call.category !== undefined && call.category !== null) {
+    if (typeof call.category !== 'string'
+      || exceeds(call.category.trim(), LEXICON_CATEGORY_MAX_CHARS)) {
+      return {ok: false, reason: 'invalid-category'};
+    }
   }
   if (call.library !== undefined && call.library !== null
     && (typeof call.library !== 'string' || !LEXICON_LIBRARIES.includes(call.library))) {

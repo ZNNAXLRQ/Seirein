@@ -3,7 +3,7 @@
  *
  * Covers the user's v1 request, not the deferred v2 recall/injection work:
  *   1. manual add without speakerId → confirmed + assigned, category/usage/reading/library;
- *   2. category enum / length / library validation, duplicate key → exists;
+ *   2. category text bound / length / library validation, duplicate key → exists;
  *   3. update keeps status, move changes only library, remove deletes;
  *   4. `/word` quoted + whitespace parsing, incomplete arguments never guessed, result carries
  *      the editable entry id;
@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { cleanupRoot, disposeAll } from './helpers/cleanup.mjs';
 import {
   LEXICON_CATEGORIES,
+  LEXICON_CATEGORY_MAX_CHARS,
   LEXICON_DEFAULT_LIBRARY,
   LEXICON_LIBRARIES,
   LEXICON_READING_MAX_CHARS,
@@ -115,13 +116,17 @@ test('1. 无 speakerId 手动添加：直接 confirmed/assigned，字段完整�
   console.log('[1] added=', JSON.stringify(result.entry), 'list=', JSON.stringify(store.listConfirmed().map((entry) => entry.text)));
 });
 
-test('2. 三字段/类别/长度/库位校验；重复 key 返回 exists 且不覆盖', (t) => {
+test('2. 类别文本/长度/库位校验；重复 key 返回 exists 且不覆盖', (t) => {
   const root = tempRoot(t);
   const store = createLexiconStore({ root });
 
   assert.deepEqual(store.addEntry({ text: '', category: 'person' }), { ok: false, reason: 'text-required' });
   assert.deepEqual(store.addEntry({ text: 'x'.repeat(LEXICON_TEXT_MAX_CHARS + 1), category: 'person' }), { ok: false, reason: 'text-too-long' });
-  assert.deepEqual(store.addEntry({ text: '甲', category: 'not-a-category' }), { ok: false, reason: 'invalid-category' });
+  assert.deepEqual(store.addEntry({
+    text: '甲',
+    category: '类'.repeat(LEXICON_CATEGORY_MAX_CHARS + 1),
+  }), { ok: false, reason: 'invalid-category' });
+  assert.deepEqual(store.addEntry({ text: '甲', category: 42 }), { ok: false, reason: 'invalid-category' });
   assert.deepEqual(store.addEntry({ text: '甲', category: 'person', usage: 'x'.repeat(LEXICON_USAGE_MAX_CHARS + 1) }), { ok: false, reason: 'invalid-usage' });
   assert.deepEqual(store.addEntry({ text: '甲', category: 'person', reading: 'x'.repeat(LEXICON_READING_MAX_CHARS + 1) }), { ok: false, reason: 'invalid-reading' });
   assert.deepEqual(store.addEntry({ text: '甲', category: 'person', library: 'private' }), { ok: false, reason: 'invalid-library' });
@@ -135,7 +140,13 @@ test('2. 三字段/类别/长度/库位校验；重复 key 返回 exists 且不�
   assert.equal(store.listConfirmed().length, 1);
   assert.equal(store.listConfirmed()[0].usage, '项目名', 'the existing row was not merged/overwritten');
 
-  console.log('[2] validation=ok duplicate=', JSON.stringify(duplicate), 'rows=', store.listConfirmed().length);
+  const custom = store.addEntry({ text: '奶茶', category: '  饮品  ' });
+  assert.equal(custom.ok, true);
+  assert.equal(custom.entry.category, '饮品', 'a non-empty arbitrary category is stored (trimmed)');
+  assert.equal(store.listConfirmed().length, 2);
+
+  console.log('[2] validation=ok duplicate=', JSON.stringify(duplicate),
+    'customCategory=', JSON.stringify(custom.entry.category), 'rows=', store.listConfirmed().length);
 });
 
 test('3. update 只改字段不改 status；move 只改库位与归属；remove 真删除', (t) => {
@@ -169,7 +180,11 @@ test('3. update 只改字段不改 status；move 只改库位与归属；remove 
   assert.equal(categoryOnly.entry.usage, '便携电源');
   assert.equal(categoryOnly.entry.status, 'confirmed');
 
-  assert.deepEqual(store.updateEntry({ id, category: 'bogus' }), { ok: false, reason: 'invalid-category' });
+  assert.deepEqual(store.updateEntry({ id, category: '类'.repeat(LEXICON_CATEGORY_MAX_CHARS + 1) }), { ok: false, reason: 'invalid-category' });
+  assert.deepEqual(store.updateEntry({ id, category: 42 }), { ok: false, reason: 'invalid-category' });
+  const customCategory = store.updateEntry({ id, category: '  自定义  ' });
+  assert.equal(customCategory.ok, true);
+  assert.equal(customCategory.entry.category, '自定义', 'an arbitrary category update is accepted');
   assert.deepEqual(store.updateEntry({ id, canonical: '' }), { ok: false, reason: 'text-required' });
   assert.deepEqual(store.updateEntry({ id, reading: 42 }), { ok: false, reason: 'invalid-reading' });
   assert.deepEqual(store.updateEntry({ id: 'lex-99', category: 'person' }), { ok: false, reason: 'not-found' });
@@ -214,7 +229,7 @@ test('3. update 只改字段不改 status；move 只改库位与归属；remove 
   console.log('[3] updated=', JSON.stringify(updated.entry), 'moved=', moved.entry.library, 'remaining=', JSON.stringify(store.listConfirmed().map((entry) => entry.text)));
 });
 
-test('4. /word：引号/空格/参数不全；类别不猜；成功结果带 ID', async (t) => {
+test('4. /word：引号/空格/参数不全；类别可自定义；成功结果带 ID', async (t) => {
   const root = tempRoot(t);
   const store = createLexiconStore({ root });
   const log = collectingLog();
@@ -252,6 +267,13 @@ test('4. /word：引号/空格/参数不全；类别不猜；成功结果带 ID'
   assert.equal(withReading.kind, 'success');
   assert.equal(store.listConfirmed().find((entry) => entry.text === 'Seirein').reading, 'se-i-rein');
 
+  const parsedCustom = parseWordCommand('奶茶 饮品 "指奶茶"');
+  assert.equal(parsedCustom.ok, true);
+  assert.equal(parsedCustom.value.category, '饮品', 'an arbitrary category is accepted by /word');
+  const customCategory = await command.handler({ rawInput: '奶茶 饮品 "指奶茶"' });
+  assert.equal(customCategory.kind, 'success');
+  assert.equal(store.listConfirmed().find((entry) => entry.text === '奶茶').category, '饮品');
+
   const duplicate = await command.handler({ rawInput: '充电 expression "重复添加"' });
   assert.equal(duplicate.kind, 'error');
   assert.match(duplicate.text, /已存在/u);
@@ -261,7 +283,6 @@ test('4. /word：引号/空格/参数不全；类别不猜；成功结果带 ID'
     ['', /缺少词、类别和用法/u],
     ['充电', /缺少类别/u],
     ['充电 特殊表达', /缺少用法说明/u],
-    ['充电 奇怪的类别 "用法"', /类别「奇怪的类别」无效/u],
     ['充电 特殊表达 "未闭合', /引号没有闭合/u],
     ['充电 特殊表达 "用法" 读音 多余', /参数过多/u],
   ]) {
@@ -272,7 +293,12 @@ test('4. /word：引号/空格/参数不全；类别不猜；成功结果带 ID'
     assert.equal(result.kind, 'error');
     assert.match(result.text, pattern);
   }
-  assert.equal(store.listConfirmed().length, 3, 'refused commands wrote nothing');
+
+  const longCategory = '类'.repeat(LEXICON_CATEGORY_MAX_CHARS + 1);
+  const longCategoryResult = await command.handler({ rawInput: `奶茶 ${longCategory} "用法"` });
+  assert.equal(longCategoryResult.kind, 'error');
+  assert.match(longCategoryResult.text, /类别最多/u);
+  assert.equal(store.listConfirmed().length, 4, 'refused commands wrote nothing');
 
   console.log('[4] quoted=', JSON.stringify(parsedQuoted), 'success=', JSON.stringify(success.text), 'rows=', JSON.stringify(store.listConfirmed().map((entry) => [entry.text, entry.category, entry.usage])));
 });

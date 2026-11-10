@@ -328,6 +328,21 @@ test('5. 坏输入：动作/授权/store、字段校验与不存在目标', (t) 
   assert.equal(added.ok, true);
   const id = added.entry.id;
 
+  // Category is free text now: a non-enum value is accepted and read back unchanged (the safe
+  // view must not collapse it to `unknown`, an old regression the legacy id previously masked).
+  const custom = invoke(store, 'add', USER, {text: '自定义类别词', category: 'nope'});
+  assert.equal(custom.ok, true);
+  assert.equal(custom.entry.category, 'nope');
+  const customReadBack = invoke(store, 'query', USER, {id: custom.entry.id});
+  assert.equal(customReadBack.ok, true);
+  assert.equal(customReadBack.entry.category, 'nope');
+  const customUpdate = invoke(store, 'update', USER, {id: custom.entry.id, category: '自定义'});
+  assert.equal(customUpdate.ok, true);
+  assert.equal(customUpdate.entry.category, '自定义');
+  const customListReadBack = invoke(store, 'query', USER, {text: '自定义类别词'});
+  assert.equal(customListReadBack.ok, true);
+  assert.equal(customListReadBack.entry.category, '自定义');
+
   assert.deepEqual(runLexiconTool({store, action: 'delete', authorization: USER}),
     {ok: false, action: 'delete', reason: 'invalid-action'});
   assert.deepEqual(
@@ -347,7 +362,6 @@ test('5. 坏输入：动作/授权/store、字段校验与不存在目标', (t) 
   const badAdds = [
     [{}, 'text-required'],
     [{text: 'x'.repeat(41), category: 'person'}, 'text-too-long'],
-    [{text: '甲', category: 'nope'}, 'invalid-category'],
     [{text: '甲', category: 'person', library: 'nope'}, 'invalid-library'],
     [{text: '甲', category: 'person', usage: 123}, 'invalid-usage'],
     [{text: '甲', category: 'person', usage: 'x'.repeat(201)}, 'invalid-usage'],
@@ -365,7 +379,6 @@ test('5. 坏输入：动作/授权/store、字段校验与不存在目标', (t) 
     [{id: 'lex-99', category: 'person'}, 'not-found'],
     [{id}, 'no-editable-field'],
     [{text: '不存在', category: 'person'}, 'not-found'],
-    [{id, category: 'nope'}, 'invalid-category'],
     [{id, library: 'public'}, 'unsupported-field'],
   ];
   for (const [params, reason] of badUpdates) {
@@ -382,7 +395,6 @@ test('5. 坏输入：动作/授权/store、字段校验与不存在目标', (t) 
   const badProposals = [
     [{}, 'text-required'],
     [{text: 'x'.repeat(41)}, 'text-too-long'],
-    [{text: '甲', category: 'nope'}, 'invalid-category'],
     [{text: '甲', library: 'nope'}, 'invalid-library'],
     [{text: '甲', usage: 123}, 'invalid-usage'],
     [{text: '甲', usage: 'x'.repeat(201)}, 'invalid-usage'],
@@ -394,6 +406,15 @@ test('5. 坏输入：动作/授权/store、字段校验与不存在目标', (t) 
     assert.equal(result.ok, false, JSON.stringify(params));
     assert.equal(result.reason, reason, JSON.stringify(params));
   }
+
+  // A custom category is valid on the candidate path too (the candidate keeps the store's own
+  // candidate defaults; this path only checks meaning conflicts).
+  const customProposal = invoke(store, 'propose', DISCOVERED, {
+    text: '自定义候选',
+    category: 'nope',
+  });
+  assert.equal(customProposal.ok, true);
+  assert.equal(customProposal.candidates.length, 1);
 
   const unsupported = invoke(noCandidateSeamStore(), 'propose', DISCOVERED, {text: '甲'});
   assert.deepEqual(unsupported, {ok: false, action: 'propose', reason: 'unsupported-store'});

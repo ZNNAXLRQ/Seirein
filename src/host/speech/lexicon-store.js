@@ -26,7 +26,7 @@
  *     entries: [{
  *       id, key, text, canonical, wrongForms: [],
  *       kind: 'proper-noun'|'correction',
- *       category: 'person'|'character'|'work'|'place'|'term'|'expression'|'meme'|'unknown',
+ *       category: string,               // free text; legacy ids still round-trip, '' → 'unknown'
  *       usage: string, reading: string, library: 'public'|'voiceprint',
  *       status: 'candidate'|'confirmed'|'rejected',
  *       speakerId: null|string, assigned: boolean,
@@ -81,7 +81,11 @@ import {
 /** The path inside the caller-provided root. */
 export const LEXICON_STORE_PATH = join('data', 'lexicon.json');
 
-/** Manual shared-lexicon taxonomy. `unknown` is the safe default for old/automatic rows. */
+/**
+ * Legacy shared-lexicon taxonomy. These ids are still valid input and keep their exact stored
+ * value (old files must round-trip), but the category field is no longer restricted to them:
+ * any non-empty text is accepted, and an empty value is stored as `unknown`.
+ */
 export const LEXICON_CATEGORIES = Object.freeze([
   'person',
   'character',
@@ -92,6 +96,9 @@ export const LEXICON_CATEGORIES = Object.freeze([
   'meme',
   'unknown',
 ]);
+
+/** Safe default for a missing/blank category. */
+export const LEXICON_DEFAULT_CATEGORY = 'unknown';
 
 /**
  * Library slot of one entry:
@@ -104,6 +111,7 @@ export const LEXICON_DEFAULT_LIBRARY = 'public';
 
 /** User-facing field limits, measured in code points (an emoji counts once). */
 export const LEXICON_TEXT_MAX_CHARS = 40;
+export const LEXICON_CATEGORY_MAX_CHARS = 40;
 export const LEXICON_USAGE_MAX_CHARS = 200;
 export const LEXICON_READING_MAX_CHARS = 80;
 
@@ -155,20 +163,40 @@ function textLength(value) {
 }
 
 /**
+ * The stored category projection: any trimmed non-empty text within the limit, otherwise
+ * `unknown`. Tolerant on purpose (it repairs disk data); mutators use `cleanCategory` to refuse
+ * an over-long or non-string value instead of silently rewriting the user's input.
+ */
+function storedCategory(value) {
+  if (typeof value !== 'string') return LEXICON_DEFAULT_CATEGORY;
+  const text = value.trim();
+  if (text.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  return textLength(text) <= LEXICON_CATEGORY_MAX_CHARS ? text : LEXICON_DEFAULT_CATEGORY;
+}
+
+/**
  * Repair the manual fields on one entry read from disk (or about to be written by `write`).
  * Old lexicon files have none of these fields, so they must still read as usable public words.
  * Mutators validate their input strictly; this tolerant pass only guarantees the persisted shape.
  */
 function normalizeEntryExtras(entry) {
-  if (!LEXICON_CATEGORIES.includes(entry.category)) entry.category = 'unknown';
+  entry.category = storedCategory(entry.category);
   if (typeof entry.usage !== 'string') entry.usage = '';
   if (typeof entry.reading !== 'string') entry.reading = '';
   if (!LEXICON_LIBRARIES.includes(entry.library)) entry.library = LEXICON_DEFAULT_LIBRARY;
 }
 
-/** Validate a category/usage/reading/library argument; `null` means "invalid". */
+/**
+ * Validate a category argument. Free text is accepted (trimmed, at most
+ * `LEXICON_CATEGORY_MAX_CHARS` code points); `undefined`/`null`/blank mean `unknown`.
+ * `null` means "invalid" (non-string or too long).
+ */
 function cleanCategory(value) {
-  return typeof value === 'string' && LEXICON_CATEGORIES.includes(value) ? value : null;
+  if (value === undefined || value === null) return LEXICON_DEFAULT_CATEGORY;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (text.length === 0) return LEXICON_DEFAULT_CATEGORY;
+  return textLength(text) <= LEXICON_CATEGORY_MAX_CHARS ? text : null;
 }
 
 function cleanUsage(value) {
@@ -357,12 +385,12 @@ export function createLexiconStore({ root, log = null, clock = () => new Date(),
       const editedAt = stored !== undefined && typeof stored.editedAt === 'string' ? stored.editedAt : '';
       const extra = stored !== undefined && stored !== null && typeof stored === 'object'
         ? {
-            category: LEXICON_CATEGORIES.includes(stored.category) ? stored.category : 'unknown',
+            category: storedCategory(stored.category),
             usage: typeof stored.usage === 'string' ? stored.usage : '',
             reading: typeof stored.reading === 'string' ? stored.reading : '',
             library: LEXICON_LIBRARIES.includes(stored.library) ? stored.library : LEXICON_DEFAULT_LIBRARY,
           }
-        : { category: 'unknown', usage: '', reading: '', library: LEXICON_DEFAULT_LIBRARY };
+        : { category: LEXICON_DEFAULT_CATEGORY, usage: '', reading: '', library: LEXICON_DEFAULT_LIBRARY };
       return { ...view, ...extra, editedAt };
     });
   };
@@ -470,6 +498,9 @@ export function createLexiconStore({ root, log = null, clock = () => new Date(),
    *
    * A duplicate key/canonical returns exactly `{ok:false, reason:'exists'}` and writes nothing.
    *
+   * `category` is free text (trimmed, up to `LEXICON_CATEGORY_MAX_CHARS` code points). The legacy
+   * ids in `LEXICON_CATEGORIES` keep working; blank/missing becomes `unknown`.
+   *
    * @param {{text?: string, canonical?: string, category?: string, usage?: string|null,
    *   reading?: string|null, library?: string, speakerId?: string}} [options]
    * @returns {{ok: true, entry: object}|{ok: false, reason: string}}
@@ -547,6 +578,7 @@ export function createLexiconStore({ root, log = null, clock = () => new Date(),
    *
    * `text` and `canonical` are two names for the same display form; when both are supplied
    * `canonical` wins. Changing it updates `text`, `canonical` and the normalized `key` together.
+   * `category` follows the same free-text rule as `addEntry` (blank → `unknown`).
    *
    * @param {{id?: string, text?: string, canonical?: string, category?: string,
    *   usage?: string|null, reading?: string|null, library?: string,

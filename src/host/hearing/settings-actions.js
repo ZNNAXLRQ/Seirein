@@ -2,6 +2,7 @@
 
 import {
   LEXICON_CATEGORIES,
+  LEXICON_CATEGORY_MAX_CHARS,
   LEXICON_LIBRARIES,
   LEXICON_READING_MAX_CHARS,
   LEXICON_TEXT_MAX_CHARS,
@@ -1287,7 +1288,8 @@ export function createHearingSettingsActions(services) {
 
 /**
  * Chinese/English labels accepted by `/word` and shown by the form/listing. The canonical stored
- * values are the English enum ids in `LEXICON_CATEGORIES`; labels are only an input/display alias.
+ * values are the English ids in `LEXICON_CATEGORIES` for those legacy categories; every other
+ * non-empty text is stored as the/user typed it. Labels are only an input/display alias.
  */
 export const LEXICON_CATEGORY_LABELS = Object.freeze({
   person: '人名',
@@ -1385,8 +1387,10 @@ export function tokenizeWordCommand(rawInput) {
 
 /**
  * Parse the `/word` arguments. Category and usage are REQUIRED and are never guessed: an
- * incomplete call tells the user exactly what is missing. Reading is optional (auto-generation
- * may leave it blank, and the user can add it later).
+ * incomplete call tells the user exactly what is missing. Category is free text: the legacy labels
+ * above still map to their canonical ids, and any other non-empty text is stored as typed (bounded
+ * by `LEXICON_CATEGORY_MAX_CHARS`). Reading is optional (auto-generation may leave it blank, and
+ * the user can add it later).
  *
  * @param {unknown} rawInput everything after `/word`
  * @returns {{ok: true, value: {text: string, category: string, usage: string, reading: string}}
@@ -1409,12 +1413,19 @@ export function parseWordCommand(rawInput) {
     return { ok: false, error: `词或短语最多 ${LEXICON_TEXT_MAX_CHARS} 个字符。` };
   }
   if (categoryInput === undefined || categoryInput.trim() === '') {
-    return { ok: false, error: `缺少类别。可用类别：${WORD_CATEGORY_HINT}` };
+    return { ok: false, error: `缺少类别。常用类别：${WORD_CATEGORY_HINT}` };
   }
-  const category = CATEGORY_ALIASES.get(categoryInput.trim())
-    ?? CATEGORY_ALIASES.get(categoryInput.trim().toLowerCase());
-  if (category === undefined) {
-    return { ok: false, error: `类别「${categoryInput}」无效。可用类别：${WORD_CATEGORY_HINT}` };
+  const typedCategory = categoryInput.trim();
+  // Known ids/labels keep their canonical English value; anything else is free text now, so the
+  // command can never disagree with the store's accepting category (only the bound is shared).
+  const category = CATEGORY_ALIASES.get(typedCategory)
+    ?? CATEGORY_ALIASES.get(typedCategory.toLowerCase())
+    ?? typedCategory;
+  if ([...category].length > LEXICON_CATEGORY_MAX_CHARS) {
+    return {
+      ok: false,
+      error: `类别最多 ${LEXICON_CATEGORY_MAX_CHARS} 个字符。常用类别：${WORD_CATEGORY_HINT}`,
+    };
   }
   if (usage === undefined || String(usage).trim() === '') {
     return { ok: false, error: `缺少用法说明。用法：${WORD_COMMAND_USAGE}` };

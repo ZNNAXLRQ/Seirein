@@ -2612,7 +2612,7 @@ window.__ModuleLoader__.load({
       return LEXICON_KIND_LABEL[String(kind ?? '')] ?? '专有名词';
     }
 
-    /** 手动词条的类别：值写英文枚举，界面显示中文。 */
+    /** 手动词条的类别：旧英文枚举与中文标签只作为建议；其他文本按用户输入保存。 */
     const LEXICON_CATEGORY_OPTIONS = Object.freeze([
       ['person', '人名'],
       ['character', '角色'],
@@ -2624,9 +2624,20 @@ window.__ModuleLoader__.load({
       ['unknown', '未知'],
     ]);
     const LEXICON_CATEGORY_LABEL = Object.freeze(Object.fromEntries(LEXICON_CATEGORY_OPTIONS));
+    const LEXICON_CATEGORY_PLACEHOLDER = '可自定义，如 人名 / 术语 / 饮品';
+    const LEXICON_CATEGORY_SUGGESTIONS_NEW = 'lexicon-category-suggestions-new';
+    const LEXICON_CATEGORY_SUGGESTIONS_DIALOG = 'lexicon-category-suggestions-dialog';
 
     function lexiconCategoryLabel(category) {
-      return LEXICON_CATEGORY_LABEL[String(category ?? '')] ?? '未知';
+      const value = String(category ?? '').trim();
+      if (value === '') return '未知';
+      return LEXICON_CATEGORY_LABEL[value] ?? value;
+    }
+
+    /** 类别 datalist：只给建议，任意输入都有效，空字符串由宿主存成 unknown。 */
+    function lexiconCategoryDatalist(h, id) {
+      return h('datalist', { id },
+        LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label)));
     }
 
     const LEXICON_LIBRARY_LABEL = Object.freeze({ public: '公共库', voiceprint: '声纹库' });
@@ -2644,7 +2655,7 @@ window.__ModuleLoader__.load({
       return {
         action: 'lexicon.add',
         text: String(draft?.text ?? '').trim(),
-        category: String(draft?.category ?? ''),
+        category: String(draft?.category ?? '').trim(),
         usage: String(draft?.usage ?? '').trim(),
         reading: String(draft?.reading ?? '').trim(),
         library: String(draft?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public',
@@ -2682,9 +2693,7 @@ window.__ModuleLoader__.load({
     function lexiconDialogOf(entry, mode) {
       const observed = lexiconObservedForms(entry);
       const editing = mode === 'edit';
-      const category = LEXICON_CATEGORY_LABEL[String(entry?.category ?? '')]
-        ? String(entry.category)
-        : 'unknown';
+      const category = String(entry?.category ?? '').trim();
       return {
         mode: editing ? 'edit' : 'confirm',
         id: String(entry?.id ?? ''),
@@ -2722,7 +2731,7 @@ window.__ModuleLoader__.load({
           action: 'lexicon.update',
           id: String(current.id ?? ''),
           canonical: String(current.canonical ?? '').trim(),
-          category: String(current.category ?? ''),
+          category: String(current.category ?? '').trim(),
           usage: String(current.usage ?? '').trim(),
           reading: String(current.reading ?? '').trim(),
         };
@@ -2858,8 +2867,7 @@ window.__ModuleLoader__.load({
         ? 'voiceprint'
         : 'public';
       const addBlocked = stopped
-        || draftText.trim() === ''
-        || !LEXICON_CATEGORY_LABEL[draftCategory];
+        || draftText.trim() === '';
       const isPending = (kind, id) => pending?.kind === kind && String(pending?.id ?? '') === String(id);
       const evidenceText = (entry) => {
         const count = Number(entry?.count);
@@ -2987,9 +2995,7 @@ window.__ModuleLoader__.load({
       const editing = dialog?.mode === 'edit';
       const forms = Array.isArray(dialog?.wrongForms) ? dialog.wrongForms : [];
       const canonical = String(dialog?.canonical ?? '');
-      const dialogCategory = LEXICON_CATEGORY_LABEL[String(dialog?.category ?? '')]
-        ? String(dialog.category)
-        : 'unknown';
+      const dialogCategory = String(dialog?.category ?? '').trim();
       const dialogUsage = String(dialog?.usage ?? '');
       const dialogReading = String(dialog?.reading ?? '');
       const dialogLibrary = String(dialog?.library ?? 'public') === 'voiceprint' ? 'voiceprint' : 'public';
@@ -3025,13 +3031,17 @@ window.__ModuleLoader__.load({
           editing
             ? h('div', { style: styles.field },
                 h('span', { style: styles.value }, '类别'),
-                h('select', {
+                h('input', {
                   'data-lexicon-dialog-category': '1',
                   style: styles.input,
                   value: dialogCategory,
+                  list: LEXICON_CATEGORY_SUGGESTIONS_DIALOG,
+                  placeholder: LEXICON_CATEGORY_PLACEHOLDER,
+                  title: '可填任意类别；留空按“未知”保存',
                   disabled: stopped,
                   onChange: (event) => handlers.changeDialog({ category: event.target.value }),
-                }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label))))
+                }),
+                lexiconCategoryDatalist(h, LEXICON_CATEGORY_SUGGESTIONS_DIALOG))
             : null,
           editing
             ? h('div', { style: styles.field },
@@ -3072,7 +3082,7 @@ window.__ModuleLoader__.load({
                   'data-lexicon-dialog-reading': '1',
                   style: styles.input,
                   value: dialogReading,
-                  placeholder: '例如：chōng diàn',
+                  placeholder: '可填拼音，无需声调，如 chong dian',
                   disabled: stopped,
                   onChange: (event) => handlers.changeDialog({ reading: event.target.value }),
                 }))
@@ -3150,13 +3160,17 @@ window.__ModuleLoader__.load({
                   })),
                 h('div', { style: styles.field },
                   h('span', { style: styles.value }, '类别'),
-                  h('select', {
+                  h('input', {
                     'data-lexicon-new-category': '1',
                     style: styles.input,
-                    value: LEXICON_CATEGORY_LABEL[draftCategory] ? draftCategory : 'person',
+                    value: draftCategory,
+                    list: LEXICON_CATEGORY_SUGGESTIONS_NEW,
+                    placeholder: LEXICON_CATEGORY_PLACEHOLDER,
+                    title: '可填任意类别；留空按“未知”保存',
                     disabled: stopped,
                     onChange: (event) => handlers.changeDraft({ category: event.target.value }),
-                  }, LEXICON_CATEGORY_OPTIONS.map(([value, label]) => h('option', { key: value, value }, label)))),
+                  }),
+                  lexiconCategoryDatalist(h, LEXICON_CATEGORY_SUGGESTIONS_NEW)),
                 h('div', { style: styles.field },
                   h('span', { style: styles.value }, '库位'),
                   h('select', {
@@ -3189,7 +3203,7 @@ window.__ModuleLoader__.load({
                     'data-lexicon-new-reading': '1',
                     style: styles.input,
                     value: String(newDraft?.reading ?? ''),
-                    placeholder: '例如：chōng diàn',
+                    placeholder: '可填拼音，无需声调，如 chong dian',
                     disabled: stopped,
                     onChange: (event) => handlers.changeDraft({ reading: event.target.value }),
                   })),

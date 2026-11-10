@@ -306,8 +306,11 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
   const form = nodeOf(tree, 'data-lexicon-new-form', '1');
   assert.ok(form !== undefined, 'the manual add form is mounted');
   assert.equal(inputOf(form, (node) => node.props['data-lexicon-new-text'] === '1').props.value, '');
-  assert.ok(nodesOf(form).some((node) => node.type === 'select'
-    && node.props?.['data-lexicon-new-category'] === '1'), 'the category dropdown is present');
+  const newCategory = inputOf(form, (node) => node.props['data-lexicon-new-category'] === '1');
+  assert.equal(newCategory.props.value, 'person', 'the category is a text input prefilled with the default');
+  assert.match(String(newCategory.props.placeholder), /可自定义/u, 'the category input accepts free text');
+  assert.ok(nodesOf(form).some((node) => node.type === 'datalist'),
+    'known categories remain available as datalist suggestions');
   const librarySelect = nodesOf(form).find((node) => node.type === 'select'
     && node.props?.['data-lexicon-new-library'] === '1');
   assert.ok(librarySelect !== undefined, 'the new-entry library dropdown is present');
@@ -316,8 +319,9 @@ test('1. 两组列表：有数据渲染行，空数据与加载中各自有文�
     true, 'the voiceprint option is disabled without a confirmed self');
   assert.ok(nodesOf(form).some((node) => node.type === 'input'
     && node.props?.['data-lexicon-new-usage'] === '1'), 'the usage field is present');
-  assert.ok(nodesOf(form).some((node) => node.type === 'input'
-    && node.props?.['data-lexicon-new-reading'] === '1'), 'the optional reading field is present');
+  const newReading = inputOf(form, (node) => node.props['data-lexicon-new-reading'] === '1');
+  assert.match(String(newReading.props.placeholder), /可填拼音，无需声调，如 chong dian/u,
+    'the reading field says toneless pinyin is enough');
   assert.equal(buttonOf(form, '添加词条').props.disabled, true, 'empty text cannot be added');
 
   const empty = mount().render();
@@ -464,14 +468,15 @@ test('3. 编辑弹窗：预填三字段/读音/库位；保存走 lexicon.update
   assert.ok(dialog !== undefined, 'the edit dialog is open');
   assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-text'] === '1').props.value, '向晚',
     'the canonical spelling is prefilled');
-  const categorySelect = nodesOf(dialog).find((node) => node.type === 'select'
-    && node.props?.['data-lexicon-dialog-category'] === '1');
-  assert.ok(categorySelect !== undefined, 'the category dropdown is shown in edit');
-  assert.equal(categorySelect.props.value, 'person');
+  const categoryInput = inputOf(dialog, (node) => node.props['data-lexicon-dialog-category'] === '1');
+  assert.equal(categoryInput.props.value, 'person', 'the category text input is prefilled');
+  assert.match(String(categoryInput.props.placeholder), /可自定义/u);
   assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-usage'] === '1').props.value,
     '角色名', 'the usage is prefilled');
-  assert.equal(inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1').props.value,
-    'xiàng wǎn', 'the optional reading is prefilled');
+  const dialogReading = inputOf(dialog, (node) => node.props['data-lexicon-dialog-reading'] === '1');
+  assert.equal(dialogReading.props.value, 'xiàng wǎn', 'the optional reading is prefilled');
+  assert.match(String(dialogReading.props.placeholder), /可填拼音，无需声调，如 chong dian/u,
+    'the edit reading field documents toneless pinyin');
   const librarySelect = nodesOf(dialog).find((node) => node.type === 'select'
     && node.props?.['data-lexicon-dialog-library'] === '1');
   assert.ok(librarySelect !== undefined, 'the edit dialog shows the library dropdown');
@@ -486,8 +491,7 @@ test('3. 编辑弹窗：预填三字段/读音/库位；保存走 lexicon.update
     .props.onChange({ target: { value: '向晚晚' } });
   assert.deepEqual(view.calls.change.at(-1), { canonical: '向晚晚' }, 'typing updates the dialog state');
   dialog = nodeOf(view.render(), 'data-lexicon-dialog', 'edit');
-  nodesOf(dialog).find((node) => node.type === 'select'
-    && node.props?.['data-lexicon-dialog-category'] === '1')
+  inputOf(dialog, (node) => node.props['data-lexicon-dialog-category'] === '1')
     .props.onChange({ target: { value: 'character' } });
   inputOf(dialog, (node) => node.props['data-lexicon-dialog-usage'] === '1')
     .props.onChange({ target: { value: '  角色别称  ' } });
@@ -954,6 +958,10 @@ test('10. 手动新建：三字段+读音+库位请求体；库位移动；候�
     library: 'public',
   }, 'the add body carries the three fields plus optional reading and the library slot');
   assert.equal(lexicon.lexiconCategoryLabel('expression'), '特殊表达');
+  assert.equal(lexicon.lexiconCategoryLabel('饮品'), '饮品', 'a custom category is shown as entered');
+  assert.equal(lexicon.lexiconCategoryLabel('  '), '未知', 'a blank category is shown as unknown');
+  assert.equal(lexicon.lexiconAddBody({ ...draft, category: '  饮品  ' }).category, '饮品',
+    'the add body trims an arbitrary category');
   assert.equal(lexicon.lexiconLibraryLabel('public'), '公共库');
   assert.equal(lexicon.lexiconLibraryLabel('voiceprint'), '声纹库');
 
@@ -964,10 +972,10 @@ test('10. 手动新建：三字段+读音+库位请求体；库位移动；候�
   inputOf(blankForm, (node) => node.props['data-lexicon-new-text'] === '1')
     .props.onChange({ target: { value: '充电' } });
   assert.deepEqual(blank.calls.changeDraft.at(-1), { text: '充电' });
-  const select = nodesOf(blankForm).find((node) => node.type === 'select'
-    && node.props?.['data-lexicon-new-category'] === '1');
-  select.props.onChange({ target: { value: 'term' } });
-  assert.deepEqual(blank.calls.changeDraft.at(-1), { category: 'term' });
+  const categoryInput = inputOf(blankForm, (node) => node.props['data-lexicon-new-category'] === '1');
+  categoryInput.props.onChange({ target: { value: '饮品' } });
+  assert.deepEqual(blank.calls.changeDraft.at(-1), { category: '饮品' },
+    'the category input sends arbitrary text, not an enum');
 
   // With a confirmed self the voiceprint slot is selectable, and the body carries it.
   const ready = mount({
