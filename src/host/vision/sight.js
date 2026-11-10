@@ -1,9 +1,9 @@
 /**
  * Vision: two paths, one interface.
  *
- * 1. Storyboard (preferred): delegate frame capture and change-scoring to `dsh-see-now`
+ * 1. Storyboard (preferred): reuse ffmpeg arguments and change-scoring from `dsh-see-now`
  *    (ffmpeg ddagrab/gdigrab → 12 fps raw pipe → 4–8 changed frames packed into one image).
- *    The heavy lifting and its tuned thresholds are theirs; we only keep the loop and the file.
+ *    Raw pipe assembly is local and linear-cost; scoring and its tuned thresholds remain theirs.
  * 2. Snapshot (fallback): PowerShell + System.Drawing when ffmpeg is absent, so "look at the
  *    screen" still works on a bare machine.
  */
@@ -730,11 +730,13 @@ export async function startStoryboard({
   };
 
   const [
-    { spawnFrames, pickScreenEngine, captureArgs },
+    { pickScreenEngine, captureArgs },
     { createPipeline },
+    { spawnFrames },
   ] = await Promise.all([
     import('dsh-see-now/capture'),
     import('dsh-see-now/pipeline'),
+    import('./frame-capture.js'),
   ]);
 
   await mkdir(dir, { recursive: true });
@@ -855,6 +857,7 @@ export async function startStoryboard({
   const frameIndex = (frame) => (Number.isFinite(frame?.i) ? frame.i : Math.round(Number(frame?.t) * fps));
 
   const run = spawnFrames({
+    args: captureArgs({ source, width: size.width, height: size.height, fps, engine: captureEngine, ffmpegPath }).slice(1),
     source,
     width: size.width,
     height: size.height,

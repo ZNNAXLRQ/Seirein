@@ -22,7 +22,7 @@ globalThis.__storyboardFreshnessTest = state;
 
 const hooks = registerHooks({
   load(url, context, next) {
-    if (url.endsWith('/dsh-see-now/src/capture.js')) return {
+    if ((url.endsWith('/dsh-see-now/src/capture.js') || url.endsWith('/vision/frame-capture.js'))) return {
       format: 'module',
       shortCircuit: true,
       // The fake stream keeps the real contract: `{ i, t: i / fps, buf }`, arrival order.
@@ -46,7 +46,7 @@ const hooks = registerHooks({
 });
 const sight = await import('../src/host/vision/sight.js');
 // Load the dynamic storyboard dependencies while these exact module doubles are active.
-await Promise.all([import('dsh-see-now/capture'), import('dsh-see-now/pipeline')]);
+await Promise.all([import('dsh-see-now/capture'), import('dsh-see-now/pipeline'), import('../src/host/vision/frame-capture.js')]);
 hooks.deregister();
 after(() => { delete globalThis.__storyboardFreshnessTest; });
 

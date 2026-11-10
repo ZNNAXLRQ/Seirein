@@ -20,7 +20,7 @@ const hooks = registerHooks({
       source: `export const execFile = (...args) => globalThis.__sightAbortTest.exec(...args);
         export const spawn = () => { throw new Error('real spawn forbidden'); };`,
     };
-    if (url.endsWith('/dsh-see-now/src/capture.js')) return {
+    if ((url.endsWith('/dsh-see-now/src/capture.js') || url.endsWith('/vision/frame-capture.js'))) return {
       format: 'module', shortCircuit: true,
       source: `const s = globalThis.__sightAbortTest;
         export const pickScreenEngine = async () => 'ddagrab';
@@ -39,7 +39,7 @@ const hooks = registerHooks({
 });
 const sight = await import('../src/host/vision/sight.js');
 // Load the dynamic storyboard dependencies while these exact module doubles are active.
-await Promise.all([import('dsh-see-now/capture'), import('dsh-see-now/pipeline')]);
+await Promise.all([import('dsh-see-now/capture'), import('dsh-see-now/pipeline'), import('../src/host/vision/frame-capture.js')]);
 hooks.deregister();
 after(() => { delete globalThis.__sightAbortTest; });
 
