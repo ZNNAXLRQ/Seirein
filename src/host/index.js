@@ -4339,6 +4339,12 @@ export function apply(ctx, config) {
         },
       },
       motionEpoch: snap.motion?.epoch ?? 0,
+      /**
+       * Phase 2 observation only: the base-activity counters (blink/breath/head, advanced by the
+       * existing frame loop) and the channel ownership table. `null` when this runtime knows
+       * nothing yet; it never throws and never contains an input name/path.
+       */
+      motionLayers: snap.motionLayers ?? null,
       /** Verified takeover set; unmapped channels are skipped, failed explicit probes unverified. */
       channels: {
         controlled: snap.channels?.controlled ?? [],

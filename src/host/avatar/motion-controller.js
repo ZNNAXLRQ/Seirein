@@ -220,6 +220,21 @@ export const OCCASIONAL_ACTION = Object.freeze({
   BROW_MAX: 0.4,
 });
 
+/**
+ * Phase 2 base activity: one head-channel change below this (pose units, 1 = 30°) is not counted as
+ * "the head really moved". 1e-4 ≈ 0.003°, well under one rendered pixel of head rotation, but
+ * above floating-point noise on a held/zero curve.
+ */
+const HEAD_ACTIVITY_EPSILON = 1e-4;
+
+/**
+ * Phase 2 scope (explicit): this layer only OBSERVES the activity that already exists and reports
+ * channel ownership. It is NOT the "two base libraries" (continuous idle + full gesture) and it
+ * does NOT add a body/arm writer. VTS's own idle animation stays ON: this plugin never calls
+ * Start/StopIdleAnimation, so a native blink/breath/head motion can coexist with these writes and
+ * which one wins visually is unproven until a real-VTS check.
+ */
+
 
 /**
  * Autonomous expression layer (stage 4 continuation). These are NOT new intents and NOT new
@@ -953,6 +968,32 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     idle: neutralPose(),
     breathPhase: 0,
     idleMs: 0,
+    /**
+     * Phase 2 base activity — READ-ONLY evidence advanced by the SAME frame loop as the generators.
+     * There is no extra timer and nothing is persisted: a restart starts at zero. The counters mean
+     * exactly:
+     *   blinkCount    a real blink cycle STARTED (blink machine idle → closing, never a suppressed
+     *                 blink on an already-closed eye);
+     *   breathCycles  a breath phase wrapped past 2π while breathing was enabled;
+     *   headMotionMs  accumulated dt (ms) of frames in which at least one idle head channel really
+     *                 changed (by more than HEAD_ACTIVITY_EPSILON);
+     *   lastAt        timestamp of the last frame that was allowed to advance the counters;
+     *   state         'running' | 'paused' (generators deliberately still) | 'stopped' (host gate);
+     *   enabled       host gate; a privacy lock / disconnect / disposed runtime sets it false so a
+     *                 still-computed pose can never keep the activity counters moving.
+     * `presetHeld` is projected in snapshot() from the last preset selection; a hold / no-candidate
+     * decision never pauses these counters (the base layer keeps running through a held preset).
+     */
+    baseActivity: {
+      blinkCount: 0,
+      breathCycles: 0,
+      headMotionMs: 0,
+      lastAt: null,
+      state: 'stopped',
+      enabled: true,
+      /** Previous tick's idle head values; internal only, never exposed. */
+      previousHead: null,
+    },
     /**
      * The ONE continuous posture controller. It owns the slow natural posture every layer is
      * mixed on top of: decision state, per-axis position/velocity, hold window, relaxation and
@@ -4789,9 +4830,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // blink factor touches the eye, which is the AIRI `preBlink` idea (§C.2 pitfall 1).
     const expressionEye = clamp01(finite(frame.pose.eyeOpenL ?? frame.pose.eyeOpen, 1));
     state.blink = { ...state.blink, baseline: expressionEye };
+    // A real blink starts exactly on the idle → closing edge. Counting the edge (not the factor)
+    // keeps a suppressed blink (baseline ≤ BLINK_THRESHOLD) and a mid-cycle frame from counting.
+    const blinkWasIdle = state.blink.phase === 'idle';
     const blinkResult = stepBlink(state.blink, dt, { random });
     state.blink = blinkResult.state;
     state.blinkFactor = blinkResult.factor;
+    if (state.baseActivity.enabled && blinkWasIdle && blinkResult.state.phase === 'closing') {
+      state.baseActivity.blinkCount += 1;
+    }
 
     const breathing = frame.flags.breathing !== false;
     // A slow cycle in EVERY state: speaking only shortens it by the bounded factor, and the
@@ -4803,7 +4850,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       Math.max(TIMING.BREATH_PERIOD_MIN_MS, configuredPeriodMs / speed),
     );
     const periodSeconds = periodMs / 1000;
+    const breathPhaseBefore = state.breathPhase;
     state.breathPhase = (state.breathPhase + (Math.PI * 2 / periodSeconds) * dt) % (Math.PI * 2);
+    // One completed cycle per wrap; the phase is modulo 2π and dt is clamped to 50 ms, so at most
+    // one wrap can happen in a frame. A disabled breathing flag still advances the phase but is not
+    // counted as a breath the avatar took.
+    if (state.baseActivity.enabled && breathing && state.breathPhase < breathPhaseBefore) {
+      state.baseActivity.breathCycles += 1;
+    }
 
     // Our own idle base: one posture controller (held target + smooth drift + micro-noise) feeds
     // EVERY layer below. There is no second idle generator and no fixed-period sine. Speaking
@@ -4906,6 +4960,22 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       breath: 0.5,
     };
     state.idle = idle;
+    // Head activity is judged on the IDLE BASE (the posture baseline), not the final pose: a
+    // preset/gesture offset belongs to another layer and must not be reported as "base activity".
+    // A hold still changes the drift/noise, so a held preset keeps accumulating — that is the point:
+    // the base layer never stops just because a preset is holding.
+    const previousHead = state.baseActivity.previousHead;
+    if (state.baseActivity.enabled && previousHead !== null
+      && (Math.abs(idle.headX - previousHead.headX) > HEAD_ACTIVITY_EPSILON
+        || Math.abs(idle.headY - previousHead.headY) > HEAD_ACTIVITY_EPSILON
+        || Math.abs(idle.headZ - previousHead.headZ) > HEAD_ACTIVITY_EPSILON)) {
+      state.baseActivity.headMotionMs += dt * 1000;
+    }
+    state.baseActivity.previousHead = {
+      headX: idle.headX,
+      headY: idle.headY,
+      headZ: idle.headZ,
+    };
     const activeComponent = motion.posture.component;
     if (activeComponent !== null) {
       // Evidence for the component layer: the pose-unit target, the semantic 30°-unit target, and
@@ -5021,6 +5091,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       : Math.min(Math.max((now - state.lastAt) / 1000, 0), LIMITS.MAX_STEP_SECONDS);
     state.lastAt = now;
     state.idleMs += dt * 1000;
+    // The one host gate for the phase-2 counters. `state` is deliberately about the OBSERVATION
+    // source, not about a preset: a held/no-candidate preset keeps the base layer running.
+    if (state.baseActivity.enabled) {
+      const flags = state.intent.flags ?? {};
+      state.baseActivity.state = flags.idle === false && flags.breathing === false ? 'paused' : 'running';
+      state.baseActivity.lastAt = now;
+    } else {
+      state.baseActivity.state = 'stopped';
+    }
     // ONE effective style for this whole frame: state scaling, idle curve, intents and the mouth
     // all read it, so the same channel can never receive two different final values.
     state.effective = effectiveStyle();
@@ -5433,6 +5512,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     };
   }
 
+  /**
+   * Phase 2 host gate. The pose keeps being computed while `enabled:false` (so unlock/resume is
+   * continuous), but the base-activity counters, `lastAt` and `state` freeze at their last values.
+   * Used by the facade for privacy lock / disconnect / disposed generation; there is no timer here.
+   */
+  function setBaseActivityEnabled(enabled) {
+    state.baseActivity.enabled = enabled !== false;
+    if (!state.baseActivity.enabled) state.baseActivity.state = 'stopped';
+    return { enabled: state.baseActivity.enabled };
+  }
+
   function snapshot() {
     const mapped = (Array.isArray(cfg.channels) ? cfg.channels : []).filter((channel) => CHANNELS.includes(channel));
     return {
@@ -5539,6 +5629,21 @@ export function createBehaviorRuntime({ config = {} } = {}) {
        */
       motion: {
         seed: cfg.seed === undefined ? null : cfg.seed,
+        /**
+         * Phase 2 base activity (observation only, no persistence). See the state comment for the
+         * exact counting rules; `presetHeld` is true while the LAST selector decision was a legal
+         * hold / no-candidate and no preset action is running (the base layer still accumulates).
+         */
+        baseActivity: {
+          blinkCount: state.baseActivity.blinkCount,
+          breathCycles: state.baseActivity.breathCycles,
+          headMotionMs: state.baseActivity.headMotionMs,
+          lastAt: state.baseActivity.lastAt,
+          state: state.baseActivity.state,
+          presetHeld: state.presets.enabled === true
+            && state.presets.active.length === 0
+            && state.presets.lastSelection?.kind === 'hold',
+        },
         decisionHz: finite(cfg.decisionHz, MOTION_DECISION_HZ),
         posture: {
           target: { ...state.motion.posture.target },
@@ -5656,6 +5761,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     setIntent,
     setStyle,
     setStatus,
+    /** Phase 2: gate the base-activity counters only (privacy lock / disconnect / disposed). */
+    setBaseActivityEnabled,
     setIdleActions,
     intent,
     // Motion preset execution: selection, execution, interruption and the proof-bearing state.

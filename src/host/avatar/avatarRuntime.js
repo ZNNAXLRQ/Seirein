@@ -1459,6 +1459,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     if (enabled === false) {
       motionLocked = true;
       motionLockReason = String(reason ?? 'component');
+      // Phase 2: close the observation gate immediately; a snapshot taken before the next tick
+      // must not claim the base layer is still running.
+      inner.setBaseActivityEnabled(false);
       bumpMotionEpoch(`lock:${motionLockReason}`);
       // A component close / privacy lock stops the old generation's intents immediately: neither a
       // staged intent nor a running action may resume when the gate opens again.
@@ -1470,6 +1473,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     motionLocked = false;
     motionLockReason = '';
+    inner.setBaseActivityEnabled(state.connected === true);
     lastIdleWriteAt = Number.NEGATIVE_INFINITY;
     motionPump.lastAttemptAt = Number.NEGATIVE_INFINITY;
     recordIdleEvent('avatar.motion.unlocked', { epoch: motionEpoch });
@@ -4354,6 +4358,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     connectionOwner = 0;
     state.connected = true;
     state.generation += 1;
+    // Phase 2: a fresh connection opens the observation gate (unless the motion gate is locked);
+    // the next tick advances the counters.
+    inner.setBaseActivityEnabled(motionLocked !== true);
     bumpMotionEpoch('connect');
     state.connectedAt = clockNow();
     syncMouthInput();
@@ -4444,6 +4451,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   async function runDisconnect(record) {
     const wasConnected = state.connected === true;
     stopAutoTick();
+    // Phase 2: the observation gate closes with the socket, not on the next tick.
+    inner.setBaseActivityEnabled(false);
     detachTransportListeners();
     let failure = null;
     try {
@@ -4482,6 +4491,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       return { ok: true, code: null, disposed: true, alreadyDisposed: true, generation: state.generation };
     }
     state.disposed = true;
+    // Phase 2: a disposed runtime (component/master switch off) is a terminal stop for observation.
+    inner.setBaseActivityEnabled(false);
     // Teardown is terminal: leave neither a watchdog nor a stale gate behind for a late settle.
     if (motionPump.watchdog !== null) {
       clearTimeout(motionPump.watchdog);
@@ -4529,6 +4540,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function tick(nowMs) {
     if (state.disposed) return disposedResult();
     const at = Number.isFinite(nowMs) ? nowMs : clockNow();
+    // Phase 2: base activity is observed only while this runtime is allowed to drive the avatar.
+    // A privacy lock / disconnected socket stops the counters; the pose itself keeps being
+    // computed so an unlock is continuous (and the 4 Hz/30 Hz writer gates stay where they were).
+    inner.setBaseActivityEnabled(motionLocked !== true && state.connected === true);
     const pose = inner.tick(at);
     state.mouth = pose.mouth;
     state.lastActivityAt = at;
@@ -4790,9 +4805,108 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   // ---- observation -----------------------------------------------------------------------
+  /**
+   * Phase 2 channel ownership — READ-ONLY and input-name free (a status view must never leak a
+   * transport path or a guessed parameter). Each entry answers two separate questions:
+   *
+   *   owner    who is DESIGNED to drive the channel (`plugin-base` posture, `plugin`, `vts-native`,
+   *            `unsupported`);
+   *   source   who can ACTUALLY drive it right now (`plugin` = this plugin has a verified mapping,
+   *            `vts-native` = VTS keeps it, `unsupported` = no writer at all).
+   *
+   * `nativePossible` is always about VTS: a verified plugin write does not disable VTS's own idle
+   * animation, and the blink layer is especially exposed (VTS may blink natively at the same time).
+   * `status` keeps the requirement's `plugin` / `native-possible` / `unconfigured` / `native` /
+   * `unsupported` vocabulary without overloading `source`. No channel is added to the writer here:
+   * body/arms stay unwritten and gaze entries only report what the verified writer already gates.
+   */
+  function channelOwnershipView() {
+    const mapped = (channel) => {
+      const binding = channelState.bindings.get(channel);
+      const hasInput = binding !== undefined && String(binding.inputName ?? '').trim().length > 0;
+      return { hasInput, verified: hasInput && binding.verified === true };
+    };
+    const pluginStatus = (m) => (m.verified ? 'plugin' : (m.hasInput ? 'native-possible' : 'unconfigured'));
+    const head = (channel) => {
+      const m = mapped(channel);
+      return {
+        source: m.verified ? 'plugin' : 'vts-native',
+        owner: 'plugin-base',
+        layer: 'posture',
+        verified: m.verified,
+        status: pluginStatus(m),
+        nativePossible: true,
+      };
+    };
+    const gaze = (channel) => {
+      const m = mapped(channel);
+      return {
+        source: m.verified ? 'plugin' : 'vts-native',
+        owner: m.verified ? 'plugin' : 'vts-native',
+        verified: m.verified,
+        status: pluginStatus(m),
+        nativePossible: true,
+        /** The verified writer already refuses an unverified/unmapped gaze channel. */
+        mappingEvidence: m.hasInput,
+      };
+    };
+    const body = () => ({
+      source: 'vts-native',
+      owner: 'vts-native',
+      verified: false,
+      status: 'native',
+      nativePossible: true,
+    });
+    const breathVerified = breathBinding() !== null;
+    const entries = {
+      headX: head('headX'),
+      headY: head('headY'),
+      headZ: head('headZ'),
+      blink: {
+        source: 'plugin',
+        owner: 'plugin',
+        verified: true,
+        status: 'plugin',
+        /** VTS's own idle animation may blink independently: this layer is not exclusive. */
+        nativePossible: true,
+        /** The blink chain is always computed; the eye INPUT is opt-in (`idleEye`). */
+        eyeWriteOptIn: host.idleEye === true,
+      },
+      breath: {
+        source: breathVerified ? 'plugin' : 'vts-native',
+        owner: breathVerified ? 'plugin' : 'vts-native',
+        verified: breathVerified,
+        status: breathVerified ? 'plugin' : 'native',
+        nativePossible: true,
+      },
+      gazeX: gaze('gazeX'),
+      gazeY: gaze('gazeY'),
+      bodyX: body(),
+      bodyY: body(),
+      bodyZ: body(),
+      arms: {
+        source: 'unsupported',
+        owner: 'unsupported',
+        verified: false,
+        status: 'unsupported',
+        nativePossible: false,
+      },
+    };
+    const bySource = (source) => Object.entries(entries)
+      .filter(([, entry]) => entry.source === source)
+      .map(([channel]) => channel);
+    return {
+      channels: entries,
+      plugin: bySource('plugin'),
+      vtsNative: bySource('vts-native'),
+      unsupported: bySource('unsupported'),
+    };
+  }
+
   function snapshot() {
     const innerSnap = inner.snapshot();
     const speaking = innerSnap.turn.speaking === true;
+    const channelOwnership = channelOwnershipView();
     return {
       connected: state.connected,
       /** True from the start of disconnect() until its transport close settles (success or failure). */
@@ -4899,6 +5013,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         lastFrameAt: motionPump.lastFrameAt,
         lastSentAt: motionPump.lastSentAt,
         ...innerSnap.motion,
+        /** Phase 2 ownership table: who may drive each channel, and whether the mapping is verified. */
+        channelOwnership,
         /**
          * Sender evidence, five phases kept apart: a prepared frame is not an attempted send, an
          * attempted send is not a commit, and failed/stale results are never commits. Transport
@@ -4931,6 +5047,15 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         actionTrace: traceState.recent.map((record) => ({
           ...record, channels: [...record.channels], final: { ...record.final },
         })),
+      },
+      /**
+       * Phase 2 status projection (`live2d.runtime.motionLayers` in the host status). Both fields
+       * are read-only: the counters are advanced by the ONE frame loop, ownership is derived from
+       * the verified takeover set. No input name/path is included.
+       */
+      motionLayers: {
+        baseActivity: innerSnap.motion?.baseActivity ?? null,
+        channelOwnership,
       },
       /** Discrete idle pool actually sampled, plus the fallback mode currently in force. */
       idleActions: {
