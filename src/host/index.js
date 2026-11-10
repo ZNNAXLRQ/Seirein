@@ -493,6 +493,7 @@ import {
   memoryReferentRecord,
 } from './memory/memory-injection.js';
 import { createHostTools } from './runtime/tools.js';
+import { runLexiconTool } from './speech/lexicon-tool.js';
 
 import { chunkCuts, chunkPlayer, chunkClamp } from './speech/chunk-capabilities.js';
 import { normalizeGeometry } from './subtitle/geometry.js';
@@ -8334,6 +8335,66 @@ export function apply(ctx, config) {
   };
   const tools = createHostTools(toolDeps);
 
+  /**
+   * Attach the optional `lexiconIds` field to tool records that already reached the model.
+   *
+   * The store's own read projection returns the array, but `runtime/tools.js` whitelists each
+   * record field explicitly. This host-side wrapper re-reads the association for exactly the ids
+   * on screen and adds the field only when it is non-empty, so old records and no-link results
+   * keep their previous shape. It is one bounded query per tool call, never a per-row query.
+   */
+  const hydrateLexiconIds = (records) => {
+    if (!Array.isArray(records) || records.length === 0) return records;
+    const ids = records
+      .map((record) => (record !== null && typeof record === 'object' ? record.id : ''))
+      .filter((id) => typeof id === 'string' && id.length > 0);
+    let byId = new Map();
+    if (ids.length > 0 && typeof memory.lexiconIdsByIds === 'function') {
+      try {
+        byId = memory.lexiconIdsByIds(ids);
+      } catch {
+        byId = new Map();
+      }
+    }
+    return records.map((record) => {
+      if (record === null || typeof record !== 'object') return record;
+      const linked = byId.get(record.id);
+      return Array.isArray(linked) && linked.length > 0 ? { ...record, lexiconIds: linked } : record;
+    });
+  };
+
+  /** `assistant_remember` wrapper: persist the optional id links after the record exists. */
+  const executeRememberWithLexicon = async (args, exec) => {
+    const value = await tools.executeRemember(args, exec);
+    const id = typeof value?.id === 'string' ? value.id : '';
+    if (id.length === 0 || args?.lexiconIds === undefined) return value;
+    let ids = [];
+    try {
+      ids = memory.setLexiconIds(id, args.lexiconIds);
+    } catch {
+      return value;
+    }
+    return ids.length > 0 ? { ...value, lexiconIds: ids } : value;
+  };
+
+  /** `assistant_recall` wrapper: expose linked ids on every projected hit. */
+  const executeRecallWithLexicon = async (args, exec) => {
+    const value = await tools.executeRecall(args, exec);
+    if (!Array.isArray(value?.hits)) return value;
+    return { ...value, hits: hydrateLexiconIds(value.hits) };
+  };
+
+  /** `assistant_memory_brief` wrapper: expose linked ids on both record lists. */
+  const executeMemoryBriefWithLexicon = async (args, exec) => {
+    const value = await tools.executeMemoryBrief(args, exec);
+    if (!Array.isArray(value?.fixedRecords) && !Array.isArray(value?.matchedRecords)) return value;
+    return {
+      ...value,
+      fixedRecords: hydrateLexiconIds(value.fixedRecords ?? []),
+      matchedRecords: hydrateLexiconIds(value.matchedRecords ?? []),
+    };
+  };
+
   register({
     name: 'assistant_say',
     description:
@@ -9016,6 +9077,12 @@ export function apply(ctx, config) {
           type: 'string',
           description: 'Optional evidence reference(s) supporting the statement: mem:<id> (a stored memory) or msg:<id> (a recorded message), optionally followed by #<来源原文片段>; multiple references are comma-separated (多个用逗号分隔). The source must exist, be visible in the same domain or session, and actually support the statement; only then is an inference lifted. An unverified reference leaves an inference unverified.',
         },
+        lexiconIds: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 8,
+          description: 'Optional stable lexicon entry ids to associate with this memory (max 8; trimmed, de-duplicated). Store ids only — never copy the entry spelling or explanation here; the lexicon stays the single source of truth.',
+        },
       },
       required: ['text'],
     },
@@ -9027,6 +9094,8 @@ export function apply(ctx, config) {
           id: { type: 'string' },
           domain: { type: 'string' },
           ts: { type: 'string' },
+          // Present only when the call supplied valid lexicon ids.
+          lexiconIds: { type: 'array', items: { type: 'string' } },
           inference: { type: 'boolean' },
           // Only evidence-bearing calls return these two fields (see runtime/tools.js), so they
           // stay optional: a call without evidence keeps the original closed shape.
@@ -9071,7 +9140,7 @@ export function apply(ctx, config) {
         return blocks;
       },
     },
-    execute: tools.executeRemember,
+    execute: executeRememberWithLexicon,
   });
 
   register({
@@ -9289,6 +9358,8 @@ export function apply(ctx, config) {
                 ts: { type: 'string' },
                 domain: { type: 'string' },
                 text: { type: 'string' },
+                // Stable shared-lexicon ids linked from this record; omitted when there are none.
+                lexiconIds: { type: 'array', items: { type: 'string' } },
                 importance: { type: 'integer' },
                 clarity: { type: 'string' },
                 version: { type: 'integer' },
@@ -9391,7 +9462,7 @@ export function apply(ctx, config) {
         return [{ type: 'text', text: lines.join('\n') }];
       },
     },
-    execute: tools.executeRecall,
+    execute: executeRecallWithLexicon,
   });
 
   register({
@@ -9441,6 +9512,8 @@ export function apply(ctx, config) {
                 id: { type: 'string' },
                 text: { type: 'string' },
                 domain: { type: 'string' },
+                // Stable shared-lexicon ids linked from this record; omitted when there are none.
+                lexiconIds: { type: 'array', items: { type: 'string' } },
                 importance: { type: 'integer' },
                 clarity: { type: 'string' },
                 version: { type: 'integer' },
@@ -9458,6 +9531,8 @@ export function apply(ctx, config) {
                 id: { type: 'string' },
                 text: { type: 'string' },
                 domain: { type: 'string' },
+                // Stable shared-lexicon ids linked from this record; omitted when there are none.
+                lexiconIds: { type: 'array', items: { type: 'string' } },
                 importance: { type: 'integer' },
                 clarity: { type: 'string' },
                 version: { type: 'integer' },
@@ -9492,7 +9567,109 @@ export function apply(ctx, config) {
         return [{ type: 'text', text: refs.length > 0 ? `${body}\n（定位：${refs.join('；')}）` : body }];
       },
     },
-    execute: tools.executeMemoryBrief,
+    execute: executeMemoryBriefWithLexicon,
+  });
+
+  // Safe view of one shared-lexicon entry. Only the fields the pure tool core may project are
+  // declared here, so a store-internal field (wrongForms, sourceIds, context, audio paths, …)
+  // can never be smuggled through this tool's result.
+  const lexiconEntryOutputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      id: { type: 'string' },
+      text: { type: 'string' },
+      canonical: { type: 'string' },
+      category: { type: 'string' },
+      usage: { type: 'string' },
+      reading: { type: 'string' },
+      library: { type: 'string' },
+      status: { type: 'string' },
+      version: { oneOf: [{ type: 'integer' }, { type: 'string' }] },
+    },
+    required: ['id', 'text', 'canonical', 'category', 'usage', 'reading', 'library', 'status'],
+  };
+
+  // Lexicon assistant tool (independent from the memory tools). It reads/proposes through the
+  // shared store's pure core, but every mutating action is gated on the user's own explicit
+  // request: the model cannot add/update/delete a confirmed word by calling this tool alone.
+  register({
+    name: 'assistant_lexicon',
+    description:
+      'Read or change the shared personal lexicon (词库), independently of memory. `query` looks up an exact id/text and then recalls locally; `propose` only writes a CANDIDATE for a word the assistant noticed and never confirms it. `add`, `update` and `remove` MUST include `explicit:true`, and only when the user\'s own turn explicitly asked to 加入/修改/删除词库; without explicit:true they are refused with needs-user-confirmation and nothing changes. Never pass explicit:true for an assistant guess, inference or suggestion — use `propose` instead. Results are safe views carrying id/status/version; this tool never auto-confirms a candidate.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['query', 'propose', 'add', 'update', 'remove'],
+          description: 'query/propose are assistant-discovered; add/update/remove need explicit:true.',
+        },
+        explicit: {
+          type: 'boolean',
+          description: 'Only true when the user explicitly asked to add, modify or delete a lexicon word. Assistant-discovered calls must omit it or pass false and may only query/propose.',
+        },
+        id: { type: 'string', description: 'Lexicon entry id (query/update/remove).' },
+        text: { type: 'string', description: 'Word or lookup text (query by text, add, update selector).' },
+        query: { type: 'string', description: 'Query text when `text` is not supplied (query).' },
+        canonical: { type: 'string', description: 'Preferred spelling (add/update rename).' },
+        category: { type: 'string', description: 'Lexicon category, as validated by the store.' },
+        usage: { type: 'string', description: 'Short usage/meaning note, stored by the lexicon (never copied into memory).' },
+        reading: { type: 'string', description: 'Optional reading/pronunciation.' },
+        library: { type: 'string', description: 'Target library at add time (public or the reserved voiceprint library).' },
+        limit: { type: 'integer', minimum: 1, maximum: 10, description: 'Maximum query recall results (1-10).' },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          action: { type: 'string' },
+          reason: { type: 'string' },
+          entry: lexiconEntryOutputSchema,
+          candidates: { type: 'array', items: lexiconEntryOutputSchema },
+          revision: lexiconEntryOutputSchema,
+          ambiguous: { type: 'boolean' },
+        },
+        required: ['ok', 'action'],
+      },
+      render: (_args, value) => {
+        if (value.ok !== true) {
+          const text = value.reason === 'needs-user-confirmation'
+            ? '需要用户明确确认：只有用户明确说要加入/修改/删除词库时才传 explicit:true；本次未做任何改动。'
+            : `词库操作未执行（${value.reason ?? 'unknown'}）。`;
+          return [{ type: 'text', text }];
+        }
+        const entries = Array.isArray(value.candidates) && value.candidates.length > 0
+          ? value.candidates
+          : (value.entry ? [value.entry] : []);
+        if (entries.length === 0) return [{ type: 'text', text: '词库里没有匹配的词语。' }];
+        const lines = entries.map((entry) => {
+          const word = entry.canonical || entry.text || entry.id;
+          const version = entry.version === undefined ? '' : ` v${entry.version}`;
+          return `- ${word} [${entry.status || 'unknown'}] id=${entry.id}${version}`;
+        });
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
+    },
+    execute: (args) => {
+      const action = typeof args?.action === 'string' ? args.action : '';
+      // The authorization is derived ONLY from the explicit user-facing switch. Query/propose stay
+      // least-privileged; a mutating action without the switch is refused before the store is read.
+      if ((action === 'add' || action === 'update' || action === 'remove') && args?.explicit !== true) {
+        return { ok: false, action, reason: 'needs-user-confirmation' };
+      }
+      const authorization = args?.explicit === true ? 'user-explicit' : 'assistant-discovered';
+      try {
+        return runLexiconTool({ ...args, store: lexiconStore, action, authorization });
+      } catch {
+        return { ok: false, action, reason: 'store-failed' };
+      }
+    },
   });
 
   register({

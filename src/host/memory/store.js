@@ -20,6 +20,7 @@ import {
   zonedDateParts,
 } from './memory-normalize.js';
 import { dedupCandidates as findDedupCandidates } from './dedup-candidates.js';
+import { normalizeLexiconIds } from './lexicon-links.js';
 export {
   DEDUP_DEFAULTS,
   dedupCandidates,
@@ -130,6 +131,65 @@ export const INFERENCE_MARKERS = Object.freeze([
 
 /** Evidence ids are provenance, not display text: keep them bounded and never split a string. */
 const EVIDENCE_MAX_CHARS = 2_000;
+
+/**
+ * Serialize one record's optional lexicon associations.
+ *
+ * The memory row stores `lexicon_ids` as a JSON array of stable lexicon entry ids, never a copy
+ * of the entry's spelling/definition. Only an array is accepted; each id is trimmed, bad values
+ * are dropped, duplicates collapse and the list is capped (all rules live in `lexicon-links.js`).
+ * A legacy row has no value, so an empty/malformed input is stored as SQL NULL.
+ *
+ * @param {unknown} value raw `lexiconIds` (or the already-serialized column from an archive row)
+ * @returns {string|null} JSON text, or null when there is nothing valid to store
+ */
+function serializeLexiconIds(value) {
+  let source = value;
+  if (typeof source === 'string') {
+    if (source.length === 0) return null;
+    try {
+      source = JSON.parse(source);
+    } catch {
+      return null;
+    }
+  }
+  const ids = normalizeLexiconIds(source);
+  return ids.length > 0 ? JSON.stringify(ids) : null;
+}
+
+/**
+ * Decode a stored `lexicon_ids` value back into the public array shape. A missing/legacy value,
+ * a malformed JSON string and a non-array all read as "no links" (`[]`), never an exception.
+ *
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function decodeLexiconIds(value) {
+  if (Array.isArray(value)) return normalizeLexiconIds(value);
+  if (typeof value !== 'string' || value.length === 0) return [];
+  try {
+    return normalizeLexiconIds(JSON.parse(value));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Copy one raw message row into the public shape: the internal `lexicon_ids` column becomes a
+ * `lexiconIds` array, and an empty list is omitted (so an old row's shape is unchanged).
+ *
+ * @param {unknown} row
+ * @returns {object|null}
+ */
+function withLexiconIds(row) {
+  if (row === null || typeof row !== 'object') return row;
+  const ids = decodeLexiconIds(row.lexicon_ids);
+  const next = { ...row };
+  delete next.lexicon_ids;
+  delete next.lexiconIds;
+  if (ids.length > 0) next.lexiconIds = ids;
+  return next;
+}
 
 /**
  * Normalize an evidence value to the stored form: a trimmed string, or null when absent.
@@ -949,6 +1009,10 @@ export class MemoryStore {
       // Stage 3 (purely additive): the speaker attribution of a NEW voice record, as JSON text.
       // Old rows stay NULL; no query, index or recall path reads it, so compatibility is unchanged.
       ['speaker_attribution', 'TEXT'],
+      // Optional stable id links to shared-lexicon entries, stored as a bounded JSON id array.
+      // Deliberately not an FTS column and not a ranking input: it is a reference on the record,
+      // never a copy of the entry's spelling/definition. Legacy rows stay NULL.
+      ['lexicon_ids', 'TEXT'],
     ]) {
       if (!columns.has(name)) db.exec(`ALTER TABLE memory_event ADD COLUMN ${name} ${type}`);
     }
@@ -1065,6 +1129,9 @@ export class MemoryStore {
       // The stage-3 speaker attribution survives fading: a forgotten record still says whose voice
       // it was (when one was confirmed at write time). Legacy archive rows stay NULL.
       ['speaker_attribution', 'TEXT'],
+      // Lexicon associations survive fading as ids only; a forgotten record still names the word
+      // it was about, while the lexicon remains the single source of truth.
+      ['lexicon_ids', 'TEXT'],
     ]) {
       if (!archiveColumns.has(name)) db.exec(`ALTER TABLE memory_archive ADD COLUMN ${name} ${type}`);
     }
@@ -1217,8 +1284,8 @@ export class MemoryStore {
           .prepare(`INSERT OR IGNORE INTO memory_event
             (id, ts, domain, kind, text, importance, clarity, last_seen, recall_count, source,
              session_id, turn_id, message_id, role, truncated, raw_text, unresolved, tz_used,
-             evidence, pressure_epoch, pressure_contribution, speaker_attribution)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+             evidence, pressure_epoch, pressure_contribution, speaker_attribution, lexicon_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .run(
             id,
             row.ts ?? nowIso(),
@@ -1246,6 +1313,9 @@ export class MemoryStore {
             typeof row.speaker_attribution === 'string'
               ? row.speaker_attribution
               : serializeSpeakerAttribution(row.speaker_attribution),
+            // A restored archive row carries the serialized column; the public add() path carries
+            // `lexiconIds`. Both end up as one bounded JSON id array (or NULL).
+            serializeLexiconIds(row.lexicon_ids ?? row.lexiconIds),
           );
         // Only the row that actually landed costs pressure: duplicates are ignored by SQLite.
         if (Number(result.changes) > 0) this.noteNewMemory(id);
@@ -1595,13 +1665,15 @@ export class MemoryStore {
    * @param {{importance?: number, source?: string, rawText?: string|null,
    *          unresolved?: number, tzUsed?: string|null, now?: Date|number|string,
    *          timeZone?: string, resolveTime?: boolean, inference?: boolean,
-   *          evidence?: string|string[]|null, sessionId?: string|null}} [extra]
+   *          evidence?: string|string[]|null, sessionId?: string|null,
+   *          lexiconIds?: string[]}} [extra]
    *   `now`/`timeZone` inject the reference instant; `resolveTime:true` opts a non-manual caller
    *   in explicitly (the manual source is already opted in). `inference`/`evidence` are the P-127
    *   gate: a marked statement without a verified reference is stored as `kind:'hypothesis'` +
    *   `unresolved:1`. `evidence` uses the `mem:<id>[#quote]` / `msg:<id>[#quote]` format and is
    *   accepted only when every reference verifies; `sessionId` is the claim's session, used only
-   *   by the conservative evidence scope check.
+   *   by the conservative evidence scope check. `lexiconIds` are stable shared-lexicon entry ids,
+   *   normalized/de-duplicated/capped here and stored as ids only (never their definitions).
    * @returns {object} the stored record plus `timeResolved` (structured report or null) and the
    *   gate result (`inference:boolean`, `kind`, `evidence`, `evidenceVerified:boolean`,
    *   `evidenceErrors:Array<{ref:string, reason:string}>`)
@@ -1672,6 +1744,7 @@ export class MemoryStore {
       storedEvidence = evidenceText;
     }
     const storedKind = isInference ? 'hypothesis' : (kind ?? 'fact');
+    const lexiconIds = normalizeLexiconIds(extra.lexiconIds);
     const record = {
       id: randomUUID(),
       ts: nowIso(),
@@ -1688,9 +1761,63 @@ export class MemoryStore {
       evidenceVerified,
       evidenceErrors,
       timeResolved,
+      // Public array shape; `insert()` serializes it into the `lexicon_ids` column. Empty is
+      // omitted from the returned record so a no-link write keeps the previous shape.
+      ...(lexiconIds.length > 0 ? { lexiconIds } : {}),
     };
-    this.insert({ ...record, clarity: 'vivid', last_seen: record.ts });
+    this.insert({
+      ...record,
+      clarity: 'vivid',
+      last_seen: record.ts,
+      lexicon_ids: serializeLexiconIds(lexiconIds),
+    });
     return record;
+  }
+
+  /**
+   * Replace one active memory's lexicon associations. The public write path (`add()` via
+   * `assistant_remember`) can carry them directly; this setter exists for a host wrapper that
+   * already wrote the record, and it applies the same normalization: trim, drop bad values,
+   * de-duplicate, cap and store ids only. A missing/target row is left untouched.
+   *
+   * @param {string} id memory id
+   * @param {unknown} value raw lexicon id list
+   * @returns {string[]} the normalized list actually written (empty when nothing changed)
+   */
+  setLexiconIds(id, value) {
+    this.open();
+    const wanted = typeof id === 'string' ? id.trim() : '';
+    if (wanted.length === 0) return [];
+    const ids = normalizeLexiconIds(value);
+    this.db
+      .prepare('UPDATE memory_event SET lexicon_ids = ? WHERE id = ?')
+      .run(ids.length > 0 ? JSON.stringify(ids) : null, wanted);
+    return ids;
+  }
+
+  /**
+   * Read the lexicon associations of several active records in one query, keyed by memory id.
+   * Only non-empty lists are present, so a caller can attach the field only where it belongs.
+   *
+   * @param {unknown} ids memory ids
+   * @returns {Map<string, string[]>}
+   */
+  lexiconIdsByIds(ids = []) {
+    this.open();
+    const list = [...new Set((Array.isArray(ids) ? ids : [])
+      .filter((id) => typeof id === 'string' && id.trim().length > 0)
+      .map((id) => id.trim()))];
+    const byId = new Map();
+    if (list.length === 0) return byId;
+    const rows = this.db
+      .prepare(`SELECT id, lexicon_ids FROM memory_event
+        WHERE id IN (${list.map(() => '?').join(', ')})`)
+      .all(...list);
+    for (const row of rows) {
+      const linked = decodeLexiconIds(row.lexicon_ids);
+      if (linked.length > 0) byId.set(row.id, linked);
+    }
+    return byId;
   }
 
   /** Column list shared by every message-aware read (camelCase aliases for the public shape). */
@@ -1701,7 +1828,7 @@ export class MemoryStore {
       `${prefix}importance`, `${prefix}clarity`, `${prefix}role`, `${prefix}source`,
       `${prefix}session_id AS sessionId`, `${prefix}turn_id AS turnId`,
       `${prefix}message_id AS messageId`, `${prefix}truncated`, `${prefix}recall_count`,
-      `${prefix}version`, `${prefix}unresolved`, `${prefix}evidence`,
+      `${prefix}version`, `${prefix}unresolved`, `${prefix}evidence`, `${prefix}lexicon_ids`,
     ].join(', ');
   }
 
@@ -1714,7 +1841,8 @@ export class MemoryStore {
    *          messageId: string, ts?: string, text: string, domain?: string,
    *          importance?: number, clarity?: string, source?: string,
    *          minChars?: number, rawText?: string|null, unresolved?: number,
-   *          tzUsed?: string|null, speakerAttribution?: object|null}} [message]
+   *          tzUsed?: string|null, speakerAttribution?: object|null,
+   *          lexiconIds?: string[]}} [message]
    * @returns {{record: object|null, deduped: boolean, skipped: string, chars: number,
    *            truncated: boolean, archived?: boolean}}
    */
@@ -1734,6 +1862,7 @@ export class MemoryStore {
     unresolved = 0,
     tzUsed = null,
     speakerAttribution = null,
+    lexiconIds = [],
   } = {}) {
     this.open();
     const body = typeof text === 'string' ? text.trim() : '';
@@ -1778,6 +1907,7 @@ export class MemoryStore {
         truncated: false,
       };
     }
+    const linked = normalizeLexiconIds(lexiconIds);
     const record = {
       id: randomUUID(),
       ts,
@@ -1792,6 +1922,7 @@ export class MemoryStore {
       message_id: key,
       role,
       truncated: 0,
+      lexicon_ids: serializeLexiconIds(linked),
       // Stage-2 normalization audit: the original wording (only when it differs), the zone the
       // relative date was resolved in, and whether anything could not be resolved.
       raw_text: typeof rawText === 'string' && rawText.length > 0 && rawText !== clipped.text ? rawText : null,
@@ -1832,6 +1963,7 @@ export class MemoryStore {
         speakerAttribution: record.speaker_attribution === null
           ? null
           : JSON.parse(record.speaker_attribution),
+        ...(linked.length > 0 ? { lexiconIds: linked } : {}),
       },
       deduped: false,
       skipped: '',
@@ -1946,7 +2078,8 @@ export class MemoryStore {
         FROM memory_link l JOIN memory_event e ON e.id = l.to_id
         WHERE ${filters.join(' AND ')}
         ORDER BY l.created_at ASC, l.rowid ASC LIMIT ?`)
-      .all(...args, cap);
+      .all(...args, cap)
+      .map(withLexiconIds);
   }
 
   /** Read-only link edges that start at `fromId` (diagnostics/tests, no expansion). */
@@ -1984,7 +2117,7 @@ export class MemoryStore {
     const row = this.db
       .prepare(`SELECT ${this.messageColumns()} FROM memory_event WHERE id = ?`)
       .get(id);
-    return row === undefined ? null : row;
+    return row === undefined ? null : withLexiconIds(row);
   }
 
   /** Message-level records, newest first (tests/diagnostics; not a retention change). */
@@ -2003,7 +2136,8 @@ export class MemoryStore {
     return this.db
       .prepare(`SELECT ${this.messageColumns()} FROM memory_event
         WHERE ${filters.join(' AND ')} ORDER BY ts DESC LIMIT ?`)
-      .all(...args, Math.max(1, Math.floor(Number(limit) || 1)));
+      .all(...args, Math.max(1, Math.floor(Number(limit) || 1)))
+      .map(withLexiconIds);
   }
 
   /**
@@ -2046,9 +2180,10 @@ export class MemoryStore {
     this.db
       .prepare("UPDATE memory_event SET importance = ?, clarity = 'vivid', last_seen = ? WHERE id = ?")
       .run(target, nowIso(), id);
-    return this.db
+    const record = this.db
       .prepare(`SELECT ${this.messageColumns()} FROM memory_event WHERE id = ?`)
       .get(id);
+    return record === undefined ? null : withLexiconIds(record);
   }
 
   /** Promote any auto record whose exact text the manual entry restates. Best-effort. */
@@ -2121,7 +2256,8 @@ export class MemoryStore {
         WHERE ${filters.join(' AND ')}
           AND turn_id IN (${turns.map(() => '?').join(', ')})
         ORDER BY turn_id ASC, ts ASC, CASE role WHEN 'user' THEN 0 ELSE 1 END ASC`)
-      .all(...args, ...turns);
+      .all(...args, ...turns)
+      .map(withLexiconIds);
   }
 
   /** Recent message-level rows for a role/time question with no useful keywords. */
@@ -2153,7 +2289,8 @@ export class MemoryStore {
     const hits = this.db
       .prepare(`SELECT ${this.messageColumns()} FROM memory_event WHERE ${where}
         ORDER BY ts DESC LIMIT ?`)
-      .all(...args, Math.max(1, Math.floor(Number(limit) || 1)));
+      .all(...args, Math.max(1, Math.floor(Number(limit) || 1)))
+      .map(withLexiconIds);
     return { hits, scanned };
   }
 
@@ -3025,7 +3162,7 @@ export class MemoryStore {
     if (before > target) {
       const columns = `id, ts, domain, kind, text, importance, clarity,
         message_id, session_id, turn_id, role, truncated, superseded_by, hidden, tz_used, raw_text,
-        unresolved, pressure_epoch, pressure_contribution, speaker_attribution`;
+        unresolved, pressure_epoch, pressure_contribution, speaker_attribution, lexicon_ids`;
       const selectHidden = this.db.prepare(`SELECT ${columns}
         FROM memory_event WHERE clarity = 'trace' AND hidden = 1
         ORDER BY importance ASC, ts ASC LIMIT ?`);
@@ -3036,8 +3173,9 @@ export class MemoryStore {
         `INSERT OR IGNORE INTO memory_archive
           (id, ts, domain, kind, text, importance, clarity, archived_at, reason,
            message_id, session_id, turn_id, role, truncated, superseded_by, hidden, tz_used,
-           raw_text, unresolved, pressure_epoch, pressure_contribution, speaker_attribution)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           raw_text, unresolved, pressure_epoch, pressure_contribution, speaker_attribution,
+           lexicon_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       const remove = this.db.prepare('DELETE FROM memory_event WHERE id = ?');
 
@@ -3050,7 +3188,7 @@ export class MemoryStore {
             row.truncated ?? 0, row.superseded_by ?? null, row.hidden ?? 0, row.tz_used ?? null,
             row.raw_text ?? null, row.unresolved ?? 0,
             row.pressure_epoch ?? 0, row.pressure_contribution ?? 0,
-            row.speaker_attribution ?? null,
+            row.speaker_attribution ?? null, row.lexicon_ids ?? null,
           );
           remove.run(row.id);
           moved += 1;
@@ -3488,6 +3626,9 @@ export class MemoryStore {
       hits = this.db.prepare(sql).all(...likeArgs, ...filterArgs, pool);
     }
 
+    // Both the FTS and the LIKE branch select the internal lexicon_ids column; expose it only as
+    // the public array (and omit it for a legacy row with no links).
+    hits = hits.map(withLexiconIds);
     const terms = tokenizeQuery(query);
     const scored = hits.map((hit, index) => {
       const text = String(hit.text).toLowerCase();
@@ -3547,7 +3688,8 @@ export class MemoryStore {
     const rows = this.db
       .prepare(`SELECT ${this.messageColumns()} FROM memory_event
         WHERE ${filters.join(' AND ')} ORDER BY ts DESC LIMIT ?`)
-      .all(...args, cap);
+      .all(...args, cap)
+      .map(withLexiconIds);
     const excluded = excludeIds instanceof Set ? excludeIds : new Set();
     return rows.filter((row) => !excluded.has(row.id) && upcomingConvention(row.text, now).matched);
   }
@@ -4243,10 +4385,11 @@ export class MemoryStore {
   landmarkMemories({ budgetChars = 600, limit = 12 } = {}) {
     this.open();
     const rows = this.db
-      .prepare(`SELECT id, ts, domain, text, importance, version FROM memory_event
+      .prepare(`SELECT id, ts, domain, text, importance, version, lexicon_ids FROM memory_event
         WHERE importance >= 85 AND superseded_by IS NULL AND kind <> 'hypothesis'
         ORDER BY importance DESC, ts DESC LIMIT ?`)
-      .all(limit);
+      .all(limit)
+      .map(withLexiconIds);
     return trimToBudget(rows, budgetChars);
   }
 
