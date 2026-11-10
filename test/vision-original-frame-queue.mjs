@@ -6,9 +6,11 @@
  *   1. `take()` 保存 sheet 时，把 `sheet.frames` 引用的独立原帧编码成 PNG 落到同目录；
  *   2. 每个 cell 有稳定 frameId，能通过证据窗口的 byId/latest/between 追溯；
  *   3. 原帧内存队列与文件账本都有 TTL/容量上限，超限从最旧淘汰；
- *   4. 停止/隐私 abort 会删除已落盘原帧；status/证据状态里不出现原帧路径。
+ *   4. 停止/隐私 abort 会删除已落盘原帧；status/证据状态里不出现原帧路径；
+ *   5. 原帧编码是异步的：编码完成前不产生 cell；队列满/编码失败只跳过原帧，
+ *      故事板照常返回，并记录有界原因（queue_full / encode_failed）。
  *
- * Run: node --test test/vision-original-frame-queue.mjs
+ * Run: node test/vision-original-frame-queue.mjs
  */
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
@@ -22,6 +24,8 @@ import {
   createOriginalFileLedger,
   createOriginalFrameQueue,
 } from '../src/host/vision/sight.js';
+import { createPngEncoderPool } from '../src/host/vision/png-worker.js';
+import { encodePng } from 'dsh-see-now/png';
 import { createEvidenceWindow } from '../src/host/vision/evidence-window.js';
 
 const NOW = 1_700_000_000_000;
@@ -398,3 +402,100 @@ test('8. 默认边界存在且不是无限缓存', () => {
   assert.ok(ORIGINAL_FRAME_DEFAULTS.maxFiles >= ORIGINAL_FRAME_DEFAULTS.maxFrames);
   assert.ok(ORIGINAL_FRAME_DEFAULTS.maxFileBytes > 0);
 });
+
+test('9. 异步编码：take() 等编码完成才把原帧标成可用', async (t) => {
+  const pending = [];
+  const encoder = {
+    encode(input) {
+      return new Promise((resolve, reject) => pending.push({ input, resolve, reject }));
+    },
+  };
+  const { dir, session } = await fixture(t, { originalFrameEncoding: { encoder } });
+  feed([rgb(4, 3, 0x42)]);
+  state.take = sheet({ frames: [{ t: 0, via: 'cut' }] });
+
+  let resolved = false;
+  const taking = session.take({ force: false }).then((value) => {
+    resolved = true;
+    return value;
+  });
+  for (let wait = 0; wait < 200 && pending.length === 0; wait += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(pending.length, 1, '编码任务已提交');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(resolved, false, '编码未完成时 take() 不返回');
+  assert.deepEqual(await listRawPng(dir), [], '未完成编码不产生原帧文件');
+
+  const { input, resolve } = pending[0];
+  resolve(encodePng(input.rgb, input.width, input.height, { level: 1 }));
+  const taken = await taking;
+  assert.equal(taken.cells.length, 1, '编码完成后才出现 cell');
+  assert.equal((await listRawPng(dir)).length, 1);
+  const stats = session.stats();
+  assert.equal(stats.originalFrames, 1);
+  assert.equal(stats.originalFrameSkipped, 0);
+});
+
+test('10. 过载降级：队列满只跳过原帧，故事板照常返回并记录有界原因', async (t) => {
+  const pool = createPngEncoderPool({ concurrency: 1, queueLimit: 0 });
+  t.after(() => pool.close());
+  const { dir, session } = await fixture(t, { originalFrameEncoding: { encoder: pool } });
+  const times = [0, 0.5, 1, 1.5, 2, 2.5];
+  feed(times.map((_, index) => rgb(4, 3, 0x10 + index)));
+  state.take = sheet({ frames: times.map((time) => ({ t: time, via: 'mark' })) });
+
+  const taken = await session.take({ force: false });
+  assert.ok(taken !== null);
+  assert.equal(taken.frames, 6, '故事板本身完整返回');
+  assert.equal(taken.cells.length, 1, '并发 1 + 队列 0：只有第一个原帧被受理');
+  assert.equal((await listRawPng(dir)).length, 1);
+
+  const stats = session.stats();
+  assert.equal(stats.originalFrameSkipped, 5);
+  assert.equal(stats.originalFrameSkipReasons.queue_full, 5);
+  assert.equal(stats.originalFrameErrors, 5);
+  assert.equal(stats.originalEncoder.dropped, 5);
+});
+
+test('11. 编码失败不阻塞 take：故事板保留，cell 缺席并记录原因', async (t) => {
+  const encoder = {
+    async encode() {
+      const error = new Error('encode boom');
+      error.code = 'worker_error';
+      throw error;
+    },
+  };
+  const { dir, session } = await fixture(t, { originalFrameEncoding: { encoder } });
+  feed([rgb(4, 3, 0xa0), rgb(4, 3, 0xb0), rgb(4, 3, 0xc0)]);
+  state.take = sheet({ frames: [0, 0.5, 1].map((time) => ({ t: time, via: 'mark' })) });
+
+  const started = Date.now();
+  const taken = await session.take({ force: false });
+  assert.ok(Date.now() - started < 2_000, '编码失败必须快速返回，不能挂住 take');
+  assert.equal(taken.cells.length, 0);
+  assert.deepEqual(await listRawPng(dir), []);
+  assert.equal((await listPng(dir)).length, 1, 'sheet 仍然落盘');
+
+  const stats = session.stats();
+  assert.equal(stats.originalFrameErrors, 3);
+  assert.equal(stats.originalFrameSkipped, 3);
+  assert.equal(stats.originalFrameSkipReasons.encode_failed, 3);
+});
+
+test('12. 同一会话多次 take：worker 池复用，第二轮原帧仍能编码', async (t) => {
+  const { dir, session } = await fixture(t);
+  feed([rgb(4, 3, 0x11), rgb(4, 3, 0x22)]);
+
+  state.take = sheet({ frames: [{ t: 0, via: 'cut' }] });
+  const first = await session.take({ force: false });
+  assert.equal(first.cells.length, 1);
+
+  state.take = sheet({ frames: [{ t: 0.5, via: 'mark' }] });
+  const second = await session.take({ force: false });
+  assert.equal(second.cells.length, 1, '第二次 take 复用同一个编码池');
+  assert.notEqual(first.cells[0].frameId, second.cells[0].frameId);
+  assert.equal((await listRawPng(dir)).length, 2);
+  assert.equal(session.stats().originalEncoder.completed, 2);
+});
+

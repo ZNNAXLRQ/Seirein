@@ -14,6 +14,8 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { createPngEncoderPool } from './png-worker.js';
+
 /** Default freshness window for a perception result: anything older is no longer "now". */
 export const OBSERVATION_TTL_MS = 30_000;
 
@@ -653,13 +655,7 @@ export async function shrinkShot(shot, { dir, ffmpegPath, maxBytes, signal, atte
   return null;
 }
 
-/**
- * Continuous capture with change-gated frame packing, delegated to dsh-see-now.
- * `source` selects the input: the desktop, or OBS's virtual camera for scene mode.
- * `width`/`height` default to the trial storyboard size (1920×1200) and are clamped by
- * `resolveStoryboardSize`; the actual values are reported through `stats()`.
- * @param {{ffmpegPath: string, dir: string, width?: number, height?: number, fps?: number, source?: object, signal?: AbortSignal}} options
- */
+/** Cached result of the cancellable screen-engine probe, shared across sessions. */
 let cancellableScreenEngine = null;
 
 /** How long one frame's arrival stamp is kept: comfortably longer than a sheet can sit queued. */
@@ -698,17 +694,47 @@ function rgbPixelsOf(buf, width, height) {
   return null;
 }
 
-export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12, source = { kind: 'screen' }, signal }) {
+/**
+ * 连续采集 + 变化门控拼图（故事板），采集与拼图委托给 dsh-see-now。
+ *
+ * 原帧 PNG 编码在独立的 worker 池里完成（见 `png-worker.js`）：
+ * `originalFrameEncoding` 可覆盖并发/队列上限，或注入一个 `{encode, close?, state?}` 编码器
+ * （测试用）。编码失败、超时或队列满只跳过对应原帧，故事板本身永远保留。
+ *
+ * `source` selects the input: the desktop, or OBS's virtual camera for scene mode.
+ * `width`/`height` default to the trial storyboard size (1920×1200) and are clamped by
+ * `resolveStoryboardSize`; the actual values are reported through `stats()`.
+ * @param {{ffmpegPath: string, dir: string, width?: number, height?: number, fps?: number, source?: object, signal?: AbortSignal, originalFrameEncoding?: object}} options
+ */
+export async function startStoryboard({
+  ffmpegPath, dir, width, height, fps = 12, source = { kind: 'screen' }, signal,
+  originalFrameEncoding = null,
+}) {
   signal?.throwIfAborted();
   const size = resolveStoryboardSize({ width, height });
+  const encodingOptions = originalFrameEncoding !== null && typeof originalFrameEncoding === 'object'
+    ? originalFrameEncoding
+    : {};
+  // 测试可注入一个假编码器；生产路径用有界 worker 池。注入的编码器由调用方负责关闭。
+  const injectedEncoder = encodingOptions.encoder;
+  const ownsEncoder = !(injectedEncoder !== null && typeof injectedEncoder === 'object'
+    && typeof injectedEncoder.encode === 'function');
+  const frameEncoder = ownsEncoder ? createPngEncoderPool(encodingOptions) : injectedEncoder;
+  const closeEncoder = () => {
+    if (typeof frameEncoder.close !== 'function') return Promise.resolve();
+    try {
+      return Promise.resolve(frameEncoder.close()).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  };
+
   const [
     { spawnFrames, pickScreenEngine, captureArgs },
     { createPipeline },
-    { encodePng },
   ] = await Promise.all([
     import('dsh-see-now/capture'),
     import('dsh-see-now/pipeline'),
-    import('dsh-see-now/png'),
   ]);
 
   await mkdir(dir, { recursive: true });
@@ -764,6 +790,23 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
   let originalFrameCount = 0;
   let originalFrameBytes = 0;
   let originalFrameErrors = 0;
+  let originalFrameSkipped = 0;
+  /** 有界原因计数：键固定，不会随错误文本无限增长，也不含路径。 */
+  const ORIGINAL_FRAME_SKIP_REASONS = Object.freeze([
+    'queue_full',
+    'encode_failed',
+    'encode_timeout',
+    'write_failed',
+  ]);
+  const originalFrameSkipCounts = Object.fromEntries(
+    ORIGINAL_FRAME_SKIP_REASONS.map((reason) => [reason, 0]),
+  );
+  const recordOriginalFrameSkip = (reason) => {
+    originalFrameErrors += 1;
+    originalFrameSkipped += 1;
+    const key = ORIGINAL_FRAME_SKIP_REASONS.includes(reason) ? reason : 'encode_failed';
+    originalFrameSkipCounts[key] += 1;
+  };
   /** `stop()` 的磁盘清理任务：重复 stop 共享同一个 Promise。 */
   let stopCleanup = null;
 
@@ -868,7 +911,11 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
     const remaining = originalFiles.clear();
     signal?.removeEventListener('abort', stop);
     try { run.stop(); } catch { /* already gone */ }
-    stopCleanup = deleteOriginalFiles(remaining);
+    // 编码线程随会话结束：在途任务会被拒绝，避免 take() 永久等待；注入的编码器归调用方管。
+    stopCleanup = Promise.all([
+      deleteOriginalFiles(remaining),
+      ownsEncoder ? closeEncoder() : Promise.resolve(),
+    ]).then(() => undefined);
     return stopCleanup;
   };
   signal?.addEventListener('abort', stop, { once: true });
@@ -909,6 +956,11 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
       originalFrames: originalFrameCount,
       originalBytes: originalFrameBytes,
       originalFrameErrors,
+      // 有界原因计数：队列满/编码失败/超时/写盘失败，键固定。
+      originalFrameSkipped,
+      originalFrameSkipReasons: { ...originalFrameSkipCounts },
+      // 编码池的并发/队列上限与当前占用，供状态页和性能验收读取。
+      originalEncoder: typeof frameEncoder.state === 'function' ? frameEncoder.state() : null,
       firstFrameMs,
       uptimeMs: Date.now() - startedAt,
     }),
@@ -965,9 +1017,13 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
          * 独立原帧：优先使用 `frame.buf`（未来 dsh-see-now 若把像素留在 sheet 上），否则从
          * 有界原帧队列里按 `t` 取回。队列只保留管线真正留下的帧，所以不会把 12fps 的整条
          * 流常驻内存；取不到像素的帧只跳过 cells，绝不影响故事板本身。
+         *
+         * 像素找齐后一次性提交给 worker 池并行编码。队列满的任务会立刻同步拒绝（不排队），
+         * 因此 `take()` 只等待被受理的编码，失败/过载都只会让对应 cell 缺席。
          */
+        const candidates = [];
         for (let cellIndex = 0; cellIndex < sheetFrames.length; cellIndex += 1) {
-          if (cells.length >= MAX_ORIGINAL_CELLS) break;
+          if (candidates.length >= MAX_ORIGINAL_CELLS) break;
           signal?.throwIfAborted();
           if (stopped) throw new Error('storyboard stopped');
           const frame = sheetFrames[cellIndex];
@@ -997,34 +1053,52 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
           const frameCapturedAt = at === null
             ? capturedAt
             : Math.min(endedAt, Math.max(capturedAt, at));
+          candidates.push({ frame, rgb, frameCapturedAt, cellIndex });
+        }
+        // 编码与落盘都不阻塞事件循环；每个原帧只有在文件 stat 成功后才成为 cell。
+        const encoded = await Promise.all(candidates.map(async (candidate) => {
           let png;
           try {
-            // level 1：原帧只用于“看清细节”，编码延迟比几 MB 的额外体积更重要。
-            png = encodePng(rgb, sheetWidth, sheetHeight, { level: 1 });
-          } catch {
-            originalFrameErrors += 1;
-            continue;
+            png = await frameEncoder.encode({
+              rgb: candidate.rgb,
+              width: sheetWidth,
+              height: sheetHeight,
+              signal,
+            });
+          } catch (error) {
+            return { candidate, error, stage: 'encode' };
           }
-          const rawFile = join(dir, `${sheetId}-frame-${cellIndex}.png`);
-          let rawInfo;
+          const rawFile = join(dir, `${sheetId}-frame-${candidate.cellIndex}.png`);
           try {
             await writeFile(rawFile, png, { signal });
-            rawInfo = await stat(rawFile);
+            const rawInfo = await stat(rawFile);
+            createdFrameFiles.push(rawFile);
+            return { candidate, rawFile, bytes: rawInfo.size };
           } catch (error) {
             await rm(rawFile, { force: true }).catch(() => {});
-            if (signal?.aborted) throw signal.reason ?? error;
-            if (stopped) throw new Error('storyboard stopped');
-            originalFrameErrors += 1;
+            return { candidate, error, stage: 'write' };
+          }
+        }));
+        signal?.throwIfAborted();
+        if (stopped) throw new Error('storyboard stopped');
+        for (const result of encoded) {
+          if (result.error !== undefined) {
+            // 原因有界：queue_full / encode_failed / encode_timeout / write_failed。
+            const code = typeof result.error?.code === 'string' ? result.error.code : '';
+            let reason = result.stage === 'write' ? 'write_failed' : 'encode_failed';
+            if (code === 'queue_full') reason = 'queue_full';
+            else if (code === 'encode_timeout') reason = 'encode_timeout';
+            recordOriginalFrameSkip(reason);
             continue;
           }
-          createdFrameFiles.push(rawFile);
+          const { candidate } = result;
           // 像素已经变成独立 PNG，立刻释放内存；文件由账本继续按 TTL/容量管理。
-          originalFrames.remove(frame);
+          originalFrames.remove(candidate.frame);
           originalFrameCount += 1;
-          originalFrameBytes += rawInfo.size;
+          originalFrameBytes += result.bytes;
           const evicted = originalFiles.add({
-            file: rawFile,
-            bytes: rawInfo.size,
+            file: result.rawFile,
+            bytes: result.bytes,
             createdAt: Date.now(),
           });
           if (evicted.length > 0) void deleteOriginalFiles(evicted);
@@ -1032,13 +1106,13 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
             // 稳定身份：同一张故事板里每个 cell 一旦生成就不再变化。shotId 由宿主在登记
             // 证据时补上（采集层还不知道宿主的镜头分段），这里先留空字符串。
             frameId: `frame-${++originalFrameSequence}`,
-            capturedAt: frameCapturedAt,
+            capturedAt: candidate.frameCapturedAt,
             shotId: typeof sheet.shotId === 'string' ? sheet.shotId : '',
             width: sheetWidth,
             height: sheetHeight,
-            bytes: rawInfo.size,
+            bytes: result.bytes,
             // 仅供宿主复制/清理；不进入 status，也不进入模型可见的工具结果。
-            file: rawFile,
+            file: result.rawFile,
           });
         }
         // 这张故事板已经取走：解除原帧锁定，容量淘汰恢复。
