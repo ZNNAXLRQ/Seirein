@@ -163,6 +163,9 @@ export const SHORT_ACTION_TRANSITION = Object.freeze({
 // Only the verified head channels are driven. Gaze / body / breath are deliberately absent: they
 // either have no idle write path (gaze/body) or are VTS-native (body/breath), so a component must
 // not claim them before a real-VTS probe exists.
+//
+// WHICH component is drawn is persona-weighted (see `postureComponentWeights`): the persona is a
+// soft probability bias, not a fixed template, and the existing no-repeat rule still applies.
 export const POSTURE_COMPONENT_CHANNELS = Object.freeze(['headX', 'headY', 'headZ']);
 
 /** A component is held for this window. A persona may stretch/shrink it, always inside the band. */
@@ -198,7 +201,7 @@ export const POSTURE_COMPONENT_TARGET_LIMIT = 72;
  * remains a recognisable part of the held pose instead of rounding away to ≈0.2°.
  */
 export const POSTURE_COMPONENTS = Object.freeze([
-  Object.freeze({ id: 'natural', label: '自然', headX: 0.3, headY: 0.05, headZ: 0.5 }),
+  Object.freeze({ id: 'natural', label: '自然', headX: 0.03, headY: 0, headZ: 0.25 }),
   Object.freeze({ id: 'lean-left', label: '左侧倾', headX: 0.35, headY: 0, headZ: 1 }),
   Object.freeze({ id: 'lean-right', label: '右侧倾', headX: -0.35, headY: 0, headZ: -1 }),
   Object.freeze({ id: 'look-back', label: '偏头/回看', headX: 1, headY: 0.45, headZ: 0.55 }),
@@ -240,14 +243,249 @@ export const POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE = 0.12;
  * Shape weights of one gaze component. Only the two verified gaze channels are used; a `value` is
  * `weight × amplitude`, clamped per channel to the 0.12 semantic cap, so a shape can never ask for
  * more than the component budget. The four directions are deliberately distinct so two consecutive
- * holds are visibly different.
+ * holds are visibly different; `gaze-center` is a still, zero-value hold that keeps the verified
+ * gaze channels owned and written (0), so a previous direction is actively released instead of
+ * sticking.
  */
 export const POSTURE_GAZE_COMPONENTS = Object.freeze([
   Object.freeze({ id: 'gaze-left', label: '左看', gazeX: -1, gazeY: 0 }),
   Object.freeze({ id: 'gaze-right', label: '右看', gazeX: 1, gazeY: 0 }),
   Object.freeze({ id: 'gaze-up', label: '上看', gazeX: 0, gazeY: 1 }),
   Object.freeze({ id: 'gaze-down', label: '下看', gazeX: 0, gazeY: -1 }),
+  // A still centre: the eyes return to the held baseline and stay there. It is a real component
+  // shape (own hold window, own anti-repeat slot), not "no component".
+  Object.freeze({ id: 'gaze-center', label: '中心/少动', gazeX: 0, gazeY: 0 }),
 ]);
+
+
+// ---------------------------------------------------------------------------------------------
+// Persona → component SELECTION (soft weights, never a fixed template)
+// ---------------------------------------------------------------------------------------------
+//
+// The head/gaze component layers used to sample their shape uniformly and only let the persona
+// change duration/transition. That made a shy, a lively and a composed avatar pick the SAME shape
+// distribution. The tables below turn the persona dimensions (`state.traits`) and the optional
+// behavioural classification (`state.style.expression`) into POSITIVE weights per shape:
+//
+//   - a weight changes only the next draw's PROBABILITY; it never disables a shape, so a quiet
+//     persona can still draw `natural` and a lively one can still draw it (soft floor);
+//   - the anti-repeat rule is unchanged: a roll that lands on the current shape is re-drawn among
+//     the other shapes, so the weighted result can never be a back-to-back repeat;
+//   - weights are multiplicative and every shape keeps a floor, so no persona is a hard template
+//     and two similar personas still overlap substantially;
+//   - all randomness stays on the controller's existing seeded component streams. The same
+//     seed+style reproduces the same trajectory; a different style re-weights the same roll.
+//
+// A persona dimension or tendency that is absent contributes 0, which is neutral (the factor is
+// 1). The tendencies are read from `style.expression` only; they never rewrite the numeric fields.
+/** No shape is ever unreachable: every selection weight keeps this positive floor. */
+export const COMPONENT_SELECTION_WEIGHT_FLOOR = 0.05;
+
+const componentTrait = (traits, name) => clamp01(finite(traits?.[name], 0.5));
+
+const readComponentExpression = (expression) => {
+  const source = expression !== null && typeof expression === 'object' ? expression : {};
+  return {
+    tender: clamp01(finite(source.tender, 0)),
+    playful: clamp01(finite(source.playful, 0)),
+    shy: clamp01(finite(source.shy, 0)),
+    composed: clamp01(finite(source.composed, 0)),
+  };
+};
+
+const floorComponentWeight = (value) => Math.max(COMPONENT_SELECTION_WEIGHT_FLOOR, value);
+
+/**
+ * Soft selection weights for the four head components.
+ *
+ *   lively / playful   leans + look-back up, natural down
+ *   soft / tender      natural + look-back up (and a gentler amplitude/hold bias below)
+ *   shy                look-back strongly up, a side lean up, natural still present
+ *   composed           natural/lean up, look-back down (plus a longer hold, so it switches less)
+ *
+ * Every returned weight is > 0. The caller multiplies nothing else: the persona biases the DRAW,
+ * while the existing semantic/axis caps and the preset arbitration remain the hard bounds.
+ *
+ * @param {object} [traits] `state.traits`
+ * @param {object|null} [expression] `state.style.expression`
+ * @returns {{natural: number, 'lean-left': number, 'lean-right': number, 'look-back': number}}
+ */
+export function postureComponentWeights(traits, expression) {
+  const liveliness = componentTrait(traits, 'liveliness');
+  const softness = componentTrait(traits, 'softness');
+  const restraint = componentTrait(traits, 'restraint');
+  const expressiveness = componentTrait(traits, 'expressiveness');
+  const attention = componentTrait(traits, 'attention');
+  const composure = componentTrait(traits, 'composure');
+  const texture = componentTrait(traits, 'texture');
+  const { tender, playful, shy, composed } = readComponentExpression(expression);
+  const natural = 1
+    * (1 - 0.55 * liveliness)
+    * (1 + 0.85 * softness)
+    * (1 + 0.30 * restraint)
+    * (1 - 0.20 * expressiveness)
+    * (1 + 0.15 * attention)
+    * (1 + 0.20 * composure)
+    * (1 - 0.10 * texture)
+    * (1 + 0.85 * tender)
+    * (1 - 0.55 * playful)
+    * (1 + 0.10 * shy)
+    * (1 + 0.40 * composed);
+  const lean = 1
+    * (1 + 0.90 * liveliness)
+    * (1 - 0.10 * softness)
+    * (1 - 0.10 * restraint)
+    * (1 + 0.20 * expressiveness)
+    * (1 + 0.35 * attention)
+    * (1 + 0.25 * composure)
+    * (1 + 0.10 * texture)
+    * (1 + 0.15 * tender)
+    * (1 + 0.60 * playful)
+    * (1 + 0.30 * shy)
+    * (1 + 0.40 * composed);
+  const lookBack = 1
+    * (1 + 0.55 * liveliness)
+    * (1 + 0.60 * softness)
+    * (1 - 0.20 * restraint)
+    * (1 + 0.30 * expressiveness)
+    * (1 + 0.55 * attention)
+    * (1 - 0.35 * composure)
+    * (1 + 0.30 * texture)
+    * (1 + 0.50 * tender)
+    * (1 + 0.70 * playful)
+    * (1 + 2.00 * shy)
+    * (1 - 0.50 * composed);
+  return Object.freeze({
+    natural: floorComponentWeight(natural),
+    'lean-left': floorComponentWeight(lean),
+    'lean-right': floorComponentWeight(lean),
+    'look-back': floorComponentWeight(lookBack),
+  });
+}
+
+/**
+ * Soft selection weights for the gaze components. `gaze-center` is the restful option, not a
+ * disabled direction: shy/playful can still look away, and composed can still glance.
+ *
+ *   attention high     side/up up, down/centre down => more eye movement
+ *   shy                down + side up, up down, centre kept available
+ *   playful            up + side up
+ *   composed / tender  centre/down up, hold longer and amplitude biased lower => less movement
+ *
+ * @param {object} [traits] `state.traits`
+ * @param {object|null} [expression] `state.style.expression`
+ * @returns {{'gaze-left': number, 'gaze-right': number, 'gaze-up': number, 'gaze-down': number,
+ *            'gaze-center': number}}
+ */
+export function gazeComponentWeights(traits, expression) {
+  const liveliness = componentTrait(traits, 'liveliness');
+  const softness = componentTrait(traits, 'softness');
+  const restraint = componentTrait(traits, 'restraint');
+  const attention = componentTrait(traits, 'attention');
+  const composure = componentTrait(traits, 'composure');
+  const texture = componentTrait(traits, 'texture');
+  const { tender, playful, shy, composed } = readComponentExpression(expression);
+  const side = 1
+    * (1 + 0.30 * liveliness)
+    * (1 + 0.60 * attention)
+    * (1 - 0.20 * composure)
+    * (1 - 0.10 * restraint)
+    * (1 + 0.10 * texture)
+    * (1 + 0.15 * tender)
+    * (1 + 0.50 * playful)
+    * (1 + 0.35 * shy)
+    * (1 + 0.10 * composed);
+  const up = 1
+    * (1 + 0.35 * liveliness)
+    * (1 + 0.45 * attention)
+    * (1 - 0.30 * softness)
+    * (1 - 0.25 * composure)
+    * (1 + 0.10 * texture)
+    * (1 + 0.85 * playful)
+    * (1 - 0.25 * shy)
+    * (1 - 0.20 * composed);
+  const down = 1
+    * (1 + 0.45 * softness)
+    * (1 - 0.15 * attention)
+    * (1 + 0.15 * composure)
+    * (1 - 0.35 * liveliness)
+    * (1 + 0.35 * tender)
+    * (1 - 0.40 * playful)
+    * (1 + 0.55 * shy)
+    * (1 + 0.10 * composed);
+  const center = 1
+    * (1 - 0.30 * liveliness)
+    * (1 + 0.15 * softness)
+    * (1 + 0.30 * composure)
+    * (1 - 0.15 * attention)
+    * (1 + 0.10 * tender)
+    * (1 - 0.30 * playful)
+    * (1 - 0.10 * shy)
+    * (1 + 0.35 * composed);
+  return Object.freeze({
+    'gaze-left': floorComponentWeight(side),
+    'gaze-right': floorComponentWeight(side),
+    'gaze-up': floorComponentWeight(up),
+    'gaze-down': floorComponentWeight(down),
+    'gaze-center': floorComponentWeight(center),
+  });
+}
+
+/**
+ * The persona's amplitude/hold bias for a component draw. It is deliberately separate from the
+ * SELECTION weights: selection chooses which shape, this chooses how strong/long that shape is.
+ * `amplitudeExponent` shapes the existing uniform [MIN, MAX] draw (1 = unchanged, >1 = gentler,
+ * <1 = more emphatic); `holdFactor` stretches the existing hold inside the band. Both are soft and
+ * bounded, and neither touches base micro-motion.
+ *
+ * @param {object} [traits]
+ * @param {object|null} [expression]
+ * @returns {{amplitudeExponent: number, holdFactor: number}}
+ */
+export function personaComponentBias(traits, expression) {
+  const liveliness = componentTrait(traits, 'liveliness');
+  const softness = componentTrait(traits, 'softness');
+  const composure = componentTrait(traits, 'composure');
+  const { tender, playful, shy, composed } = readComponentExpression(expression);
+  const gentle = 0.55 * (softness - 0.5) + 0.45 * tender + 0.30 * composed + 0.20 * shy;
+  const dynamic = 0.55 * (liveliness - 0.5) + 0.45 * playful;
+  return Object.freeze({
+    amplitudeExponent: Math.max(0.55, Math.min(2.4, 1 + 1.5 * gentle - 1.1 * dynamic)),
+    holdFactor: Math.max(0.70, Math.min(1.35,
+      1 + 0.22 * (composure - 0.5) + 0.14 * (softness - 0.5) - 0.12 * (liveliness - 0.5)
+        + 0.18 * composed + 0.10 * tender + 0.06 * shy - 0.12 * playful)),
+  });
+}
+
+/**
+ * Draw one shape from a positive weight map. The first roll is over the FULL pool, so the same
+ * seed/persona maps a roll to a shape as directly as possible. Only when that roll lands on the
+ * shape that is already held does a second weighted roll pick among the other shapes: the existing
+ * "no two consecutive identical holds" contract is kept without changing every non-repeat draw.
+ */
+function weightedComponentEntry(entries, rand) {
+  let total = 0;
+  for (const entry of entries) total += entry.weight;
+  let roll = Math.max(0, Math.min(0.999999999999, finite(rand(), 0))) * total;
+  for (const entry of entries) {
+    if (roll < entry.weight) return entry.item;
+    roll -= entry.weight;
+  }
+  return entries[entries.length - 1].item;
+}
+
+function drawWeightedComponent({ pool, weights, currentId, rand }) {
+  const entries = pool.map((item) => ({
+    item,
+    weight: Math.max(COMPONENT_SELECTION_WEIGHT_FLOOR, finite(weights?.[item.id], 1)),
+  }));
+  const first = weightedComponentEntry(entries, rand);
+  if (currentId === null || first.id !== currentId) return first;
+  // A back-to-back repeat is not a new hold: re-draw among the other shapes, preserving the
+  // weighted preference and the existing seeded stream (one extra roll, as before).
+  const others = entries.filter((entry) => entry.item.id !== currentId);
+  return others.length > 0 ? weightedComponentEntry(others, rand) : first;
+}
 
 
 /** Intent kinds that count as a short response (they are the ones that may use B). */
@@ -1466,23 +1704,28 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return next;
   }
 
-  /** One component draw: shape × semantic amplitude, converted through the live head gain. */
+  /** One component draw: persona-weighted shape × persona-shaped semantic amplitude. */
   function drawPostureComponent(now) {
-    const pool = POSTURE_COMPONENTS;
     const current = state.motion.posture.component;
-    let index = Math.floor(componentRandom() * pool.length) % pool.length;
-    if (current !== null && pool.length > 1 && pool[index].id === current.id) {
-      // A back-to-back repeat is not a new component hold: move to a different shape.
-      index = (index + 1 + Math.floor(componentRandom() * (pool.length - 1))) % pool.length;
-    }
-    const spec = pool[index];
+    const weights = postureComponentWeights(state.traits, state.style.expression);
+    const spec = drawWeightedComponent({
+      pool: POSTURE_COMPONENTS,
+      weights,
+      currentId: current?.id ?? null,
+      rand: componentRandom,
+    });
+    const bias = personaComponentBias(state.traits, state.style.expression);
+    // The amplitude stays inside the SAME 0.12–0.15 semantic band; the exponent only biases where
+    // inside it the draw lands (a soft/tender/composed persona leans low, a lively/playful high).
     const amplitude = POSTURE_COMPONENT_MIN_AMPLITUDE
-      + (POSTURE_COMPONENT_MAX_AMPLITUDE - POSTURE_COMPONENT_MIN_AMPLITUDE) * componentRandom();
+      + (POSTURE_COMPONENT_MAX_AMPLITUDE - POSTURE_COMPONENT_MIN_AMPLITUDE)
+        * Math.pow(componentRandom(), bias.amplitudeExponent);
     const drawMs = postureComponentMinMs
       + (postureComponentMaxMs - postureComponentMinMs) * componentRandom();
     // A persona tempo/composure may stretch or shrink the hold, but the 10–20 s band is the
     // contract: a slow persona never turns a component into a statue, a lively one never flickers.
-    const influenced = drawMs * Math.max(0.8, Math.min(1.2, (1 / postureTempo()) * traitEffects().hold));
+    const influenced = drawMs * Math.max(0.8, Math.min(1.2,
+      (1 / postureTempo()) * traitEffects().hold * bias.holdFactor));
     const holdMs = Math.max(postureComponentMinMs, Math.min(postureComponentMaxMs, influenced));
     const axes = {};
     const semantic = {};
@@ -1556,20 +1799,26 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    * semantic 30°-unit convention and clamped per channel, so the component can never exceed 0.12.
    */
   function drawGazeComponent(now) {
-    const pool = POSTURE_GAZE_COMPONENTS;
     const current = state.motion.posture.gazeComponent;
-    let index = Math.floor(gazeComponentRandom() * pool.length) % pool.length;
-    if (current !== null && pool.length > 1 && pool[index].id === current.id) {
-      // Consecutive holds must not look identical: draw a different direction.
-      index = (index + 1 + Math.floor(gazeComponentRandom() * (pool.length - 1))) % pool.length;
-    }
-    const spec = pool[index];
-    const amplitude = POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE
-      + (POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE - POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE) * gazeComponentRandom();
+    const weights = gazeComponentWeights(state.traits, state.style.expression);
+    const spec = drawWeightedComponent({
+      pool: POSTURE_GAZE_COMPONENTS,
+      weights,
+      currentId: current?.id ?? null,
+      rand: gazeComponentRandom,
+    });
+    const bias = personaComponentBias(state.traits, state.style.expression);
+    const drawnAmplitude = POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE
+      + (POSTURE_GAZE_COMPONENT_MAX_AMPLITUDE - POSTURE_GAZE_COMPONENT_MIN_AMPLITUDE)
+        * Math.pow(gazeComponentRandom(), bias.amplitudeExponent);
+    // The still centre has no amplitude: its semantic value is exactly 0. The normal directions
+    // keep the drawn amplitude inside the 0.08–0.12 band.
+    const amplitude = spec.id === 'gaze-center' ? 0 : drawnAmplitude;
     const drawMs = postureGazeComponentMinMs
       + (postureGazeComponentMaxMs - postureGazeComponentMinMs) * gazeComponentRandom();
     // The gaze hold stays inside its own 6–12 s band; persona tempo may stretch/shrink it there.
-    const influenced = drawMs * Math.max(0.8, Math.min(1.2, (1 / postureTempo()) * traitEffects().hold));
+    const influenced = drawMs * Math.max(0.8, Math.min(1.2,
+      (1 / postureTempo()) * traitEffects().hold * bias.holdFactor));
     const holdMs = Math.max(
       postureGazeComponentMinMs,
       Math.min(postureGazeComponentMaxMs, influenced),
@@ -4901,14 +5150,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     }
     // Phase 3: the gaze component is an independent owner of gazeX/gazeY, but only while its
     // verified+plugin gate is open and the master idle switch is on. It never adds a channel to the
-    // write set when unverified/native-possible, and body channels are never added here.
+    // write set when unverified/native-possible, and body channels are never added here. The
+    // component owns the channels even when its target is the still centre (0): that is what
+    // releases a previous direction instead of leaving the last non-zero eye value on the wire.
     const posture = state.motion.posture;
     if (posture.componentGazeVerified === true && posture.gazeComponent !== null
       && state.intent.flags?.idle !== false) {
-      const value = posture.gazeComponent.value ?? {};
-      if (Math.abs(finite(value.gazeX, 0)) > 1e-6 || Math.abs(finite(value.gazeY, 0)) > 1e-6) {
-        for (const channel of POSTURE_GAZE_COMPONENT_CHANNELS) set.add(channel);
-      }
+      for (const channel of POSTURE_GAZE_COMPONENT_CHANNELS) set.add(channel);
     }
     return [...set];
   }
