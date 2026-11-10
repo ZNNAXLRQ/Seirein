@@ -5563,6 +5563,12 @@ window.__ModuleLoader__.load({
       // 持续观看的独立开关：只作为本次动作的乐观值，最终以 status.vision.continuous.enabled 为准。
       const [continuousDraft, setContinuousDraft] = useState(null);
       const [continuousError, setContinuousError] = useState('');
+      // 文字陪伴归属（settings.companion）：开关、手动登记输入与最近一次动作提示。
+      // 归属只认宿主返回的 typedSessions；pre-step 不会自动登记，本页也只发送显式动作。
+      const [typedCompanionDraft, setTypedCompanionDraft] = useState(null);
+      const [typedSessionDraft, setTypedSessionDraft] = useState('');
+      const [typedCompanionError, setTypedCompanionError] = useState('');
+      const [typedCompanionNotice, setTypedCompanionNotice] = useState('');
       // 人设库：本次手动整理/保存拆分的结果、「保存」前的文本草稿，以及「重新分类」的预览状态。
       const [profileMaintain, setProfileMaintain] = useState(null);
       const [profileDraft, setProfileDraft] = useState(null);
@@ -6949,6 +6955,73 @@ window.__ModuleLoader__.load({
               const at = Number(value);
               return Number.isFinite(at) && at > 0 ? new Date(at).toLocaleTimeString() : '—';
             };
+            // 文字陪伴归属：只读 status.companion；未登记/关闭时界面如实显示，不把普通会话
+            // 当成陪伴。draft 只承载本次动作的乐观值，失败时清掉即回滚到 status。
+            const companion = status.companion ?? {};
+            const typedEnabledSaved = companion.typedEnabled !== false;
+            const typedEnabledOn = typeof typedCompanionDraft === 'boolean'
+              ? typedCompanionDraft
+              : typedEnabledSaved;
+            const typedSessions = Array.isArray(companion.typedSessions)
+              ? companion.typedSessions.filter((entry) => typeof entry === 'string' && entry.length > 0)
+              : [];
+            const typedSessionLimit = Number.isFinite(Number(companion.limit)) && Number(companion.limit) > 0
+              ? Math.floor(Number(companion.limit))
+              : 32;
+            const lastTypedSessionId = typeof companion.lastSessionId === 'string'
+              ? companion.lastSessionId
+              : '';
+            const commitTypedEnabled = async () => {
+              const next = !typedEnabledOn;
+              setTypedCompanionDraft(next);
+              setTypedCompanionError('');
+              setTypedCompanionNotice('');
+              const result = await act(
+                { action: 'companion.typedEnabled.set', enabled: next },
+                'companion-typed-enabled',
+              );
+              if (result?.ok === true) {
+                setTypedCompanionDraft(typeof result.typedEnabled === 'boolean' ? result.typedEnabled : next);
+                setTypedCompanionNotice(next ? '已开启已登记会话的文字能力' : '已关闭已登记会话的文字能力；登记列表保留');
+                return;
+              }
+              setTypedCompanionDraft(null);
+              setTypedCompanionError(String(result?.error ?? '保存失败'));
+            };
+            const commitTypedRegister = async (id) => {
+              const target = String(id ?? '').trim();
+              if (target === '') {
+                setTypedCompanionError('请输入要登记的会话 ID');
+                return;
+              }
+              setTypedCompanionError('');
+              setTypedCompanionNotice('');
+              const result = await act(
+                { action: 'companion.typed.register', sessionId: target },
+                'companion-typed-register',
+              );
+              if (result?.ok === true) {
+                setTypedSessionDraft('');
+                setTypedCompanionNotice(`已登记文字陪伴会话：${target}`);
+                return;
+              }
+              setTypedCompanionError(String(result?.error ?? '登记失败'));
+            };
+            const commitTypedRemove = async (id) => {
+              const target = String(id ?? '').trim();
+              if (target === '') return;
+              setTypedCompanionError('');
+              setTypedCompanionNotice('');
+              const result = await act(
+                { action: 'companion.typed.remove', sessionId: target },
+                'companion-typed-remove',
+              );
+              if (result?.ok === true) {
+                setTypedCompanionNotice(result.removed === true ? `已移除登记：${target}` : `该会话原本未登记：${target}`);
+                return;
+              }
+              setTypedCompanionError(String(result?.error ?? '移除失败'));
+            };
             // 通过率提交：先乐观写本地，成功以宿主返回的 0–100 值为准，失败清掉乐观值回滚。
             const commitProactiveRate = async () => {
               const next = clampProactiveRate(proactiveRate);
@@ -7002,7 +7075,7 @@ window.__ModuleLoader__.load({
             const understandingIntervalText = understandingIntervalMs % 1000 === 0
               ? `${understandingIntervalMs / 1000} 秒`
               : `${(understandingIntervalMs / 1000).toFixed(1)} 秒`;
-            return settingsGroup(h, 'vision', '观看来源与隐私',
+            return [settingsGroup(h, 'vision', '观看来源与隐私',
               h('div', { style: styles.row },
                 h('span', { style: styles.label }, '当前视觉来源'),
                 h('span', {
@@ -7216,7 +7289,85 @@ window.__ModuleLoader__.load({
               h('div', { style: styles.hint }, feature('vision')
                 ? '视觉 ↔ OBS：选择 OBS 来源时按需启动 OBS；虚拟摄像头只按归属释放（插件启动的会停，用户自己启动的保留）。'
                 : '「视觉」组件当前关闭：点截图或启动观看会先启用组件；桌面观看不会因此启动 OBS。'),
-            );
+            ),
+            settingsGroup(h, 'typed-companion', '文字陪伴归属',
+              h('div', { style: styles.row },
+                h('span', { style: styles.label },
+                  '已登记会话的文字能力',
+                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（默认开启；关闭不取消登记）')),
+                h('button', {
+                  'data-settings-toggle': 'companion-typed-enabled',
+                  style: { ...(typedEnabledOn ? styles.btnActive : styles.btn), ...(busyNow ? styles.off : {}) },
+                  disabled: busyNow,
+                  onClick: () => void commitTypedEnabled(),
+                }, typedEnabledOn ? '已开启' : '已关闭')),
+              h('div', { style: styles.hint },
+                `归属只认这里的登记，不再用“没有 coding 标记”反推陪伴；编码、子代理、后台/压缩/摘要轮即使 id 在列表里也不会注入。登记表最多 ${typedSessionLimit} 条，最近登记的排在最前。`),
+              h('div', {
+                'data-settings-list': 'companion-typed-sessions',
+                style: { display: 'flex', flexDirection: 'column', gap: 6 },
+              },
+                typedSessions.length === 0
+                  ? h('div', { style: styles.hint }, '尚未登记任何文字陪伴会话：所有普通文字会话都不会收到画面理解/评论证据。')
+                  : typedSessions.map((id) => h('div', {
+                    key: id,
+                    'data-typed-session-id': id,
+                    style: { display: 'flex', alignItems: 'center', gap: 8 },
+                  },
+                    h('span', { style: { ...styles.value, flex: '1 1 0', wordBreak: 'break-all' } }, id),
+                    h('button', {
+                      style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
+                      disabled: busyNow,
+                      onClick: () => void commitTypedRemove(id),
+                    }, '移除'))),
+              ),
+              h('div', { style: styles.field },
+                h('span', { style: styles.value }, '手动登记会话 ID'),
+                h('div', { style: { display: 'flex', gap: 8 } },
+                  h('input', {
+                    'data-settings-input': 'companion-typed-session-id',
+                    'aria-label': '文字陪伴会话 ID',
+                    style: styles.input,
+                    value: typedSessionDraft,
+                    placeholder: '粘贴 session / agent id',
+                    disabled: busyNow,
+                    onChange: (event) => setTypedSessionDraft(event.target.value),
+                    onKeyDown: (event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void commitTypedRegister(typedSessionDraft);
+                      }
+                    },
+                  }),
+                  h('button', {
+                    'data-companion-action': 'register',
+                    style: { ...styles.btnPrimary, ...(busyNow ? styles.off : {}) },
+                    disabled: busyNow,
+                    onClick: () => void commitTypedRegister(typedSessionDraft),
+                  }, '登记'))),
+              lastTypedSessionId !== ''
+                ? h('div', { style: styles.row },
+                  h('span', { style: styles.label }, '最近一次文字会话'),
+                  h('span', { style: { ...styles.value, flex: '1 1 0', wordBreak: 'break-all' } }, lastTypedSessionId),
+                  h('button', {
+                    'data-companion-action': 'register-last',
+                    style: { ...styles.btn, ...(busyNow ? styles.off : {}) },
+                    disabled: busyNow || typedSessions.includes(lastTypedSessionId),
+                    onClick: () => void commitTypedRegister(lastTypedSessionId),
+                  }, typedSessions.includes(lastTypedSessionId) ? '已登记' : '登记最近一次'))
+                : null,
+              h('div', {
+                style: styles.hint,
+                'data-settings-note': 'typed-companion-registration',
+              }, '设置页拿不到当前会话 ID：请从 DSH 会话信息复制后登记，或点「登记最近一次」。普通会话不会静默自动登记；移除登记后下一次文字轮立即失去画面理解/评论证据。'),
+              typedCompanionError !== ''
+                ? h('div', { style: { ...styles.hint, color: DANGER } }, `文字陪伴保存失败：${typedCompanionError}`)
+                : null,
+              typedCompanionNotice !== ''
+                ? h('div', { style: styles.hint }, typedCompanionNotice)
+                : null,
+            ),
+            ];
           })(),
         )),
         settingsBlock('hearing', settingsCard(h, 'hearing', '听觉',

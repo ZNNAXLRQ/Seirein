@@ -442,3 +442,33 @@ test('13. 形象卡片：验证动作映射按钮 + 结果行 + 启动时自动�
     '全局轮询仍只有原有的那一个');
   console.log('13) mappingButton=1 autoVerifySwitch=1 resultRow=1 poll=0');
 });
+
+// ---- 8. explicit typed-companion ownership ------------------------------------------------
+test('14. 文字陪伴归属：视觉卡片内的开关/登记列表/手动 ID/最近一次，显式动作、无新增卡片或轮询', () => {
+  const visionAt = at("settingsCard(h, 'vision', '视觉与感知'");
+  const hearingAt = at("settingsCard(h, 'hearing', '听觉'");
+  const region = clientSource.slice(visionAt, hearingAt);
+  assert.match(region, /settingsGroup\(h, 'typed-companion', '文字陪伴归属'/u,
+    '视觉卡片里有「文字陪伴归属」子容器');
+  assert.match(region, /'data-settings-toggle': 'companion-typed-enabled'/u, '有已登记会话的文字能力开关');
+  assert.match(region, /'data-settings-list': 'companion-typed-sessions'/u, '显示已登记会话列表');
+  assert.match(region, /'data-settings-input': 'companion-typed-session-id'/u, '提供手动 ID 输入');
+  assert.match(region, /'data-companion-action': 'register'/u, '显式登记按钮');
+  assert.match(region, /'data-companion-action': 'register-last'/u, '可显式登记最近一次会话');
+  assert.match(region, /action: 'companion\.typed\.register'/u);
+  assert.match(region, /action: 'companion\.typed\.remove'/u);
+  assert.match(region, /action: 'companion\.typedEnabled\.set'/u);
+  // 归属来自宿主投影，不在客户端用“没有 coding 标记”反推。
+  assert.match(region, /status\.companion/u);
+  assert.match(region, /typedSessions/u);
+  assert.match(region, /'data-settings-note': 'typed-companion-registration'/u,
+    '说明设置页拿不到当前会话 ID，需要显式登记');
+  // 新增内容不改变 12 分区 / 14 张卡片的既有信息架构，也不新增轮询或定时器。
+  assert.equal((clientSource.match(/settingsBlock\('/gu) ?? []).length, 14,
+    '仍然只有 14 张分区卡片（新内容并入视觉卡片）');
+  assert.doesNotMatch(region, /setInterval|setTimeout|requestAnimationFrame/u,
+    '归属卡片不新增定时器');
+  assert.equal((clientSource.match(/setInterval\(load, 3000\)/gu) ?? []).length, 1,
+    '全局轮询仍只有原有的那一个');
+  console.log('14) typedCompanion group=1 toggle=1 list=1 manualInput=1 actions=3 cards=14 poll=0');
+});

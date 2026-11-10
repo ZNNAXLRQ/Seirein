@@ -1,13 +1,12 @@
 /**
- * 用户决定：普通 GUI 打字会话也算 companion，可接收画面理解/评论证据；但仍排除子代理、
- * Coding/后台/压缩/摘要等非陪伴用途。语音 lane 仍只认当天陪伴会话（`isCompanionAgent`），
- * 这次放宽只作用于 typed lane 的 `isTypedCompanionAgent`，不是全局 companion 语义。
+ * typed 陪伴归属（P-188 后）：普通文字会话只有显式登记到
+ * `settings.companion.typedSessions` 后，才可接收画面理解/评论证据；语音 lane 仍只认当天
+ * 陪伴会话（`isCompanionAgent`）。本文件保留 typed 注入与语音隔离的回归覆盖：
  *
- * 覆盖：
- *  1. 普通主 GUI typed agent → 评论证据 + understanding 块注入；
- *  2. typed 子代理/background/coding/summary/agent 用途 → 不注入（即使理解状态已存在）；
+ *  1. 已登记的普通 typed agent → 评论证据 + understanding 块注入；
+ *  2. typed 子代理/background/coding/summary/agent 用途 → 即使已在登记表里也不注入；
  *  3. voice lane 行为不变：只认当天陪伴会话，非陪伴 agent 借不到 voice 证据；
- *  4. typed 非 vision / privacy / 跨 workspace → 不注入；
+ *  4. typed 非 vision / privacy / 跨 workspace → 不注入（登记不等于绕过这些门禁）；
  *  5. `understandingBlockAllowed` 的 lane 身份分离与 ephemeral 块。
  *
  * 不碰屏幕、麦克风、ffmpeg、OBS 或真实模型：sight 用注册钩子替换，理解用注入 analyzer。
@@ -115,6 +114,10 @@ async function fixture(t, options = {}) {
   if (options.privacy === true) visionSettings.mode = 'privacy';
   await writeFile(join(root, 'data', 'settings.json'), `${JSON.stringify({
     vision: visionSettings,
+    companion: {
+      typedEnabled: options.typedEnabled !== false,
+      typedSessions: Array.isArray(options.typedSessions) ? options.typedSessions : [],
+    },
   })}\n`, 'utf8');
 
   const tools = new Map();
@@ -318,14 +321,15 @@ const analyzer = async () => ({
 });
 
 // ---------------------------------------------------------------------------
-// 1. 普通 GUI typed 主会话
+// 1. 已登记的普通 typed 主会话
 // ---------------------------------------------------------------------------
 
-test('1. 普通 GUI typed 主会话：评论证据与画面理解块都注入', async (t) => {
+test('1. 已登记的普通 typed 主会话：评论证据与画面理解块都注入', async (t) => {
   const app = await fixture(t, {
     continuousView: true,
     allowCapture: true,
     analyzer,
+    typedSessions: ['gui-main-typed'],
   });
   await seedStoryboard(app.root);
 
@@ -333,7 +337,7 @@ test('1. 普通 GUI typed 主会话：评论证据与画面理解块都注入', 
   await app.preStep(agent, 1, '这个表情好搞笑');
 
   const record = app.commentEvidence.take('gui-main-typed', { turnId: 1 });
-  assert.ok(record !== null, '普通 GUI typed 轮应产生按 turn 绑定的评论证据');
+  assert.ok(record !== null, '已登记 typed 轮应产生按 turn 绑定的评论证据');
   assert.equal(record.turnId, '1');
   assert.equal(record.timeSource, 'typed-sent');
   assert.equal(record.startedAt, record.sentAt, 'typed 无音频：startedAt 就是发送时刻');
@@ -350,7 +354,7 @@ test('1. 普通 GUI typed 主会话：评论证据与画面理解块都注入', 
   assert.equal(avText.includes('语音结束'), false);
   assert.equal(avText.includes('识别完成'), false);
 
-  // 首轮正常 GUI typed 也置位 companionSessionSeen，持续采集可产出理解状态。
+  // 首轮已登记的 typed 会话也置位 companionSessionSeen，持续采集可产出理解状态。
   await waitFor(
     () => understanding.text({ agent }).includes('测试场景'),
     '普通 GUI typed 轮拿到 understanding 块',
@@ -364,11 +368,15 @@ test('1. 普通 GUI typed 主会话：评论证据与画面理解块都注入', 
 // 2. 排除用途
 // ---------------------------------------------------------------------------
 
-test('2. typed 子代理/background/coding/summary/agent 用途不注入，即使理解状态已存在', async (t) => {
+test('2. typed 子代理/background/coding/summary/agent 用途不注入，即使已在登记表里', async (t) => {
   const app = await fixture(t, {
     continuousView: true,
     allowCapture: true,
     analyzer,
+    // 故意把排除 id 也写进登记表：显式登记不能把子代理/编码轮变成陪伴。
+    typedSessions: [
+      'gui-main-typed-2', 'sub-origin', 'sub-depth', 'bg-1', 'code-1', 'sum-1', 'agent-1',
+    ],
   });
   await seedStoryboard(app.root);
 
@@ -492,25 +500,25 @@ test('3. voice lane 行为不变：仍只认当天陪伴会话，不借 typed �
 // 4. 非 vision / privacy / 跨 workspace
 // ---------------------------------------------------------------------------
 
-test('4. typed 非 vision / privacy / 跨 workspace 不注入', async (t) => {
-  // 视觉组件关闭。
-  const off = await fixture(t, { visionEnabled: false });
+test('4. typed 非 vision / privacy / 跨 workspace 不注入（登记不等于绕过这些门禁）', async (t) => {
+  // 视觉组件关闭：即使会话已登记也不注入。
+  const off = await fixture(t, { visionEnabled: false, typedSessions: ['gui-off'] });
   const offAgent = off.agentFor('gui-off');
   await off.preStep(offAgent, 1, '这个表情好搞笑');
   assert.equal(off.commentEvidence.take('gui-off', { turnId: 1 }), null);
   assert.equal(off.promptContexts.get('assistant:audiovisual').text({ agent: offAgent }), '');
   assert.equal(off.promptContexts.get('assistant:understanding').text({ agent: offAgent }), '');
 
-  // 隐私锁：pre-step 不登记，渲染也不注入。
-  const privacy = await fixture(t, { privacy: true });
+  // 隐私锁：登记过也不登记本轮，渲染也不注入。
+  const privacy = await fixture(t, { privacy: true, typedSessions: ['gui-privacy'] });
   const privacyAgent = privacy.agentFor('gui-privacy');
   await privacy.preStep(privacyAgent, 1, '这个表情好搞笑');
   assert.equal(privacy.commentEvidence.take('gui-privacy', { turnId: 1 }), null);
   assert.equal(privacy.promptContexts.get('assistant:audiovisual').text({ agent: privacyAgent }), '');
   assert.equal(privacy.promptContexts.get('assistant:understanding').text({ agent: privacyAgent }), '');
 
-  // 跨 workspace：agent 的 cwd 不在作用域内。
-  const cross = await fixture(t);
+  // 跨 workspace：agent 的 cwd 不在作用域内，登记也不行。
+  const cross = await fixture(t, { typedSessions: ['gui-cross'] });
   const outside = join(cross.root, 'elsewhere');
   await mkdir(outside, { recursive: true });
   const crossAgent = cross.agentFor('gui-cross', { cwd: outside });

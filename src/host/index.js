@@ -607,6 +607,10 @@ import { ACTIONS as avatarActions, createAvatarSettingsActions, createMotionPres
 import { ACTIONS as subtitleActions, createSubtitleSettingsActions } from './subtitle/settings-actions.js';
 import { ACTIONS as visionActions, createVisionSettingsActions } from './vision/settings-actions.js';
 import { ACTIONS as profileActions, createProfileSettingsActions } from './profile/settings-actions.js';
+import {
+  COMPANION_TYPED_SESSION_LIMIT,
+  createCompanionSessionRegistry,
+} from './companion/session-registry.js';
 import { createSettingsRouter } from './runtime/http/actions.js';
 import { createVoiceContextObserver } from './session/events/voice-context.js';
 import {
@@ -1900,6 +1904,18 @@ export function apply(ctx, config) {
     writeFileSync(settingsFile, `${JSON.stringify({ ...readSettings(), ...patch }, null, 2)}\n`, 'utf8');
   };
   /**
+   * P-188：typed 陪伴归属的显式登记表。`settings.companion.typedSessions` 是唯一入口；
+   * 普通文字会话不再因为“没有 coding purpose”被反推为陪伴。登记/移除只由设置页动作触发，
+   * 任何 pre-step 都不会静默登记会话。登记表有界（默认 32 条），开关默认开启。
+   */
+  const companionRegistry = createCompanionSessionRegistry({
+    readSettings,
+    writeSettings,
+    limit: COMPANION_TYPED_SESSION_LIMIT,
+  });
+  /** 设置页方便显式登记的只读提示：最近一次普通会话（非子代理/编码/后台）的 id。 */
+  let companionLastSessionId = '';
+  /**
    * `voice.inputInterruptsReply` — whether the user's own next input (voice or typed) may stop the
    * assistant speech that is already playing. Missing is the historical `true`; only a stored
    * boolean `false` turns it off. Invalid stored values fall back to the default instead of
@@ -2941,8 +2957,8 @@ export function apply(ctx, config) {
   };
   /**
    * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁：workspace + 视觉组件开启 + 对应 lane 的
-   * 陪伴身份；语音轮仍只认当天陪伴会话（`isCompanionAgent`），文字轮认 typed companion
-   * （普通主 GUI 也算，仍排除子代理/编码/后台/压缩/摘要等）。取用时只认本轮绑定：
+   * 陪伴身份；语音轮仍只认当天陪伴会话（`isCompanionAgent`），文字轮认显式登记的 typed
+   * companion 或当天语音陪伴会话，仍排除子代理/编码/后台/压缩/摘要等。取用时只认本轮绑定：
    * 语音轮和 typed 轮都绝不回退到会话最近一条（`commentEvidence.render` 的 turnId 查询）。
    *
    * `commentEvidence` 在本函数之后才初始化（挂载时的证据窗口之后）：这里只能在函数体内引用，
@@ -2999,8 +3015,8 @@ export function apply(ctx, config) {
   };
   /**
    * P-187 阶段 3：后台“按变化理解画面”的被动块。它只在陪伴上下文里渲染：voice lane 只认
-   * 当天陪伴会话，typed lane 认 typed companion（同一陪伴会话里的文字轮、普通主 GUI 打字
-   * 会话）。门禁与 ephemeral block 共用 `understandingBlockAllowed`；无状态时 render() 返回 ''。
+   * 当天陪伴会话，typed lane 只认显式登记且未被排除的 typed companion。
+   * 门禁与 ephemeral block 共用 `understandingBlockAllowed`；无状态时 render() 返回 ''。
    *
    * `understanding` 与 `commentEvidence` 一样在本函数之后才初始化：这里只能在函数体内引用，
    * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
@@ -13575,8 +13591,8 @@ export function apply(ctx, config) {
    */
   /**
    * 陪伴用途的排除规则：子代理、显式后台轮，以及压缩/摘要/维护/编码/画像/记忆等非对话
-   * 用途。普通主 GUI 会话的 purpose 为空（或 'assistant'），由 `isTypedCompanionAgent` 放行。
-   * 规则同时读 session header 的 purpose，兼容持久化会话没有 live options 的情况。
+   * 用途。它在显式登记之前执行：即使某个子代理/编码会话的 id 被登记进 typedSessions，
+   * 也不会因此变成陪伴。规则同时读 session header 的 purpose，兼容持久化会话没有 live options 的情况。
    */
   const COMPANION_EXCLUDED_PURPOSE = /^(?:compaction|summary|summarize|maintenance|background|digest|profile|memory|coding|agent|subagent)(?:[-_:].*)?$/u;
   const isCompanionExcludedTurn = (agent) => {
@@ -13595,33 +13611,43 @@ export function apply(ctx, config) {
       return true; // an unreadable identity fails closed
     }
   };
+  /** 从 agent/session 取一个稳定的 id；空串表示身份不可读。 */
+  const companionAgentId = (agent) => {
+    return typeof agent?.id === 'string' && agent.id.length > 0
+      ? agent.id
+      : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
+  };
   /**
-   * 用户决定：普通 GUI 打字会话也算 companion，可接收画面理解/评论证据；但仍排除子代理、
-   * Coding/后台/压缩/摘要等。它与 `isCompanionAgent`（只认当天语音陪伴会话）分开，
-   * 语音观察/其它逻辑继续只认 `isCompanionAgent`，不受这次放宽影响。
+   * P-188 typed 陪伴归属：**普通文字会话只认显式登记**。用户决定不再把“没有 coding 标记的
+   * 普通 GUI 打字会话”自动视为 companion；只有 `settings.companion.typedSessions` 里的 id
+   * （或当天语音陪伴会话这一正向身份）才能接收画面理解/评论证据。排除规则先执行：子代理/
+   * 编码/后台/压缩/摘要等即使被登记也不放行。
    *
-   * 这里只回答“身份是否属于 typed 陪伴”，lane 由调用方决定；workspace/vision/privacy
-   * 仍由各渲染门禁单独检查。
+   * `isCompanionAgent` 是明确的当天陪伴身份，不是“没有 coding 标记”的兜底；它让语音陪伴
+   * 会话里的文字轮与语音共用同一套证据。`companion.typedEnabled` 只控制这些文字轮的能力，
+   * 关闭不清空登记表，也不影响语音 lane。
    */
   const isTypedCompanionAgent = (agent) => {
     try {
       if (isCompanionExcludedTurn(agent)) return false;
+      const companion = companionRegistry.status();
+      if (companion.typedEnabled !== true) return false;
+      // 当天语音陪伴会话：正向身份，允许其中的文字轮复用语音证据。
       if (isCompanionAgent(agent)) return true;
-      const id = typeof agent?.id === 'string' && agent.id.length > 0
-        ? agent.id
-        : (typeof agent?.session?.id === 'string' ? agent.session.id : '');
-      return id.length > 0;
+      const id = companionAgentId(agent);
+      return id.length > 0 && companion.typedSessions.includes(id);
     } catch {
-      return false;
+      return false; // an unreadable identity or registry fails closed
     }
   };
   /**
-   * 持续观看只认“真实陪伴轮”：当天陪伴会话，或普通主 GUI typed 会话。子代理、编码、
-   * 摘要/后台维护轮仍被排除，避免它们误置位 companionSessionSeen。
+   * 持续观看只认“真实陪伴轮”：当天语音陪伴会话，或显式登记且未被排除的 typed 会话。
+   * 子代理、编码、摘要/后台维护轮即使被登记也不得置位 companionSessionSeen。
    */
   const isCompanionEvidenceTurn = (agent) => {
     try {
-      return isTypedCompanionAgent(agent);
+      if (isCompanionExcludedTurn(agent)) return false;
+      return isCompanionAgent(agent) || isTypedCompanionAgent(agent);
     } catch {
       return false;
     }
@@ -13786,9 +13812,13 @@ export function apply(ctx, config) {
     const sessionId = typeof agent?.session?.id === 'string' ? agent.session.id : '';
     const turn = Number.isSafeInteger(payload?.turn) ? payload.turn : -1;
     if (sessionId.length === 0 || turn < 0) return;
+    // 最近一次普通文字会话只作设置页的“登记最近一次”提示，绝不自动登记；子代理/编码/
+    // 后台/压缩等排除轮也不更新这个提示。
+    if (!isCompanionExcludedTurn(agent)) companionLastSessionId = sessionId;
     // 只有真实陪伴轮能证明“用户真的进入了陪伴会话”：工具挂载、设置页、裸宿主 mount、
     // 编码代理/子代理/摘要后台轮都走不到这里。首次置位同时尝试启动一次（开关/隐私/
     // 组件关闭时由 evidenceCaptureAllowed 拒绝）。
+    const typedCompanionTurn = isTypedCompanionAgent(agent);
     const companionTurn = isCompanionEvidenceTurn(agent);
     const firstCompanionTurn = companionTurn && companionSessionSeen !== true;
     if (firstCompanionTurn) companionEvidenceFrom = Date.now();
@@ -13828,14 +13858,20 @@ export function apply(ctx, config) {
           understandingFocus = { ...understandingFocus, turnId: turn };
         }
       } else if (inputKind === 'typed') {
-        if (companionTurn) {
+        if (typedCompanionTurn) {
           rememberTypedVisionTurn({ sessionId, turn, text: inputMessage.text, source });
         } else {
-          // 普通 GUI/编码 typed 会话不是当天陪伴会话：如实记录“没有注入”，不伪造评论证据。
+          // 未登记（或开关关闭）的文字会话没有陪伴归属：如实记录“没有注入”，不伪造评论证据。
+          // 显式登记也无法绕过子代理/编码/后台/压缩/摘要排除，这类轮仍报 not-companion。
+          const disabled = !isCompanionExcludedTurn(agent)
+            && !companionRegistry.typedEnabled()
+            && companionRegistry.isRegistered(sessionId);
           rememberTurnVisionKind(sessionId, turn, 'typed', Date.now());
           understandingFocus = null;
           void log.emit('vision.comment.skipped', {
-            reason: 'not-companion', turnId: turn, timeSource: 'typed-sent',
+            reason: disabled ? 'typed-disabled' : 'not-companion',
+            turnId: turn,
+            timeSource: 'typed-sent',
           }).catch(() => {});
         }
       }
@@ -20902,6 +20938,13 @@ export function apply(ctx, config) {
       // Voice card switch: `voice.inputInterruptsReply` (settings.voice), default true (historical
       // barge-in behavior). The settings page reads this exact persisted value on every poll.
       voiceInputInterruptsReply: voiceInputInterruptsReply(),
+      // P-188 typed 陪伴归属：开关 + 有界登记列表 + 最近一次普通会话提示。设置页只读这个投影；
+      // 登记/移除必须显式点击对应动作，pre-step 不会静默写入。`lastSessionId` 只用于「登记最近
+      // 一次」，不是归属依据；归属只认 typedSessions，且仍受子代理/编码/后台等排除规则约束。
+      companion: {
+        ...companionRegistry.status(),
+        lastSessionId: companionLastSessionId,
+      },
       // Optional provenance for the confirm dialog: the explicit registration wins, a
       // speaker-shadow match is only a fallback, and `source` says which one answered. This is NOT
       // the voiceprint gate: the personal library uses the explicitly confirmed
@@ -21495,6 +21538,26 @@ export function apply(ctx, config) {
 { actions: ['avatar.channelMap.set'], handle: async (body) => setAvatarChannelMap(body) },
 // Explicit blink ownership (settings.avatar.blinkOwner); plugin requires both eye inputs verified.
 { actions: ['avatar.blinkOwner.set'], handle: async (body) => setAvatarBlinkOwner(body) },
+/**
+ * P-188 typed 陪伴归属的显式入口：设置页登记/移除某个 session/agent id，或切换已登记会话的
+ * 文字能力。没有任何自动登记路径；写盘只发生在用户点击这三个动作之一时。
+ */
+{ actions: ['companion.typed.register', 'companion.typed.remove', 'companion.typedEnabled.set'], handle: async (body) => {
+  try {
+    switch (body?.action) {
+      case 'companion.typed.register':
+        return companionRegistry.register(body?.sessionId);
+      case 'companion.typed.remove':
+        return companionRegistry.remove(body?.sessionId);
+      case 'companion.typedEnabled.set':
+        return companionRegistry.setEnabled(body?.enabled);
+      default:
+        return { ok: false, error: 'unknown companion action' };
+    }
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+} },
 { actions: ['vts.authorize'], handle: async (body) => vtsAuthorize(body) },
 { actions: subtitleActions, handle: createSubtitleSettingsActions({
     get ensureComponent() { return ensureComponent; },
