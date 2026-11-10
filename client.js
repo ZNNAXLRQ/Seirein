@@ -5476,6 +5476,9 @@ window.__ModuleLoader__.load({
       // 显式视线输入映射（settings.avatar.channelMap）：null = 未编辑，输入框回显 status；
       // 保存失败时用 status.avatar.channelMap 回滚，避免输入框停在宿主拒绝的值上。
       const [avatarChannelMapDraft, setAvatarChannelMapDraft] = useState(null);
+      // 眨眼控制方（settings.avatar.blinkOwner）：null = 未编辑，按钮回显 status；
+      // 失败时回到最近一次确认值，不把界面留在宿主拒绝的选择上。
+      const [avatarBlinkOwnerDraft, setAvatarBlinkOwnerDraft] = useState(null);
       const [fastpathReviewOpen, setFastpathReviewOpen] = useState(false);
       const [fastpathGroups, setFastpathGroups] = useState([]);
       const [fastpathFilter, setFastpathFilter] = useState(FASTPATH_GROUP_ALL);
@@ -7644,6 +7647,73 @@ window.__ModuleLoader__.load({
                         ? { ...styles.value, color: DANGER }
                         : styles.hint,
                       'data-avatar-channel-map-status': statusState,
+                    }, statusText),
+                  );
+                })(),
+                (() => {
+                  // 眨眼控制方：显式设置（settings.avatar.blinkOwner），不根据 VTS 原生 idle 是否
+                  // 运行来推断。当前值来自 status.avatar.blink；眼输入未验证时插件按钮禁用。
+                  const blink = status.avatar?.blink ?? {};
+                  const savedOwner = blink.setting === 'plugin' ? 'plugin' : 'vts';
+                  const selected = avatarBlinkOwnerDraft ?? savedOwner;
+                  const eyeVerified = blink.eyeVerified === true;
+                  const setOwner = async (owner) => {
+                    if (owner === 'plugin' && !eyeVerified) {
+                      setAvatarBlinkOwnerDraft(savedOwner);
+                      show('眼输入尚未验证：需要 eyeOpenL 与 eyeOpenR 都通过验证');
+                      return;
+                    }
+                    setAvatarBlinkOwnerDraft(owner); // 乐观选择；成功后由 status 确认
+                    const result = await act(
+                      { action: 'avatar.blinkOwner.set', owner },
+                      'avatar-blink-owner',
+                    );
+                    if (result?.ok === true) {
+                      const settled = result.blink?.setting === 'plugin' ? 'plugin' : 'vts';
+                      setAvatarBlinkOwnerDraft(settled);
+                      show(settled === 'plugin' ? '眨眼已由插件控制' : '眨眼已交回 VTS');
+                    } else {
+                      // 失败回滚：回到 status 的最近确认值，不留在被拒绝的选择上。
+                      setAvatarBlinkOwnerDraft(savedOwner);
+                      if (result?.code === 'eye-unverified') show('眼输入未验证：已保持 VTS 控制');
+                    }
+                  };
+                  const reason = String(blink.eyeWriteOptInReason ?? '');
+                  const fallback = savedOwner === 'plugin' && blink.owner !== 'plugin';
+                  const statusText = fallback
+                    ? `已请求插件控制，但眼输入未验证（${reason || 'eye-unverified'}），当前由 VTS 控制。`
+                    : eyeVerified
+                      ? (savedOwner === 'plugin'
+                        ? `当前：插件控制（眼输入已验证）· 已发 ${Number(blink.sent ?? 0)} / 生成 ${Number(blink.generated ?? 0)}`
+                        : `当前：VTS 控制 · 可选插件控制（眼输入已验证）· 已发 ${Number(blink.sent ?? 0)} / 生成 ${Number(blink.generated ?? 0)}`)
+                      : '眼输入未验证（需要 eyeOpenL / eyeOpenR 都通过探测），插件控制不可用；当前由 VTS 控制。';
+                  return h('div', { style: { marginTop: 10 } },
+                    h('div', { style: styles.label }, '眨眼控制'),
+                    h('div', { style: styles.hint },
+                      '显式选择谁写眨眼。默认由 VTS 控制；插件控制只在眼输入已验证时可用，避免双重眨眼。'),
+                    settingsActions(h,
+                      h('button', {
+                        style: {
+                          ...(selected === 'plugin' ? styles.btnPrimary : styles.btn),
+                          ...(busy !== '' || !eyeVerified ? styles.off : {}),
+                        },
+                        disabled: busy !== '' || !eyeVerified,
+                        title: eyeVerified ? '插件写眨眼（眼输入已验证）' : '眼输入未验证：暂不可用',
+                        'data-avatar-blink-owner': 'plugin',
+                        onClick: () => setOwner('plugin'),
+                      }, '眨眼由插件控制'),
+                      h('button', {
+                        style: {
+                          ...(selected === 'vts' ? styles.btnPrimary : styles.btn),
+                          ...(busy !== '' ? styles.off : {}),
+                        },
+                        disabled: busy !== '',
+                        'data-avatar-blink-owner': 'vts',
+                        onClick: () => setOwner('vts'),
+                      }, '由 VTS 控制')),
+                    h('div', {
+                      style: fallback ? { ...styles.value, color: DANGER } : styles.hint,
+                      'data-avatar-blink-owner-status': fallback ? 'fallback' : selected,
                     }, statusText),
                   );
                 })(),

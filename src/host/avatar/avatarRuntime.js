@@ -355,7 +355,15 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     /** Effective idle swing multiplier; 0 is an explicit "no idle sway" opt-out. */
     idleSwayScale: Number.isFinite(userConfig.idleSwayScale) && userConfig.idleSwayScale >= 0
       ? userConfig.idleSwayScale : DEFAULT_CONFIG.idleSwayScale,
-    idleEye: userConfig.idleEye === true,
+    /**
+     * Blink ownership is an EXPLICIT setting (`blinkOwner`), never inferred from whether VTS's own
+     * idle animation runs. `plugin` is only a REQUEST: `reconcileBlinkOwner()` makes `idleEye`
+     * effective only after BOTH eye inputs are verified. `idleEye` therefore always agrees with the
+     * reported `blink.owner` (`plugin` vs `vts`), and the default/unknown owner is VTS.
+     */
+    blinkOwner: userConfig.blinkOwner === 'plugin' || userConfig.idleEye === true ? 'plugin' : 'vts',
+    /** EFFECTIVE eye-write opt-in; derived from `blinkOwner` + verified eye mappings. */
+    idleEye: false,
     /** Interpolated output rate (default 30 Hz) and optional high-rate transport path. */
     motionOutputHz: Math.min(
       DEFAULT_HOST_CONFIG.motionOutputHzMax,
@@ -1822,6 +1830,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     refreshPresetCapabilities();
     // Phase 3: the gaze component's write gate is the verified+plugin set, not the channelMap.
     syncComponentGazeGate();
+    // Blink ownership follows the verified eye set: a `plugin` request falls back to VTS until
+    // BOTH eye inputs are proven, and re-opens automatically once discovery verifies them.
+    reconcileBlinkOwner();
     return { ok: true, code: null, channels: statusChannels() };
   }
 
@@ -2954,9 +2965,91 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
   }
 
-  /** Why the eye-open idle row is (not) in the write set. `idleEye-off` is the normal default. */
+  /** Both eye inputs must be verified; a candidate/unverified row can never open the eye writer. */
+  function eyeBindingsVerified() {
+    const usable = (binding) => binding?.verified === true
+      && String(binding.inputName ?? '').trim().length > 0;
+    return usable(channelState.bindings.get('eyeOpenL'))
+      && usable(channelState.bindings.get('eyeOpenR'));
+  }
+
+  /** Who is EFFECTIVELY writing the blink rows right now (`plugin` only when the eyes are proven). */
+  function effectiveBlinkOwner() {
+    return host.idleEye === true ? 'plugin' : 'vts';
+  }
+
+  /**
+   * Re-derive the EFFECTIVE eye write opt-in from the explicit owner request and the verified eye
+   * mappings. Called whenever the takeover set changes, so a model switch that drops an eye mapping
+   * falls back to VTS instead of writing an unverified row.
+   */
+  function reconcileBlinkOwner() {
+    const before = host.idleEye;
+    host.idleEye = host.blinkOwner === 'plugin' && eyeBindingsVerified();
+    if (before !== host.idleEye) {
+      appendLog('debug', 'avatar blink owner reconciled', {
+        event: 'avatar.blink.owner',
+        owner: effectiveBlinkOwner(),
+        requestedOwner: host.blinkOwner,
+        reason: eyeWriteOptInReason(),
+      });
+    }
+    return host.idleEye;
+  }
+
+  /**
+   * Explicit blink owner switch. `plugin` is refused (and nothing changes) until BOTH eye inputs
+   * are verified; `vts` always succeeds. The caller persists the setting only after `ok:true`.
+   */
+  function setBlinkOwner(owner) {
+    if (state.disposed) return disposedResult();
+    if (owner !== 'plugin' && owner !== 'vts') {
+      return {
+        ok: false,
+        code: 'invalid-blink-owner',
+        message: '眨眼控制方只能是 plugin 或 vts',
+        owner: effectiveBlinkOwner(),
+        requestedOwner: host.blinkOwner,
+        idleEye: host.idleEye === true,
+        reason: eyeWriteOptInReason(),
+      };
+    }
+    if (owner === 'plugin' && !eyeBindingsVerified()) {
+      return {
+        ok: false,
+        code: 'eye-unverified',
+        message: '眼输入未验证：eyeOpenL 与 eyeOpenR 都需要已验证的映射',
+        owner: effectiveBlinkOwner(),
+        requestedOwner: host.blinkOwner,
+        idleEye: host.idleEye === true,
+        reason: eyeWriteOptInReason(),
+      };
+    }
+    host.blinkOwner = owner;
+    reconcileBlinkOwner();
+    appendLog('info', 'avatar blink owner set', {
+      event: 'avatar.blink.owner.set',
+      owner: effectiveBlinkOwner(),
+      requestedOwner: host.blinkOwner,
+      idleEye: host.idleEye === true,
+      reason: eyeWriteOptInReason(),
+    });
+    return {
+      ok: true,
+      code: null,
+      owner: effectiveBlinkOwner(),
+      requestedOwner: host.blinkOwner,
+      idleEye: host.idleEye === true,
+      reason: eyeWriteOptInReason(),
+    };
+  }
+
+  /** Why the eye-open idle row is (not) in the write set. `idleEye-off` is the normal VTS default. */
   function eyeWriteOptInReason() {
     if (host.idleEye === true) return 'idleEye-on';
+    // An explicit `plugin` request that the verified set cannot satisfy names that cause, not the
+    // generic VTS default: this is the fallback the status must expose.
+    if (host.blinkOwner === 'plugin') return 'eye-input-unverified-or-unmapped';
     const left = channelState.bindings.get('eyeOpenL');
     const right = channelState.bindings.get('eyeOpenR');
     if (left?.verified !== true || right?.verified !== true) return 'eye-input-unverified-or-unmapped';
@@ -5190,13 +5283,18 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       headZ: head('headZ'),
       blink: {
         source: 'plugin',
-        owner: 'plugin',
+        /** Effective owner, so this view agrees with `blink.owner` and `idleParams.eye`. */
+        owner: effectiveBlinkOwner(),
+        designatedOwner: 'plugin',
         verified: true,
         status: 'plugin',
         /** VTS's own idle animation may blink independently: this layer is not exclusive. */
         nativePossible: true,
         /** The blink chain is always computed; the eye INPUT is opt-in (`idleEye`). */
         eyeWriteOptIn: host.idleEye === true,
+        /** Requested by settings.avatar.blinkOwner; `plugin` falls back until the eyes are proven. */
+        requestedOwner: host.blinkOwner,
+        eyeVerified: eyeBindingsVerified(),
         /** Why that opt-in is off (e.g. `idleEye-off`), independent of VTS native idle. */
         eyeWriteOptInReason: eyeWriteOptInReason(),
       },
@@ -5268,6 +5366,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const blinkView = {
       generated: innerSnap.motion?.baseActivity?.blinkCount ?? 0,
       sent: blinkEvidence.sent,
+      /** `plugin` only while the verified eye rows are actually eligible; otherwise VTS owns it. */
+      owner: effectiveBlinkOwner(),
+      /** Explicit setting request (`plugin` may still be waiting for eye verification). */
+      requestedOwner: host.blinkOwner,
+      eyeVerified: eyeBindingsVerified(),
+      idleEye: host.idleEye === true,
       generatedCountMeaning: 'blink-machine cycles (idle → closing), not screen blinks',
       sentCountMeaning: 'committed eye-open sends that belonged to a newer generated cycle',
       eyeWriteOptIn: host.idleEye === true,
@@ -5614,6 +5718,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     writeMouth,
     setMouthInput,
     setIdleParams,
+    /** Explicit blink ownership: `plugin` only while BOTH eye inputs are verified, else `vts`. */
+    setBlinkOwner,
     setChannelMappings,
     /** Explicit, non-automatic gazeX/gazeY mapping proof; pauses all facade writes while it runs. */
     probeGazeMapping,

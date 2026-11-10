@@ -3301,6 +3301,44 @@ export function apply(ctx, config) {
     const avatar = readSettings().avatar;
     return avatar !== null && typeof avatar === 'object' && !Array.isArray(avatar) ? avatar : {};
   };
+  // ---- explicit blink ownership (settings.avatar.blinkOwner) ---------------------------------
+  // 'plugin' | 'vts'. Missing/unknown is VTS: the safe default never writes an eye row that VTS's
+  // own idle animation may also blink. This is an explicit setting, never inferred from whether
+  // the native idle animation happens to be running.
+  const AVATAR_BLINK_OWNERS = Object.freeze(['plugin', 'vts']);
+  const normalizeAvatarBlinkOwner = (value) => (value === 'plugin' ? 'plugin' : 'vts');
+  const storedAvatarBlinkOwner = () => normalizeAvatarBlinkOwner(storedAvatarSettings().blinkOwner);
+  /** Both eye inputs must be controlled (verified) before `plugin` can be selected or stay active. */
+  const avatarEyeVerified = () => {
+    const current = avatarRuntime;
+    if (current === null || current.snapshot().disposed === true) return false;
+    const controlled = current.snapshot().channels?.controlled ?? [];
+    return controlled.includes('eyeOpenL') && controlled.includes('eyeOpenR');
+  };
+  /**
+   * Read-only blink projection for status: `setting` is what is persisted, `owner` is who is
+   * EFFECTIVE right now (a persisted `plugin` falls back to `vts` until the eyes are proven).
+   * `idleEye` is projected from the runtime so it agrees with `owner`.
+   */
+  const avatarBlinkStatus = () => {
+    const setting = storedAvatarBlinkOwner();
+    const current = avatarRuntime !== null && avatarRuntime.snapshot().disposed !== true
+      ? avatarRuntime
+      : null;
+    const snap = current === null ? null : current.snapshot();
+    const blink = snap?.blink ?? null;
+    return {
+      owner: blink?.owner === 'plugin' ? 'plugin' : 'vts',
+      setting,
+      requestedOwner: blink?.requestedOwner === 'plugin' ? 'plugin' : setting,
+      eyeVerified: current !== null && avatarEyeVerified(),
+      idleEye: snap?.idleParams?.eye === true,
+      eyeWriteOptInReason: String(blink?.eyeWriteOptInReason
+        ?? (setting === 'plugin' ? 'eye-input-unverified-or-unmapped' : 'idleEye-off')),
+      sent: Number(blink?.sent ?? 0),
+      generated: Number(blink?.generated ?? 0),
+    };
+  };
   /** Trim and keep only non-empty string input names for the supported channels. */
   const normalizeAvatarChannelMap = (raw) => {
     const map = {};
@@ -3487,6 +3525,79 @@ export function apply(ctx, config) {
       channelMap: effective,
       effective: avatarChannelMapStatus(),
       saved: true,
+    };
+  };
+  /**
+   * The ONE explicit blink-owner write (`avatar.blinkOwner.set`). Only the two documented values
+   * are accepted. Selecting `plugin` is validated against the LIVE verified eye set first: until
+   * eyeOpenL and eyeOpenR are both controlled, the action returns `eye-unverified` and does NOT
+   * touch settings or the running owner. The settings write merges into the existing
+   * `settings.avatar` object so channelMap and every other field survive.
+   */
+  const setAvatarBlinkOwner = async (body = {}) => {
+    const requested = body?.owner ?? body?.blinkOwner;
+    if (!AVATAR_BLINK_OWNERS.includes(requested)) {
+      return {
+        ok: false,
+        code: 'invalid-blink-owner',
+        error: '眨眼控制方只能是 plugin 或 vts',
+        blink: avatarBlinkStatus(),
+      };
+    }
+    const current = avatarRuntime !== null && avatarRuntime.snapshot().disposed !== true
+      ? avatarRuntime
+      : null;
+    const previousSetting = storedAvatarBlinkOwner();
+    if (requested === 'plugin') {
+      if (current === null) {
+        return {
+          ok: false,
+          code: 'eye-unverified',
+          error: '眼输入未验证：需要已连接的形象运行时且 eyeOpenL/eyeOpenR 都通过验证',
+          blink: avatarBlinkStatus(),
+        };
+      }
+      const applied = typeof current.setBlinkOwner === 'function'
+        ? current.setBlinkOwner('plugin')
+        : { ok: false, code: 'eye-unverified' };
+      if (applied?.ok !== true) {
+        return {
+          ok: false,
+          code: applied?.code ?? 'eye-unverified',
+          error: applied?.message ?? '眼输入未验证：eyeOpenL 与 eyeOpenR 都需要已验证的映射',
+          blink: avatarBlinkStatus(),
+        };
+      }
+    }
+    const avatar = { ...storedAvatarSettings(), blinkOwner: requested };
+    try {
+      writeSettings({ avatar });
+    } catch (error) {
+      // The runtime was switched first for `plugin`; a failed disk write must not leave the live
+      // owner ahead of what a restart would read.
+      if (requested === 'plugin') current?.setBlinkOwner?.(previousSetting);
+      return {
+        ok: false,
+        code: 'settings-write-failed',
+        error: `保存眨眼设置失败：${error?.message ?? String(error)}`,
+        blink: avatarBlinkStatus(),
+      };
+    }
+    // Switching to VTS is always safe; apply it only after the persisted value exists.
+    if (requested === 'vts') current?.setBlinkOwner?.('vts');
+    const blink = avatarBlinkStatus();
+    await log.emit('avatar.blinkOwner.set', {
+      owner: blink.owner,
+      setting: blink.setting,
+      eyeVerified: blink.eyeVerified,
+      idleEye: blink.idleEye,
+    }).catch(() => {});
+    return {
+      ok: true,
+      owner: blink.owner,
+      setting: blink.setting,
+      blinkOwner: blink.setting,
+      blink,
     };
   };
   /**
@@ -3999,7 +4110,11 @@ export function apply(ctx, config) {
         ...(config?.avatarIdleWriteHz == null ? {} : { idleWriteHz: Number(config.avatarIdleWriteHz) }),
         ...(config?.avatarIdleAmplitude == null ? {} : { idleAmplitude: Number(config.avatarIdleAmplitude) }),
         ...(config?.avatarIdleMaxStep == null ? {} : { idleMaxStep: Number(config.avatarIdleMaxStep) }),
-        idleEye: config?.avatarIdleEye === true,
+        // Explicit blink ownership (`settings.avatar.blinkOwner`, default vts). The runtime keeps
+        // this as a REQUEST: idleEye only becomes effective after both eye inputs are verified, so
+        // an absent/unverified mapping falls back to VTS instead of writing an eye row.
+        blinkOwner: storedAvatarBlinkOwner(),
+        idleEye: storedAvatarBlinkOwner() === 'plugin',
         // Stage 1 is the default writer: the single-slot 30 Hz controller. Only an explicit
         // `avatarMotionWrites:false` opts back into the legacy 4 Hz idle contract.
         motionWrites: config?.avatarMotionWrites !== false,
@@ -4243,6 +4358,13 @@ export function apply(ctx, config) {
         failed: inner.mouth?.failed ?? 0,
         unmapped: inner.mouth?.unmapped ?? 0,
       },
+      /**
+       * Blink ownership/evidence. `owner` is EFFECTIVE (`plugin` only while both eye rows are
+       * verified); `requestedOwner` is the explicit setting request. `idleEye` mirrors the owner.
+       */
+      blink: snap.blink ?? null,
+      blinkOwner: snap.blink?.owner === 'plugin' ? 'plugin' : 'vts',
+      idleEye: snap.idleParams?.eye === true,
       /**
        * P-54: sentence-level clip boundaries the host reported from real playback (never a timer).
        * P-139: the communication-phase generation and its counters (`staged` = admissions,
@@ -19604,7 +19726,7 @@ export function apply(ctx, config) {
        * evidence): `lastAt:null, ok:null` means no probe has been run, not a failure.
        * `channelMap` is the persisted explicit input names (safe view: no paths, no settings dump).
        */
-      avatar: { mapping: avatarMappingStatus(), channelMap: avatarChannelMapStatus() },
+      avatar: { mapping: avatarMappingStatus(), channelMap: avatarChannelMapStatus(), blink: avatarBlinkStatus() },
       // P0 portability evidence: where the voice compaction preset came from (registered by the
       // plugin, or a leftover builtin/profile declaration) and the registration result.
       voiceCompaction: voiceCompaction.presetStatus(),
@@ -20198,6 +20320,8 @@ export function apply(ctx, config) {
 { actions: ['avatar.mapping.probe'], handle: async () => probeAvatarGazeMapping() },
 // Explicit gaze input names (settings.avatar.channelMap); validated, persisted, then rediscovered.
 { actions: ['avatar.channelMap.set'], handle: async (body) => setAvatarChannelMap(body) },
+// Explicit blink ownership (settings.avatar.blinkOwner); plugin requires both eye inputs verified.
+{ actions: ['avatar.blinkOwner.set'], handle: async (body) => setAvatarBlinkOwner(body) },
 { actions: ['vts.authorize'], handle: async (body) => vtsAuthorize(body) },
 { actions: subtitleActions, handle: createSubtitleSettingsActions({
     get ensureComponent() { return ensureComponent; },
