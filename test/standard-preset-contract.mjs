@@ -99,8 +99,8 @@ test('native group contains the real tool rows and excludes coding identity, pla
   const merged = mergeVoicePresetWithNativeTools(VOICE_COMPACTION_PRESET, standard);
   const native = nativeGroupOf(merged);
 
-  // Exact top-level shape of the real standard minus persona / agent-instructions / planning /
-  // compaction, in source order.
+  // Exact top-level shape of the real standard minus persona / agent-instructions / compaction,
+  // in source order. Planning is inherited so `/plan` remains a native companion capability.
   assert.deepEqual(native.config.map((row) => row.id), [
     'time-context',
     'tool-bash',
@@ -113,6 +113,7 @@ test('native group contains the real tool rows and excludes coding identity, pla
     'tool-skill',
     'command-goal',
     'tool-goal',
+    'planning',
     'delegation',
     'tool-ask-user',
     'tool-todo',
@@ -125,7 +126,6 @@ test('native group contains the real tool rows and excludes coding identity, pla
   const forbiddenPackages = [
     '@deepseek-ai/dsh-persona',
     '@deepseek-ai/dsh-agent-instructions',
-    '@deepseek-ai/dsh-plan-mode',
     '@deepseek-ai/dsh-compaction-basic',
     '@deepseek-ai/dsh-command-compact',
     '@deepseek-ai/dsh-compaction-tool-result-pruner',
@@ -134,13 +134,15 @@ test('native group contains the real tool rows and excludes coding identity, pla
   for (const name of forbiddenPackages) {
     assert.equal(names.has(name), false, `${name} must not enter the native group`);
   }
-  for (const id of ['persona', 'agent-instructions', 'planning', 'compaction']) {
+  for (const id of ['persona', 'agent-instructions', 'compaction']) {
     assert.equal(
       allRows(native.config).some((row) => row.id === id),
       false,
       `${id} id must not enter the native group`,
     );
   }
+  assert.equal(allRows(native.config).some((row) => row.id === 'planning'), true);
+  assert.equal(allRows(native.config).some((row) => row.id === 'plan-mode'), true);
 
   // Named capabilities the live standard really declares, with their real package names.
   assert.deepEqual(
@@ -257,7 +259,7 @@ test('a real, unmodified standard never leaks identity packages into the merged 
   const merged = mergeVoicePresetWithNativeTools(VOICE_COMPACTION_PRESET, standard);
   const native = nativeGroupOf(merged);
   const serialized = JSON.stringify(native);
-  for (const needle of ['dsh-persona', 'dsh-agent-instructions', 'dsh-plan-mode', 'dsh-compaction-']) {
+  for (const needle of ['dsh-persona', 'dsh-agent-instructions', 'dsh-compaction-']) {
     assert.equal(serialized.includes(needle), false, `${needle} is absent from the native group`);
   }
 });

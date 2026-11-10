@@ -64,7 +64,8 @@ test('native merge copies live tool capabilities but not coding identity/plan/du
   assert.ok(ids.includes('delegation'));
   assert.equal(ids.includes('persona'), false);
   assert.equal(ids.includes('agent-instructions'), false);
-  assert.equal(ids.includes('planning'), false);
+  assert.equal(ids.includes('planning'), true);
+  assert.equal(JSON.stringify(merged).includes('dsh-plan-mode'), true);
   assert.equal(merged.plugins.filter((row) => row.id === 'compaction').length, 1);
   assert.equal(flatten(merged).find((row) => row.id === 'delegation').isolate.workflowEngine, true);
 });

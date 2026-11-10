@@ -86,11 +86,11 @@ export const VOICE_COMPACTION_OPTIONAL_PLUGINS = Object.freeze([
 
 /**
  * Standard-preset rows that must not be copied into the companion preset: the coding persona,
- * repository instructions, plan mode and the duplicate compaction group. Every other row is a
- * native DSH capability (tools, jobs, goals, schedules, subagents, workflows, skills, web, …).
+ * repository instructions and the duplicate compaction group. Plan mode is a native command/tool
+ * capability, so its group is inherited; every other row is a native DSH capability too.
  */
 export const VOICE_NATIVE_EXCLUDED_IDS = Object.freeze([
-  'persona', 'agent-instructions', 'planning', 'compaction',
+  'persona', 'agent-instructions', 'compaction',
 ]);
 
 /**
@@ -134,8 +134,7 @@ export function mergeVoicePresetWithNativeTools(base, standard) {
     return VOICE_NATIVE_EXCLUDED_IDS.includes(id)
       || isVoiceCompactionPackage(name)
       || name.includes('/dsh-persona')
-      || name.includes('/dsh-agent-instructions')
-      || name.includes('/dsh-plan-mode');
+      || name.includes('/dsh-agent-instructions');
   };
   // Recursive: a compaction provider must be removed by PACKAGE even when a release renames the
   // wrapper groups, and an identity row must be removed even when a release nests it differently.
@@ -288,8 +287,7 @@ export function assessVoiceCompactionPreset(definition, { allowNativeTools = fal
         // group or a local row id. The native group may carry native capabilities, never a second
         // compaction service.
         if (isVoiceCompactionPackage(name)
-          || name.includes('/dsh-persona') || name.includes('/dsh-agent-instructions')
-          || name.includes('/dsh-plan-mode')) {
+          || name.includes('/dsh-persona') || name.includes('/dsh-agent-instructions')) {
           addExtra(`native:${name}`);
         }
         continue;
