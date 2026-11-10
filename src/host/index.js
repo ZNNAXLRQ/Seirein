@@ -10721,6 +10721,9 @@ export function apply(ctx, config) {
    * priority 路径不带签名，直接放行，仍受运行时最短间隔与单在途约束（定向补看另有 5 秒去重）。
    */
   const noteUnderstandingChange = (request) => {
+    // 首轮前的画面只做有界证据缓存：不排队、不调用理解模型，也不产生主动候选。等首次真实
+    // 陪伴轮置位后，才从该轮之后的材料开始触发。
+    if (companionSessionSeen !== true) return;
     const source = request !== null && typeof request === 'object' ? request : {};
     const signature = typeof source.materialSignature === 'string' ? source.materialSignature : '';
     if (!understandingMaterial.accept(signature, source.materialAt)) return;
@@ -10731,6 +10734,7 @@ export function apply(ctx, config) {
   /**
    * `understanding` 在函数体后段才初始化：
    *   - `isBlocked` 读取的 `companionSessionSeen` 在本段之后才 `let`（闭包只在挂载后被调用）；
+   *   - `noteUnderstandingChange` 也读同一个标记，用来保证首轮前只做有界缓存、不排队理解；
    *   - `framesBetween` 读取的 `speechEvidenceSource` / `visionGeneration`（后者已初始化）；
    *   - `audioBetween` 读取的 `mediaTimeline` / `ambientEpoch` 在环境声采集段才初始化。
    * 这些闭包只在挂载完成、真实触发/渲染时才执行，因此 TDZ 不会发生；这里的注释是给未来改动的
@@ -10772,13 +10776,12 @@ export function apply(ctx, config) {
   };
   /**
    * 持续观看（后台证据采集）的独立设置：`settings.vision.continuousView`。
-   * 无记录时默认 `true`，兼容旧版“进入陪伴会话后自动持续观看”的行为；用户显式写下的
-   * `false` 必须原样保留，任何首轮/切源/重试路径都不得把它翻回 true。
+   *
+   * 安全迁移：旧 settings 文件没有这个字段时按 `false` 处理，升级不会突然开始碰屏幕；用户
+   * 必须在设置页显式开启一次并持久化。显式 `false` 原样保留，任何首轮/切源/重试路径都不得
+   * 把它翻回 true。只有显式 `true` 才允许自动采集。
    */
-  const continuousViewEnabled = () => {
-    const stored = readSettings()?.vision?.continuousView;
-    return typeof stored === 'boolean' ? stored : true;
-  };
+  const continuousViewEnabled = () => readSettings()?.vision?.continuousView === true;
   const proactive = createProactiveArbiter();
   const proactiveLine = createProactiveLineGenerator({
     getService,
@@ -11114,6 +11117,23 @@ export function apply(ctx, config) {
   });
 
   /**
+   * 视觉组件本身是否可采集/理解：隐私锁、切换中、卸载/关闭中或组件关闭都算关门。
+   * 持续采集和后台理解共用这层“设备/组件”门禁，但理解额外受 companionSessionSeen 约束。
+   */
+  const visionComponentGateOpen = () => {
+    if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return false;
+    try { return features.enabled('vision') === true; } catch { return false; }
+  };
+  /**
+   * 首轮门禁只属于理解/主动回应，不属于采集：没有真实陪伴轮时，采集可以继续把画面写进
+   * 有界证据窗口，但理解不会排队/调用模型，主动候选也不会产生。
+   */
+  const understandingEnabled = () => companionSessionSeen === true
+    && continuousViewEnabled() && visionComponentGateOpen();
+  const proactiveAllowed = () => companionSessionSeen === true
+    && proactiveEnabled() && visionComponentGateOpen();
+
+  /**
    * 20 秒是“最短间隔”的下限，不是定时器：只有出现新材料/用户评论时才登记一次，调度器保证
    * 两次真正开始的分析至少相隔这么久。设置页的成本概览直接读这个值与运行时上限。
    */
@@ -11131,10 +11151,7 @@ export function apply(ctx, config) {
       sourceEpoch: visionGeneration,
     }).filter((entry) => typeof entry.file === 'string'),
     audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
-    isBlocked: () => companionSessionSeen !== true || visionDisposed || visionChanging
-      || shutdown.closing || vision.mode === 'privacy' || features.enabled('vision') !== true
-      // 持续观看关闭后，后台理解也必须停：评论定向补看等旁路不能再凭旧材料排一次分析。
-      || !continuousViewEnabled(),
+    isBlocked: () => !understandingEnabled(),
     minIntervalMs: understandingMinIntervalMs,
     // 运行时以单对象 `{type, ok, reason, ...}` 回调 emit；展开成宿主事件名，避免 type 变成对象。
     emit: (event, payload) => {
@@ -11434,9 +11451,12 @@ export function apply(ctx, config) {
   let continuousViewRetryAttempt = 0;
   /**
    * 真实陪伴轮标记：只有 `prepareVisionForTurn` 收到非子代理、工作区内的真实 pre-step 时才置位。
-   * 工具挂载、设置页、裸宿主 mount 都不置位，所以后台证据采集不会在测试/开机未使用时碰屏幕。
+   * 它只门禁后台理解/主动回应，不再门禁持续采集；工具挂载、设置页、裸宿主 mount 都不会让它
+   * 变成 true，所以状态里 capturing 与 companionSeen:false 可以同时出现。
    */
   let companionSessionSeen = false;
+  /** 首个真实陪伴轮的时间下界：早于它的旧画面不得成为首次理解的材料。 */
+  let companionEvidenceFrom = null;
   const clearEvidenceRetry = () => {
     continuousViewRetryAt = null;
     if (evidenceRetryTimer === null) return;
@@ -11450,9 +11470,10 @@ export function apply(ctx, config) {
   const evidenceCaptureAllowed = () => {
     // 测试/诊断逃生阀：显式关闭时绝不启动持续采集；默认 undefined 视作开启，生产行为不变。
     if (config?.evidenceCaptureEnabled === false) return false;
-    // 独立设置优先：关闭后任何启动路径（首轮/切模式/feature enable/retry）都不得重新打开。
+    // 独立设置优先：关闭后任何启动路径（启动/首轮/切模式/feature enable/retry）都不得重新打开。
     if (!continuousViewEnabled()) return false;
-    if (companionSessionSeen !== true) return false;
+    // 注意：这里不再要求 companionSessionSeen。采集门禁与理解/主动回应的首轮门禁已拆开；
+    // 没有陪伴轮时也可以把画面写进有界证据窗口，但 noteUnderstandingChange 会拒绝排队。
     if (visionDisposed || visionChanging || shutdown.closing || vision.mode === 'privacy') return false;
     try { return features.enabled('vision') === true; } catch { return false; }
   };
@@ -11515,6 +11536,10 @@ export function apply(ctx, config) {
       continuousViewLastFrameAt = continuousViewLastFrameAt === null
         ? capturedAt
         : Math.max(continuousViewLastFrameAt, capturedAt);
+      // 首轮前的画面只进有界证据窗口：可以缓存，但不能成为首次理解的材料，避免首轮一出现
+      // 就回看启动以来的整段旧画面。
+      if (companionSessionSeen !== true) return;
+      if (companionEvidenceFrom !== null && capturedAt < companionEvidenceFrom) return;
       // 材料签名只做去重：同一份 sheet 被重复投递时不再排一次理解（不读像素）。
       noteUnderstandingChange({
         reason: 'sheet',
@@ -11649,6 +11674,10 @@ export function apply(ctx, config) {
     return {
       enabled,
       state,
+      // 采集、理解、主动回应是三个独立门禁：capturing 与 companionSeen:false 可以同时成立。
+      capturing: capture.running === true,
+      understandingEnabled: understandingEnabled(),
+      proactiveEnabled: proactiveAllowed(),
       source: mode === 'scene' ? 'obs' : 'desktop',
       lastFrameAt: continuousViewLastFrameAt,
       lastUnderstandingAt: continuousViewLastUnderstandingAt,
@@ -11660,7 +11689,8 @@ export function apply(ctx, config) {
   /**
    * 设置页动作 `vision.continuousView` 的运行时半段：设置已经写盘，这里只负责立即生效。
    * 关闭：停采集、清后台理解、取消在途分析/主动候选、取消重试；不重建任何运行时。
-   * 开启：只有门禁全开且依赖就绪才启动，否则保持 `waiting`，等首次真实陪伴轮/依赖恢复。
+   * 开启：门禁全开且依赖就绪就立即启动；否则保持 waiting，等隐私/组件/依赖变化后的下一次
+   * 显式启动（切模式、feature enable、设置开关），不再等首次陪伴轮。
    */
   const applyContinuousView = async (enabled, { reason = 'settings' } = {}) => {
     if (enabled !== true) {
@@ -12549,6 +12579,7 @@ export function apply(ctx, config) {
     // 组件关闭时由 evidenceCaptureAllowed 拒绝）。
     const companionTurn = isCompanionEvidenceTurn(agent);
     const firstCompanionTurn = companionTurn && companionSessionSeen !== true;
+    if (firstCompanionTurn) companionEvidenceFrom = Date.now();
     if (companionTurn) companionSessionSeen = true;
     const source = vision.mode === 'scene' ? 'obs' : 'desktop';
     const scene = vision.mode === 'scene' ? vision.scene : '';
@@ -20252,13 +20283,13 @@ export function apply(ctx, config) {
     Number.isFinite(bootDelay) && bootDelay >= 0 ? bootDelay : 8000,
   );
   autostartBoot.unref?.();
-  // P-186/P-187: 持续证据采集要等“真实陪伴轮”出现后才允许启动（默认 5 s 后检查一次）。
-  // 未置位时到点直接返回，不启动、不安排重试：裸宿主 mount / 测试 / 开机未使用都不得碰屏幕。
+  // P-186/P-187: 持续证据采集在启动时立即尝试一次，不再等待“真实陪伴轮”；是否允许由
+  // continuousViewEnabled（缺失默认 false）、组件开关、隐私/卸载状态和依赖共同决定。
+  // 显式关闭时 startEvidenceCapture 不会产生任何副作用。
   const evidenceBootDelay = Number(config?.evidenceCaptureBootDelayMs);
   const evidenceBoot = setTimeout(() => {
-    if (companionSessionSeen !== true) return;
     void startEvidenceCapture('startup');
-  }, Number.isFinite(evidenceBootDelay) && evidenceBootDelay >= 0 ? evidenceBootDelay : 5000);
+  }, Number.isFinite(evidenceBootDelay) && evidenceBootDelay >= 0 ? evidenceBootDelay : 0);
   evidenceBoot.unref?.();
   ctx.effect(() => () => {
     clearTimeout(autostartBoot);

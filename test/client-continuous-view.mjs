@@ -64,8 +64,8 @@ test('2. 初值来自 status.vision.continuous.enabled；未知时按默认开�
   assert.match(source, /const \[continuousDraft, setContinuousDraft\] = useState\(null\);/u);
   assert.match(source, /const \[continuousError, setContinuousError\] = useState\(''\);/u);
   assert.doesNotMatch(source, /useEffect\([^)]*continuous/iu, '不新增 effect 去写回初始值');
-  assert.match(visionRegion, /持续观看默认开启（兼容旧版自动行为）/u,
-    '设置页写明无记录时默认开启，兼容旧自动行为');
+  assert.match(visionRegion, /需显式开启；开启后启动 DSH 自动采集，关闭后重启仍关闭/u,
+    '设置页写明需显式开启、启动 DSH 自动采集、关闭后重启仍关闭');
 });
 
 test('3. 状态行显示来源、状态、最近帧、最近理解、失败原因与下次重试', () => {
@@ -81,14 +81,14 @@ test('3. 状态行显示来源、状态、最近帧、最近理解、失败原�
   assert.match(visionRegion, /continuousView\.source === 'obs'/u, '来源按 desktop/obs 展示');
   // 关闭文案必须明确，不能只说“未运行”。
   assert.match(visionRegion, /已关闭，不会自动恢复/u, '关闭后明确不会自动恢复');
-  assert.match(visionRegion, /首轮、切换来源、重试和重启插件都不会重新打开/u,
+  assert.match(visionRegion, /首轮、切换来源、重试和重启 DSH 都不会重新打开/u,
     '关闭文案点名所有不会自动恢复的路径');
   assert.doesNotMatch(visionRegion, /未启动 · 最近取景[\s\S]{0,80}持续观看状态/u,
     '旧的“未启动”不能冒充持续观看状态');
 });
 
 test('4. 状态机标签：starting 不写成 capturing；没有新轮询', () => {
-  for (const label of ['已关闭', '等待首次真实陪伴轮 / 依赖就绪', '正在启动', '采集中',
+  for (const label of ['已关闭', '等待依赖就绪', '正在启动', '采集中',
     '隐私模式暂停', '启动失败', '等待重试']) {
     assert.ok(visionRegion.includes(`'${label}'`), `状态标签包含「${label}」`);
   }

@@ -6920,7 +6920,7 @@ window.__ModuleLoader__.load({
               : (continuousOn ? 'waiting' : 'off');
             const continuousLabels = {
               off: '已关闭',
-              waiting: '等待首次真实陪伴轮 / 依赖就绪',
+              waiting: '等待依赖就绪',
               starting: '正在启动',
               capturing: '采集中',
               privacy: '隐私模式暂停',
@@ -7013,7 +7013,7 @@ window.__ModuleLoader__.load({
               h('div', { style: styles.row },
                 h('span', { style: styles.label },
                   '持续观看（后台证据采集）',
-                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（默认开启；关闭后不会自动恢复）')),
+                  h('span', { style: { ...styles.value, marginLeft: 6 } }, '（需显式开启；开启后启动 DSH 自动采集，关闭后重启仍关闭）')),
                 h('button', {
                   'data-settings-toggle': 'vision-continuous-view',
                   style: { ...(continuousOn ? styles.btnActive : styles.btn), ...(busyNow ? styles.off : {}) },
@@ -7052,8 +7052,8 @@ window.__ModuleLoader__.load({
                 ? h('div', { style: { ...styles.hint, color: DANGER } }, `持续观看保存失败：${continuousError}`)
                 : null,
               h('div', { style: styles.hint }, continuousOn
-                ? '持续观看默认开启（兼容旧版自动行为）：只有真实陪伴轮出现后才开始；隐私、视觉组件关闭或依赖缺失时暂停/失败。'
-                : '已关闭，不会自动恢复：首轮、切换来源、重试和重启插件都不会重新打开；只有再次打开这个开关才会恢复。'),
+                ? '已开启：启动 DSH 后会自动采集；隐私、视觉组件关闭或依赖缺失时暂停/失败。理解与主动回应仍从首次真实陪伴轮开始。'
+                : '已关闭，不会自动恢复：首轮、切换来源、重试和重启 DSH 都不会重新打开；只有再次打开这个开关才会恢复。'),
               line('虚拟摄像头', vm.virtualCam
                 ? capturing ? '运行中（持续观看占用）' : `运行中 · 空闲 ${vm.idleSeconds ?? 0} 秒后自动停止`
                 : '已停止（取景时按需启动；用户自启的不会关闭）'),

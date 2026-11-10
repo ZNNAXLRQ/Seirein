@@ -120,10 +120,14 @@ async function fixture(t, config = {}, options = {}) {
   state.failStarts = options.failStarts ?? 0;
   state.startStoryboard = options.startStoryboard ?? ((startOptions) => fakeSession(startOptions));
 
-  // 可预置 settings.json（例如显式 false），模拟用户上一轮保存的配置。
-  if (options.settings !== undefined) {
+  // 可预置 settings.json（例如显式 false）；未指定时按“用户已显式开启”准备，因为缺失字段
+  // 现在安全迁移为 false。传 settings:null 可模拟旧文件里完全没有该字段。
+  const settings = options.settings === undefined
+    ? { vision: { continuousView: true } }
+    : options.settings;
+  if (settings !== null) {
     await mkdir(join(root, 'data'), { recursive: true });
-    await writeFile(join(root, 'data', 'settings.json'), `${JSON.stringify(options.settings, null, 2)}\n`, 'utf8');
+    await writeFile(join(root, 'data', 'settings.json'), `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
   }
 
   const tools = new Map();
@@ -258,18 +262,36 @@ async function fixture(t, config = {}, options = {}) {
 // 1. 默认值与显式持久化
 // ---------------------------------------------------------------------------
 
-test('1. 无记录默认 enabled:true/state:waiting；显式 false 写盘且切模式不丢失', async (t) => {
-  const app = await fixture(t);
+test('1. 缺失字段安全迁移为 false；显式 true 立即采集并落盘；显式 false 保留', async (t) => {
+  // 旧 settings 文件没有 vision.continuousView：升级后不得自动采集。
+  const app = await fixture(t, {}, { settings: null, sheetsToTake: 0 });
   const before = (await app.status()).vision.continuous;
-  assert.equal(before.enabled, true, '无记录默认开启，兼容旧自动行为');
-  assert.equal(before.state, 'waiting');
+  assert.equal(before.enabled, false, '缺失字段按安全迁移视为关闭');
+  assert.equal(before.state, 'off');
   assert.equal(before.companionSeen, false);
+  assert.equal(before.capturing, false);
+  assert.equal(before.understandingEnabled, false);
   assert.equal(before.lastFrameAt, null, '进程/挂载不算有画面');
   assert.equal(before.lastUnderstandingAt, null);
+  await sleep(80);
+  assert.equal(state.storyboardStarts, 0, '缺失字段不得因升级自动开始采集');
 
   const invalid = await app.action({ action: 'vision.continuousView', enabled: 'false' });
   assert.equal(invalid.ok, false, 'enabled 必须是布尔值');
   assert.match(invalid.error, /布尔/u);
+
+  // 显式开启：写盘并立即启动，无需任何陪伴轮。
+  const on = await app.action({ action: 'vision.continuousView', enabled: true });
+  assert.equal(on.ok, true, on.error);
+  assert.equal(on.enabled, true);
+  await app.waitFor(async () => (await app.status()).vision.continuous.state === 'capturing',
+    'explicit true to start capture immediately');
+  let snapshot = await app.status();
+  assert.equal(snapshot.vision.continuous.enabled, true);
+  assert.equal(snapshot.vision.continuous.capturing, true);
+  assert.equal(snapshot.vision.continuous.companionSeen, false, '采集不伪造陪伴轮');
+  let saved = JSON.parse(await readFile(join(app.root, 'data', 'settings.json'), 'utf8'));
+  assert.equal(saved.vision.continuousView, true, '显式 true 落盘');
 
   const off = await app.action({ action: 'vision.continuousView', enabled: false });
   assert.equal(off.ok, true, off.error);
@@ -278,15 +300,28 @@ test('1. 无记录默认 enabled:true/state:waiting；显式 false 写盘且切�
   const after = (await app.status()).vision.continuous;
   assert.equal(after.enabled, false);
   assert.equal(after.state, 'off');
+  assert.equal(after.capturing, false);
 
-  const saved = JSON.parse(await readFile(join(app.root, 'data', 'settings.json'), 'utf8'));
+  saved = JSON.parse(await readFile(join(app.root, 'data', 'settings.json'), 'utf8'));
   assert.equal(saved.vision.continuousView, false, '只写 settings.vision.continuousView，显式 false 落盘');
-  // 模式切换只写 mode/scene 等字段，必须保留独立开关（否则会被默认 true 翻回来）。
+  // 模式切换只写 mode/scene 等字段，必须保留独立开关（否则会被默认值翻回来）。
   const mode = await app.action({ action: 'vision.mode', mode: 'watch' });
   assert.equal(mode.ok, true, mode.error);
   const preserved = JSON.parse(await readFile(join(app.root, 'data', 'settings.json'), 'utf8'));
   assert.equal(preserved.vision.continuousView, false, '切模式不得丢失显式 false');
   assert.equal((await app.status()).vision.continuous.enabled, false);
+
+  // 重挂载读取显式 false：启动 boot 也不得启动采集。
+  const restarted = await fixture(t, { evidenceCaptureBootDelayMs: 10 }, {
+    settings: { vision: { continuousView: false } },
+    sheetsToTake: 0,
+  });
+  await sleep(120);
+  const restartedView = (await restarted.status()).vision.continuous;
+  assert.equal(restartedView.enabled, false);
+  assert.equal(restartedView.state, 'off');
+  assert.equal(restartedView.capturing, false);
+  assert.equal(state.storyboardStarts, 0, '显式 false 重启后仍不采集');
 });
 
 // ---------------------------------------------------------------------------
@@ -337,7 +372,7 @@ test('2. 关闭后：首轮、切模式、feature enable 都不启动采集；�
 // 3. 首次真实陪伴轮 / 排除代理轮
 // ---------------------------------------------------------------------------
 
-test('3. 开启 + 首次真实陪伴轮才启动；子代理/编码代理/维护轮不置位', async (t) => {
+test('3. 代理/维护轮不置位 companionSeen；真实陪伴轮置位并可在未启动时补启采集', async (t) => {
   const app = await fixture(t, { evidenceCaptureBootDelayMs: 60_000 }, { sheetsToTake: 0 });
   const workspace = join(app.root, 'workspace');
 
@@ -358,7 +393,10 @@ test('3. 开启 + 首次真实陪伴轮才启动；子代理/编码代理/维护
   });
   await sleep(60);
   assert.equal(state.storyboardStarts, 0, '代理/维护轮不得启动持续采集');
-  assert.equal((await app.status()).vision.continuous.companionSeen, false, 'companionSessionSeen 不得被代理轮置位');
+  let beforeTurn = await app.status();
+  assert.equal(beforeTurn.vision.continuous.companionSeen, false, 'companionSessionSeen 不得被代理轮置位');
+  assert.equal(beforeTurn.vision.continuous.understandingEnabled, false);
+  assert.equal(beforeTurn.vision.continuous.proactiveEnabled, false);
 
   // 真实陪伴轮：启动。
   await app.runPreStep({ agent: app.companionAgent(), turn: 4 });
@@ -368,6 +406,8 @@ test('3. 开启 + 首次真实陪伴轮才启动；子代理/编码代理/维护
   const snapshot = await app.status();
   assert.equal(snapshot.vision.continuous.enabled, true);
   assert.equal(snapshot.vision.continuous.companionSeen, true);
+  assert.equal(snapshot.vision.continuous.understandingEnabled, true);
+  assert.equal(snapshot.vision.continuous.proactiveEnabled, true);
   assert.equal(snapshot.vision.continuous.source, 'desktop');
   assert.equal(snapshot.vision.evidenceCapture.running, true);
 });
@@ -494,8 +534,8 @@ test('7. status.continuous 字段齐全；starting 期间不写 capturing/不冒
 
   snapshot = await app.status();
   const view = snapshot.vision.continuous;
-  for (const key of ['enabled', 'state', 'source', 'lastFrameAt', 'lastUnderstandingAt',
-    'error', 'retryAt', 'companionSeen']) {
+  for (const key of ['enabled', 'state', 'capturing', 'understandingEnabled', 'proactiveEnabled',
+    'source', 'lastFrameAt', 'lastUnderstandingAt', 'error', 'retryAt', 'companionSeen']) {
     assert.ok(Object.hasOwn(view, key), `continuous.${key} 必须存在`);
   }
   assert.equal(typeof view.enabled, 'boolean');
