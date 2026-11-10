@@ -334,6 +334,13 @@ export const BODY_ARM_CHANNELS = Object.freeze([
 ]);
 
 /**
+ * Every channel a preset may write, including the body/shoulder/arm layer. The legacy
+ * `CHANNELS` table predates that layer, so using it alone here silently excluded arm/hand
+ * channels from the post-preset reset — the exact "hand stays raised" symptom.
+ */
+const PRESET_SETTLE_CHANNELS = new Set([...CHANNELS, ...BODY_ARM_CHANNELS]);
+
+/**
  * Per-channel semantic safety limits. Body angles share the ±30° body-input convention (±1);
  * shoulders and hands are deliberately narrower because their model parameters differ wildly.
  * The writer still applies the input's own min/max, so this is a semantic budget, not a range.
@@ -4682,8 +4689,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const contributionVelocity = item.contributionVelocity ?? {};
     const started = [];
     for (const channel of item.written) {
-      if (!CHANNELS.includes(channel)) continue;
-      if (PRESET_NATIVE_CHANNELS.includes(channel)) continue;
+      if (!PRESET_SETTLE_CHANNELS.has(channel)) continue;
+      // `PRESET_NATIVE_CHANNELS` only says who normally owns body/breath; it must not exempt a
+      // channel the finished action REALLY wrote. Body/shoulder/arm rows need the same reset as
+      // head rows. Breath and absolute eye-open are never part of this tail.
+      if (channel === 'breath' || channel === 'eyeOpenL' || channel === 'eyeOpenR') continue;
       if (PRESET_TAKEOVER.ABSOLUTE_CHANNELS.includes(channel)) continue;
       if (verified !== null && verified.size > 0 && verified.has(channel) !== true) continue;
       if (presetSettleOwner(channel, now) !== null) continue;
