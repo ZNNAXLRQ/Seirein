@@ -410,3 +410,32 @@ test('user 文本按码点截断到 600 字，人设读取抛错时退化为只�
   assert.match(calls[0].system, /你正和用户一起看屏幕/);
   assert.equal(calls[0].system.includes('persona unavailable'), false);
 });
+
+test('detail 回查文本进入真实生成请求，而不是只到状态', async () => {
+  const calls = [];
+  const llm = makeLlm(calls, () => streamOf([
+    { type: 'text-delta', text: '嗯，这次细节对上了。' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]));
+  const generator = createProactiveLineGenerator({
+    getService: servicesOf({ llm, selection: ROUTE }),
+    personaText: () => '你是小助手。',
+  });
+
+  const result = await generator.generate({
+    event: { description: '人物转身', reaction: '意外' },
+    detail: {
+      source: 'event-index',
+      eventId: 'ue-detail',
+      description: '人物转身后看见路边的汽车起火',
+      keyDialogue: '那不是烟花，是火',
+      frameIds: ['frame-detail-1'],
+    },
+  });
+  assert.equal(result.ok, true);
+  const userText = calls[0].messages[0].content[0].text;
+  assert.match(userText, /补充细节：人物转身后看见路边的汽车起火/);
+  assert.match(userText, /关键台词：那不是烟花，是火/);
+  assert.match(userText, /你的观察角度：意外/);
+});
+

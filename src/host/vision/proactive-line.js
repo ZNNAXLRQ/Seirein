@@ -167,6 +167,14 @@ export function createProactiveLineGenerator({
       // 没有事件描述就没有可说的东西；在碰任何服务之前就拒绝，避免无意义调用。
       if (description.length === 0) return failure('bad-input');
       const reaction = typeof event.reaction === 'string' ? event.reaction.trim() : '';
+      // The two-stage gate may have looked up a more detailed local event. That evidence must
+      // reach the actual generation request, not only the diagnostic status: otherwise the
+      // "detail" round is paid for but the line is still written from the short macro summary.
+      const detail = isObject(input.detail) ? input.detail : null;
+      const detailDescription = detail !== null && typeof detail.description === 'string'
+        ? detail.description.trim() : '';
+      const detailDialogue = detail !== null && typeof detail.keyDialogue === 'string'
+        ? detail.keyDialogue.trim() : '';
       const externalSignal = input.signal !== null
         && typeof input.signal === 'object'
         && typeof input.signal.addEventListener === 'function'
@@ -194,8 +202,19 @@ export function createProactiveLineGenerator({
 
       // 3. user 文本只包含事实描述与可选反应角度，截断到 600 字（按码点）。
       const observed = `刚看到：${description}`;
+      const detailLines = [];
+      if (detailDescription.length > 0 && detailDescription !== description) {
+        detailLines.push(`补充细节：${codePointClip(detailDescription, 200)}`);
+      }
+      if (detailDialogue.length > 0) {
+        detailLines.push(`关键台词：${codePointClip(detailDialogue, 120)}`);
+      }
       const userText = codePointClip(
-        reaction.length > 0 ? `${observed}\n你的观察角度：${reaction}` : observed,
+        [
+          observed,
+          ...(reaction.length > 0 ? [`你的观察角度：${reaction}`] : []),
+          ...detailLines,
+        ].join('\n'),
         USER_TEXT_MAX,
       );
 

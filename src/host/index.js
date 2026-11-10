@@ -11634,11 +11634,14 @@ export function apply(ctx, config) {
         : []);
       const candidateIds = normalizeIds(candidate?.evidenceFrameIds);
       const detailIds = normalizeIds(frameIds);
-      const ids = candidateIds.length > 0 ? candidateIds : detailIds;
+      // Prefer the frames the detail lookup actually resolved. If the event only carries
+      // storyboard sheet ids, fall back to the candidate's own visible evidence; never use the
+      // candidate's evidence to validate an unrelated detail event.
+      const ids = detailIds.length > 0 ? detailIds : candidateIds;
       if (ids.length === 0) return false;
       try {
         const found = new Set(evidenceWindow.byId(ids).map((entry) => entry.id));
-        return ids.every((id) => found.has(id));
+        return ids.every((id) => found.has(id) || originalFrameRefById(id) !== null);
       } catch {
         return false;
       }

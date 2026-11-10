@@ -181,14 +181,14 @@ export function resolveProactiveDetail(input = {}) {
     event = null;
   }
   if (!isObject(event) && canSearch) {
+    const candidateFrames = evidenceIdsOf(candidate);
     let result = null;
     try {
+      // Do NOT fall back to timeOnly here. A different event in the same time window is not the
+      // candidate's detail. The fallback must prove identity or share an original-frame id.
       result = index.search({
-        from: candidate.from,
-        to: candidate.to,
-        frameIds: evidenceIdsOf(candidate),
+        frameIds: candidateFrames,
         limit: 4,
-        timeOnly: true,
       });
     } catch {
       result = null;
@@ -196,7 +196,11 @@ export function resolveProactiveDetail(input = {}) {
     if (isObject(result)) {
       searchReason = typeof result.reason === 'string' ? result.reason : '';
       if (Array.isArray(result.events) && result.events.length > 0) {
-        event = result.events[0];
+        const frameSet = new Set(candidateFrames);
+        event = result.events.find((entry) => isObject(entry)
+          && (normalizeId(entry.eventId) === sourceEventId
+            || (Array.isArray(entry.frameIds) && entry.frameIds.some((id) => frameSet.has(id)))))
+          ?? null;
       }
     }
   }

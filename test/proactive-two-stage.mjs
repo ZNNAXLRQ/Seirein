@@ -214,6 +214,55 @@ test('detail 回查：复用事件索引，modelCalls=0，失败返回机器原�
   assert.equal(noMatch.ok, false);
   assert.equal(noMatch.reason, 'detail-event-missing');
 
+  // Same time window but a different event with no shared frame: this is not the candidate's
+  // detail, even if it is the only result returned by a loose search.
+  const unrelated = resolveProactiveDetail({
+    candidate,
+    eventIndex: {
+      get: () => null,
+      search: () => ({
+        ok: true,
+        reason: 'ok',
+        events: [{
+          eventId: 'ue-other',
+          frameIds: ['frame-other'],
+          description: '路边汽车起火',
+          keyDialogue: '',
+          startedAt: T0 - 500,
+          endedAt: T0,
+        }],
+        count: 1,
+      }),
+    },
+    evidenceAvailable: () => true,
+  });
+  assert.equal(unrelated.ok, false);
+  assert.equal(unrelated.reason, 'detail-event-missing');
+
+  // A storyboard cell that really belongs to the candidate may be used.
+  const cellMatch = resolveProactiveDetail({
+    candidate,
+    eventIndex: {
+      get: () => null,
+      search: () => ({
+        ok: true,
+        reason: 'ok',
+        events: [{
+          eventId: 'ue-cell',
+          frameIds: ['frame-1'],
+          description: '同一张故事板的细节',
+          keyDialogue: '',
+          startedAt: T0 - 500,
+          endedAt: T0,
+        }],
+        count: 1,
+      }),
+    },
+    evidenceAvailable: () => true,
+  });
+  assert.equal(cellMatch.ok, true);
+  assert.equal(cellMatch.evidence.eventId, 'ue-cell');
+
   const expiredEvidence = resolveProactiveDetail({
     candidate,
     eventIndex: index,
