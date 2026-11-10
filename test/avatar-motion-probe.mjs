@@ -24,6 +24,7 @@ import test from 'node:test';
 import { WebSocketServer } from 'ws';
 
 import { createAvatarRuntime } from '../src/host/avatar/avatarRuntime.js';
+import { VtsClient } from '../src/host/avatar/vts.js';
 import { apply } from '../src/host/index.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -81,8 +82,8 @@ function createTransport(probeInputMapping) {
 test('1. 头部 changed:true/false；eye 仅在 blinkOwner=plugin 时探测', async () => {
   const calls = [];
   let firstUnverified = [];
-  const transport = createTransport(async ({ inputName, parameterNames }) => {
-    calls.push({ inputName, parameterNames: [...parameterNames] });
+  const transport = createTransport(async ({ inputName, parameterNames, value, restoreValue }) => {
+    calls.push({ inputName, parameterNames: [...parameterNames], value, restoreValue });
     return {
       ok: true,
       changed: inputName === 'FaceAngleX',
@@ -107,6 +108,11 @@ test('1. 头部 changed:true/false；eye 仅在 blinkOwner=plugin 时探测', as
     firstUnverified = [...result.mappingUnverified];
     assert.deepEqual(calls.map((entry) => entry.inputName).sort(),
       ['FaceAngleX', 'FaceAngleY', 'FaceAngleZ'], 'no eye input is measured under VTS blink owner');
+    // Head inputs keep the neutral 0.5 injection and restore to 0.
+    for (const entry of calls) {
+      assert.equal(entry.value, 0.5, `${entry.inputName} probe value is 0.5`);
+      assert.equal(entry.restoreValue, 0, `${entry.inputName} restore value is 0`);
+    }
 
     const snapshot = runtime.snapshot();
     assert.ok(snapshot.channels.controlled.includes('headX'), 'changed:true stays controlled');
@@ -128,8 +134,8 @@ test('1. 头部 changed:true/false；eye 仅在 blinkOwner=plugin 时探测', as
   // With blinkOwner=plugin the same action probe also measures both eyes and can open the owner.
   const eyeCalls = [];
   const pluginRuntime = createAvatarRuntime({
-    transport: createTransport(async ({ inputName, parameterNames }) => {
-      eyeCalls.push(inputName);
+    transport: createTransport(async ({ inputName, parameterNames, value, restoreValue }) => {
+      eyeCalls.push({ inputName, value, restoreValue });
       return { ok: true, changed: inputName.startsWith('EyeOpen'), delta: { [parameterNames[0]]: 0.5 }, error: '' };
     }),
     config: { autoTickMs: 0, blinkOwner: 'plugin' },
@@ -142,7 +148,16 @@ test('1. 头部 changed:true/false；eye 仅在 blinkOwner=plugin 时探测', as
     assert.ok(result.channels.eyeOpenR, 'right eye was measured with the plugin owner');
     assert.equal(result.channels.eyeOpenL.changed, true);
     assert.equal(result.channels.eyeOpenR.changed, true);
-    assert.ok(eyeCalls.includes('EyeOpenLeft') && eyeCalls.includes('EyeOpenRight'));
+    assert.ok(eyeCalls.some((entry) => entry.inputName === 'EyeOpenLeft')
+      && eyeCalls.some((entry) => entry.inputName === 'EyeOpenRight'));
+    // Eye inputs are unipolar: inject 0.5 and restore 1, never 0.
+    for (const entry of eyeCalls) {
+      if (!entry.inputName.startsWith('EyeOpen')) continue;
+      assert.equal(entry.value, 0.5, `${entry.inputName} injects the half-open value`);
+      assert.equal(entry.restoreValue, 1, `${entry.inputName} restores to 1 (open)`);
+    }
+    assert.equal(eyeCalls.some((entry) => entry.inputName.startsWith('EyeOpen')
+      && entry.restoreValue === 0), false, 'an eye probe never restores to 0 (closed)');
     assert.equal(pluginRuntime.snapshot().blink.owner, 'plugin', 'both verified eyes open the plugin owner');
   } finally {
     pluginRuntime.dispose();
@@ -599,5 +614,105 @@ test('6. channelOwnership.blink：默认 vts → vts-native/native；plugin 且�
   } finally {
     pluginOwned.dispose();
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. VtsClient probe values: 0.5 default injection, restoreValue default 0 / eye 1, real no-change
+// ---------------------------------------------------------------------------------------------
+function createProbeClient({ mapping = {}, values = {} } = {}) {
+  const client = new VtsClient({ tokenPath: 'unused-token.json' });
+  // A plain OPEN sentinel is enough: every request is served by the stub, no socket is opened.
+  client.socket = { readyState: 1 };
+  client.authenticated = true;
+  const requests = [];
+  const params = { ...values };
+  client.request = async (messageType, data = {}) => {
+    requests.push({ messageType, data: JSON.parse(JSON.stringify(data)) });
+    if (messageType === 'Live2DParameterListRequest') {
+      return {
+        messageType: 'Live2DParameterListResponse',
+        data: {
+          live2DModelParameters: Object.entries(params).map(([name, value]) => ({
+            name, value, min: 0, max: 1, defaultValue: 0,
+          })),
+        },
+      };
+    }
+    if (messageType === 'InjectParameterDataRequest') {
+      for (const entry of Array.isArray(data.parameterValues) ? data.parameterValues : []) {
+        const target = mapping[entry.id];
+        if (typeof target === 'string' && Object.hasOwn(params, target)) {
+          params[target] = Number(entry.value);
+        }
+      }
+      return { messageType: 'InjectParameterDataResponse', data: {} };
+    }
+    return { messageType: 'APIError', data: { errorID: 100, message: `Unknown ${messageType}` } };
+  };
+  const injections = () => requests
+    .filter((entry) => entry.messageType === 'InjectParameterDataRequest')
+    .map((entry) => entry.data.parameterValues[0]);
+  return { client, params, injections };
+}
+
+test('7. VtsClient：注入默认 0.5、恢复默认 0；眼输入恢复 1 且真实参数回到 1', async () => {
+  // Real (stubbed) eye mapping: the model parameter starts at 1 (normal open).
+  const eye = createProbeClient({
+    mapping: { EyeOpenLeft: 'ParamEyeLOpen', EyeOpenRight: 'ParamEyeROpen' },
+    values: { ParamEyeLOpen: 1, ParamEyeROpen: 1 },
+  });
+  const left = await eye.client.probeInputMapping({
+    inputName: 'EyeOpenLeft',
+    parameterNames: ['ParamEyeLOpen'],
+    value: 0.5,
+    restoreValue: 1,
+  });
+  assert.equal(left.ok, true, `probe completed (${left.error})`);
+  assert.equal(left.changed, true, '1 → 0.5 is a real parameter change');
+  assert.equal(left.before.ParamEyeLOpen, 1);
+  assert.equal(left.after.ParamEyeLOpen, 0.5);
+  assert.equal(left.delta.ParamEyeLOpen, -0.5);
+  assert.deepEqual(eye.injections().map((row) => [row.id, row.value]),
+    [['EyeOpenLeft', 0.5], ['EyeOpenLeft', 1]], 'inject 0.5, restore 1');
+  assert.equal(eye.params.ParamEyeLOpen, 1, 'the eye is left open, not closed at 0');
+
+  const right = await eye.client.probeInputMapping({
+    inputName: 'EyeOpenRight',
+    parameterNames: ['ParamEyeROpen'],
+    value: 0.5,
+    restoreValue: 1,
+  });
+  assert.equal(right.changed, true);
+  assert.equal(eye.params.ParamEyeROpen, 1, 'the right eye is left open too');
+
+  // An accepted injection that does not reach the target is not evidence; restore still happens.
+  const unchanged = createProbeClient({ mapping: {}, values: { ParamEyeLOpen: 1 } });
+  const noChange = await unchanged.client.probeInputMapping({
+    inputName: 'EyeOpenLeft',
+    parameterNames: ['ParamEyeLOpen'],
+    value: 0.5,
+    restoreValue: 1,
+  });
+  assert.equal(noChange.ok, true);
+  assert.equal(noChange.changed, false, 'no movement = no evidence');
+  assert.equal(unchanged.params.ParamEyeLOpen, 1);
+  assert.deepEqual(unchanged.injections().map((row) => row.value), [0.5, 1]);
+
+  // Defaults stay compatible: value 0.5 and restore 0 for head/gaze-style inputs.
+  const gaze = createProbeClient({
+    mapping: { EyeRightX: 'ParamEyeBallX' },
+    values: { ParamEyeBallX: 0 },
+  });
+  const defaulted = await gaze.client.probeInputMapping({
+    inputName: 'EyeRightX',
+    parameterNames: ['ParamEyeBallX'],
+  });
+  assert.equal(defaulted.ok, true);
+  assert.equal(defaulted.changed, true);
+  assert.deepEqual(gaze.injections().map((row) => [row.id, row.value]),
+    [['EyeRightX', 0.5], ['EyeRightX', 0]], 'default injection 0.5, default restore 0');
+  assert.equal(gaze.params.ParamEyeBallX, 0);
+  console.log(`7) eye inject/restore=${JSON.stringify(eye.injections().map((row) => row.value))}`
+    + ` noChange=${noChange.changed} default=${JSON.stringify(gaze.injections().map((row) => row.value))}`);
 });
 

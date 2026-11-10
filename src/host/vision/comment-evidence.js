@@ -270,9 +270,11 @@ export function createCommentEvidence({
     const from = timestamp(value.from);
     const to = timestamp(value.to);
     const timeSource = timeSourceOf(value.timeSource);
+    // 兼容旧记录必须由调用方显式选择；默认的 turnId 查询永远严格。
+    const allowLegacy = value.allowLegacy === true;
     if (turnId === null && utteranceId === null && sentAt === null
       && from === null && to === null) return null;
-    return { turnId, utteranceId, sentAt, from, to, timeSource };
+    return { turnId, utteranceId, sentAt, from, to, timeSource, allowLegacy };
   }
 
   /** 记录的有效窗口：优先对齐窗口，旧记录退回开口/发送时间。 */
@@ -309,6 +311,21 @@ export function createCommentEvidence({
   function latestRecord(key) {
     const list = records.get(key);
     return list === undefined || list.length === 0 ? null : list[list.length - 1];
+  }
+
+  /**
+   * 旧记录（没有 turnId）只作为显式兼容返回：调用方必须传 `allowLegacy:true`，且本轮查询
+   * 带 turnId。它只从没有 turnId 的记录里取最近一条，绝不会把“另一轮”的新记录当旧记录。
+   */
+  function latestLegacyRecord(key, query) {
+    const list = records.get(key) ?? [];
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const record = list[index];
+      if (record.turnId !== null) continue;
+      if (query.timeSource.length > 0 && record.timeSource !== query.timeSource) continue;
+      return record;
+    }
+    return null;
   }
 
   /** TTL 读时清理：take/render/state/attach/bindTurn 都会先走这里。 */
@@ -429,6 +446,8 @@ export function createCommentEvidence({
   /**
    * 当前有效记录；过期/未知返回 null。返回副本，调用方改不到内部状态。
    * 传 `query` 时只返回本轮相关记录（turnId/utteranceId/窗口），不匹配就返回 null。
+   * 带 `turnId` 的查询默认严格：本轮没有记录时绝不回退到会话最近一条。只有调用方显式传
+   * `allowLegacy:true` 时，才会在找不到本轮记录后返回一条没有 turnId 的旧式记录。
    */
   function take(sessionId, query = null) {
     const key = sessionKey(sessionId);
@@ -442,6 +461,11 @@ export function createCommentEvidence({
     const list = records.get(key) ?? [];
     for (let index = list.length - 1; index >= 0; index -= 1) {
       if (matchesQuery(list[index], parsed)) return snapshotRecord(list[index]);
+    }
+    // 显式兼容模式：只认没有 turnId 的旧记录，而且只服务带 turnId 的查询。
+    if (parsed.allowLegacy === true && parsed.turnId !== null) {
+      const legacy = latestLegacyRecord(key, parsed);
+      return legacy === null ? null : snapshotRecord(legacy);
     }
     return null;
   }
@@ -514,6 +538,7 @@ export function createCommentEvidence({
    * 主请求用的中文块：只含时间、帧数、把握、可回看帧 id 与“尚无画面理解”的边界说明。
    * 无记录/过期返回 ''，宿主注册的 context 因此不会产生空块。
    * 传 `query` 时只渲染本轮绑定记录；本轮没有绑定就返回 ''（typed 轮不套上一条麦克风评论）。
+   * 旧记录兼容只能由调用方显式传 `allowLegacy:true` 加入查询，默认不跨轮。
    */
   function render(sessionId, query = null) {
     const key = sessionKey(sessionId);

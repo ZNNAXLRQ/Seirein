@@ -2941,7 +2941,7 @@ export function apply(ctx, config) {
    * P-186/P-187 阶段 2：一次渲染里的视听观察。门禁：workspace + 视觉组件开启 + 对应 lane 的
    * 陪伴身份；语音轮仍只认当天陪伴会话（`isCompanionAgent`），文字轮认 typed companion
    * （普通主 GUI 也算，仍排除子代理/编码/后台/压缩/摘要等）。取用时只认本轮绑定：
-   * typed 轮绝不回退到上一条麦克风记录（`commentEvidence.render` 的 turnId 查询）。
+   * 语音轮和 typed 轮都绝不回退到会话最近一条（`commentEvidence.render` 的 turnId 查询）。
    *
    * `commentEvidence` 在本函数之后才初始化（挂载时的证据窗口之后）：这里只能在函数体内引用，
    * 不能提前求值。真实渲染/测量都发生在挂载之后，因此不会撞上 TDZ。
@@ -2973,18 +2973,8 @@ export function apply(ctx, config) {
       if (typedTurn) {
         block = commentEvidence.render(id, { turnId: turn });
       } else if (turn !== null) {
-        // 语音记录在 pre-step 被补上 turnId；极旧注入实例没有 bindTurn 时退回最近一条，
-        // 但绝不把 typed 块回退到语音轮。
+        // 语音记录在 pre-step 被补上 turnId；渲染只认本轮，绝不回退到会话最近一条。
         block = commentEvidence.render(id, { turnId: turn });
-        if (block.length === 0) {
-          let latest = null;
-          try {
-            latest = typeof commentEvidence.take === 'function' ? commentEvidence.take(id) : null;
-          } catch {
-            latest = null;
-          }
-          if (latest === null || latest.timeSource !== 'typed-sent') block = commentEvidence.render(id);
-        }
       } else {
         block = commentEvidence.render(id);
       }
@@ -13573,7 +13563,7 @@ export function apply(ctx, config) {
             commentEvidence.bindTurn(sessionId, turn, { maxAgeMs: 10_000 });
           }
         } catch {
-          /* 旧注入实例没有 bindTurn：渲染侧仍会退回最近一条语音记录 */
+          /* 旧注入实例没有 bindTurn：本轮 turnId 查询找不到记录，绝不借用旧记录 */
         }
         if (understandingFocus !== null
           && understandingFocus.sessionId === sessionId

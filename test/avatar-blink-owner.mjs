@@ -6,8 +6,10 @@
  *   2. `plugin` + BOTH eye inputs verified opens the writer: `idleEye:true` and `blink.sent` grows;
  *   3. `plugin` without verified eyes is refused (`eye-unverified`) and never changes the setting;
  *   4. the setting persists in `settings.avatar` (other fields preserved) and switches back to VTS;
- *   5. status + client expose the two choices, disable plugin while unverified, and roll back;
- *   6. the existing motion suites stay green (run separately; see the task verification list).
+ *   5. an eye probe on a normal open eye (1) injects 0.5, proves the mapping, restores 1 and leaves
+ *      both eye parameters open instead of closing them at 0;
+ *   6. status + client expose the two choices, disable plugin while unverified, and roll back;
+ *   7. the existing motion suites stay green (run separately; see the task verification list).
  *
  * No real VTS is contacted: a fake transport drives the runtime tests and a local fake VTS
  * WebSocket server drives the host action tests. Real VTS blinking remains UNVERIFIED.
@@ -289,9 +291,70 @@ test('4. 设置持久化/切换：plugin 落盘保留其它字段，切回 vts �
 });
 
 // ---------------------------------------------------------------------------------------------
-// 5. status + client contract (static: the shipped client parses the status projection)
+// 5. eye probe on a normal open eye (1): 0.5 injection proves it, restore 1 keeps it open
 // ---------------------------------------------------------------------------------------------
-test('5. status/客户端静态：两个选项、status 当前值、未验证禁用、失败回滚', async () => {
+test('5. 眼探测：初始 1 的有效映射 changed=true、恢复 1、plugin 保持、不标 unverified', async (t) => {
+  const fake = await createFakeVts({
+    parameters: [
+      { name: 'EyeOpenLeft', min: 0, max: 1, defaultValue: 1 },
+      { name: 'EyeOpenRight', min: 0, max: 1, defaultValue: 1 },
+    ],
+    targets: ['ParamEyeLOpen', 'ParamEyeROpen'],
+    values: { ParamEyeLOpen: 1, ParamEyeROpen: 1 },
+    mappings: { EyeOpenLeft: 'ParamEyeLOpen', EyeOpenRight: 'ParamEyeROpen' },
+  });
+  const host = await startHost(fake, { settings: { avatar: { blinkOwner: 'plugin' } } });
+  t.after(async () => {
+    host.dispose();
+    await fake.close();
+  });
+  resetCapabilities();
+
+  const connected = await host.callRoute('/assistant/action', { body: { action: 'live2d.connect' } });
+  assert.equal(connected.ok, true, `host connects (${connected.error ?? ''})`);
+  const probed = await waitFor(async () => {
+    const status = await host.status();
+    const mapping = status.avatar?.mapping;
+    return mapping?.channels?.eyeOpenL?.changed === true
+      && mapping?.channels?.eyeOpenR?.changed === true;
+  });
+  assert.equal(probed, true, 'both eyes report changed:true from a 1 → 0.5 movement');
+
+  const status = await host.status();
+  assert.equal(status.avatar?.blink?.setting, 'plugin');
+  assert.equal(status.avatar?.blink?.owner, 'plugin', 'the plugin keeps blink ownership');
+  assert.equal(status.avatar?.blink?.eyeVerified, true);
+  assert.equal(status.live2d?.runtime?.idleEye, true);
+  assert.equal(status.live2d?.runtime?.blink?.owner, 'plugin');
+  assert.equal(status.avatar?.mapping?.channels?.eyeOpenL?.changed, true);
+  assert.equal(status.avatar?.mapping?.channels?.eyeOpenR?.changed, true);
+  assert.equal((status.avatar?.mapping?.unverified ?? []).includes('eyeOpenL'), false,
+    'the proven left eye is not marked unverified');
+  assert.equal((status.avatar?.mapping?.unverified ?? []).includes('eyeOpenR'), false,
+    'the proven right eye is not marked unverified');
+  assert.deepEqual(status.avatar?.mapping?.channels?.eyeOpenL?.parameterNames, ['ParamEyeLOpen']);
+
+  // Inject 0.5, then restore 1 — never 0. The real parameters end open, so a model without the
+  // native idle blink is not left with closed eyes by the probe. Plugin blink frames may write
+  // other near-1 values before the probe, so keep only the two documented probe values.
+  const eyeInjections = fake.injections.filter((entry) => entry.id.startsWith('EyeOpen')
+    && (entry.value === 0.5 || entry.value === 1));
+  assert.deepEqual(eyeInjections, [
+    { id: 'EyeOpenLeft', value: 0.5 },
+    { id: 'EyeOpenLeft', value: 1 },
+    { id: 'EyeOpenRight', value: 0.5 },
+    { id: 'EyeOpenRight', value: 1 },
+  ], 'each eye is injected at 0.5 and restored to 1');
+  assert.equal(fake.values.ParamEyeLOpen, 1, 'left eye parameter is open after the probe');
+  assert.equal(fake.values.ParamEyeROpen, 1, 'right eye parameter is open after the probe');
+  console.log(`[blink 5] eyeInjections=${eyeInjections.map((entry) => `${entry.id}:${entry.value}`).join(',')}`
+    + ` owner=${status.avatar.blink.owner} unverified=${JSON.stringify(status.avatar.mapping.unverified)}`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// 6. status + client contract (static: the shipped client parses the status projection)
+// ---------------------------------------------------------------------------------------------
+test('6. status/客户端静态：两个选项、status 当前值、未验证禁用、失败回滚', async () => {
   const here = fileURLToPath(new URL('.', import.meta.url));
   const clientSource = await readFile(join(here, '..', 'client.js'), 'utf8');
   const hostSource = await readFile(join(here, '..', 'src', 'host', 'index.js'), 'utf8');
@@ -322,7 +385,7 @@ test('5. status/客户端静态：两个选项、status 当前值、未验证禁
   }
   assert.doesNotMatch(clientSource, /avatar\.blinkOwner\.set[\s\S]{0,300}?setInterval/u,
     'the blink choice adds no poller');
-  console.log('[blink 5] client/status contract static=ok');
+  console.log('[blink 6] client/status contract static=ok');
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -332,9 +395,12 @@ async function createFakeVts({
   model = { modelName: 'BlinkOwnerModel', modelID: 'blink-owner-model' },
   parameters = [],
   targets = [],
+  values = {},
+  mappings = {},
 } = {}) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
+  const injections = [];
   const send = (socket, message) => {
     try {
       socket.send(JSON.stringify(message));
@@ -378,7 +444,11 @@ async function createFakeVts({
           return;
         case 'Live2DParameterListRequest':
           respond(socket, request, {
-            live2DModelParameters: targets.map((name) => ({ name })),
+            live2DModelParameters: targets.map((name) => (
+              typeof values[name] === 'number' && Number.isFinite(values[name])
+                ? { name, value: values[name] }
+                : { name }
+            )),
           });
           return;
         case 'EventSubscriptionRequest':
@@ -388,6 +458,15 @@ async function createFakeVts({
           });
           return;
         case 'InjectParameterDataRequest':
+          for (const entry of Array.isArray(request.data?.parameterValues)
+            ? request.data.parameterValues
+            : []) {
+            injections.push({ id: String(entry?.id ?? ''), value: Number(entry?.value) });
+            const target = mappings[entry?.id];
+            if (typeof target === 'string' && Object.hasOwn(values, target)) {
+              values[target] = Number(entry.value);
+            }
+          }
           respond(socket, request, {});
           return;
         default:
@@ -398,6 +477,8 @@ async function createFakeVts({
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   return {
     port: server.address().port,
+    injections,
+    values,
     async close() {
       for (const socket of wss.clients) socket.terminate();
       await new Promise((done) => wss.close(() => server.close(() => done())));

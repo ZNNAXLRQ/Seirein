@@ -573,8 +573,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     'gazeX', 'gazeY', 'headX', 'headY', 'headZ', 'eyeOpenL', 'eyeOpenR',
   ]);
   const PROBE_ACTION_VALUE = 0.5;
-  /** Eye-open inputs are unipolar (1 = fully open): probe them with a positive value. */
-  const PROBE_EYE_VALUE = 1;
+  /**
+   * Eye-open inputs are unipolar (1 = fully open). A normal open eye sits at 1, so injecting 0.5
+   * both proves the row (the parameter moves) and never fully closes it; the probe then restores
+   * to 1. Injecting/restoring 0 would leave the avatar with closed eyes whenever VTS's native
+   * idle blinking is off.
+   */
+  const PROBE_EYE_VALUE = 0.5;
+  const PROBE_EYE_RESTORE_VALUE = 1;
   /**
    * Reference-counted pause ownership for explicit gaze probes. Overlap and timeout must not
    * restore a stale boolean: each live probe owns one token, and only the last token reopens the
@@ -2037,11 +2043,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     for (const row of rows) {
       const ownValue = Number(row?.probeValue);
       const value = Number.isFinite(ownValue) ? ownValue : PROBE_ACTION_VALUE;
+      const ownRestore = Number(row?.restoreValue);
+      const restoreValue = Number.isFinite(ownRestore) ? ownRestore : 0;
       const parameterNames = Array.isArray(row.modelParams) ? [...row.modelParams] : [];
       const outcome = await probeWithTimeout(probeInputMapping, {
         inputName: row.inputName,
         parameterNames,
         value,
+        restoreValue,
       }, timeoutMs);
       // `changed` is decisive, but an explicit ok:false/timedOut always wins over a contradictory
       // "changed" from a failed measurement.
@@ -2130,8 +2139,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         channel,
         inputName: binding.inputName,
         modelParams: Array.isArray(binding.modelParams) ? binding.modelParams : [],
-        // Eye-open inputs are unipolar; a positive value proves an open-eye row without closing it.
-        ...(eye ? { probeValue: PROBE_EYE_VALUE } : {}),
+        // Eye-open inputs are unipolar: inject the half-open value that still moves a normal 1,
+        // then restore to 1. Head/gaze stay at the neutral 0.5 and restore to 0.
+        ...(eye ? { probeValue: PROBE_EYE_VALUE, restoreValue: PROBE_EYE_RESTORE_VALUE } : {}),
       });
     }
     const hasTarget = rows.some((row) => String(row.inputName ?? '').trim().length > 0

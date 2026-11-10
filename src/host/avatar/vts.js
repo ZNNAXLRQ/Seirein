@@ -2218,17 +2218,23 @@ export class VtsClient {
    * InputParameterListRequest only proves that a value can be sent; the user's VTS parameter
    * mapping decides whether the model reacts, and the API cannot read that mapping. This probe
    * reads the target parameters, injects one value through InjectParameterDataRequest, waits
-   * briefly, reads again, and restores the input to 0. `changed` is evidence, not name matching.
+   * briefly, reads again, and restores the input to `restoreValue` (default 0). `changed` is
+   * evidence, not name matching.
+   *
+   * The injected `value` defaults to 0.5. Eye-open inputs are unipolar (normal open is 1), so
+   * probing them with 0.5 proves the row without fully closing the eyes, and restoring them to 1
+   * leaves the model open even when VTS's native idle blinking is disabled. Head/gaze inputs keep
+   * the neutral 0.5 injection and restore to 0.
    *
    * It never throws: timeouts and VTS errors become `ok:false` with `error`. While it runs the
-   * 30 Hz frame slot is held, so a probe cannot race the motion writer. Restoring to 0 is
-   * best-effort: a failed restore is reported in `error` but does not discard a valid measurement.
+   * 30 Hz frame slot is held, so a probe cannot race the motion writer. Restoring is best-effort:
+   * a failed restore is reported in `error` but does not discard a valid measurement.
    *
-   * @param {{inputName: string, parameterNames: string[], value?: number}} options
+   * @param {{inputName: string, parameterNames: string[], value?: number, restoreValue?: number}} options
    * @returns {Promise<{ok: boolean, inputName: string, parameterNames: string[], before: object,
    *   after: object, delta: object, changed: boolean, error: string}>}
    */
-  async probeInputMapping({ inputName, parameterNames, value = 0.5 } = {}) {
+  async probeInputMapping({ inputName, parameterNames, value = 0.5, restoreValue = 0 } = {}) {
     const name = String(inputName ?? '').trim();
     const names = (Array.isArray(parameterNames) ? parameterNames : [parameterNames])
       .map((entry) => String(entry ?? '').trim())
@@ -2257,6 +2263,7 @@ export class VtsClient {
     }
 
     const probeValue = Number.isFinite(Number(value)) ? Number(value) : 0.5;
+    const restoreProbeValue = Number.isFinite(Number(restoreValue)) ? Number(restoreValue) : 0;
     let injectAttempted = false;
     this.probeActive = true;
     try {
@@ -2286,12 +2293,12 @@ export class VtsClient {
       result.error = error?.message ?? String(error);
       result.ok = false;
     } finally {
-      // Only restore when the input may have been sent: injecting 0 without an injection would
-      // overwrite a live tracking value for no reason.
+      // Only restore when the input may have been sent: injecting a restore value without an
+      // injection would overwrite a live tracking value for no reason.
       if (injectAttempted === true) {
         try {
           await this.request('InjectParameterDataRequest', {
-            parameterValues: [{ id: name, value: 0 }],
+            parameterValues: [{ id: name, value: restoreProbeValue }],
             mode: 'set',
           }, PROBE_RESTORE_TIMEOUT_MS);
         } catch (error) {
