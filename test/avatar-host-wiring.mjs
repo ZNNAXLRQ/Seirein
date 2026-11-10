@@ -1096,7 +1096,58 @@ test('默认启用 30 Hz 控制器：不传配置即 motionWrites 生效、sourc
   );
 });
 
-test('显式 avatarMotionWrites:false → source=legacy，写入频率仍 4Hz', async (t) => {
+test('默认生产接线：30 Hz 计算 / 15 Hz 发送，actualHz≈15，config 可升到 30', async (t) => {
+  const run = async (extra = {}) => {
+    const fake = await createFakeVts({
+      defaultParameters: [HEAD_INPUT],
+      modelParams: [{ name: 'ParamAngleX' }],
+    });
+    const host = await startHost(fake, extra);
+    try {
+      assert.equal((await host.callRoute('/assistant/action', { body: { action: 'live2d.connect' } })).ok, true);
+      assert.equal(await waitDiscovered(host), true);
+      // The real host path runs a real 33 ms timer; let the measured window fill with commits.
+      assert.equal(await waitFor(async () => {
+        const runtime = (await host.status()).live2d?.runtime;
+        return runtime?.motion?.actualHz >= 10;
+      }, 5000), true, 'the controller commits real frames');
+      await sleep(2000);
+      return (await host.status()).live2d.runtime;
+    } finally {
+      host.dispose();
+      await fake.close();
+    }
+  };
+
+  const runtime15 = await run();
+  assert.equal(runtime15.motion.writes, true, 'the pump is the default single writer');
+  assert.equal(runtime15.motion.outputHz, 15, 'the real host default send rate is 15 Hz');
+  assert.equal(runtime15.motion.sendPath, 'pump');
+  assert.ok(runtime15.motion.actualHz >= 13 && runtime15.motion.actualHz <= 17,
+    `the real host path delivers ~15 Hz (${runtime15.motion.actualHz})`);
+  assert.ok(runtime15.motion.controllerFrames > runtime15.motion.outputFrames,
+    `compute stays 30 Hz while send is 15 Hz (${runtime15.motion.controllerFrames}`
+    + ` compute vs ${runtime15.motion.outputFrames} sends)`);
+  assert.ok(Number.isFinite(runtime15.motion.sendDurationMs),
+    'the real path reports send duration');
+
+  const runtime30 = await run({ avatarMotionOutputHz: 30, avatarTickMs: 16 });
+  assert.equal(runtime30.motion.outputHz, 30, 'an explicit config raises the send rate to 30');
+  // The fake transport/timer can cap the measured rate below the configured one under load; the
+  // contract is that config reaches the runtime AND the real rate rises above the 15 Hz default.
+  assert.ok(runtime30.motion.actualHz > runtime15.motion.actualHz,
+    `the explicit 30 Hz override raises the measured rate (${runtime30.motion.actualHz}`
+    + ` > ${runtime15.motion.actualHz})`);
+  assert.ok(runtime30.motion.actualHz >= 15,
+    `the override does not fall back to the default (${runtime30.motion.actualHz})`);
+  console.log(
+    `[motion-host] defaultHz=${runtime15.motion.outputHz} actual=${runtime15.motion.actualHz}`
+    + ` compute=${runtime15.motion.controllerFrames}/send=${runtime15.motion.outputFrames}`
+    + ` overrideHz=${runtime30.motion.outputHz} actual=${runtime30.motion.actualHz}`,
+  );
+});
+
+test('显式 avatarMotionWrites:false → source=legacy，写入频率仍 15Hz', async (t) => {
   const fake = await createFakeVts({
     defaultParameters: [HEAD_INPUT, GAZE_X_INPUT],
     modelParams: [{ name: 'ParamAngleX' }, { name: 'ParamEyeBallX' }],

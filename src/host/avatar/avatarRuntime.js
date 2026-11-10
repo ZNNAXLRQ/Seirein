@@ -175,17 +175,19 @@ const INNER_REASON_CODES = Object.freeze({
 const DEFAULT_HOST_CONFIG = Object.freeze({
   /** 0 disables the internal compute timer; a host normally drives tick() itself. */
   autoTickMs: 0,
-  /** Mouth transport writes are coalesced to this rate (matches vts.js MIN_GAP_MS). */
-  flushIntervalMs: TIMING.FLUSH_INTERVAL_MS,
+  /** Mouth transport writes are coalesced to this rate; <=66 ms leaves room for a 15 Hz send. */
+  flushIntervalMs: 60,
   /** Fallback speech duration per non-space character when the caller passes no durationMs. */
   textCharMs: TIMING.MOUTH_STEP_MS,
-  /** Idle parameter frames are capped at this rate (4 Hz) instead of one write per tick. */
-  idleWriteHz: 4,
   /**
-   * Hard ceiling. The configured idle write rate may be 4–8 Hz; style never changes it, because
-   * style only tunes amplitude/rhythm/step. The default stays 4 Hz.
+   * Default send cadence for the continuous controller. The pose is still COMPUTED at 30 Hz
+   * (`motionOutputHz`); only the transport write is coalesced to this rate. 15 Hz is the shipped
+   * default, and the host may raise it up to `idleWriteHzMax`. Style never changes this rate,
+   * because style only tunes amplitude/rhythm/step.
    */
-  idleWriteHzMax: 8,
+  idleWriteHz: 15,
+  /** Hard ceiling for the configured send cadence; 30 Hz is the same rate the pose is computed at. */
+  idleWriteHzMax: 30,
   /**
    * Semantic cap per head axis. 0.6 = ±18° on the documented ±30° tracking range; headZ keeps
    * its own ±90° conversion, so this is a shared semantic budget, not a shared angle. The old
@@ -195,20 +197,19 @@ const DEFAULT_HOST_CONFIG = Object.freeze({
   idleAmplitude: 0.6,
   /**
    * Largest semantic change allowed between two consecutive idle-written frames (anti-jitter).
-   * The default idle cadence is 4 Hz, so 0.12 = 3.6°/write (14.4°/s on a ±30° head input): enough
-   * for a 10–20° preset to arrive inside its active phase instead of being rate-limited into a
-   * "frozen" tail. A host may lower it for a calmer display.
+   * At the default 15 Hz cadence, 0.12 keeps a 10–20° preset inside its active phase instead of
+   * being rate-limited into a "frozen" tail. A host may lower it for a calmer display.
    */
   idleMaxStep: 0.12,
   /** Eye-open idle writes are opt-in: off by default so blink/idle cannot fight each other. */
   idleEye: false,
   /**
-   * Output interpolation rate for the continuous controller. The controller always *computes* at
-   * this rate (default 30 Hz, configurable); the legacy idle transport path keeps its own 4 Hz
-   * cadence unless `motionWrites` opts into the single-slot 30 Hz output pump.
+   * Send rate for the continuous controller output. The controller still COMPUTES at 30 Hz
+   * (`computeHz` / `autoTickMs:33`); this only gates transport writes. The shipped default is
+   * 15 Hz so a real host path delivers ~15 frames/s, and it is host-configurable up to 30 Hz.
    */
-  motionOutputHz: 30,
-  motionOutputHzMax: 60,
+  motionOutputHz: 15,
+  motionOutputHzMax: 30,
   /** Opt-in: send the interpolated pose through the single-slot/single-flight pump below. */
   motionWrites: false,
   /**
@@ -491,6 +492,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     lastFrameAt: null,
     lastSentAt: Number.NEGATIVE_INFINITY,
     lastAttemptAt: Number.NEGATIVE_INFINITY,
+    /**
+     * Phase-accumulated next send deadline. Resetting the deadline to the actual tick time makes
+     * a jittery host timer quantise 15 Hz down to ~10-11 Hz (send, skip, send on 45 ms ticks).
+     * Accumulating the ideal deadline keeps the long-run rate at 15 Hz while still sending at most
+     * one frame per tick.
+     */
+    nextAttemptAt: Number.NEGATIVE_INFINITY,
   };
   /**
    * Sender-side transport evidence. These FIVE phases are separate by construction and may never
@@ -608,11 +616,13 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   let unsubscribers = [];
   let flushing = false;
   let lastFlushAt = Number.NEGATIVE_INFINITY;
-  /** Continuous idle parameter frame state (single-writer transport, own 4 Hz cadence). */
+  /** Continuous idle parameter frame state (single-writer transport, own coalesced cadence). */
   let idleParamMap = normalizeIdleParams(null);
   let flushingIdle = false;
   /** Gate timestamp of the last idle attempt; `lastIdleFrameAt` is the last real frame sent. */
   let lastIdleWriteAt = Number.NEGATIVE_INFINITY;
+  /** Phase-accumulated ideal deadline for the coalesced idle send (see motionPump.nextAttemptAt). */
+  let idleNextWriteAt = Number.NEGATIVE_INFINITY;
   let lastIdleFrameAt = null;
   let lastIdleSuppressedAt = Number.NEGATIVE_INFINITY;
   let lastIdleSuppressedLogAt = Number.NEGATIVE_INFINITY;
@@ -656,6 +666,29 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     reducedBySpeech: 0,
     /** Frames skipped because the host explicitly paused idle motion (`flags.idle === false`). */
     suppressedByIdleOff: 0,
+  };
+  /**
+   * One telemetry record for the ONE actual transport output. The legacy idle flush and the
+   * single-slot pump are mutually exclusive paths, so both report here and `actualHz` always means
+   * "frames that really committed", never "frames the controller computed". Sample timestamps use
+   * the frame's own `at`, not the promise-settle clock, so a slow send cannot inflate the rate.
+   */
+  const SEND_HISTORY_LIMIT = 32;
+  const sendTelemetry = {
+    attempts: 0,
+    commits: 0,
+    /** Frame timestamps of the most recent commits, oldest first. */
+    times: [],
+    /** End-to-end (attempt → settle) durations of the most recent sends, ms. */
+    durations: [],
+    lastFrameAt: null,
+    lastSendAt: null,
+    lastDurationMs: null,
+    /** Frames whose due time was missed by more than the late tolerance (late tick). */
+    late: 0,
+    /** Due frames overwritten/dropped while a send was in flight: only the newest survives. */
+    coalesced: 0,
+    lastCoalescedAt: null,
   };
   /**
    * Discrete action scheduler (facade-owned). ONE action at a time, each runs its own duration;
@@ -766,6 +799,61 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     /** Stage 4: `markConclusion()` admissions and the ones refused as a repeat. */
     conclusionMarks: 0,
     conclusionDeduped: 0,
+  };
+  /**
+   * Semantic request lifecycle. The old failure mode was one uniform policy for every request:
+   * either queue everything or expire everything after a blanket timeout. These categories are
+   * deliberately different:
+   *
+   *   opening      bound to the real first audio of an answer. If that boundary is missed it is
+   *                DROPPED at the boundary (or at speech end), never replayed later.
+   *   corrective   a confused reaction. It may be replaced by a newer explicit response before it
+   *                runs; it is correction, not a queued obligation.
+   *   settle       answer-end / idle: a graceful return to the idle posture.
+   *   communique   turn/listening/thinking/other phases: one short current-intent request.
+   *
+   * Persistent posture (head/gaze components) is NOT in this table: its lifetime belongs to the
+   * controller's hold window and must never be shortened to a blanket 2 s TTL. The priority order
+   * is fixed: lifecycle gate (clip/turn/generation) → current communication intent → idle.
+   */
+  const REQUEST_LIFECYCLE = Object.freeze({
+    opening: Object.freeze({
+      name: 'opening', priority: 300, deadline: 'first-audio', persistent: false, ttlMs: null,
+      supersedable: true,
+    }),
+    corrective: Object.freeze({
+      name: 'corrective', priority: 200, deadline: 'next-boundary', persistent: false, ttlMs: null,
+      supersedable: true,
+    }),
+    settle: Object.freeze({
+      name: 'settle', priority: 150, deadline: 'next-boundary', persistent: false, ttlMs: null,
+      supersedable: true,
+    }),
+    communique: Object.freeze({
+      name: 'communique', priority: 200, deadline: 'next-boundary', persistent: false, ttlMs: null,
+      supersedable: true,
+    }),
+  });
+  /** The semantic class of one communication event (not the action's duration). */
+  function lifecycleFor(event) {
+    if (event === 'answer-start') return REQUEST_LIFECYCLE.opening;
+    if (event === 'confused') return REQUEST_LIFECYCLE.corrective;
+    if (event === 'answer-end' || event === 'idle') return REQUEST_LIFECYCLE.settle;
+    return REQUEST_LIFECYCLE.communique;
+  }
+  /** Classification counters/evidence; every drop keeps its reason and semantic class. */
+  const requestLifecycle = {
+    staged: 0,
+    released: 0,
+    superseded: 0,
+    expired: 0,
+    missed: 0,
+    cancelled: 0,
+    staleGeneration: 0,
+    lastStaged: null,
+    lastReleased: null,
+    lastDropped: null,
+    priorityOrder: Object.freeze(['lifecycle-gate', 'current-intent', 'idle']),
   };
   /**
    * Discrete idle pool: only actions the parameter engine can actually animate are sampled.
@@ -1029,6 +1117,70 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const value = Number(injectedNow());
     return Number.isFinite(value) ? value : (state.lastActivityAt ?? 0);
   };
+
+  /** Record the start of one physical output send; the settle half records its duration. */
+  function beginSendTelemetry() {
+    sendTelemetry.attempts += 1;
+    return clockNow();
+  }
+
+  /**
+   * Record one frame that really committed. `at` is the frame's own timestamp (for the rate);
+   * `startedAt` is the wall/monotonic clock when the transport call started (for sendDuration).
+   */
+  function noteSendCommitted(at, startedAt = null) {
+    sendTelemetry.commits += 1;
+    sendTelemetry.lastFrameAt = Number.isFinite(at) ? at : sendTelemetry.lastFrameAt;
+    sendTelemetry.lastSendAt = clockNow();
+    if (sendTelemetry.lastFrameAt !== null) {
+      sendTelemetry.times.push(sendTelemetry.lastFrameAt);
+      while (sendTelemetry.times.length > SEND_HISTORY_LIMIT) sendTelemetry.times.shift();
+    }
+    const duration = Number.isFinite(startedAt) ? Math.max(0, clockNow() - startedAt) : 0;
+    sendTelemetry.lastDurationMs = duration;
+    sendTelemetry.durations.push(duration);
+    while (sendTelemetry.durations.length > SEND_HISTORY_LIMIT) sendTelemetry.durations.shift();
+  }
+
+  /** Mark one coalesced due frame: a newer frame will replace it, nothing is replayed. */
+  function noteSendCoalesced(at = null) {
+    sendTelemetry.coalesced += 1;
+    sendTelemetry.lastCoalescedAt = Number.isFinite(at) ? at : clockNow();
+  }
+
+  /**
+   * Mark a late frame. The tolerance is one and a half intervals: an exact 30 Hz grid on a
+   * 33.333 ms tick or a 15 Hz grid on a 66.67 ms tick is never counted as late.
+   */
+  function noteLateFrame(at, intervalMs) {
+    if (!(intervalMs > 0) || !Number.isFinite(at)) return false;
+    sendTelemetry.late += 1;
+    return true;
+  }
+
+  /** Read-only send telemetry. `actualHz` is derived from COMMITTED frame timestamps. */
+  function sendTelemetryView() {
+    const times = sendTelemetry.times;
+    const span = times.length > 1 ? times[times.length - 1] - times[0] : 0;
+    const actualHz = span > 0 ? ((times.length - 1) * 1000) / span : 0;
+    const durations = sendTelemetry.durations;
+    const averageMs = durations.length === 0
+      ? null : durations.reduce((sum, value) => sum + value, 0) / durations.length;
+    return {
+      attempts: sendTelemetry.attempts,
+      commits: sendTelemetry.commits,
+      actualHz: Math.round(actualHz * 100) / 100,
+      sendDurationMs: sendTelemetry.lastDurationMs,
+      sendDurationAvgMs: averageMs === null ? null : Math.round(averageMs * 100) / 100,
+      lastFrameAt: sendTelemetry.lastFrameAt,
+      lastSendAt: sendTelemetry.lastSendAt,
+      lateFrames: sendTelemetry.late,
+      coalesced: sendTelemetry.coalesced,
+      lastCoalescedAt: sendTelemetry.lastCoalescedAt,
+      /** One physical writer only: the legacy idle flush or the single-slot pump. */
+      path: host.motionWrites === true ? 'pump' : 'idle',
+    };
+  }
 
   const inner = createBehaviorRuntime({
     config: {
@@ -1447,6 +1599,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     // `attempted`: the transport call really starts here; the outcome is still unknown.
     noteTransportAttempted(ticket, entries, frame.at);
+    const sendStartedAt = beginSendTelemetry();
     let sent;
     try {
       sent = writer();
@@ -1489,6 +1642,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         noteTransportCommitted(ticket, entries, clockNow());
         motionPump.sent += 1;
         motionPump.writes += entries.length;
+        noteSendCommitted(frame.at, sendStartedAt);
         countBreathEntries(entries, frame.at);
         motionPump.appliedSeq = send.seq;
         motionPump.lastSentAt = clockNow();
@@ -1524,11 +1678,25 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // transport sees at most `motionOutputHz` attempts. 1 ms of tolerance keeps exact 30 Hz grids
     // from being halved by floating-point jitter.
     const interval = 1000 / Math.max(1, host.motionOutputHz);
-    if (at - motionPump.lastAttemptAt < interval - 1) return;
+    if (at < motionPump.nextAttemptAt - 1) return;
+    if (Number.isFinite(motionPump.nextAttemptAt) && at - motionPump.nextAttemptAt > interval * 1.5) {
+      noteLateFrame(at, interval);
+    }
+    // Phase accumulator: after a normal (not stalled) send, advance the IDEAL deadline, not the
+    // actual tick. A 45 ms host tick then sends on ticks 2/3/5/6/8... and still averages 15 Hz.
+    if (!Number.isFinite(motionPump.nextAttemptAt)
+      || at - motionPump.nextAttemptAt > interval) {
+      motionPump.nextAttemptAt = at + interval;
+    } else {
+      motionPump.nextAttemptAt += interval;
+    }
     motionPump.lastAttemptAt = at;
     motionPump.frames += 1;
     motionPump.lastFrameAt = at;
-    if (motionPump.slot !== null) motionPump.dropped += 1;
+    if (motionPump.slot !== null) {
+      motionPump.dropped += 1;
+      noteSendCoalesced(at);
+    }
     motionPump.slot = {
       pose: { ...pose },
       at,
@@ -1553,7 +1721,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       // staged intent nor a running action may resume when the gate opens again.
       invalidateIntents(`lock:${motionLockReason}`, { interrupted: false });
       lastIdleWriteAt = Number.NEGATIVE_INFINITY;
+      idleNextWriteAt = Number.NEGATIVE_INFINITY;
       motionPump.lastAttemptAt = Number.NEGATIVE_INFINITY;
+      motionPump.nextAttemptAt = Number.NEGATIVE_INFINITY;
       recordIdleEvent('avatar.motion.locked', { reason: motionLockReason });
       return { ok: true, code: null, locked: true, reason: motionLockReason, epoch: motionEpoch };
     }
@@ -1561,7 +1731,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     motionLockReason = '';
     inner.setBaseActivityEnabled(state.connected === true);
     lastIdleWriteAt = Number.NEGATIVE_INFINITY;
+    idleNextWriteAt = Number.NEGATIVE_INFINITY;
     motionPump.lastAttemptAt = Number.NEGATIVE_INFINITY;
+    motionPump.nextAttemptAt = Number.NEGATIVE_INFINITY;
     recordIdleEvent('avatar.motion.unlocked', { epoch: motionEpoch });
     return { ok: true, code: null, locked: false, epoch: motionEpoch };
   }
@@ -2628,10 +2800,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     return setChannelMappings([], { channelMap: map ?? {} });
   }
 
-  /** Idle write cadence: configured Hz, but never faster than the transport flush interval. */
+  /**
+   * Send cadence: configured Hz, but never faster than the transport flush interval. The exact
+   * millisecond interval is kept (not rounded up), so a configured 30 Hz really reaches every
+   * 33.333 ms tick instead of being halved to 15 Hz by a 34 ms gate.
+   */
   const idleWriteIntervalMs = () => Math.max(
     host.flushIntervalMs,
-    Math.ceil(1000 / Math.max(0.1, host.idleWriteHz)),
+    1000 / Math.max(0.1, host.idleWriteHz),
   );
 
   /** Apply a persona style (lazy merge inside the core); the host calls this after a background build. */
@@ -2700,6 +2876,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const result = inner.setIntent(patch);
     // Let the next tick carry the new intent instead of waiting out the idle interval.
     lastIdleWriteAt = Number.NEGATIVE_INFINITY;
+    idleNextWriteAt = Number.NEGATIVE_INFINITY;
     return result;
   }
 
@@ -2826,6 +3003,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       // Let the NEXT tick write the first intent frame instead of waiting out the current idle
       // interval. This is one prompt, not a new frequency: style never changes the write rate.
       lastIdleWriteAt = Number.NEGATIVE_INFINITY;
+      idleNextWriteAt = Number.NEGATIVE_INFINITY;
       appendLog('debug', 'avatar intent started', {
         event: 'avatar.intent.start',
         kind,
@@ -3630,7 +3808,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    *   channels    names actually written during the action (headX/headY/headZ/gazeX/gazeY/
    *               bodyX/bodyY/bodyZ/browL/browR)
    *   final       the value per channel the action actually REACHED (largest |written|, post
-   *               limit/speech scale) — visibility evidence, immune to the 4 Hz flush sampling
+   *               limit/speech scale) — visibility evidence, immune to the coalesced idle sampling
    *   last        the literal last value written per channel (post limit / speech scale)
    *   amplitude   peak |semantic value| written, post-scale too (0 when nothing was written)
    *   suppressed  'none' | 'action-busy' | 'speech-damping' | 'limit' | 'mixed' (one per cause)
@@ -3680,7 +3858,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     if (!Number.isFinite(value)) return;
     trace.written.add(channel);
     // `last` is the literal last write; `final` keeps the value the action actually REACHED (the
-    // largest |value| written this action). The 4 Hz idle flush can sample only the shoulders of
+    // largest |value| written this action). The coalesced idle flush can sample only the shoulders of
     // the envelope, so the literal last write of a fading gesture is tiny and would understate a
     // perfectly visible motion. Keeping the extreme makes the trace usable as visibility evidence.
     trace.last[channel] = value;
@@ -3892,6 +4070,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * other waiting-candidate start counts `candidate.other`. Neither ever counts an intent release.
    */
   function startWaitingCandidate(at, { timed = false } = {}) {
+    // Priority order: a staged communication intent owns the next boundary before any idle
+    // candidate. `stepActions` normally drains the pending slot first; this guard also protects a
+    // caller that reaches the candidate path while a lifecycle-gate request is still pending.
+    if (intentState.pending !== null) return null;
     if (actionState.waiting.length === 0) return null;
     const next = actionState.waiting.shift();
     const release = { releasedBy: 'candidate', releasedAt: at };
@@ -4016,6 +4198,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           });
           Object.assign(actionState.current, {
             event: 'sentence-gap',
+            lifecycle: lifecycleFor('sentence-gap'),
             presetId: drawn.presetId,
             /** Controller-side identity of the live trajectory (takeover lookup). */
             presetActionId: drawn.actionId ?? null,
@@ -4092,9 +4275,23 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   function dropPendingIntent(reason, { by = '', at = clockNow(), intentLabel = null } = {}) {
     const pending = intentState.pending;
     if (pending === null) return null;
+    const category = pending.lifecycle?.name ?? lifecycleFor(pending.event).name;
     intentState.pending = null;
     intentState.pendingSince = null;
     intentState.dropped += 1;
+    if (reason === 'superseded') requestLifecycle.superseded += 1;
+    else if (reason === 'expired') requestLifecycle.expired += 1;
+    else if (reason === 'missed') requestLifecycle.missed += 1;
+    else if (reason === 'cancelled') requestLifecycle.cancelled += 1;
+    else if (reason === 'stale-generation') requestLifecycle.staleGeneration += 1;
+    requestLifecycle.lastDropped = {
+      event: pending.event,
+      category,
+      reason,
+      by,
+      actionId: pending.ticket,
+      at,
+    };
     recordIdleEvent('avatar.intent.dropped', {
       reason,
       event: pending.event,
@@ -4103,6 +4300,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       mapped: pending.intent,
       actionId: pending.ticket,
       generation: pending.generation,
+      lifecycle: category,
+      priority: pending.lifecycle?.priority ?? lifecycleFor(pending.event).priority,
+      deadline: pending.lifecycle?.deadline ?? lifecycleFor(pending.event).deadline,
+      persistent: pending.lifecycle?.persistent === true,
       by,
       at,
     });
@@ -4255,6 +4456,17 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // At most one intent per sentence: a second event inside the same clip waits for the next one.
     intentState.servedClip = clipState.index;
     const actionId = pending.ticket;
+    const lifecycle = pending.lifecycle ?? lifecycleFor(pending.event);
+    requestLifecycle.released += 1;
+    requestLifecycle.lastReleased = {
+      event: pending.event,
+      category: lifecycle.name,
+      priority: lifecycle.priority,
+      deadline: lifecycle.deadline,
+      actionId,
+      by: reason,
+      at,
+    };
     intentState.lastIntent = pending.intent;
     intentState.lastActionId = actionId;
     // ---- preset execution branch -------------------------------------------------------
@@ -4348,6 +4560,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           turnId: pending.turnId,
           replyId: pending.replyId ?? null,
           event: pending.event,
+          lifecycle: pending.lifecycle ?? lifecycleFor(pending.event),
           profile: null,
           presetId: drawn.presetId,
           /** Controller-side identity of the live trajectory (the takeover lookup uses it). */
@@ -4441,6 +4654,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       turnId: pending.turnId,
       replyId: pending.replyId ?? null,
       event: pending.event,
+      lifecycle: pending.lifecycle ?? lifecycleFor(pending.event),
       profile: pending.profile ?? null,
     });
     intentState.started += 1;
@@ -4524,12 +4738,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const gazeMapped = controlled.includes('gazeX') || controlled.includes('gazeY');
     const targetVerified = attention?.verified === true && attention?.mode === 'user' && gazeMapped === true;
     const decision = degradeMotionIntent(mapped, { targetVerified });
+    const lifecycle = lifecycleFor(name);
     intentState.seq += 1;
     const next = {
       ticket: intentState.seq,
       event: name,
       intent: decision.intent,
       mapped,
+      lifecycle,
       /** Stage 4 expression profile carried to the action ('conclusion' | 'confused' | null). */
       profile: isMotionProfile(profile) ? String(profile) : null,
       degraded: decision.degraded,
@@ -4543,9 +4759,46 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       holdForClipStart: holdForClipStart === true,
     };
     // Single slot: a newer phase supersedes a still-waiting intent (the older one is reported).
-    if (intentState.pending !== null) dropPendingIntent('superseded', { by: name, at: time });
+    // The semantic class is kept on both records so a corrective (confused) replacement and an
+    // opening miss are distinguishable without parsing free-form reason text.
+    if (intentState.pending !== null) {
+      const previous = intentState.pending;
+      const previousTicket = previous.ticket;
+      const previousEvent = previous.event;
+      const previousClass = previous.lifecycle?.name ?? lifecycleFor(previousEvent).name;
+      dropPendingIntent('superseded', {
+        by: name,
+        at: time,
+        intentLabel: previous.intent,
+      });
+      recordIdleEvent('avatar.request.superseded', {
+        previousEvent,
+        previousActionId: previousTicket,
+        by: name,
+        from: previousClass,
+        to: lifecycle.name,
+        /** A corrective request is the one class a newer explicit response may replace. */
+        replacedCorrective: previousClass === 'corrective',
+        at: time,
+      });
+    }
     intentState.pending = next;
     intentState.pendingSince = time;
+    requestLifecycle.staged += 1;
+    requestLifecycle.lastStaged = {
+      event: name,
+      category: lifecycle.name,
+      priority: lifecycle.priority,
+      deadline: lifecycle.deadline,
+      persistent: lifecycle.persistent,
+      ttlMs: lifecycle.ttlMs,
+      actionId: next.ticket,
+      generation: next.generation,
+      sessionId: next.sessionId,
+      turnId: next.turnId,
+      replyId: next.replyId,
+      at: time,
+    };
     intentState.staged += 1;
     intentState.lastEvent = name;
     if (decision.degraded === true) {
@@ -4561,6 +4814,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       mapped,
       profile: next.profile,
       degraded: decision.degraded,
+      lifecycle: lifecycle.name,
+      priority: lifecycle.priority,
+      deadline: lifecycle.deadline,
+      persistent: lifecycle.persistent,
       generation: next.generation,
       sessionId: next.sessionId,
       turnId: next.turnId,
@@ -4742,10 +4999,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // not queued. The next tick stages the newest pose, so a slow transport can never backlog.
     if (flushingIdle) {
       idleStats.dropped += 1;
+      noteSendCoalesced(at);
       return;
     }
     const interval = idleWriteIntervalMs();
-    if (at - lastIdleWriteAt < interval) return;
+    // Exact grid tolerance + phase accumulator: a jittery host timer must not quantise 15 Hz down
+    // to every-other-tick (~10-11 Hz). Keep sending at the ideal deadline; one frame per tick max.
+    if (at < idleNextWriteAt - 1) return;
+    if (Number.isFinite(idleNextWriteAt) && at - idleNextWriteAt > interval * 1.5) {
+      noteLateFrame(at, interval);
+    }
     const idleSource = currentIdleSource();
     // A one-shot intent may need a channel outside the idle write set (gaze/brow/body). The same
     // snapshot is reused for the idle-frame decision, so a param runtime still pays one read.
@@ -4770,6 +5033,12 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const speaking = mouthActiveForIdle(at, snap);
     const speechScale = speaking ? IDLE_SPEECH_SCALE : 1;
     const writeScale = postureWriteScale(snap);
+    // Advance the IDEAL deadline only for a frame that really starts a send attempt.
+    if (!Number.isFinite(idleNextWriteAt) || at - idleNextWriteAt > interval) {
+      idleNextWriteAt = at + interval;
+    } else {
+      idleNextWriteAt += interval;
+    }
     lastIdleWriteAt = at;
     lastIdleSuppressedAt = Number.NEGATIVE_INFINITY;
     const frame = inner.takePendingFrame();
@@ -4909,6 +5178,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     flushingIdle = true;
     idleStats.frames += 1;
+    const sendStartedAt = beginSendTelemetry();
     const sentGeneration = state.generation;
     const sentConnection = state.connectionGeneration;
     const sentEpoch = motionEpoch;
@@ -4976,6 +5246,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       sent = Promise.reject(error);
     }
     sent
+      .then(() => {
+        // One committed frame, independent of how many rows it carried.
+        noteSendCommitted(at, sendStartedAt);
+      })
       .catch((error) => {
         noteTransportFailed(ticket, error?.evidenceRows ?? entries, error, clockNow());
         idleStats.skipped += entries.length;
@@ -5265,7 +5539,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const at = Number.isFinite(nowMs) ? nowMs : clockNow();
     // Phase 2: base activity is observed only while this runtime is allowed to drive the avatar.
     // A privacy lock / disconnected socket stops the counters; the pose itself keeps being
-    // computed so an unlock is continuous (and the 4 Hz/30 Hz writer gates stay where they were).
+    // computed so an unlock is continuous (and the idle/pump writer gates stay where they were).
     inner.setBaseActivityEnabled(motionLocked !== true && state.connected === true);
     const pose = inner.tick(at);
     state.mouth = pose.mouth;
@@ -5280,7 +5554,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     // Breath has no verified channel: report the skip (throttled) and write nothing at all.
     if (state.connected === true) noteBreathChannel(at);
     if (host.motionWrites === true) {
-      // The interpolated pose is the ONE writer on this path; the legacy 4 Hz idle flush is not
+      // The interpolated pose is the ONE writer on this path; the coalesced idle flush is not
       // also run, so one input can never receive two final values in one frame.
       submitMotionFrame(pose, at);
     } else {
@@ -5407,6 +5681,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       frames: result.frames,
       durationMs: result.durationMs,
       startedAt: result.startedAt,
+      /** True when this chunk extended the live envelope instead of opening a new session. */
+      continued: result.continued === true,
+      appended: result.appended ?? null,
     };
   }
 
@@ -5666,6 +5943,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const speaking = innerSnap.turn.speaking === true;
     const channelOwnership = channelOwnershipView();
     const now = clockNow();
+    const sendView = sendTelemetryView();
     // Reflect the current target/mixed without inventing a send: the last real `sent`/`sendResult`
     // stay visible until the next frame that actually carries the channel is assembled.
     noteComponentTargets(innerSnap, now, { resetFrame: false });
@@ -5793,6 +6071,8 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         dropped: idleStats.dropped,
         /** Writes that settled after a lock/disconnect/model switch (old generation). */
         stale: idleStats.stale,
+        /** Real committed send rate / duration / pressure, shared with `motion.send`. */
+        ...sendView,
       },
       /**
        * Breath output state. `mapped` is proof of a verified channel; while it is false the runtime
@@ -5827,6 +6107,16 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         pending: motionPump.slot !== null,
         lastFrameAt: motionPump.lastFrameAt,
         lastSentAt: motionPump.lastSentAt,
+        /**
+         * The ONE transport writer's measured facts. `actualHz` counts committed frames only;
+         * `dropped`/`coalesced` prove a slow send never accumulates a backlog, and
+         * `lateFrames` counts a due frame that arrived after one and a half intervals.
+         */
+        send: sendView,
+        actualHz: sendView.actualHz,
+        sendDurationMs: sendView.sendDurationMs,
+        coalesced: sendView.coalesced,
+        lateFrames: sendView.lateFrames,
         ...innerSnap.motion,
         /** Blink/breath counts keep their generated-vs-sent split in the motion projection too. */
         baseActivity: baseActivityView,
@@ -6046,6 +6336,82 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
           deduped: intentState.conclusionDeduped,
         },
       },
+      /**
+       * Semantic request lifecycle: categories, the staged request, the running action's request
+       * class and the non-expiring persistent posture. The priority order is explicit so a caller
+       * never has to infer it from event ordering: lifecycle gate → current intent → idle.
+       */
+      requestLifecycle: (() => {
+        const pending = intentState.pending;
+        const component = innerSnap.motion?.posture?.component ?? null;
+        const gazeComponent = innerSnap.motion?.posture?.gazeComponent ?? null;
+        const current = actionState.current;
+        return {
+          priorityOrder: [...requestLifecycle.priorityOrder],
+          categories: {
+            opening: { ...REQUEST_LIFECYCLE.opening },
+            corrective: { ...REQUEST_LIFECYCLE.corrective },
+            settle: { ...REQUEST_LIFECYCLE.settle },
+            communique: { ...REQUEST_LIFECYCLE.communique },
+            persistent: {
+              name: 'persistent', priority: 100, deadline: null, persistent: true, ttlMs: null,
+              note: 'lifetime is the controller hold window; never a blanket 2 s TTL',
+            },
+          },
+          pending: pending === null ? null : {
+            event: pending.event,
+            category: pending.lifecycle?.name ?? lifecycleFor(pending.event).name,
+            priority: pending.lifecycle?.priority ?? lifecycleFor(pending.event).priority,
+            deadline: pending.lifecycle?.deadline ?? lifecycleFor(pending.event).deadline,
+            persistent: pending.lifecycle?.persistent === true,
+            ttlMs: pending.lifecycle?.ttlMs ?? null,
+            holdForClipStart: pending.holdForClipStart === true,
+            actionId: pending.ticket,
+            generation: pending.generation,
+            turnId: pending.turnId,
+            replyId: pending.replyId ?? null,
+            since: intentState.pendingSince,
+          },
+          current: current === null ? null : {
+            event: current.event ?? null,
+            category: current.lifecycle?.name ?? lifecycleFor(current.event ?? '').name,
+            actionId: current.actionId,
+            persistent: current.lifecycle?.persistent === true,
+            ttlMs: current.lifecycle?.ttlMs ?? null,
+          },
+          /**
+           * Persistent posture components: their hold window (6–20 s by component type) is the
+           * authority. `ttlMs:null` says no uniform short TTL may cut the held pose.
+           */
+          persistent: {
+            head: component === null ? null : {
+              id: component.id,
+              startedAt: component.startedAt,
+              holdUntil: component.holdUntil,
+              ttlMs: null,
+            },
+            gaze: gazeComponent === null ? null : {
+              id: gazeComponent.id,
+              startedAt: gazeComponent.startedAt,
+              holdUntil: gazeComponent.holdUntil,
+              verified: innerSnap.motion?.posture?.componentGazeVerified === true,
+              ttlMs: null,
+            },
+          },
+          counts: {
+            staged: requestLifecycle.staged,
+            released: requestLifecycle.released,
+            superseded: requestLifecycle.superseded,
+            expired: requestLifecycle.expired,
+            missed: requestLifecycle.missed,
+            cancelled: requestLifecycle.cancelled,
+            staleGeneration: requestLifecycle.staleGeneration,
+          },
+          lastStaged: requestLifecycle.lastStaged === null ? null : { ...requestLifecycle.lastStaged },
+          lastReleased: requestLifecycle.lastReleased === null ? null : { ...requestLifecycle.lastReleased },
+          lastDropped: requestLifecycle.lastDropped === null ? null : { ...requestLifecycle.lastDropped },
+        };
+      })(),
       inner: innerSnap,
     };
   }

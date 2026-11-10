@@ -278,6 +278,10 @@ test('4. 无真实目标时 look-at-user 退化为中性并记录', async () => 
         gazeY: { inputName: 'EyeBallY', min: -1, max: 1, injectable: true },
       },
       channelMap: { gazeX: 'EyeBallX', gazeY: 'EyeBallY' },
+      // This test isolates ONE explicit intent: the phase-3 autonomous gaze component is default
+      // ON for a verified gaze mapping, so it must be switched off here or its own idle gaze rows
+      // would be mistaken for the lookAtUser gesture. The default-on path is covered by test 4b.
+      componentGazeEnabled: false,
     },
   });
   fake.writes.length = 0;
@@ -321,6 +325,118 @@ test('4. 无真实目标时 look-at-user 退化为中性并记录', async () => 
   console.log(
     `[p139] lookAtUser noTarget=intent:${NEUTRAL_INTENT}/reason:no-target writes=0`
     + ` target=x0.35 gazeWrites=${gazeWrites.length} max=${Math.max(...gazeWrites.map((entry) => entry.value)).toFixed(3)}`,
+  );
+  runtime.dispose();
+});
+
+// ---------------------------------------------------------------------------------------------
+// 4b. default-on autonomous gaze
+// ---------------------------------------------------------------------------------------------
+test('4b. 自动视线默认开启：只在能力验证后写，不冒充“看向用户”，与显式 intent 混合仍单写', async () => {
+  // Default-on is still gated by BOTH verified gaze axes: a single declaration must stay silent.
+  const partialFake = createFakeTransport();
+  let partialClock = 0;
+  const partial = await connectRuntime({
+    transport: partialFake.transport,
+    now: () => partialClock,
+    config: {
+      autoTickMs: 0,
+      flushIntervalMs: 1,
+      idleActions: [],
+      idleParams: { headY: { inputName: 'FaceAngleY', min: -30, max: 30 } },
+      inputs: {
+        gazeX: { inputName: 'EyeBallX', min: -1, max: 1, injectable: true },
+        gazeY: { inputName: 'EyeBallY', min: -1, max: 1, injectable: true },
+      },
+      // Only ONE axis is declared: the other remains unverified, so the default-on component
+      // must NOT write.
+      channelMap: { gazeX: 'EyeBallX' },
+    },
+  });
+  partialFake.writes.length = 0;
+  for (partialClock = 0; partialClock <= 800; partialClock += 20) {
+    partial.tick(partialClock);
+    await flushMicrotasks();
+  }
+  const partialSnap = partial.snapshot();
+  assert.equal(partialSnap.inner.motion.posture.componentGazeVerified, false,
+    'one verified gaze axis is not enough to open the automatic component');
+  assert.equal(partialFake.writes.filter((entry) => entry.input === 'EyeBallX'
+    || entry.input === 'EyeBallY').length, 0, 'the gated automatic component writes no gaze');
+  partial.dispose();
+
+  const fake = createFakeTransport();
+  let clock = 0;
+  const runtime = await connectRuntime({
+    transport: fake.transport,
+    now: () => clock,
+    config: {
+      autoTickMs: 0,
+      flushIntervalMs: 1,
+      idleActions: [],
+      idleParams: { headY: { inputName: 'FaceAngleY', min: -30, max: 30 } },
+      inputs: {
+        gazeX: { inputName: 'EyeBallX', min: -1, max: 1, injectable: true },
+        gazeY: { inputName: 'EyeBallY', min: -1, max: 1, injectable: true },
+      },
+      channelMap: { gazeX: 'EyeBallX', gazeY: 'EyeBallY' },
+      // componentGazeEnabled is deliberately omitted: the default must be ON, but only after the
+      // verified gaze takeover set opens the gate.
+    },
+  });
+  fake.writes.length = 0;
+  runtime.takeEvents();
+
+  for (clock = 0; clock <= 800; clock += 20) {
+    runtime.tick(clock);
+    await flushMicrotasks();
+  }
+  const autoWrites = fake.writes.filter((entry) => entry.input === 'EyeBallX'
+    || entry.input === 'EyeBallY');
+  assert.ok(autoWrites.length > 0, 'the verified gaze component writes without any explicit intent');
+
+  const auto = runtime.snapshot();
+  assert.equal(auto.inner.motion.posture.componentGazeVerified, true,
+    'automatic gaze is enabled only by the verified gaze mapping');
+  assert.equal(auto.inner.motion.attention.mode, 'neutral',
+    'an automatic gaze component is never reported as "looking at the user"');
+  assert.equal(auto.inner.motion.attention.verified, false);
+  assert.equal(ofType(runtime.takeEvents(), 'avatar.action.start')
+    .some((entry) => entry.name === 'lookAtUser'), false,
+  'automatic gaze never starts a lookAtUser action');
+
+  // Every coalesced frame still writes an input at most once: the automatic component and an
+  // explicit gesture share the ONE writer rather than producing duplicate rows.
+  for (const entries of fake.batches) {
+    const inputs = entries.map((entry) => entry.input);
+    assert.equal(new Set(inputs).size, inputs.length,
+      `duplicate input in one mixed frame: ${inputs.join(',')}`);
+  }
+
+  // A real target turns the SAME verified mapping into an explicit lookAtUser gesture. The
+  // automatic component must coexist with it (not replace it, not double-write it).
+  runtime.setAttention({ x: 0.35, y: -0.2 }, { verified: true, source: 'vision' });
+  const executed = runtime.intentEvent('turn-start', { at: 1000 });
+  assert.equal(executed.degraded, false, 'a verified target + verified mapping executes lookAtUser');
+  assert.equal(executed.intent, 'lookAtUser');
+  for (clock = 1000; clock <= 1700; clock += 20) {
+    runtime.tick(clock);
+    await flushMicrotasks();
+  }
+  const events = runtime.takeEvents();
+  assert.equal(ofType(events, 'avatar.action.start')
+    .some((entry) => entry.name === 'lookAtUser'), true, 'the explicit lookAtUser action really starts');
+  const targetWrites = fake.writes.filter((entry) => entry.input === 'EyeBallX' && entry.value > 0.1);
+  assert.ok(targetWrites.length > 0, 'the explicit target still reaches the gaze input');
+  for (const entries of fake.batches) {
+    const inputs = entries.map((entry) => entry.input);
+    assert.equal(new Set(inputs).size, inputs.length,
+      `duplicate input in one explicit+automatic frame: ${inputs.join(',')}`);
+  }
+  console.log(
+    `[p139] autoGaze writes=${autoWrites.length} verified=${auto.inner.motion.posture.componentGazeVerified}`
+    + ` attention=${auto.inner.motion.attention.mode} explicit=${executed.intent}`
+    + ` targetWrites=${targetWrites.length}`,
   );
   runtime.dispose();
 });

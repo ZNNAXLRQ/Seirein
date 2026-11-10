@@ -1095,6 +1095,15 @@ const PRESET_SKIP_REASONS = Object.freeze(['no-candidate', 'hold', 'channel-unve
 const SMOOTH_INTERRUPT_REASON = /interrupt|barge[-_ ]?in/i;
 const SMOOTH_INTERRUPT_FADE_MS = 240;
 
+/**
+ * Mouth chunk continuity. A TTS chunk boundary is a DECODE boundary, not a pause: a new envelope
+ * that starts within this window of the previous chunk's end is appended to the SAME envelope
+ * clock instead of resetting `startedAt`/the level index. A real pause (longer than this) still
+ * takes the normal release path, which lets the mouth close; explicit cancel always closes at once.
+ * No extra smoothing is added here — the existing 200 ms release cross-fade stays the only tail.
+ */
+const MOUTH_CHUNK_CONTINUITY_MS = 150;
+
 const presetClamp = (value, limit) => Math.max(-limit, Math.min(limit, finite(value, 0)));
 
 /**
@@ -1352,6 +1361,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     turnStartedAt: 0,
     intent: { gaze: null, pose: {}, squint: 0, touch: null, flags: { idle: true, breathing: true } },
     speech: null,
+    /**
+     * Last envelope kept for ONE short post-end window. A chunk boundary that arrives after the
+     * previous chunk's end tick can still append to the same clock instead of resetting; an
+     * explicit end/interrupt clears it, and a real pause beyond the window lets it expire.
+     */
+    speechContinuity: null,
     release: null,
     squint: 0,
     blink: createBlinkState({ random, baseline: 1 }),
@@ -1547,6 +1562,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       busy: 0,
       takeovers: 0,
       ended: 0,
+      /** Adjacent TTS chunks appended to the SAME envelope clock (no reset at the chunk edge). */
+      continuations: 0,
     },
     /** Idle action scheduler: one candidate per interval, deduped per action name. */
     idleAction: { accMs: 0, emitted: 0, suppressed: 0, last: null, queue: [], seen: new Map() },
@@ -2474,6 +2491,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     mouth.unmappedLogged = false;
     mouth.staleLogged.clear();
     state.speech = null;
+    state.speechContinuity = null;
     state.release = null;
     state.lastSpeech = { index: -1, level: 0, speaking: false };
     // The previous sender must be visibly released before its replacement can write.
@@ -2489,6 +2507,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     mouth.level = 0;
     mouth.token += 1; // every token issued so far is dead from here on
     state.speech = null;
+    state.speechContinuity = null;
     state.release = null;
     state.lastSpeech = { index: -1, level: 0, speaking: false };
     if (publishMouth === true && state.lastPose !== null) publish({ ...state.lastPose, mouth: 0 });
@@ -5498,6 +5517,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         // Freeze the mouth closed for the hand-off, starting exactly at the scheduled end so
         // the fade is not stretched by a late tick.
         state.release = { startedAt: speech.startedAt + speech.durationMs, level: speech.levels[index] ?? 0 };
+        // Keep the just-ended envelope briefly: a following TTS chunk may arrive one tick after the
+        // end, and appending to the same clock is still a decode boundary, not a pause.
+        state.speechContinuity = { ...speech };
         state.speech = null;
         state.lastSpeech = { index, level: state.release.level, speaking: false };
       } else {
@@ -5520,6 +5542,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         frame.mouthLevel = 0;
       } else {
         state.release = null;
+        state.speechContinuity = null;
         state.lastSpeech = { index: -1, level: 0, speaking: false };
       }
     }
@@ -6147,6 +6170,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       startedAt: start,
       durationMs: duration,
     };
+    state.speechContinuity = null;
     state.release = null;
     return {
       ok: true,
@@ -6176,11 +6200,11 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    */
   function startSpeech({ text = '', durationMs = 0, levels, stepMs, startedAt, owner, live = false, takeover = false } = {}) {
     const who = typeof owner === 'string' && owner.length > 0 ? owner : 'speech';
-    const seat = acquireMouth(who, { takeover });
-    if (seat.ok !== true) return seat;
-    const mouth = state.mouth;
+    const requestedStart = Number.isFinite(startedAt) ? startedAt : clockNow();
     if (live === true) {
-      mouth.live = true;
+      const seat = acquireMouth(who, { takeover });
+      if (seat.ok !== true) return seat;
+      state.mouth.live = true;
       return { ...seat, mode: 'live', frames: 0 };
     }
     const step = Number.isFinite(stepMs) && stepMs > 0 ? stepMs : Math.max(1, finite(cfg.mouthStepMs, TIMING.MOUTH_STEP_MS));
@@ -6188,16 +6212,84 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       ? levels.map((value) => Number(value))
       : buildSpeechLevels(text, durationMs, step);
     if (source.some((value) => !Number.isFinite(value))) {
+      const seat = acquireMouth(who, { takeover });
+      if (seat.ok !== true) return seat;
       releaseMouth('invalid-levels');
-      return { ok: false, reason: 'non-numeric level', token: mouth.token, owner: who };
+      return { ok: false, reason: 'non-numeric level', token: state.mouth.token, owner: who };
     }
     const list = source.map((value) => clamp01(value));
     const duration = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : list.length * step;
-    const start = Number.isFinite(startedAt) ? startedAt : clockNow();
-    mouth.live = false;
-    state.speech = { token: mouth.token, turnId: state.turnId, levels: list, stepMs: step, startedAt: start, durationMs: duration };
+    const start = requestedStart;
+    // Chunk continuity: a new chunk that starts inside (or just after) the current envelope is
+    // appended to the SAME clock, so the level index never resets at a decode boundary. This is
+    // the only special case; a real pause or any explicit cancel still takes the normal path.
+    const speech = state.speech !== null
+      ? state.speech
+      : (state.speechContinuity !== null
+        && start <= state.speechContinuity.startedAt
+          + state.speechContinuity.durationMs + MOUTH_CHUNK_CONTINUITY_MS
+        ? state.speechContinuity : null);
+    const mouth = state.mouth;
+    const canContinue = takeover !== true
+      && speech !== null
+      && mouth.active === true
+      && mouth.owner === who
+      && mouth.live !== true
+      && Math.abs(step - speech.stepMs) < 1e-9
+      && start >= speech.startedAt - 1
+      && start <= speech.startedAt + speech.durationMs + MOUTH_CHUNK_CONTINUITY_MS;
+    if (canContinue) {
+      // A small decode gap is filled with CLOSED levels (a real pause is allowed to shut the
+      // mouth); a contiguous chunk starts exactly at the old level count, so nothing is inserted.
+      const offsetMs = Math.max(0, start - speech.startedAt);
+      const offsetIndex = Math.round(offsetMs / speech.stepMs);
+      const merged = speech.levels.slice(0, offsetIndex);
+      while (merged.length < offsetIndex) merged.push(0);
+      merged.push(...list);
+      const mergedDuration = Math.max(speech.durationMs, offsetMs + duration);
+      // Re-activate the same envelope clock. This also works when the previous chunk already
+      // entered its release window: the new chunk appends to the clock instead of resetting it.
+      state.speech = { ...speech, levels: merged, durationMs: mergedDuration };
+      state.speechContinuity = null;
+      state.release = null;
+      mouth.continuations += 1;
+      recordEvent('avatar.mouth.continued', {
+        owner: who,
+        offsetMs,
+        appended: list.length,
+        frames: merged.length,
+        durationMs: mergedDuration,
+        startedAt: state.speech.startedAt,
+      });
+      return {
+        ok: true,
+        token: mouth.token,
+        sessionId: mouth.seq,
+        owner: who,
+        mode: 'envelope',
+        startedAt: state.speech.startedAt,
+        durationMs: mergedDuration,
+        frames: merged.length,
+        continued: true,
+        appended: list.length,
+      };
+    }
+    const seat = acquireMouth(who, { takeover });
+    if (seat.ok !== true) return seat;
+    const currentMouth = state.mouth;
+    currentMouth.live = false;
+    state.speech = {
+      token: currentMouth.token,
+      turnId: state.turnId,
+      levels: list,
+      stepMs: step,
+      startedAt: start,
+      durationMs: duration,
+    };
     state.release = null;
-    return { ...seat, mode: 'envelope', startedAt: start, durationMs: duration, frames: list.length };
+    return {
+      ...seat, mode: 'envelope', startedAt: start, durationMs: duration, frames: list.length,
+    };
   }
 
   /**
@@ -6515,6 +6607,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         busy: state.mouth.busy,
         takeovers: state.mouth.takeovers,
         ended: state.mouth.ended,
+        continuations: state.mouth.continuations,
       },
       idleActions: {
         intervalMs: finite(cfg.idleActionIntervalMs, DEFAULT_CONFIG.idleActionIntervalMs),

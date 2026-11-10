@@ -4419,7 +4419,9 @@ export function apply(ctx, config) {
       config: {
         // 30 Hz compute; the facade coalesces transport writes at 100 ms (vts.js MIN_GAP_MS).
         autoTickMs: Number(config?.avatarTickMs ?? 33),
-        flushIntervalMs: 100,
+        // <=66 ms leaves room for the default 15 Hz send (1000/15 = 66.67 ms); the mouth still
+        // coalesces at this cadence, while the pose keeps being computed every 33 ms tick.
+        flushIntervalMs: 60,
         idleActions: avatarIdleActions,
         // Inherit the module defaults unless the user really set a value: re-declaring the old
         // numbers here silently pinned them, so a future module default never reached the host.
@@ -4430,17 +4432,25 @@ export function apply(ctx, config) {
         idleParams: null,
         ...(config?.avatarIdleParamGain == null ? {} : { idleParamGain: Number(config.avatarIdleParamGain) }),
         ...(config?.avatarIdleSwayScale == null ? {} : { idleSwayScale: Number(config.avatarIdleSwayScale) }),
-        // Idle write tuning keeps the module's 4 Hz / ±5.4° / 0.03-per-frame contract unless set.
+        // Idle write tuning keeps the module's 15 Hz / ±18° / 0.12-per-frame contract unless set.
         ...(config?.avatarIdleWriteHz == null ? {} : { idleWriteHz: Number(config.avatarIdleWriteHz) }),
         ...(config?.avatarIdleAmplitude == null ? {} : { idleAmplitude: Number(config.avatarIdleAmplitude) }),
         ...(config?.avatarIdleMaxStep == null ? {} : { idleMaxStep: Number(config.avatarIdleMaxStep) }),
+        /**
+         * The pump's send cadence is independent of its 30 Hz COMPUTE rate. Default 15 Hz, and an
+         * explicit `avatarMotionOutputHz` (or the shared `avatarIdleWriteHz`) may raise it to the
+         * runtime ceiling of 30 Hz. The runtime clamps it; the host never sends above compute.
+         */
+        ...(config?.avatarMotionOutputHz == null && config?.avatarIdleWriteHz == null
+          ? {}
+          : { motionOutputHz: Number(config.avatarMotionOutputHz ?? config.avatarIdleWriteHz) }),
         // Explicit blink ownership (`settings.avatar.blinkOwner`, default vts). The runtime keeps
         // this as a REQUEST: idleEye only becomes effective after both eye inputs are verified, so
         // an absent/unverified mapping falls back to VTS instead of writing an eye row.
         blinkOwner: storedAvatarBlinkOwner(),
         idleEye: storedAvatarBlinkOwner() === 'plugin',
-        // Stage 1 is the default writer: the single-slot 30 Hz controller. Only an explicit
-        // `avatarMotionWrites:false` opts back into the legacy 4 Hz idle contract.
+        // Stage 1 is the default writer: the single-slot 30 Hz-compute / 15 Hz-send controller.
+        // Only an explicit `avatarMotionWrites:false` opts back into the legacy idle contract.
         motionWrites: config?.avatarMotionWrites !== false,
         // 预设决策的只读诊断事件（默认开，仅本地诊断）；false 时零事件，status 投影照常更新。
         presetDebugEvents: config?.presetDebugEvents !== false,
@@ -4876,16 +4886,24 @@ export function apply(ctx, config) {
       /** 'param' = continuous frames; 'hotkey' is only a discrete fallback, never the engine. */
       idleSource: snap.idleSource ?? 'none',
       /**
-       * Continuous output: whether the opt-in 30 Hz pump is on, its output generation, the hard
-       * gate (component/disconnect/model) and the attention actually published.
+       * Continuous output: whether the default 15 Hz-send / 30 Hz-compute pump is on, its output
+       * generation, the hard gate (component/disconnect/model) and the attention actually published.
        */
       motion: {
         writes: snap.motion?.writes === true,
-        /** 'controller' = unified 30 Hz writer; 'legacy' = the explicit 4 Hz opt-out. */
+        /** 'controller' = unified 30 Hz-compute / 15 Hz-send writer; 'legacy' = explicit opt-out. */
         source: snap.motion?.writes === true ? 'controller' : 'legacy',
         epoch: snap.motion?.epoch ?? 0,
         locked: snap.motion?.locked === true,
         lockReason: snap.motion?.lockReason ?? '',
+        /** Configured send rate (15 default, <=30) and its MEASURED committed rate. */
+        outputHz: snap.motion?.outputHz ?? 0,
+        actualHz: snap.motion?.actualHz ?? 0,
+        sendDurationMs: snap.motion?.sendDurationMs ?? null,
+        sendDurationAvgMs: snap.motion?.sendDurationAvgMs ?? null,
+        lateFrames: snap.motion?.lateFrames ?? 0,
+        coalesced: snap.motion?.coalesced ?? 0,
+        sendPath: snap.motion?.send?.path ?? '',
         outputFrames: snap.motion?.outputFrames ?? 0,
         // Frames the unified posture controller computed (it ticks at 30 Hz on both paths).
         controllerFrames: inner.motion?.frames ?? 0,
@@ -4943,6 +4961,12 @@ export function apply(ctx, config) {
         maxStep: snap.idleParams?.maxStep ?? 0,
         lastFrameAt: snap.idleParams?.lastFrameAt ?? null,
         suppressedBySpeech: snap.idleParams?.suppressedBySpeech ?? 0,
+        /** Real committed send telemetry (same object as motion.send). */
+        actualHz: snap.idleParams?.actualHz ?? 0,
+        sendDurationMs: snap.idleParams?.sendDurationMs ?? null,
+        lateFrames: snap.idleParams?.lateFrames ?? 0,
+        coalesced: snap.idleParams?.coalesced ?? 0,
+        sendPath: snap.idleParams?.path ?? '',
         // A frame settling after a lock/disconnect/model switch belongs to the old generation.
         stale: snap.idleParams?.stale ?? 0,
         dropped: snap.idleParams?.dropped ?? 0,

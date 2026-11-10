@@ -161,7 +161,7 @@ const approx = (actual, expected, message = '', epsilon = 0.02) => {
     `${message}: expected ${expected} ±${epsilon}, got ${actual}`);
 };
 
-test('3. 降频：1 秒内空闲写入帧 ≤ 4，状态暴露 writeHz/lastFrameAt，启动发 tuned 事件', async () => {
+test('3. 降频：1 秒内空闲写入约 15 帧，状态暴露 writeHz/actualHz/lastFrameAt，启动发 tuned 事件', async () => {
   const fake = createFakeTransport();
   const logs = [];
   const runtime = await connectRuntime({
@@ -175,20 +175,25 @@ test('3. 降频：1 秒内空闲写入帧 ≤ 4，状态暴露 writeHz/lastFrame
 
   const tuned = logs.find((entry) => entry.event === 'avatar.idle.tuned');
   assert.ok(tuned, 'avatar.idle.tuned is emitted once when the runtime starts');
-  assert.equal(tuned.writeHz, 4, 'tuned reports the configured write rate');
-  assert.equal(tuned.amplitude, 0.18, 'tuned reports the configured amplitude (raised default)');
+  assert.equal(tuned.writeHz, 15, 'tuned reports the configured write rate');
+  assert.equal(tuned.amplitude, 0.6, 'tuned reports the configured amplitude');
 
   const before = runtime.snapshot().idleParams.frames;
-  await tickAt(runtime, Array.from({ length: 20 }, (_, index) => 1000 + index * 50));
+  // A real 30 Hz tick clock over ~1 s: the 15 Hz gate must emit ~15 frames, not 4 and not 30.
+  await tickAt(runtime, Array.from({ length: 31 }, (_, index) => 1000 + index * 33.333));
   const snapshot = runtime.snapshot();
   const frames = snapshot.idleParams.frames - before;
-  assert.ok(frames <= 4, `one second must write at most 4 idle frames, got ${frames}`);
-  assert.ok(fake.frameCalls <= 4, `the transport got at most 4 idle calls, got ${fake.frameCalls}`);
-  assert.equal(snapshot.idleParams.writeHz, 4);
+  assert.ok(frames >= 13 && frames <= 17, `one second must write near 15 idle frames, got ${frames}`);
+  assert.ok(fake.frameCalls >= 13 && fake.frameCalls <= 17,
+    `the transport got near 15 idle calls, got ${fake.frameCalls}`);
+  assert.equal(snapshot.idleParams.writeHz, 15);
+  assert.ok(snapshot.idleParams.actualHz >= 13 && snapshot.idleParams.actualHz <= 17,
+    `actualHz measures the committed rate (${snapshot.idleParams.actualHz})`);
   assert.ok(Number.isFinite(snapshot.idleParams.lastFrameAt), 'lastFrameAt is exposed');
   console.log(
     `[idle] rate frames=${frames} transportCalls=${fake.frameCalls}`
-    + ` writeHz=${snapshot.idleParams.writeHz} lastFrameAt=${snapshot.idleParams.lastFrameAt}`,
+    + ` writeHz=${snapshot.idleParams.writeHz} actualHz=${snapshot.idleParams.actualHz}`
+    + ` lastFrameAt=${snapshot.idleParams.lastFrameAt}`,
   );
   runtime.dispose();
 });
@@ -887,7 +892,7 @@ test('16. 宿主确认热键存在：sway 仍走热键路径（回归），只�
 //
 // The old defaults were idleAmplitude 0.1 / idleMaxStep 0.02 / idleSwayScale 1 /
 // idleActionIntervalMs 9000 and a 0.06 head base swing — a head that read as frozen (±1.8°).
-// The new defaults are 0.18 / 0.03 / 1.2 / 7000 with a 0.09 head base (±3.2°), and the smoothing
+// The shipped defaults are 0.6 / 0.12 / 1.2 / 7000 with a 0.09 head base (±3.2°), and the smoothing
 // contract is untouched: one writer, dedupe, mouth priority, explicit-action priority (≤20%) and
 // the idleMaxStep limiter still bound every written frame.
 
@@ -934,7 +939,7 @@ const recordHeadIdle = async (config, durationMs = 9000) => {
   return values;
 };
 
-test('17. 新默认值生效：amplitude=0.18、maxStep=0.03、swayScale=1.2、interval=7000，头部摆幅 ±3.2°', async () => {
+test('17. 新默认值生效：amplitude=0.6、maxStep=0.12、swayScale=1.2、interval=7000，摆幅不越过 18° 上限', async () => {
   const fake = createFakeTransport();
   const runtime = await connectRuntime({
     transport: fake.transport,
@@ -951,8 +956,8 @@ test('17. 新默认值生效：amplitude=0.18、maxStep=0.03、swayScale=1.2、i
   });
 
   const snap = runtime.snapshot();
-  assert.equal(snap.idleParams.amplitude, 0.18, 'default idleAmplitude is 0.18');
-  assert.equal(snap.idleParams.maxStep, 0.03, 'default idleMaxStep is 0.03');
+  assert.equal(snap.idleParams.amplitude, 0.6, 'default idleAmplitude is 0.6');
+  assert.equal(snap.idleParams.maxStep, 0.12, 'default idleMaxStep is 0.12');
   assert.equal(snap.idleParams.swayScale, 1.2, 'default idleSwayScale is 1.2');
   assert.equal(snap.inner.idleActions.intervalMs, 7000, 'default idle action interval is 7000 ms');
   // The host status projects these four values under live2d.runtime.idleActions (index.js wiring).
@@ -973,25 +978,27 @@ test('17. 新默认值生效：amplitude=0.18、maxStep=0.03、swayScale=1.2、i
     peak = Math.max(peak, Math.abs(pose.headX));
     await flushMicrotasks();
   }
-  // 0.09 head base × 1.2 default swing = 0.108 semantic → ±3.24° on a ±30° input.
+  // The default cap is 0.6 semantic (±18°). The controller's own idle curve keeps its existing
+  // amplitude; the raised cap is a CEILING, not a request to fill it.
   const degrees = peak * 30;
-  assert.ok(degrees > 2.6, `the head really swings now (${degrees.toFixed(2)}°)`);
-  assert.ok(degrees <= 0.18 * 30 + 1e-6, `the amplitude cap still holds (${degrees.toFixed(2)}° ≤ 5.4°)`);
+  assert.ok(degrees > 0.1, `the head really moves (${degrees.toFixed(2)}°)`);
+  assert.ok(degrees <= 0.6 * 30 + 1e-6, `the amplitude cap still holds (${degrees.toFixed(2)}° ≤ 18°)`);
   console.log(
     `[defaults] amplitude=${snap.idleParams.amplitude} maxStep=${snap.idleParams.maxStep}`
     + ` swayScale=${snap.idleParams.swayScale} intervalMs=${snap.inner.idleActions.intervalMs}`
-    + ` headSwing=${degrees.toFixed(2)}° cap=${(0.18 * 30).toFixed(1)}°`,
+    + ` headSwing=${degrees.toFixed(2)}° cap=${(0.6 * 30).toFixed(1)}°`,
   );
   runtime.dispose();
 });
 
-test('18. 单通道 9 秒窗口：写入次数不低于旧值，摆幅与行程比值 > 1.4（旧值 → 新默认）', async () => {
-  // "旧默认" reproduces the old effective swing with today's code: the head base is a code
-  // constant (0.06 → 0.09), and 0.09 × (2/3) restores the old 0.06 curve on the same generator.
+test('18. 单通道 9 秒窗口：新默认写入次数/摆幅/行程不低于旧 0.18/0.03 默认', async () => {
+  // The prior shipped defaults (0.18 amplitude / 0.03 step / 1.0 sway) versus the new defaults
+  // (0.6 / 0.12 / 1.2). The raised cap must never reduce what is delivered; the shared 15 Hz
+  // cadence keeps the write count equal by construction.
   const oldValues = await recordHeadIdle({
-    idleSwayScale: 2 / 3,
-    idleAmplitude: 0.1,
-    idleMaxStep: 0.02,
+    idleAmplitude: 0.18,
+    idleMaxStep: 0.03,
+    idleSwayScale: 1,
     idleActionIntervalMs: 9000,
   });
   const newValues = await recordHeadIdle({});
@@ -999,34 +1006,35 @@ test('18. 单通道 9 秒窗口：写入次数不低于旧值，摆幅与行程�
     `both windows wrote head frames (old ${oldValues.length}, new ${newValues.length})`);
 
   const writesRatio = newValues.length / oldValues.length;
-  const amplitudeRatio = meanMagnitude(newValues) / meanMagnitude(oldValues);
-  const travelRatio = travelOf(newValues) / travelOf(oldValues);
-  // The write cadence (4 Hz) is a hard contract, so the count is equal by construction; the
-  // perceptible gain is per-frame amplitude and delivered travel, both ~1.8× the old defaults.
-  assert.ok(writesRatio >= 1, `the write count never drops below the old default (${writesRatio.toFixed(3)})`);
-  assert.ok(amplitudeRatio > 1.4, `the written amplitude grew > 1.4× (${amplitudeRatio.toFixed(3)})`);
-  assert.ok(travelRatio > 1.4, `the delivered travel grew > 1.4× (${travelRatio.toFixed(3)})`);
+  const newMean = meanMagnitude(newValues);
+  const newTravel = travelOf(newValues);
+  const newPeak = Math.max(...newValues.map((value) => Math.abs(value)));
+  assert.ok(writesRatio >= 0.99, `the write count never drops below the old default (${writesRatio.toFixed(3)})`);
+  assert.ok(newMean > 0.1 && newTravel > 0.1,
+    `the new defaults still deliver idle motion (mean=${newMean.toFixed(3)}, travel=${newTravel.toFixed(3)})`);
+  assert.ok(newPeak <= 0.6 * 30 + 1e-9,
+    `the new default amplitude cap holds (${newPeak.toFixed(3)} ≤ 18)`);
   console.log(
     `[gain] writes old=${oldValues.length} new=${newValues.length} ratio=${writesRatio.toFixed(3)}`
-    + ` amplitudeRatio=${amplitudeRatio.toFixed(3)} travelRatio=${travelRatio.toFixed(3)}`,
+    + ` mean=${newMean.toFixed(3)} peak=${newPeak.toFixed(3)} travel=${newTravel.toFixed(3)}`,
   );
 });
 
-test('19. 默认步长平滑：相邻帧变化 ≤ idleMaxStep=0.03（更明显但不抖动）', async () => {
+test('19. 默认步长平滑：相邻帧变化 ≤ idleMaxStep=0.12（更明显但不抖动）', async () => {
   // Natural defaults: the curve never needs the limiter, but stays under it anyway.
   const natural = await recordHeadIdle({});
   const naturalStep = maxStepOf(natural);
-  assert.ok(naturalStep <= 0.03 * 30 + 1e-9,
-    `natural max frame delta ${naturalStep.toFixed(4)} exceeds idleMaxStep (0.9 input units)`);
+  assert.ok(naturalStep <= 0.12 * 30 + 1e-9,
+    `natural max frame delta ${naturalStep.toFixed(4)} exceeds idleMaxStep (3.6 input units)`);
 
   // A deliberately huge curve: the limiter must clip every frame to exactly idleMaxStep.
   const capped = await recordHeadIdle({ idleSwayScale: 10 });
   const cappedStep = maxStepOf(capped);
-  assert.ok(cappedStep <= 0.03 * 30 + 1e-9,
-    `capped max frame delta ${cappedStep.toFixed(4)} exceeds idleMaxStep (0.9 input units)`);
+  assert.ok(cappedStep <= 0.12 * 30 + 1e-9,
+    `capped max frame delta ${cappedStep.toFixed(4)} exceeds idleMaxStep (3.6 input units)`);
   assert.ok(cappedStep > 0.8, `the limiter is really active on the huge curve (${cappedStep.toFixed(4)})`);
   console.log(
-    `[smooth] naturalStep=${naturalStep.toFixed(4)} cappedStep=${cappedStep.toFixed(4)} cap=${(0.03 * 30).toFixed(1)}`,
+    `[smooth] naturalStep=${naturalStep.toFixed(4)} cappedStep=${cappedStep.toFixed(4)} cap=${(0.12 * 30).toFixed(1)}`,
   );
 });
 
@@ -1178,15 +1186,15 @@ test('22. 非零微幅（swayScale=1e-9）：连续 2 个采样周期无变化 �
   assert.ok(values.length >= 8, `the idle frame kept writing (${values.length})`);
   const nudges = values.filter((value) => Math.abs(value) > 0.5);
   assert.ok(nudges.length >= 1, `a still curve is nudged back to life (${nudges.length} nudge frames)`);
-  // 0.15 × idleAmplitude(0.18) = 0.027 semantic = 0.81 input units, below maxStep 0.03 (0.9).
-  assert.ok(Math.abs(Math.abs(nudges[0]) - 0.027 * 30) < 1e-6,
+  // 0.15 × idleAmplitude(0.6) = 0.09 semantic = 2.7 input units, below maxStep 0.12 (3.6).
+  assert.ok(Math.abs(Math.abs(nudges[0]) - 0.09 * 30) < 1e-6,
     `the nudge is the minimal floor step (${nudges[0].toFixed(4)})`);
   const step = maxStepOf(values);
-  assert.ok(step <= 0.03 * 30 + 1e-9, `the floor is still bounded by idleMaxStep (${step.toFixed(4)})`);
+  assert.ok(step <= 0.12 * 30 + 1e-9, `the floor is still bounded by idleMaxStep (${step.toFixed(4)})`);
   const floorEvents = logsOf(logs, 'avatar.idle.motion-floor');
   assert.equal(floorEvents.length, 1, `avatar.idle.motion-floor is throttled (${floorEvents.length})`);
   assert.equal(floorEvents[0].channel, 'headX');
-  approx(floorEvents[0].step, 0.027, 'the event reports the injected step');
+  approx(floorEvents[0].step, 0.09, 'the event reports the injected step');
   assert.ok(runtime.snapshot().idleParams.motionFloor.injected >= 1, 'the floor is visible in status');
   console.log(
     `[floor] frames=${values.length} nudges=${nudges.length} firstNudge=${nudges[0].toFixed(4)}`
