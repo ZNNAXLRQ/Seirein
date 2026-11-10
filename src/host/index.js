@@ -9272,6 +9272,8 @@ export function apply(ctx, config) {
     get emitMemoryNormalize() { return emitMemoryNormalize; },
     get ensureAvatarRuntime() { return ensureAvatarRuntime; },
     get ensureAvatarRuntimeConnected() { return ensureAvatarRuntimeConnected; },
+    get avatarRuntimeStatus() { return avatarRuntimeStatus; },
+    get avatarCapabilitiesStatus() { return avatarCapabilitiesStatus; },
     get enterCallMode() { return enterCallMode; },
     get exitCallMode() { return exitCallMode; },
     get features() { return features; },
@@ -20518,7 +20520,7 @@ export function apply(ctx, config) {
   register({
     name: 'assistant_live2d',
     description:
-      'Control VTube Studio: connect, list hotkeys/expressions, trigger an animation or expression, move the model, set the mouth parameter, or perform one persona-styled gesture (nod / lookAtUser / tilt / surprise). Use it when the user asks the avatar to react.',
+      'Control VTube Studio: connect, list hotkeys/expressions, trigger an animation or expression, move the model, set the mouth parameter, or perform one persona-styled gesture (nod / lookAtUser / tilt / surprise). Use it when the user asks the avatar to react. Start with action=status to read whether the motion controller is running, which channels are verified/written, which remain with VTS, and the last error; ordinary conversation should not trigger a gesture every turn（先读控制器与映射证据，普通对话不要逐次触发动作）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -20544,6 +20546,27 @@ export function apply(ctx, config) {
           model: { type: 'string' },
           hotkeys: { type: 'array', items: { type: 'string' } },
           expressions: { type: 'array', items: { type: 'string' } },
+          controller: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              running: { type: 'boolean' },
+              locked: { type: 'boolean' },
+              source: { type: 'string' },
+              lockReason: { type: 'string' },
+            },
+          },
+          channels: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              controlled: { type: 'array', items: { type: 'string' } },
+              skipped: { type: 'array', items: { type: 'string' } },
+              unverified: { type: 'array', items: { type: 'string' } },
+              vtsOwned: { type: 'array', items: { type: 'string' } },
+            },
+          },
+          lastError: { type: 'string' },
           error: { type: 'string' },
           mouth: { type: 'number' },
           acknowledged: { type: 'boolean' },

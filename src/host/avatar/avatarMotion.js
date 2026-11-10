@@ -39,6 +39,16 @@ export const CHANNEL_ORDER = [
   'browR',
   'mouth',
   'bodyX',
+  'bodyY',
+  'bodyZ',
+  // Arms/shoulders/hands are part of the generic body catalog, but their Live2D target parameter
+  // names are model-specific: they stay name-matched candidates and are never auto-verified below.
+  'shoulderL',
+  'shoulderR',
+  'armL',
+  'armR',
+  'handL',
+  'handR',
   'breath',
 ];
 
@@ -76,6 +86,18 @@ export const PARAMETER_CANDIDATES = {
   browR: ['BrowRightY', 'BrowRY', 'BrowRight'],
   mouth: ['MouthOpen', 'MouthOpenY', 'VoiceVolume'],
   bodyX: ['BodyAngleX', 'BodyX'],
+  bodyY: ['BodyAngleY', 'BodyY'],
+  bodyZ: ['BodyAngleZ', 'BodyZ'],
+  // Only the exact shoulder spellings are candidates. ArmLeft/ArmRight deliberately stay on the
+  // arm channels: treating an arm input as a shoulder input would "discover" a shoulder the model
+  // may not have. No target rule exists for shoulder in this stage, so a hit stays a candidate.
+  shoulderL: ['ShoulderLeft'],
+  shoulderR: ['ShoulderRight'],
+  // Exact, case-insensitive candidate names only — no prefix/similarity matching.
+  armL: ['ArmLeft', 'ArmLAngle', 'ArmLeftAngle'],
+  armR: ['ArmRight', 'ArmRAngle', 'ArmRightAngle'],
+  handL: ['HandLeft', 'HandLAngle', 'HandLeftAngle'],
+  handR: ['HandRight', 'HandRAngle', 'HandRightAngle'],
   breath: ['Breath', 'BreathParam'],
 };
 
@@ -96,6 +118,11 @@ export const MODEL_TARGET_RULES = {
   browR: { input: 'BrowRightY', target: 'ParamBrowRY' },
   mouth: { input: 'MouthOpen', target: 'ParamMouthOpenY' },
   bodyX: { input: 'BodyAngleX', target: 'ParamBodyAngleX' },
+  bodyY: { input: 'BodyAngleY', target: 'ParamBodyAngleY' },
+  bodyZ: { input: 'BodyAngleZ', target: 'ParamBodyAngleZ' },
+  // No shoulder/arm/hand rule on purpose: their model parameter names are not standard enough to
+  // treat a name match as proof. They remain injectable candidates (`verified:false`) until a
+  // runtime probe or an explicit mapping supplies real evidence.
   breath: { input: 'Breath', target: 'ParamBreath' },
 };
 
@@ -108,6 +135,10 @@ export const MODEL_TARGET_RULES = {
 export const MODEL_TARGET_RULE_ALIASES = {
   gazeX: [{ input: 'EyeBallX', target: 'ParamEyeBallX' }],
   gazeY: [{ input: 'EyeBallY', target: 'ParamEyeBallY' }],
+  // BodyY/BodyZ are the short spellings of the same body-channel inputs and the same model targets;
+  // bodyX keeps its previous behaviour (no BodyX alias), as pinned by the existing tests.
+  bodyY: [{ input: 'BodyY', target: 'ParamBodyAngleY' }],
+  bodyZ: [{ input: 'BodyZ', target: 'ParamBodyAngleZ' }],
 };
 
 const normalizeName = (name) => String(name ?? '').trim().toLowerCase();

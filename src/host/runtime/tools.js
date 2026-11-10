@@ -908,11 +908,35 @@ export function createHostTools(deps) {
     async executeLive2d(args) {
       const {
         ensureAvatarRuntime, ensureAvatarRuntimeConnected, features, log, vtsClient, vtsConnect,
+        avatarRuntimeStatus, avatarCapabilitiesStatus,
       } = deps;
       if (!features.enabled('avatar')) {
         return { ok: false, connected: false, error: '形象组件已关闭' };
       }
       const client = vtsClient();
+      /** Read-only controller/mapping evidence for `status`; never creates or connects a runtime. */
+      const live2dEvidence = () => {
+        const runtime = typeof avatarRuntimeStatus === 'function' ? avatarRuntimeStatus() : null;
+        const capability = typeof avatarCapabilitiesStatus === 'function' ? avatarCapabilitiesStatus() : null;
+        const source = runtime?.motion?.source ?? 'none';
+        return {
+          controller: {
+            running: runtime !== null && runtime.connected === true
+              && runtime.disposed !== true && source === 'controller',
+            locked: runtime?.motion?.locked === true,
+            source,
+            lockReason: runtime?.motion?.lockReason ?? '',
+          },
+          channels: {
+            controlled: runtime?.channels?.controlled ?? [],
+            skipped: runtime?.channels?.skipped ?? [],
+            unverified: runtime?.channels?.unverified ?? [],
+            // Unmapped capability channels stay with VTS: discovery has no injectable input for them.
+            vtsOwned: capability?.unmapped ?? [],
+          },
+          lastError: String(runtime?.lastError || capability?.error || client?.lastError || ''),
+        };
+      };
       try {
         if (args.action === 'status') {
           return {
@@ -921,6 +945,7 @@ export function createHostTools(deps) {
             model: client.model?.modelName ?? '',
             hotkeys: client.hotkeys.map((entry) => entry.name),
             expressions: client.expressions.map((entry) => entry.name),
+            ...live2dEvidence(),
             error: '',
           };
         }

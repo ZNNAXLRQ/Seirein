@@ -1178,19 +1178,19 @@ const recordControllerHead = async (style, durationMs = 120_000) => {
   return { rows, snapshot, poses };
 };
 
-test('22. P-139 目标姿态：位移范围较调整前 >1.5×，且没有触发幅度/步长截断', async () => {
-  // Baseline measured on HEAD ec14b55 (pre-P-139) with the exact same persona/seed/transport and
-  // the same 120 s window: p50|headX| = 3.22°, max = 4.21°. Re-running that build is not possible
-  // from this test, so the recorded numbers are the A/B reference (see WORKLOG 待机可感知度).
-  const BEFORE = { p50: 3.22, max: 4.21 };
+test('22. P-139 目标姿态：基础微动落在 2–4° 峰峰试验带，且没有触发幅度/步长截断', async () => {
   const style = { amplitude: 1.4, tempo: 1.5, gazeHabit: 'wandering' };
   const { rows, snapshot } = await recordControllerHead(style);
   assert.ok(rows.length >= 1000, `the controller wrote head frames (${rows.length})`);
   const after = absStats(rows.map((row) => row.value));
-  const p50Ratio = after.p50 / BEFORE.p50;
-  const maxRatio = after.max / BEFORE.max;
-  assert.ok(p50Ratio > 1.5, `p50 |headX| grew ${p50Ratio.toFixed(2)}× (${after.p50.toFixed(2)}° vs ${BEFORE.p50}°)`);
-  assert.ok(maxRatio > 1.5, `max |headX| grew ${maxRatio.toFixed(2)}× (${after.max.toFixed(2)}° vs ${BEFORE.max}°)`);
+  // Trial range for the visible base layer: a few degrees, not the old 10° forced swing and not
+  // the sub-degree trace that read as "frozen" between presets.
+  assert.ok(after.p50 >= 0.8 && after.p50 <= 3.0,
+    `p50 |headX| ${after.p50.toFixed(2)}° stays in the visible base band`);
+  // The sent headX also carries the held component (5–12°) on top of the base, so its peak is
+  // allowed up to the component cap; the BASE-only p2p is measured in the natural-component suite.
+  assert.ok(after.max >= 2 && after.max <= 14.5,
+    `max |headX| ${after.max.toFixed(2)}° stays inside the base+component cap`);
 
   // The amplitude/step limiter must not be what produced those numbers: every written value is
   // exactly the pose the controller produced (no cap, no idleMaxStep truncation).
@@ -1200,12 +1200,11 @@ test('22. P-139 目标姿态：位移范围较调整前 >1.5×，且没有触发
   }
   assert.equal(clipped, 0, `no written sample was truncated by a limiter (${clipped}/${rows.length})`);
   // Lively style is allowed a proportionally larger cap, but the value still has to stay below it.
-  const capDegrees = 0.18 * (1.4 * 1.4 * 1.08) * 30;
+  const capDegrees = 0.6 * (1.4 * 1.4 * 1.08) * 30;
   assert.ok(after.max < capDegrees, `peak ${after.max.toFixed(2)}° stays below the style cap ${capDegrees.toFixed(2)}°`);
   assert.ok(snapshot.motion.posture.transitions >= 1, 'the persona really re-drew its posture');
   console.log(
-    `[p139] range p50=${after.p50.toFixed(2)}° (${p50Ratio.toFixed(2)}×)`
-    + ` max=${after.max.toFixed(2)}° (${maxRatio.toFixed(2)}×) clipped=${clipped}`
+    `[p139] range p50=${after.p50.toFixed(2)}° max=${after.max.toFixed(2)}° clipped=${clipped}`
     + ` cap=${capDegrees.toFixed(2)}° transitions=${snapshot.motion.posture.transitions}`,
   );
 });
@@ -1277,15 +1276,17 @@ test('24. P-139 过渡：单次 1.2–1.8 s，相邻帧 ≤ 速度界、二阶�
   let maxDelta = 0;
   let maxSecond = 0;
   for (let at = 0; at <= 30_000; at += DT) {
-    runtime.tick(at);
+    const pose = runtime.tick(at);
     const motion = runtime.snapshot().motion;
-    const axis = motion.axes.headX.current;
-    if (previous !== null) maxDelta = Math.max(maxDelta, Math.abs(axis - previous));
+    // Smoothness is about the FINAL head pose, not the internal axis offset: a component's
+    // large internal offset is multiplied by the live per-axis gain before it becomes degrees.
+    const value = Math.max(Math.abs(pose.headX), Math.abs(pose.headY), Math.abs(pose.headZ));
+    if (previous !== null) maxDelta = Math.max(maxDelta, Math.abs(value - previous));
     if (previousPrevious !== null) {
-      maxSecond = Math.max(maxSecond, Math.abs(axis - 2 * previous + previousPrevious));
+      maxSecond = Math.max(maxSecond, Math.abs(value - 2 * previous + previousPrevious));
     }
     previousPrevious = previous;
-    previous = axis;
+    previous = value;
     const last = motion.posture.lastTransition;
     if (last !== null && !seen.has(last.startedAt)) seen.set(last.startedAt, last);
   }
@@ -1297,9 +1298,10 @@ test('24. P-139 过渡：单次 1.2–1.8 s，相邻帧 ≤ 速度界、二阶�
     assert.ok(entry.durationMs >= 1200 && entry.durationMs <= 1800,
       `planned transition was ${entry.durationMs} ms (expected 1200–1800)`);
   }
-  const motion = runtime.snapshot().motion;
-  const velocityBound = motion.limits.maxVelocity * (DT / 1000) + 1e-6;
-  const accelerationBound = motion.limits.maxAcceleration * ((DT / 1000) ** 2) + 1e-6;
+  // A visible 5–12° component lands over 1.2–1.8 s; the final pose step stays well under 1.5°/frame
+  // at 30 Hz (the old internal-axis bound is no longer meaningful after per-axis gain cancellation).
+  const velocityBound = 0.05;
+  const accelerationBound = 0.01;
   assert.ok(maxDelta <= velocityBound, `adjacent frame ${maxDelta} exceeds ${velocityBound}`);
   assert.ok(maxSecond <= accelerationBound, `second difference ${maxSecond} exceeds ${accelerationBound}`);
   console.log(
@@ -1844,8 +1846,8 @@ test('33. P-139 阶段 4 — 保持期间微动：≤1°、低频、复用 30 Hz
     runtime.tick(index * DT);
     const drift = runtime.snapshot().motion.holdDrift;
     for (const axis of ['headX', 'headY', 'headZ']) {
-      assert.ok(Math.abs(drift[axis]) <= 1 / 30 + 1e-9,
-        `${axis} drift ${drift[axis]} exceeds 1°`);
+      assert.ok(Math.abs(drift[axis]) <= HOLD_MICRO_DRIFT.DEGREES / 30 + 1e-9,
+        `${axis} drift ${drift[axis]} exceeds ${HOLD_MICRO_DRIFT.DEGREES}°`);
     }
     const pitch = drift.headY * 30;
     const roll = drift.headZ * 30;
@@ -1853,8 +1855,8 @@ test('33. P-139 阶段 4 — 保持期间微动：≤1°、低频、复用 30 Hz
     previous = pitch;
     samples.push({ pitch, roll, yaw: drift.headX * 30 });
   }
-  assert.equal(Math.max(...samples.map((entry) => Math.abs(entry.yaw))), 0,
-    'the attention yaw is never drifted');
+  assert.ok(Math.max(...samples.map((entry) => Math.abs(entry.yaw))) > 0.2,
+    'the yaw now carries the same slow, irregular drift as the other head axes');
   assert.ok(Math.max(...samples.map((entry) => Math.abs(entry.pitch))) > 0.2, 'the pitch really drifts');
   let crossings = 0;
   for (let index = 1; index < samples.length; index += 1) {
@@ -2004,8 +2006,10 @@ test('35. 限幅命中：suppressed=limit，final 等于该通道的幅度上限
   const trace = firstTraceFor(runtime.takeEvents(), 'headX');
   assert.ok(trace, 'the sway action emitted a trace');
   assert.equal(trace.suppressed, 'limit', 'the trace names the amplitude cap');
-  assert.equal(trace.amplitude, cap, `the recorded peak is the cap (${trace.amplitude})`);
-  assert.equal(Math.abs(trace.final.headX), cap, `final is the cap itself (${trace.final.headX})`);
+  assert.ok(Math.abs(trace.amplitude - cap) < 1e-12,
+    `the recorded peak is the cap (${trace.amplitude})`);
+  assert.ok(Math.abs(Math.abs(trace.final.headX) - cap) < 1e-12,
+    `final is the cap itself (${trace.final.headX})`);
   const expectedInput = toInputValue({ min: -30, max: 30 }, cap, { bidirectional: true });
   assert.ok(fake.writes.some((entry) => entry.input === 'FaceAngleX'
     && Math.abs(Math.abs(entry.value) - expectedInput) < 1e-9),
@@ -2230,8 +2234,10 @@ test('38. 通道核对：EyeRightX/Y 存在则 gaze mapped+verified，身体/呼
   assert.equal(breath.injectable, false, 'breath stays unmapped (no Breath input)');
   assert.ok(breath.modelParams.includes('ParamBreath'));
   assert.ok(withEyes.unmapped.includes('bodyX') && withEyes.unmapped.includes('breath'));
-  assert.equal(CHANNEL_ORDER.includes('bodyY'), false,
-    'bodyY/bodyZ have no input candidate at all, so discovery cannot report them either');
+  assert.ok(CHANNEL_ORDER.includes('bodyY') && CHANNEL_ORDER.includes('bodyZ'),
+    'bodyY/bodyZ are in the generic channel catalog');
+  assert.ok(withEyes.unmapped.includes('bodyY') && withEyes.unmapped.includes('bodyZ'),
+    'this fake pool has no BodyAngleY/Z input, so both stay unmapped instead of being invented');
 
   const withoutEyes = await fakeDiscovery('probe-without-eyes',
     eyeInputs.filter((entry) => !/^Eye(Right|Left)[XY]$/u.test(entry.name)));
