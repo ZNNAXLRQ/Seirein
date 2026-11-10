@@ -40,6 +40,8 @@ export const EVIDENCE_WINDOW_DEFAULTS = Object.freeze({
 const KINDS = new Set(['shot', 'storyboard', 'frame']);
 /** 故事板一张图内部最多保留这么多个逐帧采集时刻（管道单张上限 40，这里再兜一层底）。 */
 const MAX_FRAME_TIMES = 32;
+/** 一张证据最多引用这么多个独立原帧；与采集层单张故事板的帧数上限一致。 */
+const MAX_CELLS = 40;
 /** 单条证据允许覆盖的最长时间范围；异常 from/to 不得把区间撑成整场会话。 */
 const MAX_EVIDENCE_SPAN_MS = 120_000;
 /** shotId 只接受单段机器标识，避免路径/正文进入证据记录。 */
@@ -60,6 +62,52 @@ function normalizeShotId(value) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   return SHOT_ID_PATTERN.test(text) ? text : null;
+}
+
+/** 原帧身份与 shotId 同一套机器标识约束：不接受路径/正文/空白。 */
+function normalizeFrameId(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return SHOT_ID_PATTERN.test(text) ? text : null;
+}
+
+/**
+ * 原帧引用（cell）：只保存“哪一帧、什么时候、多大、多少字节”和宿主内部文件引用。
+ *
+ * `file` 是内部字段，只用于宿主复制/清理；`state()` 与模型可见输出都不投影它。时间与故事板
+ * 的真实范围对齐，frameId 去重并限长，避免一张畸形 sheet 把证据窗口撑大。
+ * @param {unknown} value
+ * @param {{startedAt: number, endedAt: number}} range
+ * @returns {object[]}
+ */
+function normalizeCells(value, { startedAt, endedAt }) {
+  if (!Array.isArray(value)) return [];
+  const cells = [];
+  const seen = new Set();
+  for (const input of value) {
+    if (input === null || typeof input !== 'object') continue;
+    const frameId = normalizeFrameId(input.frameId ?? input.id);
+    if (frameId === null || seen.has(frameId)) continue;
+    const capturedAt = positive(input.capturedAt ?? input.at);
+    if (capturedAt === null) continue;
+    const file = typeof input.file === 'string' ? input.file.trim() : '';
+    const bytes = nonNegative(input.bytes);
+    const width = nonNegative(input.width);
+    const height = nonNegative(input.height);
+    const shotId = normalizeShotId(input.shotId);
+    seen.add(frameId);
+    cells.push({
+      frameId,
+      capturedAt: Math.min(endedAt, Math.max(startedAt, capturedAt)),
+      width: width ?? 0,
+      height: height ?? 0,
+      bytes: bytes ?? 0,
+      ...(file.length === 0 ? {} : { file }),
+      ...(shotId === null ? {} : { shotId }),
+    });
+    if (cells.length >= MAX_CELLS) break;
+  }
+  return cells;
 }
 
 /**
@@ -124,6 +172,7 @@ export function normalizeEvidenceFrame(input, { now = Date.now } = {}) {
   if (endedAt < startedAt) endedAt = startedAt;
   const shotId = normalizeShotId(input.shotId);
   const frameTimes = normalizeFrameTimes(input.frameTimes, startedAt, endedAt);
+  const cells = normalizeCells(input.cells, { startedAt, endedAt });
   return {
     ok: true,
     frame: {
@@ -144,6 +193,8 @@ export function normalizeEvidenceFrame(input, { now = Date.now } = {}) {
       future,
       ...(shotId === null ? {} : { shotId }),
       ...(frameTimes.length === 0 ? {} : { frameTimes }),
+      // 原帧引用：一张故事板 → 多个独立原帧。没有 cells 的旧证据保持原形状。
+      ...(cells.length === 0 ? {} : { cells }),
     },
   };
 }
@@ -211,6 +262,16 @@ export function createEvidenceWindow({
       /* 文件删除由宿主负责，失败只记在宿主侧 */
     }
   };
+
+  /**
+   * 返回给调用方的记录副本。`cells`/`frameTimes` 是数组，必须一并复制，否则调用方改一个
+   * 返回值就能污染窗口内部状态（包括原帧文件引用）。
+   */
+  const copyEntry = (entry) => ({
+    ...entry,
+    ...(Array.isArray(entry.cells) ? { cells: entry.cells.map((cell) => ({ ...cell })) } : {}),
+    ...(Array.isArray(entry.frameTimes) ? { frameTimes: [...entry.frameTimes] } : {}),
+  });
 
   /** 某帧是否被任一活跃锁覆盖（来源/代次一致才算）。按可见范围相交判断，不压成采集点。 */
   function pinnedBy(entry) {
@@ -381,14 +442,15 @@ export function createEvidenceWindow({
   }
 
   function clear(reason = 'clear') {
-    const current = clock();
-    const count = frames.length;
-    const bytes = frames.reduce((sum, entry) => sum + entry.bytes, 0);
+    const cleared = frames;
+    const count = cleared.length;
+    const bytes = cleared.reduce((sum, entry) => sum + entry.bytes, 0);
     frames = [];
     locks.clear();
     generation += 1;
     try {
-      onClear(reason);
+      // 第二个参数把被清掉的记录交给宿主：除了证据副本，原帧文件也要一起删除。
+      onClear(reason, cleared);
     } catch {
       /* 宿主清理失败不阻断窗口重置 */
     }
@@ -412,7 +474,7 @@ export function createEvidenceWindow({
         && startedAt <= end
         && (source === null || entry.source === source)
         && (sourceEpoch === null || entry.sourceEpoch === sourceEpoch);
-    }).map((entry) => ({ ...entry }));
+    }).map((entry) => copyEntry(entry));
   }
 
   /**
@@ -435,7 +497,7 @@ export function createEvidenceWindow({
       seen.add(id);
       const entry = index.get(id);
       if (entry === undefined) continue;
-      found.push({ ...entry });
+      found.push(copyEntry(entry));
       if (found.length >= 32) break;
     }
     return found;
@@ -447,7 +509,7 @@ export function createEvidenceWindow({
       const entry = frames[i];
       if (source !== null && entry.source !== source) continue;
       if (sourceEpoch !== null && entry.sourceEpoch !== sourceEpoch) continue;
-      return { ...entry };
+      return copyEntry(entry);
     }
     return null;
   }
@@ -475,7 +537,7 @@ export function createEvidenceWindow({
       if (lowerBound !== null && endedAt < lowerBound) continue;
       const ageMs = Math.max(0, current - endedAt);
       if (ageMs > limit) continue;
-      return { ...entry, baseline: true, ageMs };
+      return { ...copyEntry(entry), baseline: true, ageMs };
     }
     return null;
   }
@@ -579,6 +641,8 @@ export function createEvidenceWindow({
     return {
       generation,
       frames: frames.length,
+      // 只报原帧引用数量，不投影 frameId/file：状态里不出现任何路径。
+      cells: frames.reduce((sum, entry) => sum + (Array.isArray(entry.cells) ? entry.cells.length : 0), 0),
       bytes,
       pinnedFrames: pinned.length,
       pinnedBytes: pinned.reduce((sum, entry) => sum + entry.bytes, 0),

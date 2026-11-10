@@ -27,6 +27,7 @@ import {
   requestsDetailedSpoken,
   spokenVersionMetrics,
   spokenVersionTargetChars,
+  spokenVersionVerdict,
   SPOKEN_TARGET_MAX_RATIO,
   SPOKEN_TARGET_MIN_RATIO,
   SPOKEN_TOO_LONG_MIN_BODY,
@@ -47,6 +48,8 @@ test('1. a long body gets a soft 40–65% target; a 45% rewrite is in-target and
   assert.equal(metrics.targetMin, 80);
   assert.equal(metrics.targetMax, 130);
   assert.equal(metrics.inTarget, true);
+  assert.equal(metrics.shortened, true);
+  assert.equal(metrics.truncationSource, 'none');
   assert.equal(metrics.tooLong, false);
   assert.equal(metrics.reason, '');
   assert.deepEqual(spokenVersionTargetChars(200), {
@@ -78,14 +81,16 @@ test('2. a near-copy (181→170, the real turn-43 shape) triggers exactly one re
   const finalAttempt = evaluateSpokenVersion({ bodyText: body, spokenText: near, attempt: 2, maxAttempts: 2 });
   assert.equal(finalAttempt.retry, false, 'at most one retry');
   assert.equal(finalAttempt.tooLong, true);
-  assert.equal(finalAttempt.verdict, 'adopted-too-long');
+  assert.equal(finalAttempt.shortened, false);
+  assert.equal(finalAttempt.verdict, 'adopted-unchanged');
 
   const improved = evaluateSpokenVersion({
     bodyText: body, spokenText: '口'.repeat(110), attempt: 2, maxAttempts: 2,
   });
   assert.equal(improved.tooLong, false);
   assert.equal(improved.retry, false);
-  assert.equal(improved.verdict, 'adopted');
+  assert.equal(improved.shortened, true);
+  assert.equal(improved.verdict, 'adopted-shortened');
   assert.equal(improved.savedChars, 71);
 
   // The real turn-45 shape: 137→134 is only 3 chars shorter; it must not pass as clean.
@@ -102,12 +107,18 @@ test('2. a near-copy (181→170, the real turn-43 shape) triggers exactly one re
   );
 });
 
-test('3. an explicit detail / complete-enumeration request is exempt from target and gate', (t) => {
+test('3. an explicit detail / complete-enumeration request is exempt; negated detail is not', (t) => {
   assert.equal(requestsDetailedSpoken('把要点逐条完整列举'), true);
   assert.equal(requestsDetailedSpoken('详细说明一下'), true);
   assert.equal(requestsDetailedSpoken('全部列出来'), true);
+  assert.equal(requestsDetailedSpoken('不要省略，详细说'), true);
+  assert.equal(requestsDetailedSpoken('别省略，逐条列'), true);
   assert.equal(requestsDetailedSpoken('简单说说'), false);
   assert.equal(requestsDetailedSpoken('推荐哪个'), false);
+  assert.equal(requestsDetailedSpoken('不详细说，直接给结论'), false);
+  assert.equal(requestsDetailedSpoken('不用详细，短一点'), false);
+  assert.equal(requestsDetailedSpoken('不用说得太详细'), false);
+  assert.equal(requestsDetailedSpoken('不必太详细'), false);
 
   const metrics = spokenVersionMetrics({
     bodyText: '正'.repeat(343),
@@ -117,6 +128,7 @@ test('3. an explicit detail / complete-enumeration request is exempt from target
   assert.equal(metrics.ratio, 0.953);
   assert.equal(metrics.targetApplies, false);
   assert.equal(metrics.tooLong, false, 'a requested detailed version is allowed to stay long');
+  assert.equal(metrics.shortened, false, '327/343 is not a successful compression');
   assert.equal(metrics.reason, 'explicit-detail');
   const evaluation = evaluateSpokenVersion({
     bodyText: '正'.repeat(343), spokenText: '口'.repeat(327), explicitDetail: true,
@@ -124,7 +136,7 @@ test('3. an explicit detail / complete-enumeration request is exempt from target
   });
   assert.equal(evaluation.retry, false);
   assert.equal(evaluation.verdict, 'explicit-detail');
-  t.diagnostic(`detail ratio=${metrics.ratio} targetApplies=${metrics.targetApplies} tooLong=${metrics.tooLong}`);
+  t.diagnostic(`detail ratio=${metrics.ratio} targetApplies=${metrics.targetApplies} tooLong=${metrics.tooLong} negatedDetail=notExempt`);
 });
 
 test('4. recent-N ledger keeps only metrics and is readable for comparison', (t) => {
@@ -140,10 +152,12 @@ test('4. recent-N ledger keeps only metrics and is readable for comparison', (t)
       ratio: (80 + turn) / 200,
       savedChars: 120 - turn,
       truncated: turn === 5,
+      truncationSource: turn === 5 ? 'model' : 'none',
+      shortened: turn !== 5,
       tooLong: false,
       reason: '',
       retried: turn > 1,
-      verdict: 'adopted',
+      verdict: turn === 5 ? 'adopted-unchanged' : 'adopted-shortened',
       ms: turn * 10,
       at: 1_700_000_000_000 + turn,
     });
@@ -153,11 +167,14 @@ test('4. recent-N ledger keeps only metrics and is readable for comparison', (t)
   assert.deepEqual(recent.map((row) => row.turn), [3, 4, 5], 'oldest first, only the last N');
   const last = recent.at(-1);
   for (const field of [
-    'bodyChars', 'spokenChars', 'ratio', 'savedChars', 'truncated', 'tooLong', 'reason',
+    'bodyChars', 'spokenChars', 'ratio', 'savedChars', 'truncated', 'truncationSource',
+    'shortened', 'tooLong', 'reason',
   ]) {
     assert.equal(field in last, true, `recent row carries ${field}`);
   }
   assert.equal(last.truncated, true);
+  assert.equal(last.truncationSource, 'model');
+  assert.equal(last.shortened, false);
   assert.equal(last.savedChars, 115);
   assert.equal('bodyText' in last, false);
   assert.equal('spokenText' in last, false);
@@ -214,12 +231,28 @@ test('7. empty/short bodies and the truncated flag stay honest', (t) => {
   assert.equal(short.tooLong, false, 'the short-reply skip rule is unchanged');
   const truncated = spokenVersionMetrics({
     bodyText: '正'.repeat(200), spokenText: '口'.repeat(60), truncated: true,
+    truncationSource: 'model',
   });
   assert.equal(truncated.truncated, true);
+  assert.equal(truncated.truncationSource, 'model');
+  assert.equal(truncated.shortened, true);
+  const budgetCut = spokenVersionMetrics({
+    bodyText: '正'.repeat(200), spokenText: '口'.repeat(60), truncated: true,
+    truncationSource: 'budget',
+  });
+  assert.equal(budgetCut.truncationSource, 'budget', 'the playback budget is distinguishable');
+  const logOnly = spokenVersionMetrics({
+    bodyText: '正'.repeat(200), spokenText: '口'.repeat(60), truncated: false,
+    truncationSource: 'log',
+  });
+  assert.equal(logOnly.truncated, false);
+  assert.equal(logOnly.truncationSource, 'none', 'the 200-char log copy never truncates the version');
   const fallback = spokenVersionMetrics({
     bodyText: '正'.repeat(200), spokenText: '正'.repeat(200), source: 'full-fallback',
   });
   assert.equal(fallback.tooLong, false, 'a full fallback is not a "too-long adoption"');
+  assert.equal(fallback.shortened, false);
+  assert.equal(spokenVersionVerdict(fallback), 'fallback-full');
   assert.equal(SPOKEN_TOO_LONG_RATIO, 0.85);
-  t.diagnostic(`emptyRatio=${empty.ratio} shortTooLong=${short.tooLong} fallbackTooLong=${fallback.tooLong}`);
+  t.diagnostic(`emptyRatio=${empty.ratio} shortTooLong=${short.tooLong} fallbackVerdict=fallback-full truncation=model/budget/log`);
 });

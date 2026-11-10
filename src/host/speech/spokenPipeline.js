@@ -301,11 +301,23 @@ export const SPOKEN_VERSION_RECENT_LIMIT = 8;
 /**
  * Does the user explicitly ask for detail / a complete enumeration? Then the long-body soft target
  * and the too-long gate are both disabled: this round is allowed to stay close to the body.
+ *
+ * Bare "详细" is only a detail request when it is NOT negated. "不详细 / 不用详细 / 别详细" means
+ * the opposite (keep it short), while "不要省略" is a positive completeness request.
  */
 const DETAILED_REQUEST = /详细|完整(?:列举|列|说|讲|读)|逐条|一条一条|每一条|全部(?:列举|列出)|不要省略|别省略/u;
+/** A negated 详细: "不详细", "不太详细", "不用说得太详细", "别太详细". A comma stops the span, so
+ * "不要省略，详细说" stays a positive completeness request. */
+const NEGATED_DETAIL = /(?:不用|不必|无需|不需要|不要|别|勿)[^。！？!?；;，,]{0,6}详细/u;
+const BARE_NEGATED_DETAIL = /不\s*(?:那么|太|很|再)?\s*详细/u;
+const OTHER_DETAIL_REQUEST = /完整(?:列举|列|说|讲|读)|逐条|一条一条|每一条|全部(?:列举|列出)|不要省略|别省略/u;
 
 export function requestsDetailedSpoken(utterance) {
-  return DETAILED_REQUEST.test(String(utterance ?? ''));
+  const text = String(utterance ?? '');
+  if (NEGATED_DETAIL.test(text) || BARE_NEGATED_DETAIL.test(text)) {
+    return OTHER_DETAIL_REQUEST.test(text);
+  }
+  return DETAILED_REQUEST.test(text);
 }
 
 /**
@@ -327,18 +339,22 @@ export function spokenVersionTargetChars(bodyChars, { explicitDetail = false } =
 /**
  * Measure one spoken expression against its body. Observation only: it never edits either text.
  *
- * `tooLong` is the adoption gate (long body, ratio > 85%, not an explicit-detail round, and only
- * for an adopted condensed rewrite). `reason` reports the gate, never a truncation.
+ * `ratio` is a FAILED-SHORTENING signal, not an adoption gate: an equal-length but natural,
+ * faithful version may still be adopted. `adopted` lives on the event row (source === 'condensed');
+ * `shortened` is the separate compression verdict. `tooLong` only marks a long body whose
+ * candidate stayed >85% of it. `truncationSource` separates a model finish truncation from the
+ * playback budget and from the 200-char log copy (`log` never makes the version itself truncated).
  *
  * @param {{bodyText?: string, spokenText?: string, source?: string, explicitDetail?: boolean,
- *   truncated?: boolean}} [input]
+ *   truncated?: boolean, truncationSource?: string}} [input]
  * @returns {{bodyChars: number, spokenChars: number, ratio: number|null, savedChars: number,
- *   truncated: boolean, tooLong: boolean, reason: string, source: string,
- *   targetApplies: boolean, targetMin: number|null, targetMax: number|null, inTarget: boolean}}
+ *   truncated: boolean, truncationSource: string, shortened: boolean, tooLong: boolean,
+ *   reason: string, source: string, targetApplies: boolean, targetMin: number|null,
+ *   targetMax: number|null, inTarget: boolean}}
  */
 export function spokenVersionMetrics({
   bodyText = '', spokenText = '', source = 'condensed', explicitDetail = false,
-  truncated = false,
+  truncated = false, truncationSource = 'none',
 } = {}) {
   const bodyChars = codePoints(bodyText);
   const spokenChars = codePoints(spokenText);
@@ -350,13 +366,21 @@ export function spokenVersionMetrics({
     && ratio >= SPOKEN_TARGET_MIN_RATIO && ratio <= SPOKEN_TARGET_MAX_RATIO;
   const tooLong = source === 'condensed' && targetApplies && ratio !== null
     && ratio > SPOKEN_TOO_LONG_RATIO;
+  // A compression only "succeeded" when the result is meaningfully below the near-copy line.
+  // Equal-length/natural or still-long versions remain adopted but shortened:false.
+  const shortened = source === 'condensed' && ratio !== null && ratio <= SPOKEN_TOO_LONG_RATIO;
   const reason = explicitDetail === true ? 'explicit-detail' : (tooLong ? 'too-long' : '');
+  const truncation = truncated === true
+    ? (['model', 'budget', 'log'].includes(truncationSource) ? truncationSource : 'unknown')
+    : 'none';
   return {
     bodyChars,
     spokenChars,
     ratio,
     savedChars,
     truncated: truncated === true,
+    truncationSource: truncation,
+    shortened,
     tooLong,
     reason,
     source: String(source ?? ''),
@@ -368,12 +392,25 @@ export function spokenVersionMetrics({
 }
 
 /**
+ * The one verdict string for a decision. `adopted` is about the text being used; `shortened` is
+ * about compression; a full fallback is never presented as a successful summary.
+ */
+export function spokenVersionVerdict(metrics, { retry = false } = {}) {
+  if (metrics.source === 'original') return 'original';
+  if (metrics.source === 'full-fallback') return 'fallback-full';
+  if (metrics.reason === 'explicit-detail') return 'explicit-detail';
+  if (metrics.tooLong) return retry === true ? 'retry-too-long' : 'adopted-unchanged';
+  if (metrics.shortened === true) return 'adopted-shortened';
+  return 'adopted';
+}
+
+/**
  * Decide what to do with one validated candidate: adopt, retry once with a stronger shortening
  * instruction, or report that the accepted version is still too close to the body.
  *
  * `retry` is true only when the candidate is too-long AND this is not the final allowed attempt.
- * Keep accepting a valid retry even when it is still long: it is already shorter than the body and
- * the event carries `tooLong:true` instead of adopting it silently.
+ * A valid retry that is still long is accepted (`adopted-unchanged`) instead of being rejected or
+ * silently called a summary.
  *
  * @param {{attempt?: number, maxAttempts?: number}} [options] plus `spokenVersionMetrics` input
  * @returns {ReturnType<typeof spokenVersionMetrics> & {attempt: number, maxAttempts: number,
@@ -386,12 +423,13 @@ export function evaluateSpokenVersion({
   const attempts = Math.max(1, Math.floor(Number(maxAttempts) || 1));
   const tried = Math.max(1, Math.min(attempts, Math.floor(Number(attempt) || 1)));
   const retry = metrics.tooLong && tried < attempts;
-  let verdict = 'adopted';
-  if (metrics.reason === 'explicit-detail') verdict = 'explicit-detail';
-  else if (metrics.source === 'full-fallback') verdict = 'fallback';
-  else if (metrics.source === 'original') verdict = 'original';
-  else if (metrics.tooLong) verdict = retry ? 'retry-too-long' : 'adopted-too-long';
-  return { ...metrics, attempt: tried, maxAttempts: attempts, retry, verdict };
+  return {
+    ...metrics,
+    attempt: tried,
+    maxAttempts: attempts,
+    retry,
+    verdict: spokenVersionVerdict(metrics, { retry }),
+  };
 }
 
 /**
@@ -416,6 +454,8 @@ export function createSpokenVersionLedger({ limit = SPOKEN_VERSION_RECENT_LIMIT 
         ratio: Number.isFinite(ratio) ? ratio : null,
         savedChars: Math.max(0, Math.floor(Number(entry.savedChars) || 0)),
         truncated: entry.truncated === true,
+        truncationSource: String(entry.truncationSource ?? 'none'),
+        shortened: entry.shortened === true,
         tooLong: entry.tooLong === true,
         reason: String(entry.reason ?? ''),
         retried: entry.retried === true,

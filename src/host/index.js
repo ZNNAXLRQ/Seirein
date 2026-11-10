@@ -464,6 +464,7 @@ import {
   shouldSkipSpokenVersion,
   spokenVersionMetrics,
   spokenVersionTargetChars,
+  spokenVersionVerdict,
   splitSemanticUnits,
   SPOKEN_TOO_LONG_MIN_BODY,
   SPOKEN_VERSION_MAX_ATTEMPTS,
@@ -11309,14 +11310,29 @@ export function apply(ctx, config) {
       /* 目录仍有证据、已不存在，或正被并发写入：下一次收尾再删 */
     }
   };
+  /**
+   * 一条证据引用的文件：证据副本（`entry.file`）+ 独立原帧（`entry.cells[].file`）。
+   * 原帧只短期保留，但淘汰/清代次时必须与证据一起收走，不能留在 cache/screens。
+   */
+  const evidenceEntryFiles = (entry) => [
+    ...(typeof entry?.file === 'string' && entry.file.length > 0 ? [entry.file] : []),
+    ...(Array.isArray(entry?.cells) ? entry.cells : [])
+      .map((cell) => (typeof cell?.file === 'string' && cell.file.length > 0 ? cell.file : ''))
+      .filter((file) => file.length > 0),
+  ];
+  const removeEvidenceEntryFiles = (entry) => Promise.all(
+    [...new Set(evidenceEntryFiles(entry))].map((file) => rm(file, { force: true }).catch(() => {})),
+  );
   const evidenceWindow = createEvidenceWindow({
     onEvict: (entry) => {
-      // 淘汰只删副本文件；最后一个文件删掉后目录也收走，卸载/淘汰都不留缓存残渣。
-      void rm(entry.file, { force: true }).then(removeEvidenceDirIfEmpty).catch(() => {});
+      // 淘汰只删副本/原帧文件；最后一个文件删掉后目录也收走，卸载/淘汰都不留缓存残渣。
+      void removeEvidenceEntryFiles(entry).then(removeEvidenceDirIfEmpty).catch(() => {});
     },
-    onClear: () => {
-      // clear 是代次边界：整个目录都属于旧代次，直接递归删除；迟到复制核完代次后会自删。
+    onClear: (_reason, cleared = []) => {
+      // clear 是代次边界：整个证据目录都属于旧代次，直接递归删除；迟到复制核完代次后会自删。
       void rm(evidenceDir(), { recursive: true, force: true }).catch(() => {});
+      // 原帧文件在 cache/screens，不在证据目录里；清代次时一并删除。
+      for (const entry of cleared) void removeEvidenceEntryFiles(entry);
     },
     emit: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
   });
@@ -12423,6 +12439,16 @@ export function apply(ctx, config) {
           sourceEpoch: generation,
           shotBreak: shot.shotBreak === true,
         });
+      // 独立原帧：采集层已经写好 PNG 并给出内部 file 引用；这里补上宿主的 shotId，
+      // 让每个 cell 能同时按 frameId 和镜头追溯。路径只留在证据记录内部。
+      const cells = Array.isArray(shot.cells)
+        ? shot.cells
+          .filter((cell) => cell !== null && typeof cell === 'object')
+          .map((cell) => ({
+            ...cell,
+            ...(typeof cell.shotId === 'string' && cell.shotId.length > 0 ? {} : { shotId }),
+          }))
+        : [];
       const added = evidenceWindow.add({
         file,
         bytes: info.size,
@@ -12436,6 +12462,7 @@ export function apply(ctx, config) {
         kind,
         width: shot.width,
         height: shot.height,
+        ...(cells.length === 0 ? {} : { cells }),
       });
       // 被窗口拒绝（例如空文件）时不能把无人引用的副本留在磁盘上。
       if (added === null) {
@@ -17180,7 +17207,7 @@ export function apply(ctx, config) {
       bodyChars: speechCharCount(bodyText),
       spokenChars: points.length,
       spokenText: truncated ? `${points.slice(0, SPOKEN_TEXT_LOG_MAX).join('')}…` : spoken,
-      ...(truncated ? { truncated: true } : {}),
+      ...(truncated ? { truncated: true, truncationSource: 'log' } : {}),
       source,
       ...(String(groupId ?? '').length > 0 ? { groupId: String(groupId) } : {}),
       ...(Number.isSafeInteger(answerVersion) ? { answerVersion } : {}),
@@ -17222,11 +17249,11 @@ export function apply(ctx, config) {
    */
   const noteSpokenVersion = async ({
     turn = null, purpose = 'answer', replyVersion = null, decision = '', source = 'original',
-    bodyText = '', text = '', ms = 0, failure = '', truncated = false, explicitDetail = false,
-    retried = false,
+    bodyText = '', text = '', ms = 0, failure = '', truncated = false, truncationSource = 'none',
+    explicitDetail = false, retried = false,
   } = {}) => {
     const metrics = spokenVersionMetrics({
-      bodyText, spokenText: text, source, explicitDetail, truncated,
+      bodyText, spokenText: text, source, explicitDetail, truncated, truncationSource,
     });
     const failureText = String(failure ?? '');
     const payload = {
@@ -17237,21 +17264,21 @@ export function apply(ctx, config) {
       source,
       ms,
       adopted: source === 'condensed',
+      shortened: metrics.shortened === true,
       refused: source === 'full-fallback',
+      fallback: source === 'full-fallback' ? 'full' : '',
+      degraded: source === 'full-fallback',
       decision,
       bodyChars: metrics.bodyChars,
       spokenChars: metrics.spokenChars,
       ratio: metrics.ratio,
       savedChars: metrics.savedChars,
       truncated: metrics.truncated === true,
+      truncationSource: metrics.truncationSource,
       tooLong: metrics.tooLong === true,
       reason: failureText.length > 0 ? failureText : metrics.reason,
       retried: retried === true,
-      verdict: source === 'condensed'
-        ? (metrics.reason === 'explicit-detail'
-          ? 'explicit-detail'
-          : (metrics.tooLong ? 'adopted-too-long' : 'adopted'))
-        : (source === 'full-fallback' ? 'fallback' : 'original'),
+      verdict: spokenVersionVerdict(metrics),
     };
     await log.emit('voice.spoken.version', payload);
     spokenVersionLedger.record({
@@ -17264,6 +17291,8 @@ export function apply(ctx, config) {
       ratio: payload.ratio,
       savedChars: payload.savedChars,
       truncated: payload.truncated,
+      truncationSource: payload.truncationSource,
+      shortened: payload.shortened,
       tooLong: payload.tooLong,
       reason: payload.reason,
       retried: payload.retried,
@@ -17413,8 +17442,21 @@ export function apply(ctx, config) {
         break;
       }
     }
+    // A full-body fallback is explicit: it is not a summary and is never presented as one.
+    await noteSpokenVersion({
+      turn: boundTurn,
+      purpose: 'typed',
+      replyVersion: 0,
+      source: 'full-fallback',
+      bodyText: full,
+      text: full,
+      failure: lastFailure || 'generation-failed',
+      explicitDetail,
+      retried,
+    }).catch(() => {});
     void log.emit('voice.spoken.fallback', {
-      turn: boundTurn, purpose: 'typed', reason: lastFailure || 'too-long',
+      turn: boundTurn, purpose: 'typed', reason: lastFailure || 'generation-failed',
+      fallback: 'full', degraded: true,
     }).catch(() => {});
     return finish({ text: full, caption: full, source: 'full-fallback' });
   };
@@ -18363,6 +18405,7 @@ export function apply(ctx, config) {
           ms,
           failure,
           truncated: plan.truncated === true,
+          truncationSource: plan.truncationSource ?? (plan.truncated === true ? 'model' : 'none'),
           explicitDetail: plan.explicitDetail === true,
           retried: plan.retried === true,
         });
@@ -18525,6 +18568,7 @@ export function apply(ctx, config) {
           plan.retried = retried;
           await log.emit('voice.spoken.fallback', {
             turn: turnId, purpose: 'answer', replyVersion, reason: failure,
+            fallback: 'full', degraded: true,
           });
           await emitSpokenVersion(plan, 'full-fallback', plan.chars, ms, failure);
           return plan;
@@ -18711,6 +18755,7 @@ export function apply(ctx, config) {
           plan.ms = Math.max(0, Date.now() - startedAt);
           await log.emit('voice.spoken.fallback', {
             turn: turnId, purpose: 'answer', replyVersion, reason,
+            fallback: 'full', degraded: true,
           });
           await emitSpokenVersion(plan, 'full-fallback', plan.chars, plan.ms, reason);
           return speakWholePlan(plan);
@@ -18815,11 +18860,18 @@ export function apply(ctx, config) {
             turn: turnId, purpose: 'answer', replyVersion, reason: failure,
             // The turn already said `units` complete units; the body text is bookkeeping only.
             spokenUnits: emitted, spokenChars: units.stats().chars,
+            fallback: 'full', degraded: true,
           });
         }
         // A truncated finish/rewrite is recorded as-is; it is never repaired by speaking the tail
-        // of the body, because the user already heard the complete units.
-        plan.truncated = outcome?.truncated === true;
+        // of the body, because the user already heard the complete units. Playback-budget cuts are
+        // a different source: the reply speaker already applied `voice.speechMaxChars` to a
+        // sentence. The 200-char `voice.spoken.text` copy is log-only and never lands here.
+        const budgetTruncated = speaker?.stats?.truncated === true;
+        plan.truncationSource = outcome?.truncated === true
+          ? 'model'
+          : (budgetTruncated ? 'budget' : 'none');
+        plan.truncated = plan.truncationSource !== 'none';
         // The decision point is the FIRST unit: that is when translation + synthesis started, not
         // when the whole rewrite finished.
         plan.ms = spokenMarks.firstUnitAt > 0

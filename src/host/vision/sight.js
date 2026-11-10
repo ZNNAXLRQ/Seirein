@@ -68,6 +68,320 @@ export function resolveStoryboardSize({ width, height } = {}) {
   };
 }
 
+/**
+ * 独立原帧队列的默认边界。
+ *
+ * 故事板负责“宏观”：一张拼图看一段变化；原帧负责“细节”：需要看清某一帧时，必须能拿到
+ * 那一帧自己的像素，而不是从拼图里裁一块。原帧只在内存里短暂保留，`take()` 时再编码成
+ * PNG；`ttlMs`、`maxFrames`、`maxBytes` 保证它不会无限增长。按 1920×1200 rgb24 计，一帧
+ * 约 6.9 MB，40 帧约 276 MB —— 这是刻意的上限，不是建议值。
+ */
+export const ORIGINAL_FRAME_DEFAULTS = Object.freeze({
+  /** 原帧在内存/磁盘里的最长寿命；超过后淘汰。 */
+  ttlMs: 60_000,
+  /** 内存中最多保留多少帧原帧。 */
+  maxFrames: 40,
+  /** 内存中原帧像素的总字节上限。 */
+  maxBytes: 256 * 1024 * 1024,
+  /** 落盘原帧文件数上限（多张故事板共享同一上限）。 */
+  maxFiles: 96,
+  /** 落盘原帧文件的总字节上限。 */
+  maxFileBytes: 384 * 1024 * 1024,
+});
+
+/**
+ * 原帧的稳定查找键。故事板里的逐帧元数据只保留两位小数的 `t`（以及可能存在的 `i`），
+ * 所以这里用同一个口径；`frameId` 是 take() 时另外生成的稳定身份，不参与查找。
+ * @param {{i?: number, t?: number}} frame
+ * @returns {string}
+ */
+export function originalFrameKey(frame) {
+  const t = Number(frame?.t);
+  if (Number.isFinite(t)) return `t:${t.toFixed(2)}`;
+  const i = Number(frame?.i);
+  if (Number.isFinite(i)) return `i:${i}`;
+  return '';
+}
+
+/**
+ * 有界原帧内存队列。只保存“可能被拼进故事板”的原始像素（rgb24 或 rgba），不做编码、
+ * 不碰磁盘；淘汰顺序是 TTL → 帧数 → 字节，始终从最旧的开始。
+ *
+ * 这是一个纯模块：`now` 可注入，测试不需要真实时间；`onEvict(record, reason)` 只用于观测。
+ * @param {object} [options]
+ * @param {() => number} [options.now]
+ * @param {number} [options.ttlMs]
+ * @param {number} [options.maxFrames]
+ * @param {number} [options.maxBytes]
+ * @param {(record: object, reason: string) => void} [options.onEvict]
+ */
+export function createOriginalFrameQueue({
+  now = Date.now,
+  ttlMs = ORIGINAL_FRAME_DEFAULTS.ttlMs,
+  maxFrames = ORIGINAL_FRAME_DEFAULTS.maxFrames,
+  maxBytes = ORIGINAL_FRAME_DEFAULTS.maxBytes,
+  onEvict = () => {},
+} = {}) {
+  const clock = () => {
+    const value = Number(now());
+    return Number.isFinite(value) ? value : Date.now();
+  };
+  const ttl = () => (Number.isFinite(ttlMs) && ttlMs >= 0 ? ttlMs : ORIGINAL_FRAME_DEFAULTS.ttlMs);
+  const frameLimit = () => (Number.isFinite(maxFrames) && maxFrames > 0
+    ? Math.floor(maxFrames)
+    : ORIGINAL_FRAME_DEFAULTS.maxFrames);
+  const byteLimit = () => (Number.isFinite(maxBytes) && maxBytes > 0
+    ? Math.floor(maxBytes)
+    : ORIGINAL_FRAME_DEFAULTS.maxBytes);
+
+  /** 按加入顺序保存（采集时间单调），淘汰永远从队首开始。 */
+  let entries = [];
+  let bytes = 0;
+  const byKey = new Map();
+  /** 已排队故事板引用的原帧：在 sheet 被取走前，容量淘汰不能先把它们删掉。 */
+  const pinned = new Set();
+
+  const evict = (entry, reason) => {
+    bytes -= entry.bytes;
+    byKey.delete(entry.key);
+    pinned.delete(entry.key);
+    try {
+      onEvict(entry, reason);
+    } catch {
+      /* 观测失败不能影响队列本身 */
+    }
+  };
+
+  const firstUnpinned = () => entries.findIndex((entry) => !pinned.has(entry.key));
+
+  /** 淘汰过期/超限帧，返回被淘汰的记录（副本）。锁定的原帧只在 TTL 到期时被淘汰。 */
+  function prune() {
+    const current = clock();
+    const cutoff = current - ttl();
+    const evicted = [];
+    const kept = [];
+    for (const entry of entries) {
+      if (entry.capturedAt < cutoff) {
+        evict(entry, 'age');
+        evicted.push({ ...entry, reason: 'age' });
+      } else {
+        kept.push(entry);
+      }
+    }
+    entries = kept;
+    while (entries.length > frameLimit()) {
+      const index = firstUnpinned();
+      if (index < 0) break; // 全是排队故事板的帧：由 TTL 兜底，不让容量饥饿把它删掉
+      const [entry] = entries.splice(index, 1);
+      evict(entry, 'frames');
+      evicted.push({ ...entry, reason: 'frames' });
+    }
+    while (bytes > byteLimit() && entries.length > 0) {
+      const index = firstUnpinned();
+      if (index < 0) break;
+      const [entry] = entries.splice(index, 1);
+      evict(entry, 'bytes');
+      evicted.push({ ...entry, reason: 'bytes' });
+    }
+    return evicted;
+  }
+
+  /**
+   * 保存一帧原帧。同一查找键（同一时刻）只保留一份，新数据覆盖旧数据。
+   * @param {{buf?: Buffer|Uint8Array, t?: number, i?: number, capturedAt?: number, key?: string}} input
+   */
+  function add(input) {
+    const key = typeof input?.key === 'string' && input.key.length > 0
+      ? input.key
+      : originalFrameKey(input);
+    const buf = input?.buf;
+    if (key.length === 0 || buf === null || buf === undefined
+      || typeof buf.length !== 'number' || buf.length === 0) return null;
+    const previous = byKey.get(key);
+    if (previous !== undefined) {
+      bytes -= previous.bytes;
+      entries = entries.filter((entry) => entry !== previous);
+      byKey.delete(key);
+    }
+    const capturedAt = Number(input.capturedAt);
+    const record = {
+      key,
+      t: Number(input.t),
+      i: Number(input.i),
+      buf,
+      bytes: buf.length,
+      capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : clock(),
+    };
+    entries.push(record);
+    byKey.set(key, record);
+    bytes += record.bytes;
+    prune();
+    return record;
+  }
+
+  /** 按逐帧元数据取原帧；过期后自动淘汰并返回 null。 */
+  function get(frame) {
+    prune();
+    const key = originalFrameKey(frame);
+    return key.length === 0 ? null : byKey.get(key) ?? null;
+  }
+
+  /** 原帧已经编码落盘后可以立刻释放像素内存；文件仍由调用方的文件账本管理。 */
+  function remove(frame) {
+    const key = originalFrameKey(frame);
+    if (key.length === 0) return null;
+    const record = byKey.get(key);
+    if (record === undefined) return null;
+    bytes -= record.bytes;
+    entries = entries.filter((entry) => entry !== record);
+    byKey.delete(key);
+    pinned.delete(key);
+    return record;
+  }
+
+  /**
+   * 锁定一张已排队故事板引用的原帧。容量淘汰会跳过它们，直到 `take()` 把它们编码完；
+   * 这不是无限缓存：TTL 仍然会淘汰，且最多只锁一张故事板的帧。
+   */
+  function pin(frames) {
+    if (!Array.isArray(frames)) return 0;
+    let count = 0;
+    for (const frame of frames) {
+      const key = originalFrameKey(frame);
+      if (key.length === 0 || !byKey.has(key) || pinned.has(key)) continue;
+      pinned.add(key);
+      count += 1;
+    }
+    return count;
+  }
+
+  function unpinAll() {
+    pinned.clear();
+  }
+
+  function clear(reason = 'clear') {
+    const cleared = entries.map((entry) => ({ ...entry, reason }));
+    for (const entry of entries) {
+      bytes -= entry.bytes;
+      try {
+        onEvict(entry, reason);
+      } catch {
+        /* 观测失败不能影响清空 */
+      }
+    }
+    entries = [];
+    bytes = 0;
+    byKey.clear();
+    pinned.clear();
+    return cleared;
+  }
+
+  function state() {
+    return {
+      frames: entries.length,
+      bytes,
+      pinned: pinned.size,
+      oldestAt: entries.length === 0 ? null : entries[0].capturedAt,
+      newestAt: entries.length === 0 ? null : entries[entries.length - 1].capturedAt,
+      ttlMs: ttl(),
+      maxFrames: frameLimit(),
+      maxBytes: byteLimit(),
+    };
+  }
+
+  return { add, get, remove, pin, unpinAll, prune, clear, state };
+}
+
+/**
+ * 有界原帧文件账本。只记录“已经落盘的原帧文件”，不读像素；淘汰顺序 TTL → 文件数 → 字节。
+ * `add()`/`prune()` 返回被淘汰的记录，由调用方负责删除文件；`clear()` 返回剩余全部记录。
+ * @param {object} [options]
+ * @param {() => number} [options.now]
+ * @param {number} [options.ttlMs]
+ * @param {number} [options.maxFiles]
+ * @param {number} [options.maxBytes]
+ */
+export function createOriginalFileLedger({
+  now = Date.now,
+  ttlMs = ORIGINAL_FRAME_DEFAULTS.ttlMs,
+  maxFiles = ORIGINAL_FRAME_DEFAULTS.maxFiles,
+  maxBytes = ORIGINAL_FRAME_DEFAULTS.maxFileBytes,
+} = {}) {
+  const clock = () => {
+    const value = Number(now());
+    return Number.isFinite(value) ? value : Date.now();
+  };
+  const ttl = () => (Number.isFinite(ttlMs) && ttlMs >= 0 ? ttlMs : ORIGINAL_FRAME_DEFAULTS.ttlMs);
+  const fileLimit = () => (Number.isFinite(maxFiles) && maxFiles > 0
+    ? Math.floor(maxFiles)
+    : ORIGINAL_FRAME_DEFAULTS.maxFiles);
+  const byteLimit = () => (Number.isFinite(maxBytes) && maxBytes > 0
+    ? Math.floor(maxBytes)
+    : ORIGINAL_FRAME_DEFAULTS.maxFileBytes);
+
+  let files = [];
+  let bytes = 0;
+
+  function prune() {
+    const cutoff = clock() - ttl();
+    const evicted = [];
+    const kept = [];
+    for (const entry of files) {
+      if (entry.createdAt < cutoff) {
+        bytes -= entry.bytes;
+        evicted.push({ ...entry, reason: 'age' });
+      } else {
+        kept.push(entry);
+      }
+    }
+    files = kept;
+    while (files.length > fileLimit()) {
+      const entry = files.shift();
+      bytes -= entry.bytes;
+      evicted.push({ ...entry, reason: 'files' });
+    }
+    while (bytes > byteLimit() && files.length > 0) {
+      const entry = files.shift();
+      bytes -= entry.bytes;
+      evicted.push({ ...entry, reason: 'bytes' });
+    }
+    return evicted;
+  }
+
+  function add({ file, bytes: size, createdAt = clock() } = {}) {
+    if (typeof file !== 'string' || file.length === 0) return [];
+    const byteSize = Number(size);
+    files.push({
+      file,
+      bytes: Number.isFinite(byteSize) && byteSize > 0 ? Math.floor(byteSize) : 0,
+      createdAt: Number.isFinite(Number(createdAt)) && Number(createdAt) > 0 ? Number(createdAt) : clock(),
+    });
+    bytes += files[files.length - 1].bytes;
+    return prune();
+  }
+
+  function clear() {
+    const cleared = files.map((entry) => ({ ...entry, reason: 'clear' }));
+    files = [];
+    bytes = 0;
+    return cleared;
+  }
+
+  function state() {
+    return {
+      files: files.length,
+      bytes,
+      oldestAt: files.length === 0 ? null : files[0].createdAt,
+      newestAt: files.length === 0 ? null : files[files.length - 1].createdAt,
+      ttlMs: ttl(),
+      maxFiles: fileLimit(),
+      maxBytes: byteLimit(),
+    };
+  }
+
+  return { add, prune, clear, state };
+}
+
 /** Normalize a caller-supplied TTL; an unusable value falls back to the default window. */
 function observationTtl(ttlMs) {
   const value = Number(ttlMs);
@@ -351,12 +665,50 @@ let cancellableScreenEngine = null;
 /** How long one frame's arrival stamp is kept: comfortably longer than a sheet can sit queued. */
 const CAPTURED_AT_RETENTION_MS = 180_000;
 
+/** 单张故事板最多编码多少个独立原帧；管道本身上限 40，这里再兜一层底。 */
+const MAX_ORIGINAL_CELLS = 40;
+
+/** Process-wide frame identity; evidence ids stay unique even if two sessions overlap. */
+let originalFrameSequence = 0;
+
+/**
+ * 把一帧原始像素转成 `encodePng` 需要的 rgb24。
+ *
+ * 真实采集链路（dsh-see-now spawnFrames）给的是 rgb24；测试/未来版本可能给 rgba。
+ * 按长度判断：4 通道丢掉 alpha（截图不透明，alpha 没有信息量），3 通道原样使用。
+ * @param {Buffer|Uint8Array|null|undefined} buf
+ * @param {number} width
+ * @param {number} height
+ * @returns {Buffer|Uint8Array|null}
+ */
+function rgbPixelsOf(buf, width, height) {
+  if (buf === null || buf === undefined || typeof buf.length !== 'number') return null;
+  const pixels = Number(width) * Number(height);
+  if (!Number.isInteger(pixels) || pixels <= 0) return null;
+  if (buf.length >= pixels * 4) {
+    const rgb = Buffer.allocUnsafe(pixels * 3);
+    for (let pixel = 0, source = 0, target = 0; pixel < pixels; pixel += 1, source += 4, target += 3) {
+      rgb[target] = buf[source];
+      rgb[target + 1] = buf[source + 1];
+      rgb[target + 2] = buf[source + 2];
+    }
+    return rgb;
+  }
+  if (buf.length >= pixels * 3) return buf.subarray(0, pixels * 3);
+  return null;
+}
+
 export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12, source = { kind: 'screen' }, signal }) {
   signal?.throwIfAborted();
   const size = resolveStoryboardSize({ width, height });
-  const [{ spawnFrames, pickScreenEngine, captureArgs }, { createPipeline }] = await Promise.all([
+  const [
+    { spawnFrames, pickScreenEngine, captureArgs },
+    { createPipeline },
+    { encodePng },
+  ] = await Promise.all([
     import('dsh-see-now/capture'),
     import('dsh-see-now/pipeline'),
+    import('dsh-see-now/png'),
   ]);
 
   await mkdir(dir, { recursive: true });
@@ -398,6 +750,53 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
   let firstFrameMs = null;
   let sheets = 0;
   /**
+   * 原帧队列只保留“可能被拼进故事板”的帧：pipelines 决定了哪些帧留下之后，才把对应
+   * 的原始像素放进有界队列；`take()` 再用这份像素编码独立 PNG。这样既不会把每帧都
+   * 常驻内存，也不需要在 take 时反解拼图。
+   */
+  const originalFrames = createOriginalFrameQueue();
+  const originalFiles = createOriginalFileLedger();
+  /** 已判定但未写入磁盘的原帧（`pipeline.log` 只记元数据，不保留像素）。 */
+  const rawPending = [];
+  let lastRawFrame = null;
+  /** 当前已排队、等待 take() 的故事板；它引用的原帧在取走前不能被容量淘汰。 */
+  let pinnedSheet = null;
+  let originalFrameCount = 0;
+  let originalFrameBytes = 0;
+  let originalFrameErrors = 0;
+  /** `stop()` 的磁盘清理任务：重复 stop 共享同一个 Promise。 */
+  let stopCleanup = null;
+
+  const deleteOriginalFiles = (records) => Promise.all(records
+    .filter((record) => typeof record?.file === 'string' && record.file.length > 0)
+    .map((record) => rm(record.file, { force: true }).catch(() => {})));
+
+  const pruneOriginalFiles = () => {
+    const evicted = originalFiles.prune();
+    if (evicted.length > 0) void deleteOriginalFiles(evicted);
+    return evicted;
+  };
+
+  /**
+   * 排队中的故事板优先：每次 push 后看管线队首，把它引用的原帧锁进队列。证据采集/工具
+   * 取图通常只隔 2 秒，但高变化画面可能在 2 秒里把 40 帧上限再次填满；不锁的话，先
+   * flush 的故事板会先丢掉自己的原帧。只锁一张（管线 queueDepth 默认 1），TTL 仍是硬上限。
+   */
+  const syncPinnedSheet = () => {
+    let queued = null;
+    try {
+      queued = typeof pipeline?.peek === 'function' ? pipeline.peek() : null;
+    } catch {
+      queued = null;
+    }
+    if (queued !== pinnedSheet) {
+      pinnedSheet = queued ?? null;
+      originalFrames.unpinAll();
+    }
+    // 每次调用都重新 pin：flush 发生在 push 内部，最新判定的那帧可能晚一步才进队列。
+    if (pinnedSheet !== null) originalFrames.pin(pinnedSheet.frames);
+  };
+  /**
    * Actual capture time per ffmpeg frame index (`Date.now()` the moment the frame arrived).
    *
    * The pipeline keeps only the presentation timestamp (`t = index / fps`) and rebuilds every
@@ -427,18 +826,50 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
       const index = frameIndex(frame);
       if (Number.isFinite(index)) {
         capturedAtById.set(index, capturedAt);
-        if (frames % 120 === 0) pruneCapturedAt(capturedAt);
+        if (frames % 120 === 0) {
+          pruneCapturedAt(capturedAt);
+          pruneOriginalFiles();
+        }
       }
+      // 管线延迟一帧判定：push 之后，`pipeline.log` 是否增长决定了最老那帧有没有被留下。
+      // 只有留下来的帧才值得保留原始像素；`log` 缺失时退化为“有 frame.buf 才可用”。
+      const raw = {
+        t: Number(frame?.t),
+        i: index,
+        buf: frame?.buf,
+        capturedAt,
+      };
+      lastRawFrame = raw;
+      if (rawPending.length === 0) {
+        rawPending.push(raw);
+        pipeline.push(frame);
+        syncPinnedSheet();
+        return;
+      }
+      rawPending.push(raw);
+      const logBefore = Array.isArray(pipeline?.log) ? pipeline.log.length : 0;
       pipeline.push(frame);
+      const logAfter = Array.isArray(pipeline?.log) ? pipeline.log.length : 0;
+      const decided = rawPending.shift();
+      if (decided !== undefined && logAfter > logBefore) originalFrames.add(decided);
+      syncPinnedSheet();
     },
   });
 
   const stop = () => {
-    if (stopped) return;
+    if (stopped) return stopCleanup ?? Promise.resolve();
     stopped = true;
     pipeline = null; // Release every buffered pre-boundary frame, not just the active child.
+    rawPending.length = 0;
+    lastRawFrame = null;
+    pinnedSheet = null;
+    // 隐私/切源/停止：原帧（内存像素 + 已落盘文件）都属于当前代次，不能跨边界留下。
+    originalFrames.clear('stop');
+    const remaining = originalFiles.clear();
     signal?.removeEventListener('abort', stop);
     try { run.stop(); } catch { /* already gone */ }
+    stopCleanup = deleteOriginalFiles(remaining);
+    return stopCleanup;
   };
   signal?.addEventListener('abort', stop, { once: true });
   if (signal?.aborted) stop();
@@ -474,6 +905,10 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
       height: size.height,
       frames,
       sheets,
+      // 独立原帧：只报数量/字节/失败计数，不含任何路径或像素。
+      originalFrames: originalFrameCount,
+      originalBytes: originalFrameBytes,
+      originalFrameErrors,
       firstFrameMs,
       uptimeMs: Date.now() - startedAt,
     }),
@@ -488,7 +923,12 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
         sheet = pipeline.flushNow(null, 'user');
       }
       if (sheet === null || sheet === undefined) return null;
-      const file = join(dir, `${randomUUID()}.png`);
+      // 每次取图顺手淘汰过期原帧文件：即使没有新帧，磁盘占用也有清晰上界。
+      pruneOriginalFiles();
+      const sheetId = randomUUID();
+      const file = join(dir, `${sheetId}.png`);
+      const createdFrameFiles = [];
+      const cells = [];
       try {
         await writeFile(file, sheet.png, { signal });
         const info = await stat(file);
@@ -505,8 +945,11 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
           ? Math.max(0, (toSec - fromSec) * 1000)
           : 0;
         const endedAt = capturedAt + Math.min(spanMs, 120_000);
+        const sheetFrames = Array.isArray(sheet.frames) ? sheet.frames : [];
+        const sheetWidth = Number(sheet.w) > 0 ? Math.round(Number(sheet.w)) : size.width;
+        const sheetHeight = Number(sheet.h) > 0 ? Math.round(Number(sheet.h)) : size.height;
         const frameTimes = [];
-        for (const frame of Array.isArray(sheet.frames) ? sheet.frames : []) {
+        for (const frame of sheetFrames) {
           const stamped = capturedAtById.get(frameIndex(frame));
           const relative = Number(frame?.t);
           const at = Number.isFinite(stamped)
@@ -518,10 +961,93 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
           frameTimes.push(Math.min(endedAt, Math.max(capturedAt, at)));
           if (frameTimes.length >= 40) break;
         }
+        /**
+         * 独立原帧：优先使用 `frame.buf`（未来 dsh-see-now 若把像素留在 sheet 上），否则从
+         * 有界原帧队列里按 `t` 取回。队列只保留管线真正留下的帧，所以不会把 12fps 的整条
+         * 流常驻内存；取不到像素的帧只跳过 cells，绝不影响故事板本身。
+         */
+        for (let cellIndex = 0; cellIndex < sheetFrames.length; cellIndex += 1) {
+          if (cells.length >= MAX_ORIGINAL_CELLS) break;
+          signal?.throwIfAborted();
+          if (stopped) throw new Error('storyboard stopped');
+          const frame = sheetFrames[cellIndex];
+          const frameKey = originalFrameKey(frame);
+          const rawRecord = originalFrames.get(frame);
+          const fallbackRaw = frameKey.length > 0 && lastRawFrame !== null
+            && originalFrameKey(lastRawFrame) === frameKey
+            ? lastRawFrame
+            : null;
+          const rgb = rgbPixelsOf(
+            frame?.buf ?? rawRecord?.buf ?? fallbackRaw?.buf,
+            sheetWidth,
+            sheetHeight,
+          );
+          if (rgb === null) continue;
+          // 采集时刻：真实到达时间优先；没有时退回管线时刻（相对 sheet 起点），仍夹在本张范围内。
+          const rawAt = Number(rawRecord?.capturedAt ?? fallbackRaw?.capturedAt);
+          const stamped = capturedAtById.get(frameIndex(frame));
+          const providedAt = Number(frame?.capturedAt);
+          const relative = Number(frame?.t);
+          let at = Number.isFinite(rawAt) && rawAt > 0 ? rawAt : null;
+          if (at === null && Number.isFinite(providedAt) && providedAt > 0) at = providedAt;
+          if (at === null && Number.isFinite(stamped)) at = stamped;
+          if (at === null && Number.isFinite(relative) && Number.isFinite(fromSec)) {
+            at = capturedAt + Math.max(0, (relative - fromSec) * 1000);
+          }
+          const frameCapturedAt = at === null
+            ? capturedAt
+            : Math.min(endedAt, Math.max(capturedAt, at));
+          let png;
+          try {
+            // level 1：原帧只用于“看清细节”，编码延迟比几 MB 的额外体积更重要。
+            png = encodePng(rgb, sheetWidth, sheetHeight, { level: 1 });
+          } catch {
+            originalFrameErrors += 1;
+            continue;
+          }
+          const rawFile = join(dir, `${sheetId}-frame-${cellIndex}.png`);
+          let rawInfo;
+          try {
+            await writeFile(rawFile, png, { signal });
+            rawInfo = await stat(rawFile);
+          } catch (error) {
+            await rm(rawFile, { force: true }).catch(() => {});
+            if (signal?.aborted) throw signal.reason ?? error;
+            if (stopped) throw new Error('storyboard stopped');
+            originalFrameErrors += 1;
+            continue;
+          }
+          createdFrameFiles.push(rawFile);
+          // 像素已经变成独立 PNG，立刻释放内存；文件由账本继续按 TTL/容量管理。
+          originalFrames.remove(frame);
+          originalFrameCount += 1;
+          originalFrameBytes += rawInfo.size;
+          const evicted = originalFiles.add({
+            file: rawFile,
+            bytes: rawInfo.size,
+            createdAt: Date.now(),
+          });
+          if (evicted.length > 0) void deleteOriginalFiles(evicted);
+          cells.push({
+            // 稳定身份：同一张故事板里每个 cell 一旦生成就不再变化。shotId 由宿主在登记
+            // 证据时补上（采集层还不知道宿主的镜头分段），这里先留空字符串。
+            frameId: `frame-${++originalFrameSequence}`,
+            capturedAt: frameCapturedAt,
+            shotId: typeof sheet.shotId === 'string' ? sheet.shotId : '',
+            width: sheetWidth,
+            height: sheetHeight,
+            bytes: rawInfo.size,
+            // 仅供宿主复制/清理；不进入 status，也不进入模型可见的工具结果。
+            file: rawFile,
+          });
+        }
+        // 这张故事板已经取走：解除原帧锁定，容量淘汰恢复。
+        originalFrames.unpinAll();
+        pinnedSheet = null;
         const shotBreak = sheet.why === 'cut'
-          || (Array.isArray(sheet.frames) && sheet.frames.some((frame) => frame?.via === 'cut'));
+          || sheetFrames.some((frame) => frame?.via === 'cut');
         return {
-          file, bytes: info.size, width: sheet.w, height: sheet.h,
+          file, bytes: info.size, width: sheetWidth, height: sheetHeight,
           // Observation age comes from the earliest packed frame, never from packing/writing time:
           // a sheet that waited in the queue must keep aging instead of looking freshly captured.
           at: capturedAt,
@@ -531,18 +1057,29 @@ export async function startStoryboard({ ffmpegPath, dir, width, height, fps = 12
           endedAt,
           generatedAt: Date.now(),
           from: sheet.from, to: sheet.to,
-          frames: Array.isArray(sheet.frames) ? sheet.frames.length : 0,
+          frames: sheetFrames.length,
           frameTimes: [...new Set(frameTimes)].sort((left, right) => left - right),
+          // 原帧引用（含内部 file 路径）：宿主登记进证据窗口时保存，status/模型输出只取
+          // frameId/时间/尺寸/字节这些安全字段。
+          cells,
           shotBreak,
           why: sheet.why ?? '',
         };
       } catch (error) {
+        originalFrames.unpinAll();
+        pinnedSheet = null;
+        await Promise.all(createdFrameFiles.map((rawFile) => rm(rawFile, { force: true }).catch(() => {})));
         await rm(file, { force: true });
         throw error;
       }
     },
     stop,
-    done: run.done,
+    // 会话退出后仍要等原帧清理落地：调用方 `await session.done` 才能看到目录干净。
+    get done() {
+      return Promise.resolve(run.done).then((value) => (
+        stopCleanup === null ? value : stopCleanup.then(() => value)
+      ));
+    },
   };
 }
 

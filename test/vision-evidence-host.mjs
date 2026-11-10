@@ -219,6 +219,57 @@ test('真实截图进入证据窗口，删掉原图后副本仍在；status 只�
   assert.equal((await app.status()).vision.evidence.frames, 1);
 });
 
+test('证据窗口登记原始帧 cells：status 只给计数，隐私边界连原帧一起清理', async (t) => {
+  const app = await fixture(t);
+  const baseMakeShot = state.makeShot;
+  const rawFiles = [];
+  state.makeShot = async (dir) => {
+    const shot = await baseMakeShot(dir);
+    const cells = [];
+    for (let i = 0; i < 2; i += 1) {
+      const rawFile = join(dir, `original-${state.captures}-${i}.png`);
+      const data = Buffer.from(`RAW-FRAME-${state.captures}-${i}`);
+      await writeFile(rawFile, data);
+      rawFiles.push(rawFile);
+      cells.push({
+        frameId: `frame-${state.captures}-${i}`,
+        capturedAt: shot.capturedAt,
+        width: shot.width,
+        height: shot.height,
+        bytes: data.length,
+        file: rawFile,
+        shotId: '',
+      });
+    }
+    return { ...shot, cells };
+  };
+
+  const seen = await app.call('assistant_see', { reason: 'original-frames' });
+  assert.equal(seen.ok, true, seen.reason);
+  await app.waitFor(async () => {
+    const evidence = (await app.status()).vision.evidence;
+    return evidence.frames === 1 && evidence.cells === 2;
+  }, 'one sheet with two original frames');
+
+  const snapshot = await app.status();
+  assert.equal(snapshot.vision.evidence.cells, 2, '只暴露原帧数量');
+  const evidenceJson = JSON.stringify(snapshot.vision.evidence);
+  assert.equal(evidenceJson.includes('cache'), false, 'status 不含证据/原帧路径');
+  assert.equal(evidenceJson.includes('original-'), false, 'status 不含原帧文件名');
+  assert.equal(evidenceJson.includes('frame-'), false, 'status 不暴露 frameId');
+  assert.equal((await app.listEvidence()).length, 1, '证据目录仍只复制 sheet');
+
+  const privacy = await app.action({ action: 'vision.mode', mode: 'privacy' });
+  assert.equal(privacy.ok, true, privacy.error);
+  await app.waitFor(async () => (await app.status()).vision.evidence.cells === 0,
+    'privacy to clear the original-frame references');
+  await app.waitFor(async () => {
+    const remaining = await Promise.all(rawFiles.map((file) => readFile(file).then(() => true, () => false)));
+    return remaining.every((exists) => exists === false);
+  }, 'privacy to delete the original frame files');
+  assert.equal(JSON.stringify((await app.status()).vision.evidence).includes('cache'), false);
+});
+
 test('进隐私清掉旧证据代次，目录不残留；卸载同样清理副本', async (t) => {
   const app = await fixture(t);
   const seen = await app.call('assistant_see', { reason: 'privacy' });

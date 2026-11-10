@@ -549,12 +549,19 @@ test('7. a failed spoken version falls back to the full body and records the rea
   await tick(50);
   const fallback = await app.waitForEvent('voice.spoken.fallback');
   assert.equal(fallback.reason, 'SPOKEN_UNAVAILABLE');
+  assert.equal(fallback.fallback, 'full');
+  assert.equal(fallback.degraded, true);
   const version = await app.waitForEvent('voice.spoken.version');
   assert.equal(version.source, 'full-fallback');
   assert.equal(version.refused, true);
+  assert.equal(version.adopted, false);
+  assert.equal(version.shortened, false);
+  assert.equal(version.fallback, 'full', 'a full fallback names itself instead of pretending to summarize');
+  assert.equal(version.degraded, true);
+  assert.equal(version.verdict, 'fallback-full');
   assert.ok(app.texts().join('').includes(BODY_ONLY), 'the full body is spoken, not a truncated summary');
   assert.ok(!app.texts().includes(LONG_SPOKEN), 'no condensed text was played');
-  t.diagnostic(`fallbackReason=${fallback.reason} source=${version.source} clips=${app.texts().length}`);
+  t.diagnostic(`fallbackReason=${fallback.reason} source=${version.source} fallback=${version.fallback} degraded=${version.degraded} clips=${app.texts().length}`);
 
   // Validation failure (the model returned something longer than the body) takes the same path.
   // Equal length is allowed since turn 11; only an actually longer candidate is not-shorter.
@@ -565,6 +572,9 @@ test('7. a failed spoken version falls back to the full body and records the rea
   assert.equal(rejected.reason, 'not-shorter');
   const rejectedVersion = await invalid.waitForEvent('voice.spoken.version');
   assert.equal(rejectedVersion.source, 'full-fallback');
+  assert.equal(rejectedVersion.fallback, 'full');
+  assert.equal(rejectedVersion.degraded, true);
+  assert.equal(rejectedVersion.verdict, 'fallback-full');
   assert.ok(invalid.texts().join('').includes(BODY_ONLY), 'the full body is spoken after a failed validation');
 });
 
@@ -887,9 +897,9 @@ test('19. voice.spoken.version / voice.spoken.text keep their existing fields', 
   await playText(app, LONG_SPOKEN);
   const version = await app.waitForEvent('voice.spoken.version');
   assert.deepEqual(Object.keys(version).sort(), [
-    'adopted', 'bodyChars', 'chars', 'decision', 'ms', 'purpose', 'ratio', 'reason', 'refused',
-    'replyVersion', 'retried', 'savedChars', 'source', 'spokenChars', 'tooLong', 'truncated',
-    'turn', 'verdict',
+    'adopted', 'bodyChars', 'chars', 'decision', 'degraded', 'fallback', 'ms', 'purpose', 'ratio',
+    'reason', 'refused', 'replyVersion', 'retried', 'savedChars', 'shortened', 'source',
+    'spokenChars', 'tooLong', 'truncated', 'truncationSource', 'turn', 'verdict',
   ]);
   const textRow = await app.waitForEvent('voice.spoken.text', (payload) => payload.purpose === 'answer');
   assert.deepEqual(Object.keys(textRow).sort(), [
@@ -902,9 +912,9 @@ test('19. voice.spoken.version / voice.spoken.text keep their existing fields', 
 });
 
 // ---------------------------------------------------------------------------
-// 21. Equal length is allowed (turn 11: a 166-char body and a 166-char spoken version)
+// 21. Equal length is adopted when natural, but never counts as a successful compression
 // ---------------------------------------------------------------------------
-test('21. 口语版与正文等长时会被标为 too-long，而不是静默当作已压缩', async (t) => {
+test('21. 等长自然版可以 adopted，但 shortened:false 且标记 too-long', async (t) => {
   const equalBody = '说明'.repeat(83);
   const equalSpoken = '口播'.repeat(83);
   assert.equal([...equalBody].length, 166, 'fixture: the body is 166 characters');
@@ -915,20 +925,23 @@ test('21. 口语版与正文等长时会被标为 too-long，而不是静默当�
   await playText(app, equalSpoken);
   const version = await app.waitForEvent('voice.spoken.version');
   assert.equal(version.source, 'condensed', 'the valid candidate is still played (it is not a truncation)');
+  assert.equal(version.adopted, true, 'adoption and compression are separate verdicts');
+  assert.equal(version.shortened, false, 'equal length is not a successful shortening');
   assert.equal(version.refused, false);
   assert.equal(version.chars, 166);
   assert.equal(version.bodyChars, 166);
   assert.equal(version.ratio, 1);
   assert.equal(version.tooLong, true, 'a near-copy of a long body is reported, never silently accepted');
-  assert.equal(version.verdict, 'adopted-too-long');
+  assert.equal(version.verdict, 'adopted-unchanged');
   assert.equal(version.retried, false, 'the streamed lane cannot retry after audio already started');
+  assert.equal(version.truncationSource, 'none');
   const warning = await app.waitForEvent('voice.spoken.too-long');
   assert.equal(warning.reason, 'too-long');
   assert.equal(warning.ratio, 1);
   assert.equal(app.texts().join(''), equalSpoken, 'the 166-char spoken version is played');
   const fallbacks = (await app.events()).filter((event) => event.type === 'voice.spoken.fallback');
   assert.deepEqual(fallbacks, [], 'no fallback row for an equal-length candidate');
-  t.diagnostic(`source=${version.source} chars=${version.chars}/${[...equalBody].length} tooLong=${version.tooLong} fallbacks=0`);
+  t.diagnostic(`source=${version.source} chars=${version.chars}/${[...equalBody].length} adopted=${version.adopted} shortened=${version.shortened} fallbacks=0`);
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,9 +1043,12 @@ test('25. 长正文的口语版接近原文时先重试一次更强缩短，再�
   assert.ok(!firstSystem.includes('【更强缩短重试】'), 'the first request uses the normal guide');
   assert.ok(secondSystem.includes('【更强缩短重试】'), 'the retry carries the stronger shortening instruction');
   assert.equal(version.source, 'condensed');
+  assert.equal(version.adopted, true);
+  assert.equal(version.shortened, true, 'the shorter retry is a successful compression');
   assert.equal(version.retried, true);
   assert.equal(version.tooLong, false, 'the shorter retry is accepted normally');
-  assert.equal(version.verdict, 'adopted');
+  assert.equal(version.verdict, 'adopted-shortened');
+  assert.equal(version.truncationSource, 'none');
   assert.equal(version.bodyChars, [...RETRY_BODY].length);
   assert.equal(version.spokenChars, [...RETRY_SPOKEN].length);
   assert.ok(version.ratio < 0.85, `retry ratio ${version.ratio} is no longer a near-copy`);
@@ -1064,10 +1080,69 @@ test('26. 明确要求逐条完整列举时不强制缩短：不设目标、不�
   assert.ok(!system.includes('【本次长度参考】'), 'an explicit detail request has no length target');
   assert.ok(!system.includes('【更强缩短重试】'));
   assert.equal(version.source, 'condensed');
+  assert.equal(version.adopted, true);
+  assert.equal(version.shortened, false, 'a detail request is not a compression success');
   assert.equal(version.retried, false);
   assert.equal(version.tooLong, false, 'detail requests are exempt from the too-long gate');
   assert.equal(version.reason, 'explicit-detail');
   assert.equal(version.verdict, 'explicit-detail');
   t.diagnostic(`detail calls=${calls.length} body=${version.bodyChars} spoken=${version.spokenChars} tooLong=${version.tooLong}`);
+});
+
+// ---------------------------------------------------------------------------
+// 27. The 200-char voice.spoken.text log cap is log-only, never a failed rewrite
+// ---------------------------------------------------------------------------
+test('27. voice.spoken.text 的 200 字日志截断不算口语版截断，也不改变采用判定', async (t) => {
+  const logBody = '说明'.repeat(150); // 300 chars
+  const logSpoken = '口播'.repeat(125); // 250 chars, still under the body
+  const app = await mountRound(t, { spoken: () => logSpoken });
+  app.driveTyped(3, { body: logBody });
+  const version = await app.waitForEvent('voice.spoken.version', (payload) => payload.purpose === 'typed');
+  const textRow = await app.waitForEvent('voice.spoken.text', (payload) => payload.purpose === 'typed');
+  assert.equal(version.truncated, false, 'the version was not truncated by the model or the budget');
+  assert.equal(version.truncationSource, 'none');
+  assert.equal(version.chars, 250);
+  assert.equal(version.spokenChars, 250);
+  assert.equal(version.ratio, 0.833);
+  assert.equal(version.adopted, true);
+  assert.equal(version.shortened, true);
+  assert.equal(version.tooLong, false);
+  assert.equal(version.verdict, 'adopted-shortened');
+  assert.equal(textRow.truncated, true);
+  assert.equal(textRow.truncationSource, 'log', 'the log copy names its own truncation source');
+  assert.equal(textRow.spokenChars, 250, 'the log cap never changes the spoken length');
+  assert.equal([...textRow.spokenText].length, 201, '200 chars plus one ellipsis');
+  t.diagnostic(`versionTruncated=${version.truncated} logTruncated=${textRow.truncated} source=${textRow.truncationSource} spokenChars=${textRow.spokenChars}`);
+});
+
+// ---------------------------------------------------------------------------
+// 28. A retry that is still long is adopted (fidelity/naturalness first), not rejected
+// ---------------------------------------------------------------------------
+test('28. 重试后仍长：采用保真可用的版本，adopted:true 但 shortened:false', async (t) => {
+  const calls = [];
+  const app = await mountRound(t, {
+    spoken: () => {
+      calls.push(1);
+      return RETRY_BODY;
+    },
+  });
+  app.driveTyped(4, { body: RETRY_BODY });
+  await waitUntil(() => app.spokenRequests.length >= 2, 'the near-copy was retried once');
+  const version = await app.waitForEvent('voice.spoken.version', (payload) => payload.purpose === 'typed');
+  const fallbacks = (await app.events()).filter((event) => event.type === 'voice.spoken.fallback');
+  assert.equal(calls.length, 2, 'one retry, not an unbounded regeneration loop');
+  assert.equal(version.source, 'condensed');
+  assert.equal(version.adopted, true, 'a faithful still-long version is still usable');
+  assert.equal(version.shortened, false);
+  assert.equal(version.tooLong, true);
+  assert.equal(version.retried, true);
+  assert.equal(version.reason, 'too-long');
+  assert.equal(version.verdict, 'adopted-unchanged');
+  assert.equal(version.chars, [...RETRY_BODY].length);
+  // The repeated sentence may be de-duplicated by the playback speaker, so only prove that the
+  // adopted version reached the voice outlet (a full fallback would be the body and be rejected).
+  await waitUntil(() => app.players().length >= 1, 'the adopted version started playing');
+  assert.deepEqual(fallbacks, [], 'a still-long adoption is not silently turned into a full fallback');
+  t.diagnostic(`calls=${calls.length} adopted=${version.adopted} shortened=${version.shortened} tooLong=${version.tooLong} fallbacks=0`);
 });
 
