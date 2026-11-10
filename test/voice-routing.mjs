@@ -152,7 +152,10 @@ test('workspaceScope defaults to enabled at <root>/workspace and blocks other wo
   const state = await app.status();
   assert.equal(state.workspaceScope.enabled, true, 'scope is on without a saved setting');
   assert.equal(state.workspaceScope.path, join(root, 'workspace'));
-  assert.deepEqual(state.hotkeys.map((row) => row.action), ['mic', 'vision', 'layerEdit', 'ambient']);
+  // Call mode is a first-class global hotkey (the host exposes it in /assistant/status and the
+  // hotkeys tool); the old four-entry assertion predates it.
+  assert.deepEqual(state.hotkeys.map((row) => row.action),
+    ['mic', 'vision', 'layerEdit', 'ambient', 'callMode']);
 
   const outside = await app.call('assistant_remember', { text: '默认工作区的记忆' }, {
     agent: { session: { header: { cwd: GUI_SESSION.cwd } } },

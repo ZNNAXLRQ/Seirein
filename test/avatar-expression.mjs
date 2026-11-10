@@ -320,10 +320,11 @@ test('6. expression never bypasses user disables, priorities or the event gate',
 });
 
 // ---------------------------------------------------------------------------------------------
-// 6. Controller wiring: presetPersona hears the expression, numerics do not
+// 6. Controller wiring: presetPersona and the soft component draw hear the expression; the numeric
+//    base goal / dimensions do not
 // ---------------------------------------------------------------------------------------------
 
-test('7. controller preset selection uses expression while the numeric idle chain stays identical', () => {
+test('7. controller preset/component selection uses expression while the numeric base chain stays identical', () => {
   const makeRuntime = style => createBehaviorRuntime({
     config: {
       seed: 11,
@@ -367,7 +368,11 @@ test('7. controller preset selection uses expression while the numeric idle chai
   runtime.tick(1000);
   assert.deepEqual(runtime.snapshot().style.effective.expression, { tender: 0.8 });
 
-  // Numeric chain: the same seed produces identical poses/dimensions with and without expression.
+  // Numeric chain: the same seed keeps the numeric base goal/dimensions identical. The persona
+  // tendency is allowed to bias the SOFT component draw (commit d981072: expression reaches the
+  // head/gaze component selection and its amplitude); it still never rewrites the numeric posture
+  // draw, the hold drift or the style dimensions. Assert that split explicitly instead of demanding
+  // bit-identical head poses, which would pin the old selection-only behaviour.
   const numericRun = (expression) => {
     const rt = createBehaviorRuntime({
       config: { seed: 7, idleActions: [], style: { ...NUMERIC_STYLE, expression } },
@@ -378,13 +383,44 @@ test('7. controller preset selection uses expression while the numeric idle chai
       poses.push(rt.snapshot().pose);
     }
     const snapshot = rt.snapshot();
-    return { poses, dimensions: snapshot.style.dimensions, baseline: snapshot.style.baseline };
+    return {
+      poses,
+      dimensions: snapshot.style.dimensions,
+      baseline: snapshot.style.baseline,
+      base: snapshot.motion.posture.base,
+      drift: snapshot.motion.holdDrift,
+      component: snapshot.motion.posture.component,
+    };
   };
   const plain = numericRun(null);
   const classified = numericRun({ tender: 1, playful: 0.5 });
-  assert.deepEqual(classified.poses, plain.poses, 'expression never changes the numeric idle pose');
   assert.deepEqual(classified.dimensions, plain.dimensions, 'expression never changes dimensions');
   assert.equal(classified.baseline.amplitude, plain.baseline.amplitude);
   assert.equal(classified.baseline.tempo, plain.baseline.tempo);
-  console.log(`[expression] controller ${baseline}→${withExpression} poses=${plain.poses.length} version=${JSON.stringify(plain.dimensions.seed)}`);
+  // The numeric idle draw and drift are bit-for-bit the same; only the component layer differs.
+  assert.deepEqual(classified.base, plain.base, 'expression never changes the numeric idle base draw');
+  assert.deepEqual(classified.drift, plain.drift, 'expression never changes the hold drift');
+  assert.notDeepEqual(classified.component.targetSemantic, plain.component.targetSemantic,
+    'expression really reaches the component amplitude (the new selection-only exception)');
+  const headChannels = new Set(['headX', 'headY', 'headZ']);
+  for (const [index, pose] of plain.poses.entries()) {
+    for (const [channel, numeric] of Object.entries(pose)) {
+      if (headChannels.has(channel)) continue;
+      assert.equal(classified.poses[index][channel], numeric,
+        `expression never changes the numeric ${channel} channel`);
+    }
+    for (const channel of headChannels) {
+      assert.ok(Math.abs(classified.poses[index][channel] - pose[channel]) <= 0.05,
+        `the component-only ${channel} difference stays inside the component band`);
+    }
+  }
+  // Both are still ordinary natural holds: expression shifts WHERE inside the 5–8° band, not the band.
+  for (const run of [plain, classified]) {
+    const headZDegrees = run.component.targetDegrees.headZ;
+    assert.ok(headZDegrees >= 5 && headZDegrees <= 8,
+      `the natural component headZ ${headZDegrees.toFixed(2)}° stays in its 5–8° band`);
+  }
+  console.log(`[expression] controller ${baseline}→${withExpression} poses=${plain.poses.length}`
+    + ` component headZ ${plain.component.targetDegrees.headZ.toFixed(2)}°→`
+    + `${classified.component.targetDegrees.headZ.toFixed(2)}° version=${JSON.stringify(plain.dimensions.seed)}`);
 });

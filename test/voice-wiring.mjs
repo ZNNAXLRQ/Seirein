@@ -301,6 +301,11 @@ async function mount(t, { settings = {} } = {}) {
     langs: { speech: 'zh', subtitle: 'zh' },
     typedReply: { voice: true },
     voice: { chunking: true },
+    // This suite's scripted VTS client has no `probeInputMapping`. The unrelated startup mapping
+    // verification would mark the head channels unverified and turn every answer-start preset into
+    // a hold, so the wiring assertions would no longer observe a real gesture. The one-per-connection
+    // startup probe is covered by avatar-mapping-autoverify; disable it only here.
+    avatar: { verifyMappingsOnStartup: false },
     ...settings,
     ...(settings.voice ? { voice: { chunking: true, ...settings.voice } } : {}),
   }));

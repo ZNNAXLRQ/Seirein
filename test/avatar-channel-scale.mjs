@@ -12,9 +12,10 @@
  *   semantic (1 = 30°) → degrees (`× 30`) → input (that channel's own half-range)
  *
  * Checks:
- *   1. thinking tilt: final.headZ ≤ 14° and the write is degree-scale, not the 62° amplification;
+ *   1. thinking tilt: final.headZ uses the independent ±90° roll range and the write is
+ *      degree-scale, not the old 62° amplification (14° is only the expression budget);
  *   2. confused tilt: yaw stays in its 8–10° target band and the roll is on the same degree scale;
- *   3. idle sway: the roll amplitude falls back to ≤ 6°;
+ *   3. idle sway: the visible component stays in its 5–12° band and is written as degrees;
  *   4. nod: headY (pitch) is byte-identical and stays in 4–6°;
  *   5. gaze / brow / eye / mouth keep the unchanged normalized mapping;
  *   6. a missing/degenerate range falls back safely and never writes NaN / Infinity;
@@ -39,11 +40,19 @@ import {
   discoverCapabilities,
   resetCapabilities,
 } from '../src/host/avatar/avatarMotion.js';
+import {
+  HEAD_CHANNEL_DEGREE_LIMITS,
+  POSTURE_COMPONENT_MAX_AMPLITUDE,
+} from '../src/host/avatar/motion-controller.js';
 
 const flushMicrotasks = () => new Promise((resolve) => setImmediate(resolve));
 
-/** The 14° head ceiling in semantic units (the same conversion the writer uses). */
-const HEAD_CAP = EXPRESSION_MOTION.MAX_HEAD_DEGREES / HEAD_DEGREES_PER_POSE_UNIT;
+/**
+ * headZ is its own axis: FaceAngleZ is ±90°, so the semantic pose is bounded by the roll's model
+ * range (3 semantic units = 90°), NOT by the 14° expression budget. A plain tilt gesture may use
+ * more than 14°; only an AUTONOMOUS EXPRESSION / occasional profile stays inside 14°.
+ */
+const HEAD_ROLL_UNITS = HEAD_CHANNEL_DEGREE_LIMITS.headZ / HEAD_DEGREES_PER_POSE_UNIT;
 const degreesOf = (semantic) => semantic * HEAD_DEGREES_PER_POSE_UNIT;
 
 /** Transport that records every single-write and every coalesced frame. */
@@ -185,10 +194,11 @@ const traceFor = (result) => {
 // ---------------------------------------------------------------------------------------------
 // 1. thinking tilt — the real-machine 62.6° case
 // ---------------------------------------------------------------------------------------------
-test('1. thinking tilt：headZ 语义→角度→输入 ≤14°，不再是 62° 量级', async () => {
+test('1. thinking tilt：headZ 走独立 ±90 量程，写出角度值而不是 62° 放大', async () => {
   assert.equal(HEAD_DEGREES_PER_POSE_UNIT, OCCASIONAL_ACTION.DEGREES_PER_POSE_UNIT,
     'the writer and the motion controller share the 30°/unit head convention');
-  // A lively, long-nod persona: the UNCAPPED intent reports 16.9°, so the 14° semantic cap must bind.
+  // A lively, long-nod persona: the intent target reaches ~19° (past the 14° expression budget), and
+  // must still be written as degrees inside headZ's own ±90° range rather than ×90.
   const lively = { amplitude: 1.5, tempo: 1, nodAmplitude: 1.5, expressiveness: 1.5, nodDurationMs: 1200 };
   const result = await runShot({ event: 'thinking', config: { style: lively } });
   const trace = traceFor(result);
@@ -200,16 +210,17 @@ test('1. thinking tilt：headZ 语义→角度→输入 ≤14°，不再是 62°
   const wire = peakWrite(result.writes, 'FaceAngleZ');
   assert.ok(Number.isFinite(wire), 'FaceAngleZ was written');
 
-  // 1) the semantic layer is capped at 14°, never left to the input layer.
-  assert.ok(Math.abs(semantic) <= HEAD_CAP + 1e-9,
-    `final.headZ ${semantic.toFixed(4)} ≤ ${HEAD_CAP.toFixed(4)} (${EXPRESSION_MOTION.MAX_HEAD_DEGREES}°)`);
+  // 1) the semantic pose stays inside headZ's OWN model range (±90° = 3 pose units), not the
+  //    14° expression budget: a thinking tilt is an explicit gesture, not an autonomous expression.
+  assert.ok(Math.abs(semantic) <= HEAD_ROLL_UNITS + 1e-9,
+    `final.headZ ${semantic.toFixed(4)} ≤ ${HEAD_ROLL_UNITS} (independent ±90° roll range)`);
   assert.ok(result.start.peakDegrees > EXPRESSION_MOTION.MAX_HEAD_DEGREES,
-    `the uncapped intent target ${result.start.peakDegrees}° shows the cap really bound`);
-  assert.ok(result.posePeak.headZ <= HEAD_CAP + 1e-9,
-    `the posed headZ ${degreesOf(result.posePeak.headZ).toFixed(2)}° is capped at 14°`);
+    `the tilt target ${result.start.peakDegrees}° is allowed past the 14° expression budget`);
+  assert.ok(result.posePeak.headZ <= HEAD_ROLL_UNITS + 1e-9,
+    `the posed headZ ${degreesOf(result.posePeak.headZ).toFixed(2)}° stays inside the roll range`);
   // 2) the write is the DEGREE value, not semantic × 90 (the old 62.6° amplification).
-  assert.ok(Math.abs(wire) <= EXPRESSION_MOTION.MAX_HEAD_DEGREES + 1e-6,
-    `FaceAngleZ wrote ${wire.toFixed(3)}° ≤ 14°`);
+  assert.ok(Math.abs(wire) <= HEAD_CHANNEL_DEGREE_LIMITS.headZ + 1e-6,
+    `FaceAngleZ wrote ${wire.toFixed(3)}° inside the model's ±90° range`);
   assert.ok(Math.abs(wire - declared) <= 0.75,
     `wire ${wire.toFixed(3)}° ≈ degrees ${declared.toFixed(3)}° (sampled frames may differ)`);
   // 3) it can no longer be the 62°-class value the trace showed.
@@ -220,7 +231,7 @@ test('1. thinking tilt：headZ 语义→角度→输入 ≤14°，不再是 62°
   console.log(
     `[headZ] thinking semantic=${semantic.toFixed(4)} → degrees=${declared.toFixed(2)}°`
     + ` → FaceAngleZ=${wire.toFixed(2)}° (old would be ${(semantic * 90).toFixed(2)}°)`
-    + ` cap=${EXPRESSION_MOTION.MAX_HEAD_DEGREES}° target=${result.start.peakDegrees}°`
+    + ` rollRange=${HEAD_CHANNEL_DEGREE_LIMITS.headZ}° target=${result.start.peakDegrees}°`
     + ` posePeak=${degreesOf(result.posePeak.headZ).toFixed(2)}°`,
   );
 });
@@ -279,9 +290,14 @@ async function runIdleRoll(extra = {}) {
   runtime.takeEvents();
   fake.writes.length = 0;
   let posePeak = 0;
+  let componentPeak = 0;
   for (clock = 0; clock <= 20_000; clock += 50) {
     const pose = runtime.tick(clock);
     posePeak = Math.max(posePeak, Math.abs(pose.headZ));
+    const component = runtime.snapshot().motion.posture.component;
+    if (component !== null) {
+      componentPeak = Math.max(componentPeak, Math.abs(component.targetDegrees?.headZ ?? 0));
+    }
     await flushMicrotasks();
   }
   const roll = valuesFor(fake.writes, 'FaceAngleZ');
@@ -290,17 +306,27 @@ async function runIdleRoll(extra = {}) {
     samples: roll.length,
     peakDegrees: roll.length > 0 ? Math.max(...roll.map(Math.abs)) : 0,
     posePeakDegrees: degreesOf(posePeak),
+    componentPeakDegrees: componentPeak,
   };
 }
 
-test('3. 待机 sway：headZ 幅度回落到 ≤5–6°（而不是原来的 3×）', async () => {
+test('3. 待机 sway：headZ 留在组件带内并仍可见（不再被 ±90 放大 3×）', async () => {
   const idle = await runIdleRoll();
+  // The idle headZ now carries the visible posture component (5–12°), deliberately on top of the
+  // much smaller base sway. The old ≤6° bound assumed the pre-component idle chain; the regression
+  // it guarded (semantic × 90 instead of × 30) would put this ~26°.
+  const componentCeiling = POSTURE_COMPONENT_MAX_AMPLITUDE * HEAD_DEGREES_PER_POSE_UNIT;
   assert.ok(idle.samples > 20, `idle headZ was written continuously (${idle.samples} frames)`);
   assert.ok(idle.peakDegrees > 0.5, `the idle roll still moves (${idle.peakDegrees.toFixed(2)}°)`);
-  assert.ok(idle.peakDegrees <= 6,
-    `idle roll peak ${idle.peakDegrees.toFixed(2)}° ≤ 6° (the old ±90 mapping gave 3×)`);
-  assert.ok(idle.posePeakDegrees <= 6,
-    `idle pose peak ${idle.posePeakDegrees.toFixed(2)}° ≤ 6°`);
+  assert.ok(idle.componentPeakDegrees >= 5 && idle.componentPeakDegrees <= 12,
+    `the held component target ${idle.componentPeakDegrees.toFixed(2)}° stays in a 5–12° band`);
+  assert.ok(idle.peakDegrees <= componentCeiling + 1,
+    `idle roll peak ${idle.peakDegrees.toFixed(2)}° ≤ ${(componentCeiling + 1).toFixed(1)}° (component band)`);
+  assert.ok(idle.posePeakDegrees <= componentCeiling + 1,
+    `idle pose peak ${idle.posePeakDegrees.toFixed(2)}° ≤ ${(componentCeiling + 1).toFixed(1)}°`);
+  // The transport value is the component's DEGREE target (allowing spring lag), never ×90.
+  assert.ok(Math.abs(idle.peakDegrees - idle.componentPeakDegrees) <= 2.5,
+    `write ${idle.peakDegrees.toFixed(2)}° ≈ component degrees ${idle.componentPeakDegrees.toFixed(2)}°`);
 
   // Re-declaring the SAME roll channel as ±30 must not change the degree value anymore.
   const narrow = await runIdleRoll({
@@ -315,7 +341,7 @@ test('3. 待机 sway：headZ 幅度回落到 ≤5–6°（而不是原来的 3×
     + ` vs ${idle.peakDegrees.toFixed(3)})`);
   console.log(
     `[headZ] idle peak=${idle.peakDegrees.toFixed(2)}° (±90) / ${narrow.peakDegrees.toFixed(2)}° (±30)`
-    + ` samples=${idle.samples}`,
+    + ` component=${idle.componentPeakDegrees.toFixed(2)}° samples=${idle.samples}`,
   );
 });
 

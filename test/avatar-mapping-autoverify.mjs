@@ -284,8 +284,14 @@ test('1. 缺省 true：连接+发现后自动 probe 一次，status 有结果，
   assert.deepEqual(snapshot.avatar.mapping.unverified, ['gazeY']);
   assert.equal(snapshot.live2d.capabilities.verified.includes('gazeX'), true);
 
+  // The status view is published before `probeAvatarMapping` awaits the log flush, so the event row
+  // may land a tick later. Wait for the event itself (not a fixed sleep); only then is "exactly one"
+  // meaningful, and the later no-retry check still catches a second write.
+  assert.equal(await waitFor(async () => (await host.probeEvents('startup')).length >= 1), true,
+    'the startup probe event was recorded');
   const startup = await host.probeEvents('startup');
-  assert.equal(startup.length, 1, 'exactly one startup probe event');
+  assert.equal(startup.length, 1,
+    `exactly one startup probe event (got ${startup.length}: ${JSON.stringify(startup.map((row) => row.payload))})`);
   assert.equal(startup[0].payload.source, 'startup');
   assert.equal(startup[0].payload.ok, true);
   assert.equal(await host.probeEvents('manual').then((rows) => rows.length), 0,

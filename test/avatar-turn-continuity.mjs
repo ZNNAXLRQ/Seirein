@@ -667,6 +667,10 @@ async function mountHost(t) {
     langs: { speech: 'zh', subtitle: 'zh' },
     typedReply: { voice: true },
     voice: { chunking: true, ackDelayMs: 60000 },
+    // The scripted VTS client has no `probeInputMapping`; the unrelated startup mapping verification
+    // would unverify every head channel, so no gesture (and no kept pre-turn action) could start.
+    // This suite pins the turn-claim identity, not the one-per-connection probe.
+    avatar: { verifyMappingsOnStartup: false },
   }));
   hostState.onUpdate = null;
   hostState.players = [];
