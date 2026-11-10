@@ -1030,6 +1030,42 @@ export const PRESET_TAKEOVER = Object.freeze({
   ABSOLUTE_CHANNELS: Object.freeze(['eyeOpenL', 'eyeOpenR']),
 });
 
+/**
+ * Post-preset settle (autonomous action tail).
+ *
+ * A completed/cancelled preset used to leave its channels to the release window or to the held
+ * posture component the moment the trajectory left the active list. The visible result was "the
+ * gesture ended, but the avatar stayed in that pose". This tail changes only the TEMPORARY offset,
+ * never the natural baseline:
+ *
+ *   - it is created only for channels the finished action really wrote (`item.written`) and the
+ *     capability proof marked verified; native channels and absolute eye-open are never included;
+ *   - the channel task cancels the action's OWN temporary contribution, captured before the item
+ *     leaves the active list. The dynamic base (breath, micro-motion, blink, idle sway) keeps
+ *     running and the final output is the natural baseline — eyes are never driven to 0;
+ *   - the curve is a quintic Hermite from (offset, velocity) to (0, 0): it continues from the
+ *     pose AND velocity that really existed, decelerates first, and lands with zero velocity, so
+ *     it never reverses on the last frame;
+ *   - 500–1000 ms covers a short action; a larger offset / velocity extends the window under the
+ *     explicit distance and deceleration bounds (`MAX_MS`), never by a hidden amplitude gain;
+ *   - a held posture component whose axes the action wrote is released to the natural stance over
+ *     the same window, while the base activity continues;
+ *   - a new preset/intent/expression on a channel starts a short `TAKEOVER_FADE_MS` blend from the
+ *     CURRENT actual offset, and the old settle is then removed. It can never overwrite the new
+ *     action later.
+ */
+export const PRESET_SETTLE = Object.freeze({
+  MIN_MS: 500,
+  DEFAULT_MS: 720,
+  /** Upper bound only for a LARGE offset/speed; a short action stays inside 500–1000 ms. */
+  MAX_MS: 2400,
+  /** Distance / speed limits used to extend the short window (semantic units). */
+  DISTANCE_SPEED: 0.6,
+  VELOCITY_DECEL: 2.0,
+  /** Cross-fade when a newer owner claims a channel mid-settle. */
+  TAKEOVER_FADE_MS: 180,
+});
+
 
 const DEFAULT_CONFIG = Object.freeze({
   computeHz: TIMING.COMPUTE_HZ,
@@ -1149,6 +1185,11 @@ const DEFAULT_CONFIG = Object.freeze({
    * long dissolve.
    */
   presetTakeoverFadeMs: PRESET_TAKEOVER.FADE_MS,
+  /**
+   * Short-action post-preset window (500–1000 ms); a large offset/velocity extends it under the
+   * explicit distance/velocity bounds up to `PRESET_SETTLE.MAX_MS`. 0 disables the tail.
+   */
+  presetSettleMs: PRESET_SETTLE.DEFAULT_MS,
   random: Math.random,
   now: null,
 });
@@ -1910,6 +1951,28 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       /** Observability only: preset actions that contain a blink operation (never a second layer). */
       blinkStarts: 0,
       lastSign: Object.create(null),
+      /**
+       * Post-preset settle-to-center. One bounded entry per channel the finished action really
+       * wrote (see PRESET_SETTLE): it is overlaid on the natural base for at most one window, then
+       * the base/component takes the channel back. `entries` is bounded by the pose channel table.
+       */
+      settle: {
+        entries: new Map(),
+        /**
+         * The one posture-component release owned by the tail: the component axes the finished
+         * action wrote are walked back to the natural stance while the base keeps running.
+         */
+        componentRelease: null,
+        starts: 0,
+        completed: 0,
+        /** Channels handed to a newer preset/intent/expression before the window ended. */
+        takeovers: 0,
+        componentReleases: 0,
+        lastStartedAt: null,
+        lastCompletedAt: null,
+        lastTakeoverAt: null,
+        lastComponentReleaseAt: null,
+      },
       random: createSeededRandom(`preset:${cfg.seed === undefined ? 'default' : String(cfg.seed)}`),
       /**
        * Sender evidence counters across the whole controller life. Five phases, separate by
@@ -1971,6 +2034,17 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return isBidirectional(channel) ? clampBipolarChannel(channel, value) : clamp01(value);
   };
   const bodyArmVerified = (channel) => state.motion.posture.bodyArms.verified.has(channel);
+  /**
+   * The automatic body/arm layer is opt-out, exactly like the head idle writer: zero sway scale
+   * (`idleSwayScale: 0`) or zero idle amplitude (`idleAmplitude: 0`) means "this runtime must not
+   * move on its own". Explicit intents (wave/spread/shrug) do NOT consult this gate: they are added
+   * by `intentFrame()` after the base mix and stay fully executable.
+   */
+  function bodyArmAutomaticEnabled() {
+    const sway = Math.max(0, finite(cfg.idleSwayScale, DEFAULT_CONFIG.idleSwayScale));
+    const amplitude = finite(cfg.idleAmplitude, 1);
+    return sway > 0 && amplitude > 0;
+  }
 
   /** Current persona tempo (baseline × state modifier): the rhythm used for hold/transition. */
   function postureTempo() {
@@ -2424,6 +2498,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   /** Install one category component; the rate limiter below is the natural hand-off. */
   function installBodyArmComponent(category, now) {
     const gate = state.motion.posture.bodyArms;
+    // A runtime with zero idle sway/amplitude never draws an automatic body-arm pose. Explicit
+    // gestures do not need this layer, so they are unaffected.
+    if (!bodyArmAutomaticEnabled()) {
+      gate.components[category] = null;
+      return null;
+    }
     const previous = gate.components[category];
     const component = drawBodyArmComponent(category, now);
     gate.components[category] = component;
@@ -2457,6 +2537,18 @@ export function createBehaviorRuntime({ config = {} } = {}) {
    */
   function stepBodyArmComponents(now) {
     const gate = state.motion.posture.bodyArms;
+    // Global automatic-motion opt-out (idleSwayScale:0 / idleAmplitude:0): no base micro-motion,
+    // no component hold, no component transition. The explicit intent path is untouched.
+    if (!bodyArmAutomaticEnabled()) {
+      for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
+        gate.components[category] = null;
+      }
+      gate.base = {};
+      gate.component = {};
+      gate.mixed = {};
+      gate.clamped = {};
+      return;
+    }
     if (gate.paused === true) return;
     for (const category of Object.keys(BODY_ARM_COMPONENT_CATEGORIES)) {
       const component = gate.components[category];
@@ -2506,7 +2598,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const mixed = {};
     const clamped = {};
     for (const channel of BODY_ARM_CHANNELS) {
-      if (!bodyArmVerified(channel) || idleEnabled !== true) {
+      if (!bodyArmVerified(channel) || idleEnabled !== true || !bodyArmAutomaticEnabled()) {
         base[channel] = 0;
         component[channel] = 0;
         mixed[channel] = 0;
@@ -2693,6 +2785,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       motion.posture.lastDecision = 'initial';
       return;
     }
+    // A post-preset component release owns its axes and target until its window ends: no 1 Hz
+    // posture decision may overwrite the returning goal (or swap the component mid-release).
+    if (state.presets.settle.componentRelease !== null) return;
     motion.posture.remainingMs = Math.max(0, motion.holdUntil - now);
     motion.decisionAccMs += Math.max(0, dt) * 1000;
     if (motion.decisionAccMs < decisionIntervalMs) return;
@@ -2784,6 +2879,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
   }
 
   /**
+   * The natural base part of one posture axis: the slow amplitude drift + continuous micro-noise
+   * WITHOUT the held component offset. Keeping this as its own function lets the post-preset
+   * component release walk the axe back to the live natural stance, not to a frozen centre.
+   */
+  function motionBaseTarget(axis, tSeconds) {
+    const base = finite(state.motion.posture.base[axis], 0);
+    const salt = hash32(motionSeed, axis);
+    const slow = 0.82 + 0.18 * smoothNoise1(salt, tSeconds * 0.07 + 1.7);
+    const micro = 0.09 * smoothNoise1(salt, tSeconds * 0.55 + 3.1);
+    return base * slow + micro;
+  }
+
+  /**
    * Target = held posture + slow amplitude drift + continuous micro-noise (no fixed sine).
    *
    * The slow drift and the micro-noise belong to the BASE activity layer only. They multiply the
@@ -2797,10 +2905,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const held = finite(state.motion.posture.target[axis], 0);
     const base = finite(state.motion.posture.base[axis], 0);
     const componentOffset = held - base;
-    const salt = hash32(motionSeed, axis);
-    const slow = 0.82 + 0.18 * smoothNoise1(salt, tSeconds * 0.07 + 1.7);
-    const micro = 0.09 * smoothNoise1(salt, tSeconds * 0.55 + 3.1);
-    return componentOffset + base * slow + micro;
+    return componentOffset + motionBaseTarget(axis, tSeconds);
   }
 
   /**
@@ -2859,12 +2964,22 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (progress >= 1) motion.relaxPlan = null;
     }
     const t = state.styleClockMs / 1000;
+    // Post-preset component release writes its own axes directly (live natural base + decaying
+    // offset); every other axis keeps the normal planned-transition / hold tracker below.
+    stepPresetSettleComponentAxes(dt, now, t);
+    const releasingComponentAxes = state.presets.settle.componentRelease === null
+      ? null : state.presets.settle.componentRelease.axes;
     for (const axis of MOTION_AXES) {
+      if (releasingComponentAxes !== null
+        && Object.prototype.hasOwnProperty.call(releasingComponentAxes, axis)) continue;
       advanceMotionAxis(axis, dt, now, t);
     }
     const transition = motion.transition;
     if (transition !== null && now - transition.startedAt >= transition.durationMs) {
       for (const axis of transition.axes) {
+        // A release owns its axis; a queued transition must not overwrite that returning pose.
+        if (releasingComponentAxes !== null
+          && Object.prototype.hasOwnProperty.call(releasingComponentAxes, axis)) continue;
         motion.axes[axis].current = finite(transition.to[axis], 0);
         motion.axes[axis].velocity = 0;
       }
@@ -4258,6 +4373,410 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     return trace;
   }
 
+  /** Configured baseline window (0 disables the tail entirely); clamped into the supported band. */
+  function presetSettleBaseMs() {
+    const raw = finite(cfg.presetSettleMs, PRESET_SETTLE.DEFAULT_MS);
+    if (raw <= 0) return 0;
+    return Math.round(Math.max(PRESET_SETTLE.MIN_MS, Math.min(PRESET_SETTLE.MAX_MS, raw)));
+  }
+
+  /**
+   * Short action → the configured 500–1000 ms window; a larger temporary offset and/or a faster
+   * current pose extends it under explicit distance/deceleration bounds. No hidden gain: this only
+   * decides how long the SAME offset is allowed to travel.
+   */
+  function presetSettleDurationMs(offset, velocity) {
+    const base = presetSettleBaseMs();
+    if (base <= 0) return 0;
+    const distanceMs = (Math.abs(finite(offset, 0)) / PRESET_SETTLE.DISTANCE_SPEED) * 1000;
+    const speedMs = (Math.abs(finite(velocity, 0)) / PRESET_SETTLE.VELOCITY_DECEL) * 1000;
+    return Math.round(Math.min(PRESET_SETTLE.MAX_MS, base + distanceMs + speedMs));
+  }
+
+  /**
+   * Quintic Hermite (offset, velocity) → (0, 0) with zero end velocity AND acceleration. It follows
+   * the pose/velocity that really existed at the boundary (so it decelerates first instead of
+   * reversing in one frame) and lands exactly on the live natural base at the end.
+   */
+  function presetSettleCurve(offset, velocity, durationMs, elapsedMs) {
+    if (!(durationMs > 0)) return 0;
+    const u = clamp01(elapsedMs / durationMs);
+    const u3 = u * u * u;
+    const u4 = u3 * u;
+    const u5 = u4 * u;
+    const h00 = 1 - 10 * u3 + 15 * u4 - 6 * u5;
+    const h10 = u - 6 * u3 + 8 * u4 - 3 * u5;
+    return finite(offset, 0) * h00 + finite(velocity, 0) * (durationMs / 1000) * h10;
+  }
+
+  /**
+   * The live owner (other than the finished preset) of one channel. Base/component/idle layers are
+   * NOT owners here: they are exactly the natural baseline the settle hands the channel back to.
+   * Only a newer explicit preset, intent or expression counts.
+   */
+  function presetSettleOwner(channel, now) {
+    for (const item of state.presets.active) {
+      if (item.done !== true && item.channels.includes(channel)) return `preset:${item.presetId}`;
+    }
+    for (const item of state.intents) {
+      if (item.done === true || item.channels.includes(channel) !== true) continue;
+      const elapsed = now - item.startedAt;
+      if (elapsed >= 0 && elapsed < item.durationMs) return `intent:${item.kind}`;
+    }
+    for (const item of state.expressions) {
+      if (item.channels.includes(channel) !== true) continue;
+      if (now < expressionDoneAt(item)) return `expression:${item.kind}`;
+    }
+    return null;
+  }
+
+  /** Stop the component release on channels a newer owner claimed (never late-overwrite it). */
+  function takeOverPresetSettleComponent(channels, at, by) {
+    const settle = state.presets.settle;
+    const release = settle.componentRelease;
+    if (release === null) return;
+    const taken = [];
+    for (const channel of Array.isArray(channels) ? channels : []) {
+      if (!Object.prototype.hasOwnProperty.call(release.axes, channel)) continue;
+      delete release.axes[channel];
+      taken.push(channel);
+    }
+    if (taken.length === 0) return;
+    recordEvent('avatar.preset.settle.component', {
+      phase: 'takeover',
+      presetId: release.presetId,
+      actionId: release.actionId,
+      axes: taken,
+      by: String(by ?? 'new-owner'),
+      at: Number.isFinite(at) ? at : clockNow(),
+    });
+    if (Object.keys(release.axes).length === 0) {
+      completePresetSettleComponent(release, Number.isFinite(at) ? at : clockNow(), 'taken-over');
+    }
+  }
+
+  /** Start the short cross-fade from the settle tail to a newer owner of the same channel. */
+  function handOffPresetSettles(channels, at, by) {
+    const now = Number.isFinite(at) ? at : clockNow();
+    const settle = state.presets.settle;
+    for (const channel of Array.isArray(channels) ? channels : []) {
+      const entry = settle.entries.get(channel);
+      if (entry === undefined || entry.handoffAt !== null) continue;
+      entry.handoffAt = now;
+      entry.handoffMs = PRESET_SETTLE.TAKEOVER_FADE_MS;
+      entry.handoffBy = String(by ?? 'new-owner');
+      settle.takeovers += 1;
+      settle.lastTakeoverAt = now;
+      recordEvent('avatar.preset.settle.takeover', {
+        channel,
+        presetId: entry.presetId,
+        actionId: entry.actionId,
+        by: entry.handoffBy,
+        fadeMs: entry.handoffMs,
+        at: now,
+      });
+    }
+    // A new action also takes over the component release of the axes it drives.
+    takeOverPresetSettleComponent(channels, now, by);
+  }
+
+  /** Detect a newer owner this frame (an intent/expression may start without calling handoff). */
+  function syncPresetSettleOwners(now) {
+    if (state.presets.settle.entries.size === 0) return;
+    for (const channel of [...state.presets.settle.entries.keys()]) {
+      const owner = presetSettleOwner(channel, now);
+      if (owner !== null) handOffPresetSettles([channel], now, owner);
+    }
+  }
+
+  function completePresetSettle(entry, now, outcome) {
+    const removed = state.presets.settle.entries.delete(entry.channel);
+    if (removed !== true) return;
+    if (outcome === 'completed') {
+      state.presets.settle.completed += 1;
+      state.presets.settle.lastCompletedAt = now;
+    }
+    recordEvent('avatar.preset.settle.done', {
+      channel: entry.channel,
+      presetId: entry.presetId,
+      actionId: entry.actionId,
+      outcome,
+      durationMs: Math.max(0, Math.round(now - entry.startedAt)),
+      at: now,
+    });
+  }
+
+  /** Remove settled axes from a planned transition so it can never snap them when the tail ends. */
+  function yieldTransitionAxes(axes) {
+    const transition = state.motion.transition;
+    if (transition === null) return;
+    transition.axes = transition.axes.filter(
+      (axis) => !Object.prototype.hasOwnProperty.call(axes, axis),
+    );
+    if (transition.axes.length === 0) state.motion.transition = null;
+  }
+
+  function completePresetSettleComponent(release, now, outcome) {
+    if (state.presets.settle.componentRelease !== release) return;
+    // The transition may have been queued by a newer action while the release still owned an axis:
+    // drop that axis from it BEFORE clearing the release, so the axis loop cannot jump afterwards.
+    yieldTransitionAxes(release.axes);
+    state.presets.settle.componentRelease = null;
+    state.presets.settle.componentReleases += 1;
+    state.presets.settle.lastComponentReleaseAt = now;
+    recordEvent('avatar.preset.settle.component', {
+      phase: 'done',
+      presetId: release.presetId,
+      actionId: release.actionId,
+      axes: Object.keys(release.initial),
+      outcome,
+      durationMs: Math.max(0, Math.round(now - release.startedAt)),
+      at: now,
+    });
+  }
+
+  /**
+   * Release the held posture component on the head axes this action wrote. The axis is walked
+   * back to the LIVE natural stance (base drift + micro-noise, component removed) with the same
+   * velocity-aware quintic as the channel offset; the base activity keeps running.
+   */
+  function startPresetSettleComponent(item, startedChannels, now, reason) {
+    const settle = state.presets.settle;
+    const posture = state.motion.posture;
+    const component = posture.component;
+    // The idle posture component belongs to the ENABLED preset pipeline: a low-level direct
+    // execution (preset execution off, used only by callers/tests that inspect the executor) must
+    // not disturb the idle component it was merely riding on.
+    if (component === null || state.presets.enabled !== true) return;
+    const t = state.styleClockMs / 1000;
+    const axes = {};
+    let maxSemanticOffset = 0;
+    let maxSemanticVelocity = 0;
+    for (const axis of POSTURE_COMPONENT_CHANNELS) {
+      if (startedChannels.includes(axis) !== true) continue;
+      const natural = motionBaseTarget(axis, t);
+      const current = finite(state.motion.axes?.[axis]?.current, natural);
+      const offset = current - natural;
+      if (Math.abs(offset) <= 1e-5) continue;
+      const gain = Math.abs(headBaseSemantic(axis));
+      const velocity = finite(state.motion.axes?.[axis]?.velocity, 0);
+      axes[axis] = { offset, velocity };
+      maxSemanticOffset = Math.max(maxSemanticOffset, Math.abs(offset) * gain);
+      maxSemanticVelocity = Math.max(maxSemanticVelocity, Math.abs(velocity) * gain);
+    }
+    if (Object.keys(axes).length === 0) return;
+    const durationMs = presetSettleDurationMs(maxSemanticOffset, maxSemanticVelocity);
+    if (durationMs <= 0) return;
+    // A close follow-up action may need a fresh release: stop the old curve at its CURRENT pose and
+    // start the new one from there, so no axis ever jumps or gets a stale target later.
+    if (settle.componentRelease !== null) {
+      completePresetSettleComponent(settle.componentRelease, now, 'restarted');
+    }
+    const release = {
+      presetId: item.presetId,
+      actionId: item.actionId,
+      reason,
+      startedAt: now,
+      durationMs,
+      componentId: component.id,
+      /** Axis → { offset, velocity } in posture-axis units at the release boundary. */
+      axes: { ...axes },
+      initial: Object.fromEntries(Object.entries(axes).map(([axis, entry]) => [axis, entry.offset])),
+      /** Axis → offset still owed (evidence / snapshot). */
+      targetOffset: Object.fromEntries(Object.entries(axes).map(([axis, entry]) => [axis, entry.offset])),
+    };
+    settle.componentRelease = release;
+    // A transition may still be in flight from the action itself; its released axes are now owned
+    // by the tail, so it must not later snap them to a stale target.
+    yieldTransitionAxes(release.axes);
+    recordEvent('avatar.preset.settle.component', {
+      phase: 'start',
+      presetId: item.presetId,
+      actionId: item.actionId,
+      reason,
+      axes: Object.keys(axes),
+      from: { ...release.targetOffset },
+      durationMs,
+      at: now,
+    });
+  }
+
+  /**
+   * One frame of the component release. The released axis is written directly as
+   * `naturalBase(t) + quintic(offset, velocity → 0)`, so position AND velocity stay continuous and
+   * the base sway keeps running. Only the released axes are touched; the normal posture tracker
+   * advances every other axis.
+   */
+  function stepPresetSettleComponentAxes(dt, now, tSeconds) {
+    const settle = state.presets.settle;
+    const release = settle.componentRelease;
+    if (release === null) return;
+    const posture = state.motion.posture;
+    const component = posture.component;
+    if (component === null || component.id !== release.componentId) {
+      completePresetSettleComponent(release, now, 'owner-changed');
+      return;
+    }
+    const elapsed = Math.max(0, now - release.startedAt);
+    const u = clamp01(elapsed / Math.max(1, release.durationMs));
+    for (const [axis, entry] of Object.entries(release.axes)) {
+      const axisState = state.motion.axes[axis];
+      if (axisState === undefined) continue;
+      const natural = motionBaseTarget(axis, tSeconds);
+      const owed = presetSettleCurve(entry.offset, entry.velocity, release.durationMs, elapsed);
+      const previous = axisState.current;
+      axisState.current = clampMotion(natural + owed, POSTURE_COMPONENT_TARGET_LIMIT);
+      axisState.velocity = dt > 0 ? (axisState.current - previous) / dt : 0;
+      release.targetOffset[axis] = owed;
+      // Keep the planner's target equal to the STILL-OWED offset: if a new action stops the release
+      // early, the normal tracker holds this pose instead of crawling toward a stale neutral.
+      posture.target[axis] = clampMotion(
+        finite(posture.base?.[axis], 0) + owed,
+        POSTURE_COMPONENT_TARGET_LIMIT,
+      );
+      component.axes[axis] = owed;
+    }
+    if (u >= 1) {
+      // Land EXACTLY on the live natural stance and hand the component back at zero offset.
+      for (const axis of Object.keys(release.axes)) {
+        const axisState = state.motion.axes[axis];
+        if (axisState === undefined) continue;
+        axisState.current = motionBaseTarget(axis, tSeconds);
+        axisState.velocity = 0;
+        posture.target[axis] = clampMotion(finite(posture.base?.[axis], 0), POSTURE_COMPONENT_TARGET_LIMIT);
+        component.axes[axis] = 0;
+      }
+      completePresetSettleComponent(release, now, 'completed');
+    }
+  }
+
+  /** Drop every settle task (hard generation switch): nothing of the old action may write later. */
+  function clearPresetSettles(reason, now) {
+    const settle = state.presets.settle;
+    const channels = [...settle.entries.keys()];
+    if (channels.length === 0 && settle.componentRelease === null) return;
+    for (const channel of channels) {
+      const entry = settle.entries.get(channel);
+      if (entry !== undefined) completePresetSettle(entry, now, 'cleared');
+    }
+    const release = settle.componentRelease;
+    if (release !== null) completePresetSettleComponent(release, now, 'cleared');
+    recordEvent('avatar.preset.settle.cleared', {
+      reason: String(reason ?? 'clear'),
+      channels,
+      componentAxes: release === null ? [] : Object.keys(release.initial),
+      at: now,
+    });
+  }
+
+  /**
+   * Begin the post-preset tail for the channels this action really wrote. Eligibility is exactly:
+   * computed non-zero (`item.written`), part of the verified capability set, not a VTS-native
+   * channel and not an absolute eye-open value. A channel a newer owner already drives is skipped
+   * instead of being zeroed under it.
+   */
+  function startPresetSettle(item, now, reason) {
+    if (presetSettleBaseMs() <= 0 || item.written.size === 0) return [];
+    const verified = item.verifiedChannels instanceof Set ? item.verifiedChannels : null;
+    const contribution = item.frameContribution ?? {};
+    const contributionVelocity = item.contributionVelocity ?? {};
+    const started = [];
+    for (const channel of item.written) {
+      if (!CHANNELS.includes(channel)) continue;
+      if (PRESET_NATIVE_CHANNELS.includes(channel)) continue;
+      if (PRESET_TAKEOVER.ABSOLUTE_CHANNELS.includes(channel)) continue;
+      if (verified !== null && verified.size > 0 && verified.has(channel) !== true) continue;
+      if (presetSettleOwner(channel, now) !== null) continue;
+      // The settle cancels exactly the action's OWN temporary offset (never the spring lag or the
+      // live base). A normal exit already reached 0; a cancel/eviction is where it is non-zero.
+      const offset = finite(contribution[channel], 0);
+      const velocity = finite(contributionVelocity[channel], 0);
+      const durationMs = presetSettleDurationMs(offset, velocity);
+      if (durationMs <= 0) continue;
+      // The settle owns the channel now: an old expression release must not force a second 0 tail.
+      state.releases.delete(channel);
+      state.presets.settle.entries.set(channel, {
+        channel,
+        presetId: item.presetId,
+        actionId: item.actionId,
+        reason,
+        startedAt: now,
+        durationMs,
+        /** Captured action contribution and its velocity at the boundary. */
+        from: offset,
+        velocity,
+        handoffAt: null,
+        handoffMs: 0,
+        handoffBy: null,
+        lastOffset: offset,
+        lastNatural: finite(state.idle?.[channel], 0),
+      });
+      state.presets.settle.starts += 1;
+      started.push(channel);
+    }
+    if (started.length > 0) {
+      state.presets.settle.lastStartedAt = now;
+      recordEvent('avatar.preset.settle.start', {
+        presetId: item.presetId,
+        actionId: item.actionId,
+        reason,
+        channels: started,
+        offsets: Object.fromEntries(started.map((channel) => [
+          channel, finite(state.presets.settle.entries.get(channel)?.from, 0),
+        ])),
+        durationMs: Math.max(0, ...started.map((channel) => (
+          finite(state.presets.settle.entries.get(channel)?.durationMs, 0)
+        ))),
+        at: now,
+      });
+      startPresetSettleComponent(item, started, now, reason);
+    }
+    return started;
+  }
+
+  /**
+   * Apply the settle offset to the natural base BEFORE composition. Only the finished action's
+   * channels are touched; every other channel and the base generator keep running.
+   */
+  function applyPresetSettles(generators, frame, now) {
+    const settle = state.presets.settle;
+    if (settle.entries.size === 0) return;
+    syncPresetSettleOwners(now);
+    for (const [channel, entry] of settle.entries) {
+      // A handoff/completion inside sync may have removed this entry already.
+      if (settle.entries.get(channel) !== entry) continue;
+      const elapsed = now - entry.startedAt;
+      if (elapsed < 0) continue;
+      // An explicit attention target owns the eyes; never force a centre over a real look-at and
+      // never leave an idle-gaze task behind: the existing target simply takes the channel over.
+      if ((channel === 'gazeX' || channel === 'gazeY') && frame.gaze !== null) {
+        handOffPresetSettles([channel], now, 'attention');
+        completePresetSettle(entry, now, 'taken-over');
+        continue;
+      }
+      const natural = finite(generators.idle?.[channel], 0);
+      let offset = presetSettleCurve(entry.from, entry.velocity, entry.durationMs, elapsed);
+      if (entry.handoffAt !== null) {
+        const blend = smootherstep((now - entry.handoffAt) / Math.max(1, entry.handoffMs));
+        offset *= 1 - blend;
+        entry.lastOffset = offset;
+        entry.lastNatural = natural;
+        if (blend >= 1) {
+          completePresetSettle(entry, now, 'taken-over');
+          continue;
+        }
+      } else if (elapsed >= entry.durationMs) {
+        // The curve lands at exactly 0 offset; the new frame is the untouched natural base.
+        completePresetSettle(entry, now, 'completed');
+        continue;
+      } else {
+        entry.lastOffset = offset;
+        entry.lastNatural = natural;
+      }
+      generators.idle[channel] = clampSemanticChannel(channel, natural + offset);
+    }
+  }
+
   /**
    * Keep a finished preset's channels in the ONE write set until the pose is back at its idle
    * baseline. This reuses the expression release window (settle → settled or one forced 0). Only
@@ -4269,6 +4788,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     if (item.written.size === 0) return;
     for (const channel of item.channels) {
       if (IDLE_WRITE_CHANNELS.includes(channel)) continue;
+      // The settle tail owns this channel already; a second release/forced-zero would fight it.
+      if (state.presets.settle.entries.has(channel)) continue;
       if (state.releases.has(channel)) continue;
       const owned = state.presets.active.some((other) => other !== item && other.channels.includes(channel))
         || state.expressions.some((other) => other.channels.includes(channel))
@@ -4285,8 +4806,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const index = state.presets.active.indexOf(item);
     if (index >= 0) state.presets.active.splice(index, 1);
     item.done = true;
-    // The trajectory stopped contributing, but its last value is still on the input: hand the
-    // channels to the release window so the pose returns smoothly instead of sticking there.
+    // The trajectory stopped contributing, but what it left on the channel is still visible: the
+    // post-preset settle-to-center now owns the channels it really wrote. This is a bounded tail
+    // that hands them back to the base/component, not a second gesture.
+    startPresetSettle(item, now, interrupted
+      ? (item.cancelledAt !== null ? 'cancelled' : 'interrupted')
+      : 'completed');
+    // Channels not covered by the settle keep the legacy release window (e.g. an unverified or
+    // absolute channel), so a last non-zero value can still never freeze on the VTS input.
     markPresetRelease(item, now);
     return finishPresetTrace(item, now, { interrupted });
   }
@@ -4503,6 +5030,19 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       cancelFadeMs: 0,
       done: false,
       written: new Set(),
+      /**
+       * The capability proof this trajectory was started with. The post-preset settle may only
+       * overwrite a channel the host really verified for this action (never a candidate row).
+       */
+      verifiedChannels: new Set(Array.isArray(context.verifiedChannels) ? context.verifiedChannels : []),
+      /**
+       * The action's OWN additive contribution on the last frame, per channel, plus its rate of
+       * change. The settle tail cancels exactly this temporary offset (never the spring lag or the
+       * live base): at a normal exit it is already 0, so the natural base simply continues.
+       */
+      frameContribution: Object.create(null),
+      contributionVelocity: Object.create(null),
+      contributionAt: null,
       /** First acknowledged value per channel, for commit evidence only (`{at, values}`). */
       firstCommitted: null,
       /**
@@ -4525,11 +5065,14 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     state.presets.active.push(item);
     while (state.presets.active.length > 2) {
       const evicted = state.presets.active.shift();
-      evicted.done = true;
-      markPresetRelease(evicted, at);
-      finishPresetTrace(evicted, at, { interrupted: true });
+      // Route the eviction through the same finish path as a real end: the settle tail starts for
+      // whatever the evicted action wrote, unless the newer action already owns that channel.
+      removePresetItem(evicted, at, { interrupted: true });
     }
     handOffReleases(item.channels);
+    // A newer preset owns its channels from here: an old settle tail must blend out, never zero
+    // the channel underneath the new action.
+    handOffPresetSettles(item.channels, at, `preset:${item.presetId}`);
     if (takeover !== null && takeover.ok === true && takeover.item !== null) {
       applyTakeover(takeover, item, at);
     }
@@ -4691,6 +5234,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         continue;
       }
       let contributed = false;
+      /** This action's own additive contribution on this frame (the settle's cancellation source). */
+      const contribution = Object.create(null);
       for (const stage of item.stages) {
         const envelope = presetStageEnvelope(stage, elapsed);
         if (envelope === null) continue;
@@ -4738,10 +5283,13 @@ export function createBehaviorRuntime({ config = {} } = {}) {
           if (!Number.isFinite(scaled)) continue;
           if (PRESET_HEAD_CHANNELS.includes(channel) || channel === 'bodyX' || channel === 'bodyY' || channel === 'bodyZ') {
             adds[channel] += scaled;
+            contribution[channel] = (contribution[channel] ?? 0) + scaled;
           } else if (channel === 'browL' || channel === 'browR') {
             adds[channel] += scaled;
+            contribution[channel] = (contribution[channel] ?? 0) + scaled;
           } else if (channel === 'gazeX' || channel === 'gazeY') {
             gaze[channel === 'gazeX' ? 'x' : 'y'] += scaled;
+            contribution[channel] = (contribution[channel] ?? 0) + scaled;
           } else if (channel === 'eyeOpenL' || channel === 'eyeOpenR') {
             if (eye === null) eye = { left: 1, right: 1 };
             if (channel === 'eyeOpenL') eye.left = Math.min(eye.left, scaled);
@@ -4751,6 +5299,24 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         }
         notePresetStage(item, stage, envelope.phase, values, now);
         if (any) contributed = true;
+      }
+      // Keep the action's own offset and its rate of change for a later settle. This is NOT the
+      // published pose: spring lag / the live base belong to the natural baseline and are never
+      // cancelled by the tail.
+      if (item.done !== true) {
+        const previousContribution = item.frameContribution ?? {};
+        const elapsedContribution = item.contributionAt === null ? 0 : now - item.contributionAt;
+        if (elapsedContribution > 0) {
+          for (const channel of new Set([
+            ...Object.keys(previousContribution), ...Object.keys(contribution),
+          ])) {
+            item.contributionVelocity[channel] = (
+              (contribution[channel] ?? 0) - (previousContribution[channel] ?? 0)
+            ) / (elapsedContribution / 1000);
+          }
+        }
+        item.frameContribution = contribution;
+        item.contributionAt = now;
       }
       if (!contributed && item.cancelledAt === null && elapsed >= item.durationMs) {
         removePresetItem(item, now, { interrupted: false });
@@ -5094,6 +5660,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       removed += 1;
     }
     state.presets.generation += 1;
+    // A hard generation stop (model/lock/teardown/disable) also drops every settle task: nothing
+    // of the old action may keep writing (or release a component) into the next generation.
+    if (fade <= 0) clearPresetSettles(reason, now);
     if (removed > 0 || faded > 0) {
       recordEvent('avatar.preset.cleared', {
         reason: String(reason), removed, faded, throughGeneration, at: now,
@@ -5175,6 +5744,64 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         .map(([channel, entry]) => ({
           channel, kind: entry.kind, atMs: entry.atMs, frames: entry.frames,
         })),
+      /**
+       * Post-preset settle-to-center projection (bounded by the pose channel table). `active` lists
+       * exactly the channels currently owned by the tail; `starts/completed/takeovers` are lifetime
+       * counters. A settle is only created for a channel the finished action really wrote and the
+       * capability proof verified.
+       */
+      settle: (() => {
+        const now = state.lastAt ?? clockNow();
+        const release = state.presets.settle.componentRelease;
+        return {
+          active: [...state.presets.settle.entries.values()].map((entry) => {
+            const elapsedMs = Math.max(0, now - entry.startedAt);
+            return {
+              channel: entry.channel,
+              presetId: entry.presetId,
+              actionId: entry.actionId,
+              reason: entry.reason,
+              startedAt: entry.startedAt,
+              durationMs: entry.durationMs,
+              elapsedMs,
+              remainingMs: Math.max(0, entry.durationMs - elapsedMs),
+              phase: entry.handoffAt !== null ? 'takeover' : 'settling',
+              /** The TEMPORARY action offset at the boundary, and the part still owed now. */
+              from: entry.from,
+              velocity: entry.velocity,
+              offset: finite(entry.lastOffset, entry.from),
+              natural: finite(entry.lastNatural, 0),
+              handoff: entry.handoffAt === null ? null : {
+                at: entry.handoffAt,
+                by: entry.handoffBy,
+                fadeMs: entry.handoffMs,
+                elapsedMs: Math.max(0, now - entry.handoffAt),
+              },
+            };
+          }),
+          channels: [...state.presets.settle.entries.keys()],
+          component: release === null ? null : {
+            presetId: release.presetId,
+            actionId: release.actionId,
+            reason: release.reason,
+            startedAt: release.startedAt,
+            durationMs: release.durationMs,
+            elapsedMs: Math.max(0, now - release.startedAt),
+            remainingMs: Math.max(0, release.durationMs - (now - release.startedAt)),
+            axes: Object.keys(release.axes),
+            from: { ...release.initial },
+            remaining: { ...release.targetOffset },
+          },
+          starts: state.presets.settle.starts,
+          completed: state.presets.settle.completed,
+          takeovers: state.presets.settle.takeovers,
+          componentReleases: state.presets.settle.componentReleases,
+          lastStartedAt: state.presets.settle.lastStartedAt,
+          lastCompletedAt: state.presets.settle.lastCompletedAt,
+          lastTakeoverAt: state.presets.settle.lastTakeoverAt,
+          lastComponentReleaseAt: state.presets.settle.lastComponentReleaseAt,
+        };
+      })(),
       /**
        * Decision projection (status.live2d.runtime.motion.presets): the last select/skip/commit
        * and the counters that answer "did the idle preset really run, and what filtered it out".
@@ -5469,6 +6096,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     // An explicit gesture takes the channel over immediately: drop any expression release entry so
     // the returning pose never zeroes a channel the new owner is already driving.
     handOffReleases(allowed);
+    // Same rule for a post-preset settle tail: blend it out, never force 0 under the new gesture.
+    handOffPresetSettles(allowed, now, `intent:${action}`);
     while (state.intents.length > 4) state.intents.shift();
     // B: a short RESPONSE action (light nod / conclusion nod / listening micro reply / confused
     // tilt) also lands its posture in 0.8–1.2 s. Nothing about the idle rhythm changes.
@@ -5776,6 +6405,8 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       markExpressionRelease(evicted, time);
     }
     handOffReleases(item.channels);
+    // A new autonomous expression also takes its channels from an old preset settle tail.
+    handOffPresetSettles(item.channels, time, `expression:${kind}`);
     recordEvent('avatar.expression.start', {
       kind,
       durationMs: item.durationMs,
@@ -5918,6 +6549,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
         });
       }
     }
+    // Post-preset settle: an intent-only channel must keep being flushed while its tail walks the
+    // pose back to center; the idle-written head channels are already in the set by construction.
+    for (const channel of state.presets.settle.entries.keys()) set.add(channel);
     // Motion presets ride the SAME write set as explicit intents: the executor computes their
     // trajectory on the one pose, so while a trajectory is active its channels must be flushable.
     // Without this the preset is computed (and used to be reported as committed) but never sent.
@@ -6603,7 +7237,12 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (Number.isFinite(intent.eyeClose.left)) frame.pose.eyeOpenL = clamp01(intent.eyeClose.left);
       if (Number.isFinite(intent.eyeClose.right)) frame.pose.eyeOpenR = clamp01(intent.eyeClose.right);
     }
+    // The component-release target is applied inside advanceMotion, on the same axis trajectory.
     const generators = advanceGenerators(dt, frame);
+    // Post-preset settle: apply ONLY the finished action's temporary offset on top of the live
+    // natural base. The base generator above already ran, so breathing, blink, posture and every
+    // other channel keep moving through the tail.
+    applyPresetSettles(generators, frame, now);
     const composed = composeChannels(frame, generators, ARBITRATION);
     // Body/shoulder/arm channels outside the legacy CHANNELS table are part of the SAME composed
     // pose (and therefore the same spring/rate limiter and the same single writer below).

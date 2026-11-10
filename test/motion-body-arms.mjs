@@ -470,6 +470,90 @@ test('6. 现有 nod：headY 仍写，body 基础层同时继续（无二次通�
     'the nod does not claim an arm channel');
 });
 
+// ---------------------------------------------------------------------------------------------
+// 8. automatic body/arm output respects idleSwayScale:0 (explicit requests still run)
+// ---------------------------------------------------------------------------------------------
+test('8. idleSwayScale:0 停掉身体/手臂基础微动与自动组件，显式 spread 仍可执行', async (t) => {
+  const rig = await makeRuntime({
+    channels: ['headX', 'headY', 'headZ', 'bodyY', 'armL'],
+    config: { idleSwayScale: 0 },
+  });
+  t.after(() => rig.runtime.dispose());
+
+  for (let at = 0; at <= 18_000; at += DT) await rig.tick(at);
+  assert.ok(rig.fake.frames.length > 100, 'the real writer kept producing frames for the mapped head');
+  assert.equal(hasRow(rig.fake.frames, 'bodyY'), false, 'no automatic bodyY row with idleSwayScale:0');
+  assert.equal(hasRow(rig.fake.frames, 'armL'), false, 'no automatic armL row with idleSwayScale:0');
+  for (const channel of ['headX', 'headY', 'headZ']) {
+    const values = frameRows(rig.fake.frames, channel).map((row) => row.value);
+    assert.ok(values.length > 0, `${channel} is still written (as a still value)`);
+    const span = Math.max(...values) - Math.min(...values);
+    assert.ok(span <= 1e-9, `${channel} stays exactly still (span ${span})`);
+  }
+  const snap = rig.runtime.snapshot();
+  for (const category of ['body', 'shoulder', 'arm']) {
+    assert.equal(snap.motion.posture.bodyArms.components[category], null,
+      `${category} automatic component is not installed`);
+  }
+  assert.equal(Math.abs(snap.motion.posture.bodyArms.base.bodyY), 0);
+  assert.equal(Math.abs(snap.motion.posture.bodyArms.mixed.armL), 0);
+
+  // An explicit request is not idle output: it must still reach the transport.
+  const spread = rig.runtime.intent('spread', { at: 18_000 });
+  assert.equal(spread.ok, true);
+  const start = rig.fake.frames.length;
+  for (let at = 18_000; at <= 19_100; at += DT) await rig.tick(at);
+  const after = rig.fake.frames.slice(start);
+  const arm = frameRows(after, 'armL');
+  assert.ok(arm.length > 0, 'the explicit spread still writes armL');
+  assert.ok(Math.max(...arm.map((row) => row.value)) - Math.min(...arm.map((row) => row.value)) > 0.05,
+    'the explicit spread really moves the arm');
+});
+
+// ---------------------------------------------------------------------------------------------
+// 9. automatic body/arm output respects idleAmplitude:0 (explicit requests still run)
+// ---------------------------------------------------------------------------------------------
+test('9. idleAmplitude:0 停掉自动待机输出，显式 spread/nod 不被误杀', async (t) => {
+  const rig = await makeRuntime({
+    channels: ['headX', 'headY', 'headZ', 'bodyY', 'armL'],
+    config: { idleAmplitude: 0 },
+  });
+  t.after(() => rig.runtime.dispose());
+
+  for (let at = 0; at <= 18_000; at += DT) await rig.tick(at);
+  assert.ok(rig.fake.frames.length > 100, 'the real writer produced frames');
+  assert.equal(hasRow(rig.fake.frames, 'bodyY'), false, 'no automatic bodyY row with idleAmplitude:0');
+  assert.equal(hasRow(rig.fake.frames, 'armL'), false, 'no automatic armL row with idleAmplitude:0');
+  for (const channel of ['headX', 'headY', 'headZ']) {
+    const values = frameRows(rig.fake.frames, channel).map((row) => row.value);
+    assert.ok(values.length > 0, `${channel} is still written (as a still value)`);
+    const span = Math.max(...values) - Math.min(...values);
+    assert.ok(span <= 1e-9, `${channel} stays exactly still (span ${span})`);
+  }
+  const snap = rig.runtime.snapshot();
+  for (const category of ['body', 'shoulder', 'arm']) {
+    assert.equal(snap.motion.posture.bodyArms.components[category], null,
+      `${category} automatic component is not installed`);
+  }
+
+  // Explicit body/arm and head requests keep their own writer path.
+  const spread = rig.runtime.intent('spread', { at: 18_000 });
+  assert.equal(spread.ok, true);
+  const nod = rig.runtime.intent('nod', { at: 18_000 });
+  assert.equal(nod.ok, true);
+  const start = rig.fake.frames.length;
+  for (let at = 18_000; at <= 19_100; at += DT) await rig.tick(at);
+  const after = rig.fake.frames.slice(start);
+  const arm = frameRows(after, 'armL');
+  assert.ok(arm.length > 0, 'the explicit spread still writes armL');
+  assert.ok(Math.max(...arm.map((row) => row.value)) - Math.min(...arm.map((row) => row.value)) > 0.05,
+    'the explicit spread really moves the arm');
+  const head = frameRows(after, 'headY');
+  assert.ok(head.length > 0, 'the explicit nod still writes headY');
+  assert.ok(Math.max(...head.map((row) => Math.abs(row.value))) > 0,
+    'the explicit nod reaches the transport');
+});
+
 // Keep the floor import meaningful: a persona draw never returns a zero-weight component.
 test('7. 组件库仍使用软权重下限（没有不可达姿态）', () => {
   assert.ok(COMPONENT_SELECTION_WEIGHT_FLOOR > 0);

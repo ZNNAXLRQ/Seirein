@@ -1367,16 +1367,32 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
   }
 
   /**
+   * Automatic body/arm output is opt-out with the SAME knobs as the head idle writer:
+   * `idleSwayScale: 0` (no generated sway/components) and `idleAmplitude: 0` (no automatic output)
+   * both stop it. Explicit intents keep writing through the separate intent-channel loop.
+   */
+  function automaticBodyArmOutputEnabled() {
+    return host.idleAmplitude > 0 && host.idleSwayScale > 0;
+  }
+
+  /**
    * Append the verified body/arm rows to the SAME frame being built by the one writer. This never
    * creates a second output path: `written` is the frame-wide one-input-per-frame set, so a body
    * channel already emitted by the idle/intent loop is not repeated. Channels without a verified
    * binding simply have no row.
+   *
+   * `explicitChannels` is the controller's active intent/settle write set. When automatic motion
+   * is switched off, only those channels may still be written (a wave/spread/shrug is a request,
+   * not idle output); every automatic row is omitted.
    */
-  function appendBodyArmEntries({ entries, written, pose, at, speaking = false }) {
+  function appendBodyArmEntries({ entries, written, pose, at, speaking = false, explicitChannels = null }) {
+    const automatic = automaticBodyArmOutputEnabled();
     const channels = [];
     for (const item of bodyArmParamMap) {
       if (item.inputName === '') continue;
       if (written.has(item.inputName)) continue;
+      if (automatic !== true
+        && (explicitChannels === null || explicitChannels.has(item.channel) !== true)) continue;
       if (speaking && isMouthOwnedInput(item.inputName)) continue;
       const raw = pose?.[item.channel];
       if (!Number.isFinite(raw)) continue;
@@ -1445,7 +1461,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     // Phase 4 body/shoulder/arm: the same frame, the same written-input set. A verified channel is
     // driven continuously (base + held component), not only while an expression is active.
-    appendBodyArmEntries({ entries, written, pose, at, speaking });
+    appendBodyArmEntries({ entries, written, pose, at, speaking, explicitChannels: intentChannels });
     // Breath rides the same single-slot frame; with no verified channel it adds nothing.
     const breath = breathEntry(pose.breath, at);
     if (breath !== null && !written.has(breath.input)) entries.push(breath);
@@ -5325,7 +5341,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     }
     // Phase 4 body/shoulder/arm rows: the pending frame carries only the legacy channel table, so
     // the writer reads the current composed pose from the same snapshot instead of a second store.
-    appendBodyArmEntries({ entries, written: writtenInputs, pose: snap.pose, at, speaking });
+    appendBodyArmEntries({
+      entries, written: writtenInputs, pose: snap.pose, at, speaking, explicitChannels: intentChannels,
+    });
     // Breath is appended last: it never owns another channel's input and never replaces an idle row.
     const breath = breathEntry(frame.get('breath'), at);
     if (breath !== null && !writtenInputs.has(breath.input)) {
