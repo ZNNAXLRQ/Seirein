@@ -3035,7 +3035,10 @@ export function apply(ctx, config) {
         && (understandingFocus.turnId === undefined || turn === null || understandingFocus.turnId === turn)
         ? understandingFocus
         : null;
-      return understanding.render(focus);
+      const rendered = understanding.render(focus);
+      // 本轮交付时间：只有非空块真正进入模型上下文才算交付；空块保持上一次真实交付时间。
+      if (rendered.length > 0) understandingDeliveredAt = Date.now();
+      return rendered;
     } catch {
       return '';
     }
@@ -11762,6 +11765,105 @@ export function apply(ctx, config) {
     && proactiveEnabled() && visionComponentGateOpen();
 
   /**
+   * 上一次 `framesBetween` 的安全窗口投影：只含时间/计数/来源/代次/机器原因，不含路径、
+   * 帧 id 或正文。理解运行时在发请求前同步调用 framesBetween，因此 `understanding-run`
+   * 事件里的 `window` 就是本次运行的取证结果；status 也复用同一份。
+   */
+  let understandingWindowView = null;
+  /** 最近一次把非空 understanding 块交给模型的时间（本轮交付时间，不含正文）。 */
+  let understandingDeliveredAt = null;
+  /**
+   * 基准帧保留上限：静态画面没有新变化时，窗口内可能没有帧，但同一代次最近一帧仍在
+   * 有界时间内可用。默认 90 s，配置可缩短/关闭；上限 5 分钟，绝不无限回看。
+   */
+  const evidenceBaselineMaxAgeMs = () => {
+    const configured = Number(config?.evidenceBaselineMaxAgeMs);
+    if (Number.isFinite(configured) && configured > 0) return Math.min(300_000, Math.floor(configured));
+    return 90_000;
+  };
+  /** 由证据窗口给出的分类计数拼出可外发窗口视图；字段全是标量。 */
+  const understandingWindowOf = ({ from, to, source, sourceEpoch, frames, diagnosis }) => {
+    const safeTime = (value) => (value === null || value === undefined
+      ? null
+      : (Number.isFinite(Number(value)) ? Number(value) : null));
+    return {
+      windowFrom: safeTime(from),
+      windowTo: safeTime(to),
+      frameCount: Array.isArray(frames) ? frames.length : 0,
+      source: typeof source === 'string' ? source : '',
+      sourceEpoch: Number.isFinite(Number(sourceEpoch)) ? Number(sourceEpoch) : 0,
+      // frames / outside-window / source-epoch / file-not-ready / no-baseline / other
+      reason: typeof diagnosis?.reason === 'string' ? diagnosis.reason : 'other',
+      inWindow: Number(diagnosis?.inWindow) || 0,
+      outsideWindow: Number(diagnosis?.outsideWindow) || 0,
+      sourceMismatch: Number(diagnosis?.sourceMismatch) || 0,
+      epochMismatch: Number(diagnosis?.epochMismatch) || 0,
+      fileNotReady: Number(diagnosis?.fileNotReady) || 0,
+      frameTimesInWindow: Number(diagnosis?.frameTimesInWindow) || 0,
+      baselineAt: safeTime(diagnosis?.baselineAt),
+      at: Date.now(),
+    };
+  };
+  /**
+   * 有界基准兜底：窗口内确实没有帧时，用同来源/同代次、且发生在本次陪伴会话开始之后
+   * （`companionEvidenceFrom`）的最近一帧作为“静态画面的当前样子”。只把查询起点向前
+   * 扩到该帧的可见范围，结束点不变；超过 `evidenceBaselineMaxAgeMs()` 的旧帧不参与。
+   */
+  const windowWithBaseline = ({ from, to, source, sourceEpoch }) => {
+    try {
+      const direct = evidenceWindow.between(from, to, { source, sourceEpoch });
+      if (direct.length > 0) return { from, to, baseline: null };
+      // 自然评论轮可能因为窗口外/来源代次不对而没有帧；先留下排除原因，再尝试有界基准。
+      let diagnosis = null;
+      try {
+        diagnosis = evidenceWindow.diagnose(from, to, {
+          source,
+          sourceEpoch,
+          baselineMaxAgeMs: evidenceBaselineMaxAgeMs(),
+        });
+      } catch {
+        diagnosis = null;
+      }
+      if (diagnosis !== null && diagnosis.selected === 0) {
+        void log.emit('vision.understanding.window.miss', {
+          stage: 'comment-window',
+          reason: diagnosis.reason,
+          windowFrom: Number(from),
+          windowTo: Number(to),
+          frameCount: 0,
+          inWindow: diagnosis.inWindow,
+          outsideWindow: diagnosis.outsideWindow,
+          sourceMismatch: diagnosis.sourceMismatch,
+          epochMismatch: diagnosis.epochMismatch,
+          fileNotReady: diagnosis.fileNotReady,
+          frameTimesInWindow: diagnosis.frameTimesInWindow,
+          source: typeof source === 'string' ? source : '',
+          sourceEpoch: Number.isFinite(Number(sourceEpoch)) ? Number(sourceEpoch) : 0,
+        }).catch(() => {});
+      }
+      const base = evidenceWindow.baseline({
+        source,
+        sourceEpoch,
+        maxAgeMs: evidenceBaselineMaxAgeMs(),
+        minEndedAt: companionEvidenceFrom,
+      });
+      if (base === null) return { from, to, baseline: null };
+      const startedAt = Number(base.startedAt ?? base.capturedAt);
+      if (!Number.isFinite(startedAt) || startedAt >= from) return { from, to, baseline: null };
+      void log.emit('vision.understanding.baseline', {
+        reason: diagnosis?.reason ?? 'outside-window',
+        from: Math.max(0, startedAt),
+        to,
+        ageMs: Number(base.ageMs) || 0,
+        source: typeof source === 'string' ? source : '',
+        sourceEpoch: Number.isFinite(Number(sourceEpoch)) ? Number(sourceEpoch) : 0,
+      }).catch(() => {});
+      return { from: Math.max(0, startedAt), to, baseline: base };
+    } catch {
+      return { from, to, baseline: null };
+    }
+  };
+  /**
    * 20 秒是“最短间隔”的下限，不是定时器：只有出现新材料/用户评论时才登记一次，调度器保证
    * 两次真正开始的分析至少相隔这么久。设置页的成本概览直接读这个值与运行时上限。
    */
@@ -11774,10 +11876,44 @@ export function apply(ctx, config) {
     analyze: typeof config?.understandingAnalyzer === 'function'
       ? (options) => config.understandingAnalyzer(options)
       : (options) => understandingAnalyzer.analyze(options),
-    framesBetween: (from, to) => evidenceWindow.between(from, to, {
-      source: speechEvidenceSource(),
-      sourceEpoch: visionGeneration,
-    }).filter((entry) => typeof entry.file === 'string'),
+    framesBetween: (from, to) => {
+      const source = speechEvidenceSource();
+      const sourceEpoch = visionGeneration;
+      const frames = evidenceWindow.between(from, to, { source, sourceEpoch })
+        .filter((entry) => typeof entry.file === 'string');
+      // 无帧时先记录“是谁把帧过滤掉了”，再让上层 no-frames 可被诊断；成功运行也保留本次
+      // 窗口投影，事件/status 才能对照模型真正看到的区间。
+      let diagnosis = null;
+      try {
+        diagnosis = evidenceWindow.diagnose(from, to, {
+          source,
+          sourceEpoch,
+          baselineMaxAgeMs: evidenceBaselineMaxAgeMs(),
+        });
+      } catch {
+        diagnosis = null;
+      }
+      const view = understandingWindowOf({ from, to, source, sourceEpoch, frames, diagnosis });
+      understandingWindowView = view;
+      if (frames.length === 0) {
+        void log.emit('vision.understanding.window.miss', {
+          stage: 'frames-between',
+          reason: view.reason,
+          windowFrom: view.windowFrom,
+          windowTo: view.windowTo,
+          frameCount: 0,
+          inWindow: view.inWindow,
+          outsideWindow: view.outsideWindow,
+          sourceMismatch: view.sourceMismatch,
+          epochMismatch: view.epochMismatch,
+          fileNotReady: view.fileNotReady,
+          frameTimesInWindow: view.frameTimesInWindow,
+          source: view.source,
+          sourceEpoch: view.sourceEpoch,
+        }).catch(() => {});
+      }
+      return frames;
+    },
     audioBetween: (from, to) => mediaTimeline.between(from, to, { sourceEpoch: ambientEpoch }),
     // P0：渲染时只检查事件引用的帧是否仍可回看；命中就标“证据已过期”，不输出 id/路径。
     isEvidenceAvailable: (event) => {
@@ -11799,6 +11935,13 @@ export function apply(ctx, config) {
     emit: (event, payload) => {
       if (event !== null && typeof event === 'object') {
         const { type, ...rest } = event;
+        // no-frames 与成功运行都附带本次取证窗口（标量计数，无路径/帧 id/正文）：
+        // `understanding-run` 单独看也能判断是“窗口里没帧”还是“帧被来源/代次/范围过滤掉”。
+        if (understandingWindowView !== null
+          && (rest.reason === 'no-frames' || rest.reason === 'ok' || rest.reason === 'frames-error'
+            || rest.reason === 'build-error')) {
+          rest.window = { ...understandingWindowView };
+        }
         void log.emit(typeof type === 'string' ? type : 'vision.understanding.run', rest).catch(() => {});
         return;
       }
@@ -11827,15 +11970,37 @@ export function apply(ctx, config) {
   /**
    * `/assistant/status` 的只读投影：调度计数 + 有界状态的“有没有内容/多大”。绝不暴露场景正文、
    * 事件描述、帧 id 或文件路径。无状态（含隐私清空后）固定给三个 0。
+   *
+   * `window` 是最近一次取证的机器视图（窗口范围/帧数/来源/代次/排除原因），`timing` 把
+   * “事件发生（证据/事件时间）→ 理解完成 → 本轮交付”三个时刻并排放，先有数据再谈误差。
    */
   const understandingStatusView = () => {
     const emptyState = { sceneChars: 0, events: 0, unresolvedChars: 0 };
     const cost = understandingCostView();
+    const windowView = understandingWindowView === null ? null : { ...understandingWindowView };
+    const safeTime = (value) => (value === null || value === undefined
+      ? null
+      : (Number.isFinite(Number(value)) ? Number(value) : null));
+    const timing = {
+      evidenceAt: safeTime(continuousViewLastFrameAt),
+      eventAt: null,
+      understoodAt: safeTime(continuousViewLastUnderstandingAt),
+      deliveredAt: safeTime(understandingDeliveredAt),
+    };
     try {
       const current = understanding.current();
+      if (current !== null && Array.isArray(current.events)) {
+        // 事件发生时间：已并入状态的最近事件结束时刻（只取数字，不含描述）。
+        for (const event of current.events) {
+          const to = Number(event?.to);
+          if (Number.isFinite(to) && (timing.eventAt === null || to > timing.eventAt)) timing.eventAt = to;
+        }
+      }
       return {
         ...understanding.status(),
         ...cost,
+        window: windowView,
+        timing,
         state: current === null ? emptyState : {
           sceneChars: typeof current.sceneSummary === 'string' ? current.sceneSummary.length : 0,
           events: Array.isArray(current.events) ? current.events.length : 0,
@@ -11858,6 +12023,8 @@ export function apply(ctx, config) {
         stopped: false,
         hasState: false,
         ...cost,
+        window: windowView,
+        timing,
         state: emptyState,
       };
     }
@@ -12025,10 +12192,21 @@ export function apply(ctx, config) {
         ? alignment.window.from
         : evidenceFrom;
       const focusTo = Number.isFinite(alignment.window?.to) ? alignment.window.to : end;
+      // 静态画面：语音窗口里可能确实没有新帧。此时不把焦点收成空窗，而是把起点向前扩到
+      // 有界基准帧（同来源/同代次/本陪伴会话内），让“自然评论”仍然分析当前画面；没有
+      // 合格基准时保持原窗口，让 no-frames 如实暴露。
+      const understandingWindow = evidence.length === 0
+        ? windowWithBaseline({
+          from: focusFrom,
+          to: focusTo,
+          source: pending.source,
+          sourceEpoch: pending.sourceEpoch,
+        })
+        : { from: focusFrom, to: focusTo, baseline: null };
       understandingFocus = {
         sessionId: target.sessionId,
-        from: focusFrom,
-        to: focusTo,
+        from: understandingWindow.from,
+        to: understandingWindow.to,
         ...(focusShot === null ? {} : { shotId: focusShot }),
         retrospective: alignment.cues?.retrospective === true,
         current: alignment.cues?.current === true,
@@ -12036,11 +12214,12 @@ export function apply(ctx, config) {
         at,
       };
       // P-187 阶段 3：用户评论优先触发一次画面理解（仍受调度器的最短间隔约束）。
-      // 窗口使用本轮真实语音窗口（回溯词已扩到 16 秒），不再把故事板压成零宽。
+      // 窗口使用本轮真实语音窗口（回溯词已扩到 16 秒），不再把故事板压成零宽；
+      // 只有窗口内真的没有帧时才用有界基准把起点前移。
       noteUnderstandingChange({
         reason: 'comment',
-        from: focusFrom,
-        to: focusTo,
+        from: understandingWindow.from,
+        to: understandingWindow.to,
         priority: true,
       });
       // P-187 阶段 5：用户已经亲口评论这一轮画面。取消待说的主动候选并清掉“未回应”计时，
@@ -12602,6 +12781,9 @@ export function apply(ctx, config) {
     commentEvidence.clearAll();
     commentEvidenceTime.clear();
     understandingFocus = null;
+    // 旧代次的取证窗口/交付时刻也不能继续冒充当前状态。
+    understandingWindowView = null;
+    understandingDeliveredAt = null;
     evidenceWindow.clear('vision-invalidated');
     // P-187 阶段 3：画面理解是这一代证据的结论；隐私/切源/换代后旧场景不能继续当作“现在的内容”。
     understanding.clear('vision-invalidated');
@@ -13490,23 +13672,33 @@ export function apply(ctx, config) {
       latestAt,
       frameCount,
     });
+    // 静态画面：发送窗口里没有新帧时不排队空分析，但也不能永远 no-frames。用同来源/
+    // 同代次、本陪伴会话内的有界基准帧把理解起点前移；评论块仍按真实窗口诚实计数。
+    const understandingWindow = evidence.length === 0
+      ? windowWithBaseline({
+        from: focusFrom,
+        to: focusTo,
+        source,
+        sourceEpoch: visionGeneration,
+      })
+      : { from: focusFrom, to: focusTo, baseline: null };
     understandingFocus = {
       sessionId,
       turnId: turn,
-      from: focusFrom,
-      to: focusTo,
+      from: understandingWindow.from,
+      to: understandingWindow.to,
       ...(focusShot === null ? {} : { shotId: focusShot }),
       retrospective: alignment.cues?.retrospective === true,
       current: alignment.cues?.current === true,
       timeSource: 'typed-sent',
       at: sentAt,
     };
-    // 没有本窗口证据时不排队一次空分析；评论块仍会诚实写“无已登记画面”。
-    if (evidence.length > 0) {
+    // 有本窗口证据，或存在合格基准帧时才排队；两者都没有就如实 no-frames。
+    if (evidence.length > 0 || understandingWindow.baseline !== null) {
       noteUnderstandingChange({
         reason: 'typed',
-        from: focusFrom,
-        to: focusTo,
+        from: understandingWindow.from,
+        to: understandingWindow.to,
         priority: true,
       });
     }

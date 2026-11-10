@@ -452,6 +452,125 @@ export function createEvidenceWindow({
     return null;
   }
 
+  /**
+   * 有界基准帧：静态画面没有新变化时，窗口内可能确实没有帧，但“最近看到的样子”仍然可用。
+   * 只返回同来源、同代次、结束时间在 `maxAgeMs` 内（且不早于 `minEndedAt`）的最新一帧；
+   * 过期/跨代次一律返回 null —— 基准不是无限回看的借口。
+   *
+   * 返回副本并带 `baseline:true` 与 `ageMs`；文件路径只在宿主内部使用，不进 status/事件。
+   */
+  function baseline({
+    source = null, sourceEpoch = null, maxAgeMs = 0, minEndedAt = null,
+  } = {}) {
+    const limit = Number(maxAgeMs);
+    if (!Number.isFinite(limit) || limit <= 0) return null;
+    const floor = Number(minEndedAt);
+    const lowerBound = Number.isFinite(floor) && floor >= 0 ? floor : null;
+    const current = clock();
+    for (let i = frames.length - 1; i >= 0; i -= 1) {
+      const entry = frames[i];
+      if (source !== null && entry.source !== source) continue;
+      if (sourceEpoch !== null && entry.sourceEpoch !== sourceEpoch) continue;
+      const endedAt = entry.endedAt ?? entry.capturedAt;
+      if (lowerBound !== null && endedAt < lowerBound) continue;
+      const ageMs = Math.max(0, current - endedAt);
+      if (ageMs > limit) continue;
+      return { ...entry, baseline: true, ageMs };
+    }
+    return null;
+  }
+
+  /**
+   * 只读诊断：窗口里“有证据却一帧都没选中”时，回答是哪一层过滤掉的。
+   * 仅返回计数/机器原因/时间，不含文件路径、帧 id 或任何素材正文；调用方可安全写进
+   * status 与事件日志。分类优先级（第一个非零即原因）：
+   *   frames → no-baseline（缓存为空）→ outside-window → file-not-ready → source-epoch → other。
+   *
+   * 注意：`no-baseline` 只表示当前窗口内没有任何已登记证据，并不等于“真的没帧可看”；
+   * 调用方应再用 `baseline()` 兜底。`frameTimesInWindow` 用故事板逐帧时刻解释“窗口内
+   * 实际变化了几次”，避免把“只有 2 帧”误读成整个窗口只有一次变化。
+   */
+  function diagnose(from, to, { source = null, sourceEpoch = null, baselineMaxAgeMs = 0 } = {}) {
+    const start = Number(from);
+    const end = Number(to);
+    const valid = Number.isFinite(start) && Number.isFinite(end) && end >= start;
+    const targetSource = typeof source === 'string' && source.length > 0 ? source : null;
+    const targetEpoch = sourceEpoch === null || sourceEpoch === undefined
+      ? null
+      : normalizeEpoch(sourceEpoch);
+    const counts = {
+      total: frames.length,
+      inWindow: 0,
+      selected: 0,
+      outsideWindow: 0,
+      sourceMismatch: 0,
+      epochMismatch: 0,
+      fileNotReady: 0,
+      frameTimesInWindow: 0,
+    };
+    for (const entry of frames) {
+      const entryStart = entry.startedAt ?? entry.capturedAt;
+      const entryEnd = entry.endedAt ?? entry.capturedAt;
+      const inWindow = valid && entryEnd >= start && entryStart <= end;
+      if (!inWindow) {
+        counts.outsideWindow += 1;
+        continue;
+      }
+      counts.inWindow += 1;
+      // 逐帧时刻只统计窗口内真正发生的变化；异常值在登记时已经夹到证据范围内。
+      if (Array.isArray(entry.frameTimes)) {
+        for (const at of entry.frameTimes) {
+          if (at >= start && at <= end) counts.frameTimesInWindow += 1;
+        }
+      }
+      const sourceMatch = targetSource === null || entry.source === targetSource;
+      const epochMatch = targetEpoch === null || entry.sourceEpoch === targetEpoch;
+      const ready = typeof entry.file === 'string' && entry.file.length > 0;
+      if (!sourceMatch) counts.sourceMismatch += 1;
+      if (!epochMatch) counts.epochMismatch += 1;
+      if (!ready) counts.fileNotReady += 1;
+      if (sourceMatch && epochMatch && ready) counts.selected += 1;
+    }
+
+    // 基准候选：与 baseline() 同口径，只给“有没有、最近到什么时候”，不返回记录本身。
+    let baselineAt = null;
+    const limit = Number(baselineMaxAgeMs);
+    if (Number.isFinite(limit) && limit > 0) {
+      const current = clock();
+      for (let i = frames.length - 1; i >= 0; i -= 1) {
+        const entry = frames[i];
+        if (targetSource !== null && entry.source !== targetSource) continue;
+        if (targetEpoch !== null && entry.sourceEpoch !== targetEpoch) continue;
+        const endedAt = entry.endedAt ?? entry.capturedAt;
+        if (Math.max(0, current - endedAt) <= limit) {
+          baselineAt = endedAt;
+          break;
+        }
+      }
+    }
+
+    let reason;
+    if (!valid) reason = 'other';
+    else if (counts.selected > 0) reason = 'frames';
+    else if (counts.total === 0) reason = 'no-baseline';
+    else if (counts.inWindow === 0) reason = 'outside-window';
+    else if (counts.fileNotReady > 0) reason = 'file-not-ready';
+    else if (counts.sourceMismatch > 0 || counts.epochMismatch > 0) reason = 'source-epoch';
+    else reason = 'other';
+
+    return {
+      ...counts,
+      valid,
+      reason,
+      // 时间/来源只回显有限标量；不返回查询对象本身。
+      from: valid ? start : null,
+      to: valid ? end : null,
+      source: targetSource,
+      sourceEpoch: targetEpoch,
+      baselineAt,
+    };
+  }
+
   function state() {
     const current = clock();
     const activeLocks = [...locks.values()].filter((lock) => current < lock.expiresAt);
@@ -472,5 +591,7 @@ export function createEvidenceWindow({
     };
   }
 
-  return { add, lock, extendLock, releaseLock, clear, between, latest, byId, state };
+  return {
+    add, lock, extendLock, releaseLock, clear, between, latest, baseline, diagnose, byId, state,
+  };
 }

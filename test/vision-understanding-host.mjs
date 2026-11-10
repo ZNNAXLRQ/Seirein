@@ -472,3 +472,243 @@ test('真实采集：voice 与 typed 陪伴轮都注入 understanding，编码�
     '失败不清空既有 understanding 状态');
 });
 
+// ---------------------------------------------------------------------------
+// 窗口诊断：成功运行也记录本次取证窗口/计数与三段时刻，且始终无路径/帧 id
+// ---------------------------------------------------------------------------
+
+test('理解窗口诊断：status.window 可解释本次选择，timing 记录证据/理解/交付时刻', async (t) => {
+  let analyzed = null;
+  const app = await fixture(t, {
+    allowCapture: true,
+    evidenceCaptureEnabled: true,
+    evidenceCaptureTickMs: 25,
+    // 证据基准默认 90 s；这里显式给一个上界，证明走的是可配置的有界策略。
+    evidenceBaselineMaxAgeMs: 120_000,
+    understandingMinIntervalMs: 1,
+    features: {
+      hearing: false, ambient: false, voice: false, vision: true,
+      subtitle: false, avatar: false, memory: false, fastpath: false,
+    },
+    settings: { vision: { continuousView: true } },
+    understandingAnalyzer: async (options) => {
+      analyzed = options;
+      const frameId = options?.frames?.[0]?.id;
+      return {
+        ok: true,
+        text: JSON.stringify({
+          sceneSummary: '窗口诊断场景',
+          events: frameId === undefined
+            ? []
+            : [{
+              from: options.interval.from,
+              to: options.interval.to,
+              description: '窗口内事件',
+              evidenceFrameIds: [frameId],
+              evidenceAudioIds: [],
+              uncertainty: '',
+            }],
+          unresolved: '',
+        }),
+        reason: 'ok',
+        images: 1,
+      };
+    },
+  });
+
+  const screenDir = join(app.root, 'cache', 'screens');
+  await mkdir(screenDir, { recursive: true });
+  await writeFile(join(screenDir, 'sheet-window.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x03]));
+  const control = { takes: 0 };
+  state.storyboardFactory = () => ({
+    engine: 'fake',
+    sourceKind: 'screen',
+    done: Promise.resolve(),
+    stop: () => {},
+    take: async () => {
+      if (control.takes > 0) return null;
+      control.takes += 1;
+      return {
+        file: join(screenDir, 'sheet-window.png'),
+        capturedAt: Date.now(),
+        width: 2,
+        height: 2,
+        frames: 2,
+      };
+    },
+  });
+  const companionId = voiceSessionTarget({ root: app.root }).sessionId;
+  const workspace = join(app.root, 'workspace');
+  const companion = {
+    id: companionId,
+    session: { id: companionId, header: { cwd: workspace } },
+  };
+  const handlers = app.listeners.get('agent/pre-step') ?? [];
+  assert.ok(handlers.length > 0);
+  await handlers[0]({
+    agent: companion,
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+    messages: [{ id: 'u-win-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '嗨' }] }],
+  }, async () => ({ kind: 'enter', messages: [] }));
+
+  await waitFor(async () => (await app.status()).vision.understanding.hasState === true);
+  const view = (await app.status()).vision.understanding;
+
+  // 成功运行同样保留窗口投影：能看出“选了哪些帧、来自哪个来源/代次”。
+  assert.equal(view.lastReasonCode, 'ok');
+  assert.ok(view.window !== null, 'status.window 必须存在');
+  assert.equal(typeof view.window.windowFrom, 'number', 'windowFrom 是毫秒数字');
+  assert.equal(typeof view.window.windowTo, 'number');
+  assert.ok(view.window.windowTo >= view.window.windowFrom);
+  assert.equal(view.window.frameCount, 1, '本次确实选到 1 帧');
+  assert.equal(view.window.source, 'desktop');
+  assert.equal(view.window.sourceEpoch, 0);
+  assert.equal(view.window.reason, 'frames');
+  assert.ok(analyzed !== null && analyzed.frames.length === 1, '模型收到同一帧');
+
+  // 三段时刻：证据登记、理解完成（当前有事件）、本轮交付（还没渲染过，先为 null）。
+  assert.equal(typeof view.timing.evidenceAt, 'number');
+  assert.equal(typeof view.timing.understoodAt, 'number');
+  assert.equal(typeof view.timing.eventAt, 'number', '事件发生时刻来自已并入状态的事件');
+  assert.equal(view.timing.deliveredAt, null, '尚未交付给本轮模型时保持 null');
+
+  const understanding = app.promptContexts.get('assistant:understanding');
+  const rendered = understanding.text({ agent: companion });
+  assert.ok(rendered.includes('窗口诊断场景'), `本轮交付非空：${rendered}`);
+  const after = (await app.status()).vision.understanding;
+  assert.equal(typeof after.timing.deliveredAt, 'number', '非空理解块交付后记录交付时间');
+
+  // 安全面：窗口诊断/时刻不含路径、帧 id 或证据目录。
+  const serialized = JSON.stringify({ window: view.window, timing: view.timing });
+  assert.equal(serialized.includes(app.root), false, '不含 fixture 路径');
+  assert.equal(serialized.includes('cache'), false, '不含证据目录');
+  assert.equal(serialized.includes('ev-'), false, '不含帧 id');
+});
+
+test('接线：no-frames 事件/status 带窗口与排除原因，静态画面有有界基准兜底', () => {
+  const framesAt = hostSource.indexOf('framesBetween: (from, to) => {');
+  assert.ok(framesAt > 0, 'index.js 由 framesBetween 统一记录窗口');
+  const framesRegion = hostSource.slice(framesAt, framesAt + 2600);
+  assert.match(framesRegion, /evidenceWindow\.diagnose\(from, to, \{/, '无帧前先做排除原因诊断');
+  assert.match(framesRegion, /vision\.understanding\.window\.miss/, 'no-frames 窗口留下安全事件');
+  assert.match(framesRegion, /understandingWindowOf\(\{ from, to, source, sourceEpoch, frames, diagnosis \}\)/,
+    '窗口视图只由标量组成');
+  assert.match(hostSource, /rest\.window = \{ \.\.\.understandingWindowView \}/,
+    'understanding-run 附带本次窗口');
+
+  const statusAt = hostSource.indexOf('const understandingStatusView = () => {');
+  assert.ok(statusAt > 0);
+  const statusRegion = hostSource.slice(statusAt, statusAt + 2600);
+  assert.match(statusRegion, /window: windowView/, 'status 暴露本次窗口');
+  assert.match(statusRegion, /timing,/, 'status 暴露三段时刻');
+  assert.match(statusRegion, /deliveredAt:/, '交付时刻有独立字段');
+
+  const baselineAt = hostSource.indexOf('const windowWithBaseline = (');
+  assert.ok(baselineAt > 0, '静态画面有基准兜底');
+  const baselineRegion = hostSource.slice(baselineAt, baselineAt + 1800);
+  assert.match(baselineRegion, /evidenceWindow\.baseline\(\{/, '复用证据窗口的基准帧');
+  assert.match(baselineRegion, /minEndedAt: companionEvidenceFrom/,
+    '首轮前的旧画面不得成为基准');
+  assert.match(baselineRegion, /vision\.understanding\.baseline/, '使用基准帧留下安全事件');
+  // 语音与 typed 两条自然评论路径都接入基准兜底，不依赖 see/take。
+  assert.match(hostSource, /evidence\.length === 0\s*\n\s*\? windowWithBaseline\(/,
+    '语音/typed 路径在窗口无帧时尝试基准');
+});
+
+test('自然评论轮：typed pre-step 用本轮证据窗口实际取到相关帧，不依赖 see/take', async (t) => {
+  const calls = [];
+  const app = await fixture(t, {
+    allowCapture: true,
+    evidenceCaptureEnabled: true,
+    evidenceCaptureTickMs: 25,
+    understandingMinIntervalMs: 1,
+    features: {
+      hearing: false, ambient: false, voice: false, vision: true,
+      subtitle: false, avatar: false, memory: false, fastpath: false,
+    },
+    settings: { vision: { continuousView: true } },
+    understandingAnalyzer: async (options) => {
+      const frameId = options?.frames?.[0]?.id;
+      calls.push({
+        from: options?.interval?.from,
+        to: options?.interval?.to,
+        frames: Array.isArray(options?.frames) ? options.frames.map((entry) => entry.id) : [],
+      });
+      return {
+        ok: true,
+        text: JSON.stringify({
+          sceneSummary: '自然评论场景',
+          events: frameId === undefined
+            ? []
+            : [{
+              from: options.interval.from,
+              to: options.interval.to,
+              description: '评论所指画面',
+              evidenceFrameIds: [frameId],
+              evidenceAudioIds: [],
+              uncertainty: '',
+            }],
+          unresolved: '',
+        }),
+        reason: 'ok',
+        images: 1,
+      };
+    },
+  });
+
+  const screenDir = join(app.root, 'cache', 'screens');
+  await mkdir(screenDir, { recursive: true });
+  await writeFile(join(screenDir, 'sheet-comment.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x04]));
+  const control = { takes: 0 };
+  state.storyboardFactory = () => ({
+    engine: 'fake',
+    sourceKind: 'screen',
+    done: Promise.resolve(),
+    stop: () => {},
+    take: async () => {
+      if (control.takes > 0) return null;
+      control.takes += 1;
+      return {
+        file: join(screenDir, 'sheet-comment.png'),
+        capturedAt: Date.now(),
+        width: 2,
+        height: 2,
+        frames: 2,
+      };
+    },
+  });
+
+  const companionId = voiceSessionTarget({ root: app.root }).sessionId;
+  const workspace = join(app.root, 'workspace');
+  const companion = {
+    id: companionId,
+    session: { id: companionId, header: { cwd: workspace } },
+  };
+  const handlers = app.listeners.get('agent/pre-step') ?? [];
+  const preStep = (turn, messageId, text) => handlers[0]({
+    agent: companion,
+    turn,
+    step: 1,
+    signal: new AbortController().signal,
+    messages: [{ id: messageId, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }],
+  }, async () => ({ kind: 'enter', messages: [] }));
+
+  // 第 1 轮：建立陪伴会话并启动证据采集；故事板随即登记一帧。
+  await preStep(1, 'u-comment-1', '嗨');
+  await waitFor(async () => (await app.status()).vision.understanding.runs >= 1);
+  const firstCalls = calls.length;
+  assert.ok(firstCalls >= 1, '故事板分析已发生');
+
+  // 第 2 轮：普通 typed 陪伴轮，只在发送窗口内取证据（不触发 see/take 采集）。
+  await preStep(2, 'u-comment-2', '这个画面里的人刚才在做什么');
+  await waitFor(async () => calls.length > firstCalls);
+  const commentCall = calls[calls.length - 1];
+  assert.ok(commentCall.frames.length >= 1, '自然评论轮必须实际取到证据帧');
+  assert.ok(commentCall.to - commentCall.from >= 9_000, '使用本轮发送窗口，而不是零宽点');
+  const snapshot = await app.status();
+  assert.equal(snapshot.vision.understanding.lastReasonCode, 'ok');
+  assert.ok(snapshot.vision.understanding.window.frameCount >= 1);
+  assert.equal(snapshot.vision.evidenceCapture.running, true, '评论轮不重启/不影响持续采集');
+});
+
