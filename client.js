@@ -3367,6 +3367,8 @@ window.__ModuleLoader__.load({
     const SPEAKER_CANDIDATE_LABEL_MAX_CHARS = 40;
     const SPEAKER_CANDIDATE_NOTICE =
       '只有你确认后才生效：试听后勾选候选，点「建立基础声纹」才会写入本人声纹；不会自动认领。';
+    const SPEAKER_TEMPLATE_NOTICE =
+      '版本链最多保留 20 个版本；强化和回滚都只在你点击后发生，不会自动强化，也不会自动确认 self。';
 
     /** 一条候选：字段缺失只降级这一行；embedding / audioPath 根本不会到达客户端。 */
     function speakerCandidateOf(value, index) {
@@ -3411,6 +3413,31 @@ window.__ModuleLoader__.load({
       const library = speakerEnrollObject(list?.library);
       const listCount = speakerEnrollNumber(list?.count);
       const listedGroups = speakerEnrollNumber(list?.groupCount);
+      const template = speakerEnrollObject(list?.template);
+      const templateAvailable = template?.ok === true;
+      const templateVersions = (Array.isArray(template?.versions) ? template.versions : [])
+        .map((value) => {
+          const record = speakerEnrollObject(value);
+          if (record === null) return null;
+          const version = speakerEnrollNumber(record.version);
+          if (version === null || version < 1) return null;
+          return {
+            version: Math.round(version),
+            sampleCount: Math.max(0, Math.round(speakerEnrollNumber(record.sampleCount) ?? 0)),
+            totalDurationMs: Math.max(0, Math.round(speakerEnrollNumber(record.totalDurationMs) ?? 0)),
+            createdAt: speakerEnrollText(record.createdAt),
+            reason: speakerEnrollText(record.reason),
+            parentVersion: speakerEnrollNumber(record.parentVersion),
+          };
+        })
+        .filter((record) => record !== null);
+      const listedCurrent = speakerEnrollNumber(template?.currentVersion);
+      const templateCurrentVersion = listedCurrent === null || listedCurrent < 1
+        ? null
+        : Math.round(listedCurrent);
+      const templateCurrent = templateVersions.find(
+        (record) => record.version === templateCurrentVersion,
+      ) ?? null;
       const error = speakerEnrollText(list?.error, list?.reason, data?.error);
       return {
         available,
@@ -3424,6 +3451,11 @@ window.__ModuleLoader__.load({
         libraryPresent: library?.present === true,
         libraryLabel: speakerEnrollText(library?.label),
         libraryEnabled: library?.enabled === true,
+        templateAvailable,
+        templateVersions,
+        templateCurrentVersion,
+        templateCurrent,
+        templateCanRollback: template?.canRollback === true,
       };
     }
 
@@ -3446,6 +3478,24 @@ window.__ModuleLoader__.load({
           };
         }
         if (op === 'rename') return { ok: true, message: '已重命名；speakerId 不变。' };
+        if (op === 'strengthen') {
+          const version = speakerEnrollNumber(result.version);
+          const count = speakerEnrollNumber(result.sampleCount);
+          const total = speakerEnrollNumber(result.totalDurationMs);
+          return {
+            ok: true,
+            message: `已强化当前声纹${version === null ? '' : `：v${Math.round(version)}`}`
+              + `${count === null ? '' : ` · 累计 ${count} 条样本`}`
+              + `${total === null ? '' : ` · ${speakerEnrollDurationText(total)}`}。${SPEAKER_TEMPLATE_NOTICE}`,
+          };
+        }
+        if (op === 'rollback') {
+          const version = speakerEnrollNumber(result.currentVersion);
+          return {
+            ok: true,
+            message: `已回滚到${version === null ? '所选版本' : ` v${Math.round(version)}`}；库声纹已同步，历史版本仍保留。`,
+          };
+        }
         if (op === 'preview') {
           const count = speakerEnrollNumber(result.sampleCount);
           const total = speakerEnrollNumber(result.totalDurationMs);
@@ -3497,12 +3547,40 @@ window.__ModuleLoader__.load({
         return { ok: false, message: `读取或写入失败（${reason}），未完成。` };
       }
       if (reason === 'unavailable') return { ok: false, message: '需要宿主支持声纹候选。' };
+      if (reason === 'not-initialized' || reason === 'no-base-template') {
+        return { ok: false, message: '还没有基础声纹版本：请先「建立基础声纹」，再强化当前声纹。' };
+      }
+      if (reason === 'low-similarity') {
+        const score = speakerEnrollNumber(result?.similarity);
+        return {
+          ok: false,
+          message: `候选与当前声纹不够相似${score === null ? '' : `（${score.toFixed(2)}）`}，未写入新版本。`,
+        };
+      }
+      if (reason === 'version-not-found' || reason === 'bad-version-vector') {
+        return { ok: false, message: '这个版本已不在保留链中，无法回滚；请刷新后重试。' };
+      }
+      if (reason === 'invalid-version') return { ok: false, message: '版本号无效，未回滚。' };
+      if (reason === 'too-many-samples') {
+        const max = speakerEnrollNumber(result?.maxSamples);
+        return { ok: false, message: `一次最多强化${max === null ? ' 8' : ` ${Math.round(max)}`} 条候选，未写入。` };
+      }
+      if (reason === 'duration-cap-exceeded') {
+        return { ok: false, message: '本次候选总时长超过强化上限，未写入。' };
+      }
+      if (reason === 'template-write-failed' || reason === 'template-failed'
+        || reason === 'template-read-failed') {
+        return { ok: false, message: `声纹版本读写失败（${reason}），未完成。` };
+      }
+      if (reason === 'dim-mismatch') return { ok: false, message: '候选维度与当前声纹不一致，未写入。' };
       if (reason === '') return { ok: false, message: '操作失败' };
       const missing = speakerEnrollMissingText(reason);
       const base = missing === reason ? `操作失败：${reason}` : missing;
       return {
         ok: false,
-        message: result?.rolledBack === true ? `${base}（已回滚，未留下半套数据）` : base,
+        message: (result?.rolledBack === true || result?.restored === false)
+          ? `${base}${result?.restored === false ? '（版本文件未能恢复）' : '（已回滚，未留下半套数据）'}`
+          : base,
       };
     }
 
@@ -3519,6 +3597,48 @@ window.__ModuleLoader__.load({
       const notice = speakerEnrollObject(props?.candidateNotice);
       const noticeText = speakerEnrollText(notice?.message);
       const noSelection = selected.length === 0;
+      const rollbackAsk = speakerEnrollNumber(props?.rollbackAsk);
+      const templateCurrent = view.templateCurrent;
+      const templateCurrentText = templateCurrent === null
+        ? (view.templateAvailable ? '未建立' : '不可用')
+        : `v${templateCurrent.version} · 样本 ${templateCurrent.sampleCount} 条 · ${speakerEnrollDurationText(templateCurrent.totalDurationMs)}`;
+      const templateReasonText = (reason) => {
+        if (reason === 'initial') return '初始建立';
+        if (reason === 'strengthen') return '显式强化';
+        return reason === '' ? '手动' : reason;
+      };
+      const templateVersionRow = (record) => {
+        const isCurrent = record.version === view.templateCurrentVersion;
+        const asking = rollbackAsk === record.version;
+        return h('div', { key: `template-v${record.version}`, style: { marginTop: 6 } },
+          h('div', { style: { ...styles.row, alignItems: 'flex-start' } },
+            h('span', { style: { ...styles.value, flex: 1 } },
+              `v${record.version}${isCurrent ? ' · 当前' : ''}`
+              + ` · 样本 ${record.sampleCount} 条 · ${speakerEnrollDurationText(record.totalDurationMs)}`
+              + ` · ${templateReasonText(record.reason)}`
+              + `${record.createdAt === '' ? '' : ` · ${record.createdAt}`}`),
+            isCurrent
+              ? null
+              : (asking
+                  ? h('span', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+                      h('span', { style: styles.hint }, `确认回滚到 v${record.version}？`),
+                      h('button', {
+                        style: { ...styles.btnPrimary, ...(locked ? styles.off : {}) },
+                        disabled: locked,
+                        onClick: () => props?.onTemplateRollback?.(record.version),
+                      }, '确认回滚'),
+                      h('button', {
+                        style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                        disabled: locked,
+                        onClick: () => props?.onTemplateRollbackCancel?.(),
+                      }, '取消'))
+                  : h('button', {
+                      style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                      disabled: locked,
+                      onClick: () => props?.onTemplateRollbackAsk?.(record.version),
+                    }, '回滚到此版本'))),
+        );
+      };
       const candidateRow = (candidate) => {
         const checked = selectedSet.has(candidate.id);
         const audioUrl = speakerEnrollText(audioMap[candidate.id]);
@@ -3578,6 +3698,11 @@ window.__ModuleLoader__.load({
                   : '未建立')
               : '不可用')),
         h('div', { style: styles.row },
+          h('span', { style: styles.label }, '当前版本'),
+          h('span', { style: styles.value },
+            view.available ? templateCurrentText : '不可用')),
+        h('div', { style: styles.hint }, SPEAKER_TEMPLATE_NOTICE),
+        h('div', { style: styles.row },
           h('span', { style: styles.label }, '已选'),
           h('span', { style: styles.value }, `${selected.length} 条`)),
         view.error === ''
@@ -3595,6 +3720,15 @@ window.__ModuleLoader__.load({
                   `${group.label} · ${group.candidates.length} 条`),
                 group.candidates.map(candidateRow))))
           : null,
+        h('div', { style: { marginTop: 8 } },
+          h('div', { style: { ...styles.label, fontWeight: 600 } },
+            `版本链${view.templateVersions.length === 0 ? '' : ` · ${view.templateVersions.length} 个`}`),
+          view.templateVersions.length === 0
+            ? h('div', { style: styles.hint },
+                view.templateAvailable ? '还没有版本：建立基础声纹后会从 v1 开始。' : '版本信息不可用。')
+            : [...view.templateVersions]
+                .sort((left, right) => right.version - left.version)
+                .map(templateVersionRow)),
         h('div', { style: { ...styles.row, marginTop: 8 } },
           h('input', {
             style: styles.input,
@@ -3622,6 +3756,22 @@ window.__ModuleLoader__.load({
             title: '只有你点这里才会写入本人声纹；不会自动确认',
             onClick: () => props?.onCandidateBuild?.(selected, label === '' ? '本人' : label),
           }, '建立基础声纹'),
+          h('button', {
+            style: {
+              ...styles.btn,
+              ...(locked || !view.available || noSelection || !view.templateAvailable
+                || view.templateCurrentVersion === null ? styles.off : {}),
+            },
+            disabled: locked || !view.available || noSelection || !view.templateAvailable
+              || view.templateCurrentVersion === null,
+            title: view.templateCurrentVersion === null
+              ? '还没有基础声纹版本；先建立基础声纹'
+              : '把已选候选合并进当前声纹并追加一个版本；不会自动强化',
+            onClick: () => props?.onTemplateStrengthen?.(
+              selected,
+              label === '' ? '本人' : label,
+            ),
+          }, '强化当前声纹'),
           h('button', {
             style: { ...styles.btnDanger, ...(locked || !view.available || view.count === 0 ? styles.off : {}) },
             disabled: locked || !view.available || view.count === 0,
@@ -5234,6 +5384,8 @@ window.__ModuleLoader__.load({
       const [speakerCandidateNotice, setSpeakerCandidateNotice] = useState(null);
       const [speakerCandidateLabel, setSpeakerCandidateLabel] = useState('');
       const [speakerCandidateBusy, setSpeakerCandidateBusy] = useState('');
+      // 版本回滚的二次确认：只保存待确认的版本号，不查库也不改状态。
+      const [speakerTemplateRollback, setSpeakerTemplateRollback] = useState(null);
       // 存放位置：当前 root 只读来自 status；保存只写设置，需重启 DSH 生效（不自动重启/迁移）。
       const [rootDialog, setRootDialog] = useState(null);
       const [rootNotice, setRootNotice] = useState(null);
@@ -5511,6 +5663,34 @@ window.__ModuleLoader__.load({
         setSpeakerCandidatePreview(null);
         await Promise.all([loadSpeakerCandidates(), loadSpeakerEnroll()]);
       }, [loadSpeakerCandidates, loadSpeakerEnroll, runSpeakerCandidateAction]);
+
+      /** 显式强化：失败时保留勾选；成功只刷新候选/版本视图，不碰登记里的确认状态。 */
+      const strengthenSpeakerTemplate = useCallback(async (ids, label) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.template.strengthen', ids, label },
+          'speaker-template-strengthen',
+        );
+        const outcome = speakerCandidateOutcome('strengthen', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return; // a failed strengthen keeps the user's selection
+        setSpeakerCandidateSelection([]);
+        setSpeakerCandidatePreview(null);
+        setSpeakerTemplateRollback(null);
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
+
+      /** 回滚只在用户第二次确认后发一次请求；恢复失败也保留当前选择。 */
+      const rollbackSpeakerTemplate = useCallback(async (version) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.template.rollback', version },
+          'speaker-template-rollback',
+        );
+        const outcome = speakerCandidateOutcome('rollback', result);
+        setSpeakerCandidateNotice(outcome);
+        setSpeakerTemplateRollback(null);
+        if (!outcome.ok) return;
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
 
       const renameSpeakerLibrary = useCallback(async (label) => {
         const result = await runSpeakerCandidateAction(
@@ -7670,6 +7850,11 @@ window.__ModuleLoader__.load({
             onCandidateClear: () => void clearSpeakerCandidates(),
             onCandidatePreview: (ids) => void previewSpeakerCandidates(ids),
             onCandidateBuild: (ids, label) => void buildSpeakerBase(ids, label),
+            onTemplateStrengthen: (ids, label) => void strengthenSpeakerTemplate(ids, label),
+            rollbackAsk: speakerTemplateRollback,
+            onTemplateRollbackAsk: (version) => setSpeakerTemplateRollback(version),
+            onTemplateRollbackCancel: () => setSpeakerTemplateRollback(null),
+            onTemplateRollback: (version) => void rollbackSpeakerTemplate(version),
             onCandidateRename: (label) => void renameSpeakerLibrary(label),
             onCandidateLabel: setSpeakerCandidateLabel,
           }),

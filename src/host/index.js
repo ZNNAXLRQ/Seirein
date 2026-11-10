@@ -381,6 +381,9 @@ import { openAudioRetention } from './hearing/audio-retention.js';
 // Voiceprint enrollment (`<root>/data/speaker-enrollment.json`): the Host owns the one store the
 // settings card reads and writes through its four explicit actions.
 import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
+// Version chain (`<root>/data/speaker-template-versions.json`): host-only persistence above the
+// pure template/version modules; only explicit strengthen/rollback actions write it.
+import { createSpeakerTemplateStore } from './hearing/speaker-template-store.js';
 // Daily speaker candidates: metadata cache + the host's short-lived 16 kHz WAV files. This layer
 // only collects; the explicit settings actions below are the only path that can turn a selection
 // into a template / enrollment / self.
@@ -1827,6 +1830,9 @@ export function apply(ctx, config) {
   // 声纹登记：`<root>/data/speaker-enrollment.json`。读取永不建文件，写入只由用户的
   // speaker.enroll.confirm / reject / remove 触发；这里不自动确认、不自动拒绝任何条目。
   const speakerEnrollmentStore = createSpeakerEnrollmentStore({ root, log });
+  // Host-only version chain. It opens no handle and creates nothing on read; only an explicit
+  // build/strengthen/rollback writes it.
+  const speakerTemplateStore = createSpeakerTemplateStore({ root, log });
   /**
    * A5: the one `voice.speechMaxChars` value every speaking lane reads. The runtime setting wins;
    * the plugin config is the fallback; `undefined` keeps `resolveSpeechBudget`'s 1200 default
@@ -19653,6 +19659,7 @@ export function apply(ctx, config) {
     get speakerCandidatesStore() { return speakerCandidatesStore; },
     get speakerEnrollmentStore() { return speakerEnrollmentStore; },
     get speakerLibrary() { return speakerLibrary; },
+    get speakerTemplateStore() { return speakerTemplateStore; },
     get speakerModelState() { return speakerModelState; },
     get speakerShadowEnabled() { return speakerShadowEnabled; },
     get startAmbient() { return startAmbient; },

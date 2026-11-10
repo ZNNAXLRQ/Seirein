@@ -7,6 +7,14 @@ import {
   LEXICON_USAGE_MAX_CHARS,
 } from '../speech/lexicon-store.js';
 import { lexiconKey } from '../speech/lexicon-candidates.js';
+import { decodeEmbedding } from './speaker-candidates.js';
+import { buildSpeakerTemplate } from './speaker-template.js';
+import {
+  createVersion,
+  createVersionState,
+  nextVersion,
+  rollback as rollbackTemplateVersion,
+} from './speaker-template-version.js';
 
 export const ACTIONS = Object.freeze([
   'hearing.start',
@@ -46,6 +54,10 @@ export const ACTIONS = Object.freeze([
   'speaker.candidates.preview',
   'speaker.candidates.build',
   'speaker.rename',
+  /** Explicit version-chain writes. They never run on their own and never become candidates. */
+  'speaker.template.status',
+  'speaker.template.strengthen',
+  'speaker.template.rollback',
 ]);
 
 /** The one speaker id this host may create for the user's own base voiceprint. */
@@ -86,6 +98,217 @@ function speakerLibraryEntryView(entry) {
   };
 }
 
+/** One version as the card may see it: no vector, no embedding, no path. */
+function speakerTemplateVersionView(record) {
+  return {
+    version: Math.max(1, Math.round(Number(record?.version) || 0)),
+    sampleCount: Math.max(0, Math.round(Number(record?.sampleCount) || 0)),
+    totalDurationMs: Number.isFinite(Number(record?.totalDurationMs))
+      ? Math.max(0, Number(record.totalDurationMs))
+      : 0,
+    createdAt: record?.createdAt ?? null,
+    reason: typeof record?.reason === 'string' ? record.reason : '',
+    parentVersion: record?.parentVersion === null || record?.parentVersion === undefined
+      ? null
+      : Math.max(1, Math.round(Number(record.parentVersion) || 0)),
+  };
+}
+
+/**
+ * Read-only and fail-closed safe view of the persisted chain. A missing store is `unavailable`;
+ * a bad/corrupt file is already normalized to an empty chain by the store, never thrown here.
+ */
+function speakerTemplateStatusOf(store) {
+  if (store === null || typeof store?.read !== 'function') {
+    return { ok: false, reason: 'unavailable' };
+  }
+  let state;
+  try {
+    state = store.read();
+  } catch {
+    return { ok: false, reason: 'template-read-failed' };
+  }
+  const versions = Array.isArray(state?.versions)
+    ? state.versions.map(speakerTemplateVersionView)
+    : [];
+  const currentVersion = versions.some((record) => record.version === state?.currentVersion)
+    ? state.currentVersion
+    : null;
+  return {
+    ok: true,
+    currentVersion,
+    versions,
+    canRollback: versions.some((record) => record.version !== currentVersion),
+  };
+}
+
+/** Trim, validate and de-duplicate a template action's ids, preserving request order. */
+function prepareSpeakerTemplateIds(value) {
+  if (!Array.isArray(value)) return { ok: false, reason: 'invalid-ids' };
+  const ids = [];
+  const seen = new Set();
+  for (const raw of value) {
+    if (typeof raw !== 'string') return { ok: false, reason: 'invalid-id' };
+    const id = raw.trim();
+    if (id.length === 0) return { ok: false, reason: 'invalid-id' };
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length > 20) return { ok: false, reason: 'too-many-ids', max: 20 };
+  }
+  if (ids.length === 0) return { ok: false, reason: 'no-ids' };
+  return { ok: true, ids };
+}
+
+/**
+ * Decode the selected candidate rows into the sample shape the version module consumes.
+ * Only the id/embedding/duration cross this seam; a candidate's speakerId is deliberately ignored.
+ */
+function speakerTemplateSamplesOf(store, ids) {
+  let candidates;
+  try {
+    candidates = store.list();
+  } catch {
+    return { ok: false, reason: 'store-failed' };
+  }
+  if (!Array.isArray(candidates)) return { ok: false, reason: 'store-failed' };
+  const byId = new Map();
+  for (const candidate of candidates) {
+    const id = speakerActionText(candidate?.id);
+    if (id.length > 0 && !byId.has(id)) byId.set(id, candidate);
+  }
+  const samples = [];
+  for (const id of ids) {
+    const candidate = byId.get(id);
+    if (candidate === undefined) return { ok: false, reason: 'candidate-not-found', id };
+    const encoded = speakerActionText(candidate.embedding);
+    if (encoded.length === 0) return { ok: false, reason: 'missing-embedding', id };
+    const embedding = decodeEmbedding(encoded);
+    if (embedding === null) return { ok: false, reason: 'invalid-embedding', id };
+    const durationMs = Math.round(Number(candidate.durationMs));
+    if (!Number.isFinite(durationMs) || durationMs <= 0) {
+      return { ok: false, reason: 'invalid-duration', id };
+    }
+    samples.push({ id, embedding, durationMs });
+  }
+  if (samples.length === 0) return { ok: false, reason: 'no-ids' };
+  return { ok: true, samples };
+}
+
+/**
+ * Make the library's `self` row carry exactly one version vector.
+ *
+ * `SpeakerLibrary.register()` folds an embedding into a running average, which is right for
+ * enrolling a new sample but wrong for restoring a version: an averaged rollback would not equal
+ * the version the user selected. The version chain is authoritative here, so this helper still
+ * calls `register()` (created/retired/dim/event rules live there) and then, inside a savepoint,
+ * overwrites the stored BLOB with the exact unit vector. A newly created row already equals the
+ * vector and needs no second write. On any failure the savepoint rolls both writes back.
+ *
+ * @returns {{ok: true, created: boolean, activeCount: number}|{ok: false, reason: string}}
+ */
+function applySpeakerLibraryTemplate(library, vector, label) {
+  if (library === null || typeof library?.register !== 'function') {
+    return { ok: false, reason: 'unavailable' };
+  }
+  let existing = null;
+  const canRead = typeof library.get === 'function';
+  if (canRead) {
+    try {
+      existing = library.get(SPEAKER_BASE_ID);
+    } catch {
+      return { ok: false, reason: 'library-failed' };
+    }
+  }
+  if (existing !== null && existing !== undefined) {
+    const dim = Number(existing.dim);
+    if (Number.isFinite(dim) && dim > 0 && dim !== vector.length) {
+      return { ok: false, reason: 'dim-mismatch' };
+    }
+  }
+  const effectiveLabel = label.length > 0
+    ? label
+    : (typeof existing?.label === 'string' ? existing.label : '');
+
+  let db = null;
+  if (typeof library.open === 'function') {
+    try {
+      db = library.open();
+    } catch {
+      return { ok: false, reason: 'library-failed' };
+    }
+  }
+  const canExact = db !== null && typeof db?.exec === 'function'
+    && typeof db?.prepare === 'function';
+  const existingPresent = canRead && existing !== null && existing !== undefined;
+
+  let savepoint = false;
+  if (canExact) {
+    try {
+      db.exec('SAVEPOINT speaker_template_apply');
+      savepoint = true;
+    } catch {
+      return { ok: false, reason: 'library-failed' };
+    }
+  }
+  try {
+    const registered = library.register(SPEAKER_BASE_ID, vector, {
+      label: effectiveLabel,
+      enabled: true,
+    });
+    if (registered?.ok !== true) {
+      throw Object.assign(new Error('register failed'), {
+        speakerReason: typeof registered?.reason === 'string' && registered.reason.length > 0
+          ? registered.reason
+          : 'library-failed',
+      });
+    }
+    // A caller-provided library without `open()`/prepare() cannot be overwritten exactly; it is
+    // still allowed to accept the registered vector, but the real Host library always takes the
+    // exact branch below (version restore must not become a running average).
+    if (existingPresent && canExact) {
+      const blob = Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength);
+      const result = db.prepare(
+        `UPDATE speaker_template
+            SET label = ?, dim = ?, embedding = ?, updated_at = ?, enabled = 1
+          WHERE speaker_id = ?`,
+      ).run(
+        effectiveLabel,
+        vector.length,
+        blob,
+        new Date().toISOString(),
+        SPEAKER_BASE_ID,
+      );
+      if (!(Number(result?.changes) > 0)) {
+        throw Object.assign(new Error('template update failed'), {
+          speakerReason: 'library-failed',
+        });
+      }
+    }
+    if (savepoint) db.exec('RELEASE speaker_template_apply');
+    return {
+      ok: true,
+      created: !existingPresent,
+      activeCount: Math.max(0, Math.round(Number(registered.activeCount) || 0)),
+    };
+  } catch (error) {
+    if (savepoint) {
+      try {
+        db.exec('ROLLBACK TO speaker_template_apply');
+        db.exec('RELEASE speaker_template_apply');
+      } catch {
+        /* the connection already unwound it */
+      }
+    }
+    return {
+      ok: false,
+      reason: typeof error?.speakerReason === 'string' && error.speakerReason.length > 0
+        ? error.speakerReason
+        : 'library-failed',
+    };
+  }
+}
+
 export function createHearingSettingsActions(services) {
   /**
    * The one diagnosis-clip store. The Host owns it (one per plugin root); a live capture session
@@ -118,10 +341,16 @@ export function createHearingSettingsActions(services) {
   const candidateStore = () => services.speakerCandidatesStore ?? null;
   const speakerLibrary = () => services.speakerLibrary ?? null;
   const enrollmentStore = () => services.speakerEnrollmentStore ?? null;
+  const templateStore = () => services.speakerTemplateStore ?? null;
   const SPEAKER_CANDIDATES_UNAVAILABLE = Object.freeze({
     ok: false,
     reason: 'unavailable',
     error: '声纹候选尚未接线：需要 Host 提供候选、声纹库与登记存储',
+  });
+  const SPEAKER_TEMPLATE_UNAVAILABLE = Object.freeze({
+    ok: false,
+    reason: 'unavailable',
+    error: '声纹模板版本尚未接线：需要 Host 提供版本存储与声纹库',
   });
   const speakerEvent = async (type, payload) => {
     try {
@@ -370,6 +599,8 @@ export function createHearingSettingsActions(services) {
           groupCount,
           selfId: enrollmentSelfId(),
           library: librarySelfView(),
+          // Read-only version chain projection; a missing store is a controlled null, not a throw.
+          template: speakerTemplateStatusOf(templateStore()),
         };
       }
       case 'speaker.candidates.audio': {
@@ -509,6 +740,20 @@ export function createHearingSettingsActions(services) {
         const vector = Float32Array.from(previewed.vector.map((value) => Number(value)));
         if (vector.length !== previewed.vector.length) return { ok: false, reason: 'template-failed' };
 
+        // A base build also seeds version 1, but an existing chain is never overwritten. The
+        // store is optional here so direct/degraded callers keep the old build contract; the Host
+        // always injects it.
+        const templates = templateStore();
+        let beforeTemplateState = null;
+        let templateInitialized = false;
+        if (templates !== null && typeof templates?.read === 'function') {
+          try {
+            beforeTemplateState = templates.read();
+          } catch {
+            beforeTemplateState = null;
+          }
+        }
+
         // 3) Library + enrollment are one unit: a SQLite savepoint rolls the template back and the
         // enrollment snapshot restores the JSON file byte-for-byte on any later failure.
         let db = null;
@@ -550,6 +795,34 @@ export function createHearingSettingsActions(services) {
               },
             });
           }
+          // Seed v1 only after the library/enrollment writes succeeded, and only when the chain
+          // is empty. A second explicit build must not rewrite an existing version 1.
+          if (templates !== null && beforeTemplateState !== null
+            && beforeTemplateState.versions.length === 0) {
+            const createdAt = new Date().toISOString();
+            const created = createVersion({
+              version: 1,
+              vector,
+              sampleCount: previewed.sampleCount,
+              totalDurationMs,
+              createdAt,
+              reason: 'initial',
+              parentVersion: null,
+            });
+            if (created.ok !== true) {
+              throw Object.assign(new Error('template version failed'), {
+                speakerReason: typeof created.reason === 'string' ? created.reason : 'template-failed',
+              });
+            }
+            const seeded = createVersionState(created.record);
+            if (seeded.ok !== true) {
+              throw Object.assign(new Error('template state failed'), {
+                speakerReason: typeof seeded.reason === 'string' ? seeded.reason : 'template-failed',
+              });
+            }
+            templates.write(seeded.state);
+            templateInitialized = true;
+          }
           db.exec('RELEASE speaker_candidates_build');
         } catch (error) {
           let rolledBack = false;
@@ -574,6 +847,15 @@ export function createHearingSettingsActions(services) {
               }
             }
           }
+          let templateRestored = templateInitialized !== true;
+          if (templateInitialized) {
+            try {
+              templates.write(beforeTemplateState);
+              templateRestored = true;
+            } catch {
+              templateRestored = false;
+            }
+          }
           const reason = typeof error?.speakerReason === 'string'
             ? error.speakerReason
             : 'write-failed';
@@ -581,6 +863,7 @@ export function createHearingSettingsActions(services) {
             reason,
             rolledBack: rolledBack === true,
             enrollmentRestored: enrollmentRestored === true,
+            ...(templateInitialized ? { templateRestored: templateRestored === true } : {}),
           });
           return {
             ok: false,
@@ -588,6 +871,7 @@ export function createHearingSettingsActions(services) {
             ...(error?.speakerExtra ?? {}),
             rolledBack: rolledBack === true,
             enrollmentRestored: enrollmentRestored === true,
+            ...(templateInitialized ? { templateRestored: templateRestored === true } : {}),
           };
         }
 
@@ -619,6 +903,7 @@ export function createHearingSettingsActions(services) {
           sampleCount: samples.length,
           totalDurationMs,
           created: registered?.created === true,
+          templateInitialized: templateInitialized === true,
           library: libraryView,
           enrollment: stats === null ? null : {
             speakerId: SPEAKER_BASE_ID,
@@ -626,6 +911,182 @@ export function createHearingSettingsActions(services) {
             sampleCount: Math.max(0, Math.round(Number(stats.sampleCount) || 0)),
             totalDurationMs: Math.max(0, Math.round(Number(stats.totalDurationMs) || 0)),
           },
+        };
+      }
+      case 'speaker.template.status': {
+        const templates = templateStore();
+        if (templates === null) return SPEAKER_TEMPLATE_UNAVAILABLE;
+        return speakerTemplateStatusOf(templates);
+      }
+      case 'speaker.template.strengthen': {
+        const actions = candidateActions();
+        const store = candidateStore();
+        const library = speakerLibrary();
+        const templates = templateStore();
+        if (actions === null || store === null || library === null || templates === null) {
+          return SPEAKER_TEMPLATE_UNAVAILABLE;
+        }
+        const idsResult = prepareSpeakerTemplateIds(body.ids);
+        if (idsResult.ok !== true) return idsResult;
+        const labelResult = prepareSpeakerLabel(body.label);
+        if (labelResult.ok !== true) return labelResult;
+
+        // 1) Consistency first; the same gate the explicit build uses. Then decode the exact
+        // candidate rows for the version module. A candidate's speakerId is never read here: a
+        // selected clip is evidence, not an identity and never automatically `self`.
+        const previewed = actions.preview(idsResult.ids);
+        if (previewed?.ok !== true) return previewed;
+        const samplesRead = speakerTemplateSamplesOf(store, idsResult.ids);
+        if (samplesRead.ok !== true) return samplesRead;
+        const samples = samplesRead.samples;
+        const built = buildSpeakerTemplate(samples);
+        if (built?.ok !== true) {
+          const failure = {
+            ok: false,
+            reason: typeof built?.reason === 'string' && built.reason.length > 0
+              ? built.reason
+              : 'template-failed',
+          };
+          if (Number.isFinite(Number(built?.minPairCosine))) {
+            failure.minPairCosine = Number(built.minPairCosine);
+          }
+          if (Array.isArray(built?.outlierIds)) failure.outlierIds = [...built.outlierIds];
+          return failure;
+        }
+
+        let state;
+        try {
+          state = templates.read();
+        } catch {
+          return { ok: false, reason: 'template-read-failed' };
+        }
+        if (!Array.isArray(state?.versions) || state.versions.length === 0
+          || state.currentVersion === null) {
+          return { ok: false, reason: 'not-initialized' };
+        }
+
+        const options = {
+          reason: 'strengthen',
+          createdAt: new Date().toISOString(),
+        };
+        if (body.incomingWeight !== undefined) options.incomingWeight = body.incomingWeight;
+        const next = nextVersion(state, samples, options);
+        if (next?.ok !== true) return next;
+        const record = next.state.versions.find((entry) => entry.version === next.version) ?? null;
+        if (record === null) return { ok: false, reason: 'template-failed' };
+
+        // 2) Persist the computed state first. If the library then refuses, the previous file is
+        // restored, so a failed explicit action leaves neither a new version nor a changed library.
+        try {
+          templates.write(next.state);
+        } catch {
+          return { ok: false, reason: 'template-write-failed' };
+        }
+        const applied = applySpeakerLibraryTemplate(library, record.vector, labelResult.label);
+        if (applied.ok !== true) {
+          let restored = false;
+          try {
+            templates.write(state);
+            restored = true;
+          } catch {
+            restored = false;
+          }
+          await speakerEvent('speaker.template.strengthen.failed', {
+            reason: applied.reason,
+            restored: restored === true,
+          });
+          return { ok: false, reason: applied.reason, restored };
+        }
+
+        await speakerEvent('speaker.template.strengthened', {
+          version: record.version,
+          previousVersion: state.currentVersion,
+          sampleCount: record.sampleCount,
+          totalDurationMs: record.totalDurationMs,
+          created: applied.created === true,
+        });
+        return {
+          ok: true,
+          speakerId: SPEAKER_BASE_ID,
+          version: record.version,
+          previousVersion: state.currentVersion,
+          sampleCount: record.sampleCount,
+          totalDurationMs: record.totalDurationMs,
+          batchSampleCount: samples.length,
+          batchTotalDurationMs: built.totalDurationMs,
+          createdAt: record.createdAt,
+          reason: record.reason,
+          library: librarySelfView(),
+          canRollback: next.state.versions.some((entry) => entry.version !== record.version),
+        };
+      }
+      case 'speaker.template.rollback': {
+        const library = speakerLibrary();
+        const templates = templateStore();
+        if (library === null || templates === null) return SPEAKER_TEMPLATE_UNAVAILABLE;
+        const version = Number(body.version);
+        if (!Number.isSafeInteger(version) || version < 1) {
+          return { ok: false, reason: 'invalid-version' };
+        }
+        let state;
+        try {
+          state = templates.read();
+        } catch {
+          return { ok: false, reason: 'template-read-failed' };
+        }
+        const rolled = rollbackTemplateVersion(state, version);
+        if (rolled?.ok !== true) return rolled;
+
+        const record = rolled.state.versions.find((entry) => entry.version === rolled.currentVersion)
+          ?? null;
+        if (record === null) return { ok: false, reason: 'version-not-found', version };
+
+        // Persist first, then project the exact selected vector into the library. Re-selecting the
+        // current version is still an explicit request, so it also heals a missing/out-of-date
+        // library row; only the reported `changed` flag says whether the pointer moved.
+        try {
+          templates.write(rolled.state);
+        } catch {
+          return { ok: false, reason: 'template-write-failed' };
+        }
+        const applied = applySpeakerLibraryTemplate(library, record.vector, '');
+        if (applied.ok !== true) {
+          let restored = false;
+          try {
+            templates.write(state);
+            restored = true;
+          } catch {
+            restored = false;
+          }
+          await speakerEvent('speaker.template.rollback.failed', {
+            version,
+            reason: applied.reason,
+            restored: restored === true,
+          });
+          return { ok: false, reason: applied.reason, restored };
+        }
+
+        await speakerEvent('speaker.template.rolledback', {
+          version: rolled.currentVersion,
+          restoredFrom: rolled.restoredFrom,
+          changed: rolled.changed === true,
+          sampleCount: record.sampleCount,
+          totalDurationMs: record.totalDurationMs,
+        });
+        return {
+          ok: true,
+          speakerId: SPEAKER_BASE_ID,
+          currentVersion: rolled.currentVersion,
+          restoredFrom: rolled.restoredFrom,
+          changed: rolled.changed === true,
+          sampleCount: record.sampleCount,
+          totalDurationMs: record.totalDurationMs,
+          createdAt: record.createdAt,
+          reason: record.reason,
+          library: librarySelfView(),
+          canRollback: rolled.state.versions.some(
+            (entry) => entry.version !== rolled.currentVersion,
+          ),
         };
       }
       case 'speaker.rename': {
