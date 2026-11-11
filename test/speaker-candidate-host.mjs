@@ -606,3 +606,49 @@ function fakeWorker(text) {
   };
   return worker;
 }
+
+// ---------------------------------------------------------------------------
+// 6. Automatic training: weak match stays in the cache; reliable match trains once
+// ---------------------------------------------------------------------------
+
+test('6) 自动训练：弱匹配不训练并保留候选，可靠匹配训练一次后不进候选', async (t) => {
+  const app = await mount(t);
+  assert.equal((await app.start()).ok, true);
+  const callback = app.callback();
+  assert.equal(typeof callback, 'function');
+
+  for (let index = 0; index < 3; index += 1) {
+    callback(sampleOf(`auto-seed:${index}`, { durationMs: 1200, embedding: [1, 0, 0] }));
+  }
+  await until(async () => candidateStatusOf(await app.status())?.count === 3, 'seed candidates');
+  const listed = await app.action({ action: 'speaker.candidates.list' });
+  const ids = (Array.isArray(listed.candidates) ? listed.candidates : []).map((row) => row.id);
+  assert.equal(ids.length, 3);
+  const built = await app.action({ action: 'speaker.candidates.build', ids, label: '本人' });
+  assert.equal(built.ok, true, built.error ?? built.reason);
+  await app.action({ action: 'speaker.candidates.clear' });
+  assert.equal(candidateStatusOf(await app.status()).count, 0);
+
+  const weak = sampleOf('auto-weak:1', {
+    decision: 'match', speakerId: 'self', score: 0.5, shadowQuality: 'ok',
+    durationMs: 5000, embedding: [1, 0, 0],
+  });
+  callback(weak);
+  await until(async () => candidateStatusOf(await app.status())?.count === 1, 'weak match cached');
+  const weakSkip = await app.waitForEvent('speaker.auto.skipped');
+  assert.equal(weakSkip.payload?.reason, 'score', 'weak match is explicitly skipped as low score');
+  let events = await app.events();
+  assert.equal(ofType(events, 'speaker.auto.trained').length, 0, 'weak match never trains');
+  await app.action({ action: 'speaker.candidates.clear' });
+
+  const reliable = sampleOf('auto-good:1', {
+    decision: 'match', speakerId: 'self', score: 0.92, shadowQuality: 'ok',
+    durationMs: 5000, embedding: [1, 0, 0],
+  });
+  callback(reliable);
+  const trained = await app.waitForEvent('speaker.auto.trained');
+  assert.equal(trained.payload.version, 2, 'the reliable match appends one version');
+  assert.equal(candidateStatusOf(await app.status()).count, 0, 'trained speech never enters the cache');
+  const template = await app.action({ action: 'speaker.template.status' });
+  assert.equal(template.currentVersion, 2, 'the template checkpoint is visible and rollbackable');
+});

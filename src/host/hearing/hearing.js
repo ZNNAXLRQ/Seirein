@@ -929,6 +929,7 @@ export function startHearing({
           // A noisy RATIO with enough measured speech is a usable sample; the admission gate ran
           // above. The host's candidate store admits `ok`; the shadow row keeps the original quality.
           quality: 'ok',
+          shadowQuality: verdict.quality,
           decision: verdict.decision,
           speakerId: typeof verdict.speakerId === 'string' ? verdict.speakerId : null,
           score: Number.isFinite(Number(verdict.score)) ? Number(verdict.score) : null,

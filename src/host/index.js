@@ -399,6 +399,8 @@ import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
 // Version chain (`<root>/data/speaker-template-versions.json`): host-only persistence above the
 // pure template/version modules; only explicit strengthen/rollback actions write it.
 import { createSpeakerTemplateStore } from './hearing/speaker-template-store.js';
+import { nextVersion } from './hearing/speaker-template-version.js';
+import { cosineSimilarity } from './hearing/speaker-template.js';
 // Daily speaker candidates: metadata cache + the host's short-lived 16 kHz WAV files. This layer
 // only collects; the explicit settings actions below are the only path that can turn a selection
 // into a template / enrollment / self.
@@ -20071,40 +20073,149 @@ export function apply(ctx, config) {
    * This is deliberately only the library running average: the version chain remains the explicit
    * build/strengthen history, so an automatic match cannot silently rewrite a user-selected version.
    */
+  const SPEAKER_AUTO_TRAIN_MIN_SCORE = 0.75;
+  const SPEAKER_AUTO_TRAIN_MIN_DURATION_MS = 3000;
+  const SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE = 0.8;
+  const SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT = 0.15;
+  /**
+   * Stronger than "classified as self": a single utterance may only train the template when the
+   * match is comfortably above the generic match floor, it is a long/clean mic sample, it agrees
+   * with the current base vector, and the version module accepts it. Every accepted update is a
+   * new append-only checkpoint; weak or failed attempts leave the old template untouched and fall
+   * through to the candidate cache for explicit review.
+   */
   const autoTrainMatchedSpeaker = (sample) => {
+    const skip = (reason) => {
+      void log.emit('speaker.auto.skipped', {
+        utteranceId: typeof sample?.utteranceId === 'string' ? sample.utteranceId : '',
+        reason,
+      }).catch(() => {});
+      return false;
+    };
     if (sample?.decision !== 'match' || !(sample.embedding instanceof Float32Array)) return false;
+    if (sample.shadowQuality !== 'ok') return skip('quality');
+    const score = Number(sample.score);
+    if (!Number.isFinite(score) || score < SPEAKER_AUTO_TRAIN_MIN_SCORE) return skip('score');
+    const durationMs = Math.round(Number(sample.durationMs));
+    if (!Number.isFinite(durationMs) || durationMs < SPEAKER_AUTO_TRAIN_MIN_DURATION_MS
+      || durationMs > 15000) return skip('duration');
     let self = null;
     try {
       self = speakerEnrollmentStore.getConfirmedSelf();
     } catch {
-      return false;
+      return skip('enrollment');
     }
-    if (self === null || self === undefined) return false;
+    if (self === null || self === undefined) return skip('no-self');
     const selfId = String(self.speakerId ?? '');
-    if (selfId.length === 0) return false;
+    if (selfId.length === 0) return skip('no-self');
     if (typeof sample.speakerId === 'string' && sample.speakerId.length > 0
-      && sample.speakerId !== selfId) return false;
+      && sample.speakerId !== selfId) return skip('other-speaker');
+    let current = null;
     try {
-      const trained = speakerLibrary.register(selfId, sample.embedding, {
+      current = speakerLibrary.get(selfId);
+    } catch {
+      return skip('library');
+    }
+    if (current === null || current === undefined || !(current.embedding instanceof Float32Array)) {
+      return skip('no-base');
+    }
+    const baseCosine = cosineSimilarity(current.embedding, sample.embedding);
+    if (!Number.isFinite(baseCosine) || baseCosine < SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE) {
+      return skip('base-consistency');
+    }
+    let state = null;
+    try {
+      state = speakerTemplateStore.read();
+    } catch {
+      return skip('template-read');
+    }
+    const built = nextVersion(state, [{
+      id: typeof sample.utteranceId === 'string' ? sample.utteranceId : 'auto-match',
+      embedding: sample.embedding,
+      durationMs,
+    }], {
+      incomingWeight: SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT,
+      minSimilarity: SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE,
+      reason: 'auto-match',
+      createdAt: new Date().toISOString(),
+    });
+    if (built?.ok !== true) return skip(String(built?.reason ?? 'template-failed'));
+    const record = built.state.versions.find((entry) => entry.version === built.version);
+    if (record === null || !(record.vector instanceof Float32Array)) return skip('template-failed');
+    let db = null;
+    try {
+      db = speakerLibrary.open();
+    } catch {
+      return skip('library-open');
+    }
+    if (db === null || typeof db.exec !== 'function') return skip('library-open');
+    const baseVector = current.embedding.slice();
+    let libraryTouched = false;
+    let templateTouched = false;
+    const beforeState = state;
+    try {
+      db.exec('SAVEPOINT speaker_auto_train');
+      const registered = speakerLibrary.register(selfId, record.vector, {
         label: String(self.label ?? '') || '本人',
         enabled: true,
       });
-      if (trained?.ok !== true) {
-        void log.emit('speaker.auto.train.failed', {
-          reason: String(trained?.reason ?? 'library-failed'),
-        }).catch(() => {});
-        return false;
+      if (registered?.ok !== true) throw new Error(String(registered?.reason ?? 'library-failed'));
+      libraryTouched = true;
+      const blob = Buffer.from(
+        record.vector.buffer,
+        record.vector.byteOffset,
+        record.vector.byteLength,
+      );
+      db.prepare(
+        'UPDATE speaker_template SET dim = ?, embedding = ?, updated_at = ?, enabled = 1 WHERE speaker_id = ?',
+      ).run(record.vector.length, blob, new Date().toISOString(), selfId);
+      speakerTemplateStore.write(built.state);
+      templateTouched = true;
+      db.exec('RELEASE speaker_auto_train');
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK TO speaker_auto_train');
+        db.exec('RELEASE speaker_auto_train');
+      } catch {
+        /* best effort */
       }
-      void log.emit('speaker.auto.trained', {
+      if (libraryTouched) {
+        try {
+          const blob = Buffer.from(
+            baseVector.buffer,
+            baseVector.byteOffset,
+            baseVector.byteLength,
+          );
+          db.prepare(
+            'UPDATE speaker_template SET embedding = ?, updated_at = ? WHERE speaker_id = ?',
+          ).run(blob, new Date().toISOString(), selfId);
+        } catch {
+          /* a failed restore is reported below and can be repaired explicitly */
+        }
+      }
+      if (templateTouched) {
+        try {
+          speakerTemplateStore.write(beforeState);
+        } catch {
+          /* the next explicit action can repair */
+        }
+      }
+      void log.emit('speaker.auto.train.failed', {
         utteranceId: typeof sample.utteranceId === 'string' ? sample.utteranceId : '',
-        score: Number.isFinite(Number(sample.score)) ? Number(sample.score) : null,
-        durationMs: Math.round(Number(sample.durationMs) || 0),
-        activeCount: Number(trained.activeCount) || 0,
+        reason: error?.message ?? String(error),
+        libraryTouched,
       }).catch(() => {});
-      return true;
-    } catch {
       return false;
     }
+    void log.emit('speaker.auto.trained', {
+      utteranceId: typeof sample.utteranceId === 'string' ? sample.utteranceId : '',
+      score,
+      baseCosine,
+      durationMs,
+      version: record.version,
+      incomingWeight: SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT,
+    }).catch(() => {});
+    return true;
   };
   /**
    * One hearing callback: validate, write the short WAV, then admit the metadata row. Failure to

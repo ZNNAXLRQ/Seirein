@@ -2270,7 +2270,15 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.field },
         h('div', { style: styles.row },
           h('span', { style: styles.value }, '声纹自动收集与匹配'),
-          h('span', { style: styles.value }, shadow.enabled ? '自动收集' : '已关闭')),
+          h('button', {
+            'data-settings-toggle': 'speaker-auto-collect',
+            style: { ...(shadow.enabled ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
+            disabled: busy !== '',
+            onClick: () => act({
+              action: 'voice.speakerShadow',
+              enabled: shadow.enabled !== true,
+            }, 'speaker-shadow'),
+          }, shadow.enabled ? '关闭自动收集' : '开启自动收集')),
         h('div', { style: styles.hint },
           `${shadow.enabled ? '已开启' : '未开启'} · ${model} · ${counts}${last}；未建立声纹时自动收集候选；匹配到本人后只训练，不再进入候选。`),
       );
@@ -3887,8 +3895,8 @@ window.__ModuleLoader__.load({
                 '还没有声纹候选：正常说话会自动收集；也可以在说完后点「刷新候选」。'),
               h('div', { style: styles.hint },
                 shadowEnabled
-                  ? '当前声纹自动收集已开启：正常说话会进入候选；点「刷新候选」可以看到最新片段。'
-                  : '当前声纹自动收集未开启：到「听觉」页开启后，当前监听会立即补挂候选收集。'),
+                  ? '当前自动收集已开启：正常说话会进入候选；点「刷新候选」可以看到最新片段。'
+                  : '当前自动收集未开启：点上方「开启自动收集」后，当前监听会立即补挂候选收集。'),
               h('div', { style: styles.hint },
                 '未收集到候选时也可随时点上方「刷新候选」；不会自动确认本人，也不会自动建立声纹。'))
           : null,

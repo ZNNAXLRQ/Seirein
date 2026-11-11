@@ -184,7 +184,7 @@ test('1) mic/ok/≥800ms：回调一次，embedding 与 samples 为独立副本'
   const [sample] = samples;
   assert.deepEqual(
     Object.keys(sample).sort(),
-    ['decision', 'durationMs', 'embedding', 'quality', 'sampleRate', 'samples', 'score', 'source', 'speakerId', 'text', 'utteranceId'],
+    ['decision', 'durationMs', 'embedding', 'quality', 'sampleRate', 'samples', 'score', 'shadowQuality', 'source', 'speakerId', 'text', 'utteranceId'],
   );
   assert.equal(sample.utteranceId, final.utteranceId, 'the candidate carries the delivered utterance id');
   assert.equal(parseUtteranceId(sample.utteranceId).seq, 1);
