@@ -10,6 +10,10 @@
         obsPassword: null
         privacyScene: '隐私'
         ttsPlayback: true
+        # 15 Hz output is too coarse for the continuous idle/component layers: the pose is computed
+        # at 30 Hz, so send it at 30 Hz too. This is a bundle default; an explicit profile config wins.
+        avatarMotionOutputHz: 30
+        avatarIdleWriteHz: 30
         asrMergeWindowMs: 600
         # 5% sustained-pressure threshold = 250; a database's own value (or the one-time
         # legacy 100 → 250 migration) stays authoritative, so no pressureThreshold key is set.
