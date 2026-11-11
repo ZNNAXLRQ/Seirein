@@ -399,8 +399,7 @@ import { createSpeakerEnrollmentStore } from './hearing/speaker-enrollment.js';
 // Version chain (`<root>/data/speaker-template-versions.json`): host-only persistence above the
 // pure template/version modules; only explicit strengthen/rollback actions write it.
 import { createSpeakerTemplateStore } from './hearing/speaker-template-store.js';
-import { nextVersion } from './hearing/speaker-template-version.js';
-import { cosineSimilarity } from './hearing/speaker-template.js';
+import { createSpeakerWorkflow } from './hearing/speaker-workflow.js';
 // Daily speaker candidates: metadata cache + the host's short-lived 16 kHz WAV files. This layer
 // only collects; the explicit settings actions below are the only path that can turn a selection
 // into a template / enrollment / self.
@@ -614,7 +613,7 @@ import {
 
 import { createStatusBuilder } from './runtime/http/status.js';
 import { createSettingsRoutes } from './runtime/http/routes.js';
-import { ACTIONS as hearingActions, createHearingSettingsActions, createWordCommandDefinition, projectHearingStatus, resolveSelfSpeakerId, SPEAKER_BASE_ID } from './hearing/settings-actions.js';
+import { ACTIONS as hearingActions, createHearingSettingsActions, createWordCommandDefinition, projectHearingStatus, resolveSelfSpeakerId } from './hearing/settings-actions.js';
 import { ACTIONS as memoryActions, createMemorySettingsActions } from './memory/settings-actions.js';
 import { ACTIONS as speechActions, createSpeechSettingsActions } from './speech/settings-actions.js';
 import {
@@ -2418,8 +2417,6 @@ export function apply(ctx, config) {
   });
   /** sessionId -> the live voice round whose agent turn must settle before a continuation. */
   const voiceRounds = new Map();
-  /** The session whose complete voice round may commit one accumulated auto-training sample. */
-  let activeSpeakerTrainingSession = '';
   /** groupId -> the one reply speaker that may currently sound for that group. */
   const replyVoiceByGroup = new Map();
   /** groupId -> every accepted reply speech id of the current answer version. */
@@ -5758,6 +5755,9 @@ export function apply(ctx, config) {
     // A native animation already in flight (user or plugin) is never replaced by a blind second
     // trigger; VTS would otherwise blend two animations into the same pose.
     if (client.animations?.current != null) return;
+    // A native animation may drive the same mouth parameter and visibly freeze lip-sync. Never
+    // start one on top of a sounding answer; the next scheduler tick can use the idle window.
+    if (ttsIsSpeaking() === true) return;
     const hotkeys = nativeAnimationHotkeys();
     nativeAnimationSampler.setPool(hotkeys.map((entry) => entry.name));
     const name = nativeAnimationSampler.pick();
@@ -6052,12 +6052,23 @@ export function apply(ctx, config) {
           const levels = [];
           for (let start = 0; start + step <= samples.length; start += step) {
             let sum = 0;
+            let crossings = 0;
+            let previous = 0;
             for (let i = start; i < start + step; i += 1) {
               const value = samples[i] / 32768;
               sum += value * value;
+              if (i > start && ((value >= 0) !== (previous >= 0))) crossings += 1;
+              previous = value;
             }
             const rms = Math.sqrt(sum / step);
-            levels.push(Math.min(1, Math.max(0, (20 * Math.log10(rms + 1e-6) + 45) / 30)));
+            const db = 20 * Math.log10(rms + 1e-6);
+            const loud = Math.min(1, Math.max(0, (db + 48) / 32));
+            // A rough vowel aperture cue: high zero-crossing rate is consonant/high-vowel and gets
+            // a smaller opening than an open vowel. This is not phoneme recognition, but it keeps
+            // every 100 ms window at the same loudness from looking like one frozen mouth.
+            const zcr = Math.min(1, (crossings / step) * 12);
+            const aperture = 0.06 + 0.48 * Math.pow(loud, 0.85) * (1 - 0.3 * zcr);
+            levels.push(Math.min(0.56, Math.max(0, aperture)));
           }
           return resolve(levels);
         },
@@ -18185,10 +18196,6 @@ export function apply(ctx, config) {
       if (turnReleased) return;
       turnReleased = true;
       clearSpokenTimer?.();
-      // A voice round is complete only here (its answer has finished). Commit at most one queued
-      // matched sample for that round, then clear the accumulator so the next round starts clean.
-      flushSpeakerTraining(id);
-      if (id === '' || activeSpeakerTrainingSession === id) activeSpeakerTrainingSession = '';
       if (playback === null) {
         avatarStatusIf(['thinking', 'speaking'], 'waiting', 'voice.release');
         // P-139: the turn released its voice owner and nothing is sounding: back to silence.
@@ -18213,7 +18220,6 @@ export function apply(ctx, config) {
       const sessionId = target.sessionId;
       // P-46: the timeline row is joinable by session even when the delivery never got a message id.
       roundSessionId = sessionId;
-      activeSpeakerTrainingSession = sessionId;
       // Batch 2: one continuous expression is one response group. A second segment that arrives
       // while the previous answer is still generating/ready/playing continues that group instead
       // of replacing it; a terminal group starts a new one. The group is bookkeeping only: the
@@ -19433,7 +19439,6 @@ export function apply(ctx, config) {
           group: voiceGroup, version: voiceGroupVersion, status: 'delivery-refused', error: 'busy',
         });
         if (voiceRounds.get(sessionId) === voiceGroupRound) voiceRounds.delete(sessionId);
-        speakerTrainingQueue.delete(sessionId);
         releaseVoiceTurn(sessionId);
         return;
       }
@@ -19479,7 +19484,6 @@ export function apply(ctx, config) {
       if (!features.enabled('voice')) {
         // P-46: the utterance was delivered but this round speaks nothing; the row still exists.
         await timelineEmit('no-audio', 'voice-disabled');
-        speakerTrainingQueue.delete(sessionId);
         releaseVoiceTurn(sessionId);
         return;
       }
@@ -19833,7 +19837,6 @@ export function apply(ctx, config) {
         }
       }
       // The failed delivery never bound a session id; `idle` keeps whatever identity is current.
-      speakerTrainingQueue.delete(activeSpeakerTrainingSession || roundSessionId);
       releaseVoiceTurn();
       await log.emit('voice.inject.failed', { error: error?.message ?? String(error) });
       // P-46: a round that never delivered records why; the message itself never enters the row.
@@ -20077,206 +20080,18 @@ export function apply(ctx, config) {
     if (generation !== speakerCandidateGeneration) return 'stale-generation';
     return '';
   };
-  /**
-   * Once a confirmed self exists, a high-confidence match is training evidence, not an unlabelled
-   * candidate. Fold that embedding into the same `self` row without touching the candidate cache.
-   * This is deliberately only the library running average: the version chain remains the explicit
-   * build/strengthen history, so an automatic match cannot silently rewrite a user-selected version.
-   */
-  const SPEAKER_AUTO_TRAIN_MIN_SCORE = 0.75;
-  const SPEAKER_AUTO_TRAIN_MIN_DURATION_MS = 3000;
-  const SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE = 0.8;
-  const SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT = 0.15;
-  /**
-   * Stronger than "classified as self": a single utterance may only train the template when the
-   * match is comfortably above the generic match floor, it is a long/clean mic sample, it agrees
-   * with the current base vector, and the version module accepts it. Every accepted update is a
-   * new append-only checkpoint; weak or failed attempts leave the old template untouched and fall
-   * through to the candidate cache for explicit review.
-   */
-  const autoTrainMatchedSpeaker = (sample) => {
-    const skip = (reason) => {
-      void log.emit('speaker.auto.skipped', {
-        utteranceId: typeof sample?.utteranceId === 'string' ? sample.utteranceId : '',
-        reason,
-      }).catch(() => {});
-      return false;
-    };
-    if (sample?.decision !== 'match' || !(sample.embedding instanceof Float32Array)) return false;
-    if (sample.shadowQuality !== 'ok') return skip('quality');
-    const score = Number(sample.score);
-    if (!Number.isFinite(score) || score < SPEAKER_AUTO_TRAIN_MIN_SCORE) return skip('score');
-    const durationMs = Math.round(Number(sample.durationMs));
-    if (!Number.isFinite(durationMs) || durationMs < SPEAKER_AUTO_TRAIN_MIN_DURATION_MS
-      || durationMs > 15000) return skip('duration');
-    let self = null;
-    try {
-      self = speakerEnrollmentStore.getConfirmedSelf();
-    } catch {
-      return skip('enrollment');
-    }
-    if (self === null || self === undefined) return skip('no-self');
-    const selfId = String(self.speakerId ?? '');
-    if (selfId.length === 0) return skip('no-self');
-    if (typeof sample.speakerId === 'string' && sample.speakerId.length > 0
-      && sample.speakerId !== selfId) return skip('other-speaker');
-    let current = null;
-    try {
-      current = speakerLibrary.get(selfId);
-    } catch {
-      return skip('library');
-    }
-    if (current === null || current === undefined || !(current.embedding instanceof Float32Array)) {
-      return skip('no-base');
-    }
-    const baseCosine = cosineSimilarity(current.embedding, sample.embedding);
-    if (!Number.isFinite(baseCosine) || baseCosine < SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE) {
-      return skip('base-consistency');
-    }
-    let state = null;
-    try {
-      state = speakerTemplateStore.read();
-    } catch {
-      return skip('template-read');
-    }
-    const built = nextVersion(state, [{
-      id: typeof sample.utteranceId === 'string' ? sample.utteranceId : 'auto-match',
-      embedding: sample.embedding,
-      durationMs,
-    }], {
-      incomingWeight: SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT,
-      minSimilarity: SPEAKER_AUTO_TRAIN_MIN_BASE_COSINE,
-      reason: 'auto-match',
-      createdAt: new Date().toISOString(),
-    });
-    if (built?.ok !== true) return skip(String(built?.reason ?? 'template-failed'));
-    const record = built.state.versions.find((entry) => entry.version === built.version);
-    if (record === null || !(record.vector instanceof Float32Array)) return skip('template-failed');
-    let db = null;
-    try {
-      db = speakerLibrary.open();
-    } catch {
-      return skip('library-open');
-    }
-    if (db === null || typeof db.exec !== 'function') return skip('library-open');
-    const baseVector = current.embedding.slice();
-    let libraryTouched = false;
-    let templateTouched = false;
-    const beforeState = state;
-    try {
-      db.exec('SAVEPOINT speaker_auto_train');
-      const registered = speakerLibrary.register(selfId, record.vector, {
-        label: String(self.label ?? '') || '本人',
-        enabled: true,
-      });
-      if (registered?.ok !== true) throw new Error(String(registered?.reason ?? 'library-failed'));
-      libraryTouched = true;
-      const blob = Buffer.from(
-        record.vector.buffer,
-        record.vector.byteOffset,
-        record.vector.byteLength,
-      );
-      db.prepare(
-        'UPDATE speaker_template SET dim = ?, embedding = ?, updated_at = ?, enabled = 1 WHERE speaker_id = ?',
-      ).run(record.vector.length, blob, new Date().toISOString(), selfId);
-      speakerTemplateStore.write(built.state);
-      templateTouched = true;
-      db.exec('RELEASE speaker_auto_train');
-    } catch (error) {
-      try {
-        db.exec('ROLLBACK TO speaker_auto_train');
-        db.exec('RELEASE speaker_auto_train');
-      } catch {
-        /* best effort */
-      }
-      if (libraryTouched) {
-        try {
-          const blob = Buffer.from(
-            baseVector.buffer,
-            baseVector.byteOffset,
-            baseVector.byteLength,
-          );
-          db.prepare(
-            'UPDATE speaker_template SET embedding = ?, updated_at = ? WHERE speaker_id = ?',
-          ).run(blob, new Date().toISOString(), selfId);
-        } catch {
-          /* a failed restore is reported below and can be repaired explicitly */
-        }
-      }
-      if (templateTouched) {
-        try {
-          speakerTemplateStore.write(beforeState);
-        } catch {
-          /* the next explicit action can repair */
-        }
-      }
-      void log.emit('speaker.auto.train.failed', {
-        utteranceId: typeof sample.utteranceId === 'string' ? sample.utteranceId : '',
-        reason: error?.message ?? String(error),
-        libraryTouched,
-      }).catch(() => {});
-      return false;
-    }
-    void log.emit('speaker.auto.trained', {
-      utteranceId: typeof sample.utteranceId === 'string' ? sample.utteranceId : '',
-      score,
-      baseCosine,
-      durationMs,
-      version: record.version,
-      incomingWeight: SPEAKER_AUTO_TRAIN_INCOMING_WEIGHT,
-    }).catch(() => {});
-    return true;
-  };
-  /**
-   * Matched samples are held until the complete voice round ends. One round commits at most one
-   * best sample; utterance ids are de-duplicated, so a repeated callback can never add twice.
-   */
-  const speakerTrainingQueue = new Map();
-  const autoTrainCandidateReady = (sample) => (
-    sample?.decision === 'match'
-    && sample.shadowQuality === 'ok'
-    && Number.isFinite(Number(sample.score))
-    && Number(sample.score) >= SPEAKER_AUTO_TRAIN_MIN_SCORE
-    && Number.isFinite(Number(sample.durationMs))
-    && Number(sample.durationMs) >= SPEAKER_AUTO_TRAIN_MIN_DURATION_MS
-    && Number(sample.durationMs) <= 15000
-  );
-  const queueSpeakerTraining = (sample, generation) => {
-    if (!autoTrainCandidateReady(sample)) return false;
-    const sessionId = activeSpeakerTrainingSession
-      || voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId;
-    const id = typeof sample.utteranceId === 'string' ? sample.utteranceId : '';
-    if (id.length === 0) return false;
-    let bucket = speakerTrainingQueue.get(sessionId);
-    if (bucket === undefined) {
-      bucket = new Map();
-      speakerTrainingQueue.set(sessionId, bucket);
-    }
-    if (!bucket.has(id)) bucket.set(id, { sample, generation });
-    return true;
-  };
-  const flushSpeakerTraining = (sessionId = '') => {
-    const id = sessionId || activeSpeakerTrainingSession;
-    if (id === '') return false;
-    const bucket = speakerTrainingQueue.get(id);
-    speakerTrainingQueue.delete(id);
-    if (bucket === undefined || bucket.size === 0) return false;
-    const best = [...bucket.values()].sort((left, right) => (
-      (Number(right.sample.score) || 0) - (Number(left.sample.score) || 0)
-      || (Number(right.sample.durationMs) || 0) - (Number(left.sample.durationMs) || 0)
-    ))[0];
-    if (autoTrainMatchedSpeaker(best.sample)) return true;
-    // The complete round exists but this sample did not qualify (or persistence failed): keep it
-    // in the explicit cache instead of silently discarding the evidence.
-    handleSpeakerCandidate(best.sample, best.generation, { cacheOnly: true });
-    return false;
-  };
+  // Identity matching has already completed off the delivery path. Every clear match trains
+  // its own voiceprint immediately; unmatched audio alone belongs in the review pool.
+  const speakerWorkflow = createSpeakerWorkflow({
+    library: speakerLibrary, candidates: speakerCandidatesStore,
+    enrollment: speakerEnrollmentStore, log,
+  });
   /**
    * One hearing callback: validate, write the short WAV, then admit the metadata row. Failure to
    * write audio records one reason event and stores nothing; every path is best-effort and never
    * reaches delivery.
    */
-  const handleSpeakerCandidate = (sample, generation, { cacheOnly = false } = {}) => {
+  const handleSpeakerCandidate = (sample, generation) => {
     const drop = speakerCandidateDropReason(generation);
     if (drop !== '') {
       skipSpeakerCandidate(drop);
@@ -20330,9 +20145,15 @@ export function apply(ctx, config) {
       skipSpeakerCandidate('invalid-samples');
       return;
     }
-    // Matched speech is queued for the complete round; weak/short samples fall through to the
-    // explicit candidate cache. `cacheOnly` is used when a queued round sample failed training.
-    if (!cacheOnly && queueSpeakerTraining(sample, generation)) return;
+    if (sample.decision === 'match') {
+      const trained = speakerWorkflow.train(sample);
+      if (!trained.ok) {
+        void log.emit('speaker.auto.train.failed', {
+          utteranceId, speakerId: sample.speakerId ?? '', reason: trained.reason,
+        }).catch(() => {});
+      }
+      return; // A labelled sample is never reclassified as an unlabelled candidate.
+    }
     try {
       const duplicate = speakerCandidatesStore.list().find(
         (candidate) => candidate.utteranceId === utteranceId,
@@ -22424,6 +22245,7 @@ export function apply(ctx, config) {
     get runtime() { return runtime; },
     get saveCallNames() { return saveCallNames; },
     get speakerCandidateActions() { return speakerCandidateActions; },
+    get speakerWorkflow() { return speakerWorkflow; },
     get speakerCandidatesStore() { return speakerCandidatesStore; },
     get speakerEnrollmentStore() { return speakerEnrollmentStore; },
     get speakerLibrary() { return speakerLibrary; },
