@@ -240,7 +240,10 @@ test('2) 开启 + <0.6s：unsure/too-short + quality=short，embed 不调用', a
   });
 
   const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
-  assert.deepEqual(shadow, {
+  assert.equal(shadow.utteranceId, finals[0].utteranceId,
+    'the too-short shadow is citable by the delivered utterance');
+  const { utteranceId: _shortId, ...shortRest } = shadow;
+  assert.deepEqual(shortRest, {
     decision: 'unsure',
     reason: 'too-short',
     class: 'unknown-identity',
@@ -367,7 +370,10 @@ test('5) 库为空：no-speakers，不报错、不计算 embedding', async (t) =
   });
 
   const [shadow] = ofType(events, 'speaker.shadow').map((event) => event.payload);
-  assert.deepEqual(shadow, {
+  assert.equal(shadow.utteranceId, finals[0].utteranceId,
+    'the no-speakers shadow is citable by the delivered utterance');
+  const { utteranceId: _emptyId, ...emptyRest } = shadow;
+  assert.deepEqual(emptyRest, {
     decision: 'no-speakers',
     class: 'unknown-identity',
     quality: 'ok',

@@ -959,6 +959,7 @@ export function startHearing({
           quality: baseVerdict.quality,
           source: baseVerdict.source,
           reason: 'no-speakers',
+          utteranceId: snapshot.utteranceId,
         });
         return;
       }
@@ -1013,6 +1014,7 @@ export function startHearing({
         class: verdict.class,
         quality: verdict.quality,
         source: verdict.source,
+        utteranceId: snapshot.utteranceId,
       });
       return;
     }
