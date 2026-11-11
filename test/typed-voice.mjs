@@ -1218,6 +1218,29 @@ test('38. an agent-message result turn is spoken once through the reply outlet',
 });
 
 // ---------------------------------------------------------------------------
+// 38b. In-session goal / job completions use the same typed-reply result outlet
+// ---------------------------------------------------------------------------
+
+test('38b. goal and tool-jobs results are spoken once, without a second outlet', async (t) => {
+  const app = await mount(t);
+  const { session } = app;
+  for (const [turn, kind] of [[70, 'goal'], [71, 'tool-jobs']]) {
+    app.emit(session, startEvent(turn));
+    app.emit(session, resultEvent(turn, '', kind, `完成-${kind}`));
+    app.emit(session, assistantEvent(turn, `结果-${kind}`));
+    app.emit(session, endEvent(turn));
+    const accepted = await app.waitForEvent('voice.result.accepted', (payload) => payload.turn === turn);
+    assert.equal(accepted.kind, kind, `${kind} is accepted by the result lane`);
+    await app.waitForEvent('voice.result.completed', (payload) => payload.turn === turn);
+  }
+  const rows = await app.events();
+  assert.equal(rows.filter((event) => event.type === 'voice.result.completed').length, 2,
+    'each goal/job result completes once');
+  assert.equal(rows.filter((event) => event.type === 'voice.typed.spoken').length, 0,
+    'goal/job results did not fall back to the typed lane');
+});
+
+// ---------------------------------------------------------------------------
 // 39. The two notices of one task never replay: `agent-message` + `subagent-settled`
 //
 // The feed names no task/run id, and the two notices carry different injected message ids, so the

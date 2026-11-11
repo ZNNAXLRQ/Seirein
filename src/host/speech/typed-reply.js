@@ -77,7 +77,10 @@ export function createTypedVoiceRelay({
   const voiceOwners = new Map();
   /** Typed claim key -> {generation, controller, sessionId, turnId}: aborted by a tool/user input. */
   const typedLanes = new Map();
-  /** Typed claim key -> {generation, reason}: an aborted lane whose late result must not speak. */
+  /** Sources that carry a delegated/goal/job completion into this session's result lane. */
+const RESULT_SOURCE_KINDS = new Set([
+  'agent-message', 'subagent-settled', 'goal', 'tool-jobs', 'team-message',
+]);
   const staleTyped = new Map();
   /** sessionId -> the user's latest input turn: a late older `turn/end` never speaks. */
   const inputTurns = new Map();
@@ -547,7 +550,10 @@ export function createTypedVoiceRelay({
     // that turn, so it takes the same outlet as a typed round; the task identity (never merely the
     // sender) decides whether it is a duplicate, so a later task from the same subagent still speaks.
     const isResult = source === 'result' && result !== null && typeof result === 'object'
-      && typeof result.senderSessionId === 'string' && result.senderSessionId.length > 0;
+      && (
+        result.kind === 'goal' || result.kind === 'tool-jobs' || result.kind === 'team-message'
+        || (typeof result.senderSessionId === 'string' && result.senderSessionId.length > 0)
+      );
     const resultTaskId = isResult
       ? (typeof result.taskId === 'string' && result.taskId.length > 0
         ? result.taskId
@@ -824,8 +830,12 @@ export function createTypedVoiceRelay({
           .find((value) => typeof value === 'string' && value.length > 0) ?? '';
         // A delegated completion relays into the parent as a user message: it is its own lane,
         // but only in the parent. A child's own session never binds it and says why.
-        const resultShaped = (sourceKind === 'agent-message' || sourceKind === 'subagent-settled')
-          && senderSessionId.length > 0 && senderSessionId !== sessionId;
+        const resultShaped = RESULT_SOURCE_KINDS.has(sourceKind)
+          && (
+            sourceKind === 'goal' || sourceKind === 'tool-jobs' || sourceKind === 'team-message'
+              ? true
+              : senderSessionId.length > 0 && senderSessionId !== sessionId
+          );
         if (resultShaped && isSubagent(session) === true) {
           void log('voice.result.skipped', {
             turn: turnId ?? openTurns.get(sessionId) ?? null,
