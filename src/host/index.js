@@ -276,6 +276,8 @@ import {
 // the renderers, and the optional residual drain must not turn that mock into an import failure.
 import * as speechTextModule from './speech/speech-text.js';
 import { VtsClient } from './avatar/vts.js';
+import { PRESETS } from './avatar/presets/index.js';
+import { loadPresetLibrary } from './avatar/presets/library.js';
 import {
   AVATAR_ERROR_CODES,
   buildAvatarStylePrompt,
@@ -4505,8 +4507,19 @@ export function apply(ctx, config) {
     },
   };
 
+  let presetLibrary = null;
   const ensureAvatarRuntime = () => {
     if (avatarRuntime !== null && avatarRuntime.snapshot().disposed !== true) return avatarRuntime;
+    if (presetLibrary === null) {
+      presetLibrary = loadPresetLibrary({ root, builtins: PRESETS });
+      void log.emit('avatar.presets.library', {
+        source: presetLibrary.source,
+        created: presetLibrary.created,
+        count: presetLibrary.presets.length,
+        file: presetLibrary.file,
+        error: presetLibrary.error,
+      }).catch(() => {});
+    }
     avatarSkipLoggedAt.clear();
     avatarRuntime = createAvatarRuntime({
       transport: avatarTransport,
@@ -4518,6 +4531,7 @@ export function apply(ctx, config) {
         // coalesces at this cadence, while the pose keeps being computed every 33 ms tick.
         flushIntervalMs: 60,
         idleActions: avatarIdleActions,
+        ...(presetLibrary === null ? {} : { presetCatalog: presetLibrary.presets }),
         // Inherit the module defaults unless the user really set a value: re-declaring the old
         // numbers here silently pinned them, so a future module default never reached the host.
         ...(config?.avatarIdleActionIntervalMs == null ? {} : { idleActionIntervalMs: Number(config.avatarIdleActionIntervalMs) }),

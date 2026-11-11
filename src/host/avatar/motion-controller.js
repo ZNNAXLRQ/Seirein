@@ -1186,6 +1186,8 @@ const DEFAULT_CONFIG = Object.freeze({
    * — the `status.live2d.runtime.motion.presets` projection is maintained either way.
    */
   presetDebugEvents: true,
+  /** User-editable catalog loaded from `<root>/avatar/presets/presets.json`; null = built-ins. */
+  presetCatalog: null,
   /**
    * Answer-start takeover cross-fade (item 5). Configurable inside [120, 240] ms; a value outside
    * that window makes the takeover unavailable instead of silently clamping it to a snap or a
@@ -3416,7 +3418,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const overrides = presetOverridesValue();
     const key = JSON.stringify(overrides);
     if (state.presets.selector === null || state.presets.selectorKey !== key) {
-      state.presets.selector = createPresetSelector({ overrides });
+      const catalog = Array.isArray(cfg.presetCatalog) && cfg.presetCatalog.length > 0
+        ? cfg.presetCatalog : undefined;
+      state.presets.selector = createPresetSelector({ overrides, ...(catalog === undefined ? {} : { presets: catalog }) });
       state.presets.selectorKey = key;
     }
     return state.presets.selector;
