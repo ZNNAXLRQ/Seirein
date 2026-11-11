@@ -223,9 +223,9 @@ test('2. 0 候选：显示刷新入口、空状态与建立/强化禁用原因',
   const empty = nodeWithProp(tree, 'data-speaker-candidate-empty');
   assert.ok(empty !== undefined, 'the explicit empty state renders');
   assert.ok(textsOf(tree).some((text) => text.includes('还没有声纹候选')));
-  assert.ok(textsOf(tree).some((text) => text.includes('去「听觉」页开启「声纹影子」')));
+  assert.ok(textsOf(tree).some((text) => text.includes('当前自动收集未开启')));
 
-  const build = buttonOf(tree, '建立基础声纹');
+  const build = buttonOf(tree, '从整池新建声纹');
   assert.equal(build.props.disabled, true);
   const buildReason = nodeWithProp(tree, 'data-speaker-candidate-build-reason');
   assert.ok(buildReason !== undefined, 'the build refusal reason is visible, not only a title');
@@ -272,7 +272,7 @@ test('3. 有候选：试听/勾选/删除/清空/预览/建立/强化/重命名/
   assert.equal(buttonOf(tree, '试听').props.disabled, false);
   assert.equal(buttonOf(tree, '删除').props.disabled, false);
   assert.equal(buttonOf(tree, '预览一致性').props.disabled, false);
-  assert.equal(buttonOf(tree, '建立基础声纹').props.disabled, false);
+  assert.equal(buttonOf(tree, '从整池新建声纹').props.disabled, false);
   assert.equal(buttonOf(tree, '强化当前声纹').props.disabled, false);
   assert.equal(buttonOf(tree, '清空候选').props.disabled, false);
   assert.equal(buttonOf(tree, '重命名').props.disabled, false);
@@ -288,7 +288,7 @@ test('3. 有候选：试听/勾选/删除/清空/预览/建立/强化/重命名/
   buttonOf(tree, '删除').props.onClick();
   buttonOf(tree, '清空候选').props.onClick();
   buttonOf(tree, '预览一致性').props.onClick();
-  buttonOf(tree, '建立基础声纹').props.onClick();
+  buttonOf(tree, '从整池新建声纹').props.onClick();
   buttonOf(tree, '强化当前声纹').props.onClick();
   buttonOf(tree, '重命名').props.onClick();
   buttonOf(tree, '确认回滚').props.onClick();
@@ -305,10 +305,13 @@ test('3. 有候选：试听/勾选/删除/清空/预览/建立/强化/重命名/
   assert.deepEqual(calls.rollback, [1]);
   assert.equal(calls.refresh, 1);
 
-  // With candidates but nothing selected, both explicit build paths explain why they are off.
+  // With candidates but nothing selected, the whole-pool build is still available.
   const unselected = sectionOf(api, { candidateData: candidateDataOf(candidates) });
-  assert.equal(buttonOf(unselected, '建立基础声纹').props.disabled, true);
-  assert.ok(textsOf(nodeWithProp(unselected, 'data-speaker-candidate-build-reason')).join('').includes('先勾选'));
+  assert.equal(buttonOf(unselected, '从整池新建声纹').props.disabled, false);
+  const unselectedBuildReason = nodeWithProp(unselected, 'data-speaker-candidate-build-reason');
+  if (unselectedBuildReason !== undefined) {
+    assert.equal(textsOf(unselectedBuildReason).join('').includes('先勾选'), false);
+  }
   assert.equal(buttonOf(unselected, '强化当前声纹').props.disabled, true);
   assert.ok(textsOf(nodeWithProp(unselected, 'data-speaker-candidate-strengthen-reason')).join('').includes('先勾选'));
 

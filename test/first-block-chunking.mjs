@@ -27,6 +27,7 @@ import {
   splitFirstBlockChunks,
   resolveFirstBlockTarget,
   speakChunks,
+  planSpeechBlocks,
 } from '../src/host/speech/tts.js';
 
 /** The unit every test starts from: 80 characters, pauses well inside the default target window. */

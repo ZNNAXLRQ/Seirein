@@ -55,6 +55,8 @@ export const ACTIONS = Object.freeze([
   'speaker.candidates.clear',
   'speaker.candidates.preview',
   'speaker.candidates.build',
+  'speaker.voiceprints.remove',
+  'speaker.voiceprints.rename',
   'speaker.rename',
   /** Explicit version-chain writes. They never run on their own and never become candidates. */
   'speaker.template.status',
@@ -354,6 +356,7 @@ export function createHearingSettingsActions(services) {
   const candidateActions = () => services.speakerCandidateActions ?? null;
   const candidateStore = () => services.speakerCandidatesStore ?? null;
   const speakerLibrary = () => services.speakerLibrary ?? null;
+  const speakerWorkflow = () => services.speakerWorkflow ?? null;
   const enrollmentStore = () => services.speakerEnrollmentStore ?? null;
   const templateStore = () => services.speakerTemplateStore ?? null;
   const SPEAKER_CANDIDATES_UNAVAILABLE = Object.freeze({
@@ -661,6 +664,7 @@ export function createHearingSettingsActions(services) {
           ...listed,
           groupCount,
           selfId: enrollmentSelfId(),
+          voiceprints: speakerWorkflow()?.list()?.voiceprints ?? [],
           library: librarySelfView(),
           // Read-only version chain projection; a missing store is a controlled null, not a throw.
           template: speakerTemplateStatusOf(templateStore()),
@@ -699,7 +703,28 @@ export function createHearingSettingsActions(services) {
         }
         return result;
       }
+      case 'speaker.voiceprints.remove': {
+        const workflow = speakerWorkflow();
+        if (workflow === null || workflow === undefined) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        return workflow.remove(speakerActionText(body.speakerId));
+      }
+      case 'speaker.voiceprints.rename': {
+        const workflow = speakerWorkflow();
+        if (workflow === null || workflow === undefined) return SPEAKER_CANDIDATES_UNAVAILABLE;
+        const speakerId = speakerActionText(body.speakerId);
+        const labelResult = prepareSpeakerLabel(body.label, { required: true });
+        if (labelResult.ok !== true) return labelResult;
+        return workflow.rename(speakerId, labelResult.label);
+      }
       case 'speaker.candidates.build': {
+        const workflow = speakerWorkflow();
+        if (workflow !== null && workflow !== undefined) {
+          // The explicit build consumes the WHOLE reviewed pool and creates a NEW independent
+          // voiceprint. It never requires the old single `self` slot, so an existing voiceprint
+          // does not block creating a second one.
+          const label = speakerActionText(body.label);
+          return workflow.create({ label });
+        }
         const actions = candidateActions();
         const store = candidateStore();
         const library = speakerLibrary();
@@ -1153,6 +1178,13 @@ export function createHearingSettingsActions(services) {
         };
       }
       case 'speaker.rename': {
+        const workflow = speakerWorkflow();
+        if (workflow !== null && workflow !== undefined) {
+          const speakerId = speakerActionText(body.speakerId);
+          const labelResult = prepareSpeakerLabel(body.label, { required: true });
+          if (labelResult.ok !== true) return labelResult;
+          return workflow.rename(speakerId, labelResult.label);
+        }
         const library = speakerLibrary();
         if (library === null) return SPEAKER_CANDIDATES_UNAVAILABLE;
         const speakerId = speakerActionText(body.speakerId) || SPEAKER_BASE_ID;

@@ -410,6 +410,7 @@ import {
   createSpeakerCandidatesStore,
 } from './hearing/speaker-candidates.js';
 import { createSpeakerCandidateActions } from './hearing/speaker-candidate-actions.js';
+import { createSpeakerWorkflow } from './hearing/speaker-workflow.js';
 import { createSpeakerLibrary } from './hearing/speakerVoice.js';
 import {
   cleanupSpeakerCandidateAudio,
@@ -6495,9 +6496,18 @@ export function apply(ctx, config) {
         measured: voiceUnitSizer.samples() > 0,
       })
       : null;
-    const blocks = firstPlan !== null
-      ? firstPlan.blocks
-      : (chunking && chunkCuts !== null ? chunkCuts(prepared.speechText, { minChars }) : [prepared.speechText]);
+    const planned = firstPlan !== null && typeof ttsModule.planSpeechBlocks === 'function'
+      ? ttsModule.planSpeechBlocks(prepared.speechText, {
+        chunking,
+        minChars,
+        firstBlockPlan: firstPlan,
+      })
+      : null;
+    const blocks = planned !== null
+      ? planned.blocks
+      : (firstPlan !== null
+        ? firstPlan.blocks
+        : (chunking && chunkCuts !== null ? chunkCuts(prepared.speechText, { minChars }) : [prepared.speechText]));
     const list = blocks.length > 0 ? blocks : [prepared.speechText];
     if (firstPlan !== null && list.length > 1) {
       void log.emit('voice.first-block.chunked', {
@@ -6505,7 +6515,10 @@ export function apply(ctx, config) {
         targetChars: firstPlan.targetChars,
         targetMs: firstPlan.targetMs,
         chunks: list.length,
-        firstBlockChars: firstPlan.firstBlockChars,
+        firstBlockChars: planned?.usedFirstBlockPlan === true
+          ? firstPlan.firstBlockChars
+          : [...String(list[0] ?? '')].length,
+        fallbackToSafeChunks: planned?.fellBackToSafeChunks === true,
       }).catch(() => {});
     }
     const synthesizeBlock = (text, blockSignal, priority = 0, chunkIndex = 0) => synthesizeWatched({
@@ -19999,6 +20012,15 @@ export function apply(ctx, config) {
       }
     },
   });
+  // New multi-voiceprint workflow: reliable matches train the matched row one sample at a time;
+  // only unmatched/unreliable clips enter the candidate pool, and an explicit pool build creates a
+  // new independent voiceprint (never overwrites the confirmed self).
+  const speakerWorkflow = createSpeakerWorkflow({
+    library: speakerLibrary,
+    candidates: speakerCandidatesStore,
+    enrollment: speakerEnrollmentStore,
+    log,
+  });
   let speakerCandidateGeneration = 0;
   // Whether the CURRENT capture was opened with `onSpeakerSample`. This is deliberately separate
   // from the persisted switch: turning the shadow on while a session started without it must show
@@ -20347,9 +20369,27 @@ export function apply(ctx, config) {
       skipSpeakerCandidate('invalid-samples');
       return;
     }
-    // Matched speech is queued for the complete round; weak/short samples fall through to the
-    // explicit candidate cache. `cacheOnly` is used when a queued round sample failed training.
-    if (!cacheOnly && queueSpeakerTraining(sample, generation)) return;
+    // A reliable match updates the exact voiceprint the shadow selected, one utterance at a time;
+    // short clips are not held for a whole turn and do not enter the pool. Only unmatched,
+    // unreliable or failed-training clips fall through to the explicit candidate cache.
+    if (!cacheOnly && sample.decision === 'match' && typeof sample.speakerId === 'string'
+      && sample.speakerId.length > 0) {
+      const trained = speakerWorkflow.train(sample);
+      if (trained?.ok === true && trained.trained !== false) {
+        noteSpeakerCandidateEvent('speaker.auto.trained.received', {
+          utteranceId,
+          speakerId: sample.speakerId,
+          activeCount: Number(trained.activeCount) || 0,
+        });
+        return;
+      }
+      if (trained?.ok === true && trained.reason === 'duplicate-utterance') return;
+      noteSpeakerCandidateEvent('speaker.auto.train.skipped', {
+        utteranceId,
+        speakerId: sample.speakerId,
+        reason: typeof trained?.reason === 'string' ? trained.reason : 'train-failed',
+      });
+    }
     try {
       const duplicate = speakerCandidatesStore.list().find(
         (candidate) => candidate.utteranceId === utteranceId,
@@ -22444,6 +22484,7 @@ export function apply(ctx, config) {
     get speakerCandidatesStore() { return speakerCandidatesStore; },
     get speakerEnrollmentStore() { return speakerEnrollmentStore; },
     get speakerLibrary() { return speakerLibrary; },
+    get speakerWorkflow() { return speakerWorkflow; },
     get speakerTemplateStore() { return speakerTemplateStore; },
     get speakerModelState() { return speakerModelState; },
     get speakerShadowEnabled() { return speakerShadowEnabled; },

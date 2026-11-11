@@ -446,7 +446,7 @@ test('3) 不一致与不足 3 秒：返回原因/outliers，不写库不写登�
 // 4. build success + rename persistence
 // ---------------------------------------------------------------------------
 
-test('4) build：库+登记+self 一次成立；rename 只改名称并持久化', async (t) => {
+test('4) build：整池新建独立声纹；rename 只改名称并持久化', async (t) => {
   const specs = [
     candidateSpec('spc-1', { embedding: [1, 0, 0] }),
     candidateSpec('spc-2', { embedding: [0.9, 0.1, 0] }),
@@ -461,34 +461,30 @@ test('4) build：库+登记+self 一次成立；rename 只改名称并持久化'
     label: '基础声纹',
   });
   assert.equal(built.ok, true, `${built.reason ?? ''}`);
-  assert.equal(built.speakerId, 'self');
-  assert.equal(built.selfId, 'self', 'selfId appears only after the explicit build');
+  const speakerId = String(built.speakerId ?? '');
+  assert.notEqual(speakerId, '');
+  assert.notEqual(speakerId, 'self', 'the pool build creates an independent voiceprint id');
+  assert.equal(built.selfId, speakerId, 'the first explicit build becomes self');
   assert.equal(built.sampleCount, 3);
   assert.equal(built.totalDurationMs, 3600);
   assert.equal(built.created, true);
-  assert.equal(built.library.present, true);
-  assert.equal(built.library.label, '基础声纹');
-  assert.equal(built.library.enabled, true);
 
   const enrollment = await enrollmentState(host.root);
   assert.ok(enrollment !== null);
-  assert.equal(enrollment.selfId, 'self');
-  const entry = enrollment.entries.find((row) => row.speakerId === 'self');
+  assert.equal(enrollment.selfId, speakerId);
+  const entry = enrollment.entries.find((row) => row.speakerId === speakerId);
   assert.ok(entry !== undefined);
   assert.equal(entry.status, 'confirmed');
   assert.equal(entry.samples.length, 3);
   assert.equal(entry.samples.reduce((sum, sample) => sum + sample.durationMs, 0), 3600);
-  for (const sample of entry.samples) {
-    assert.ok(['spc-1', 'spc-2', 'spc-3'].includes(sample.sampleId), 'each sample references a candidate id');
-  }
 
   const library = libraryOf(host.root);
   try {
-    const row = library.get('self');
+    const row = library.get(speakerId);
     assert.ok(row !== null);
     assert.equal(row.label, '基础声纹');
     assert.equal(row.enabled, true);
-    assert.equal(row.activeCount, 1);
+    assert.equal(row.activeCount, 3, 'whole-pool build counts every candidate sample');
     assert.equal(row.embedding.length, 3);
     const expected = buildSpeakerTemplate(specs.map((spec) => ({
       id: spec.id,
@@ -502,33 +498,35 @@ test('4) build：库+登记+self 一次成立；rename 只改名称并持久化'
   }
 
   const afterBuild = await host.action({ action: 'speaker.candidates.list' });
-  assert.equal(afterBuild.selfId, 'self');
-  assert.equal(afterBuild.library.present, true);
-  assert.equal(afterBuild.library.label, '基础声纹');
-  assert.equal(afterBuild.count, 3, 'building does not silently delete the candidates');
+  assert.equal(afterBuild.selfId, speakerId);
+  assert.equal(afterBuild.count, 0, 'the explicit whole-pool build consumes the reviewed pool');
+  assert.equal(Array.isArray(afterBuild.voiceprints) ? afterBuild.voiceprints.length : 0, 1);
 
-  const renamed = await host.action({ action: 'speaker.rename', label: '我的声音' });
+  const renamed = await host.action({
+    action: 'speaker.voiceprints.rename', speakerId, label: '我的声音',
+  });
   assert.equal(renamed.ok, true, renamed.reason ?? '');
-  assert.equal(renamed.speakerId, 'self', 'rename never changes the speakerId');
+  assert.equal(renamed.speakerId, speakerId, 'rename never changes the speakerId');
   assert.equal(renamed.label, '我的声音');
-  assert.equal(renamed.library.label, '我的声音');
   const renamedList = await host.action({ action: 'speaker.candidates.list' });
-  assert.equal(renamedList.library.label, '我的声音');
+  assert.equal(renamedList.voiceprints.find((row) => row.speakerId === speakerId)?.label, '我的声音');
 
   const reopened = libraryOf(host.root);
   try {
-    const row = reopened.get('self');
-    assert.equal(row.speakerId, 'self');
+    const row = reopened.get(speakerId);
+    assert.equal(row.speakerId, speakerId);
     assert.equal(row.label, '我的声音', 'the new label survives a fresh connection');
   } finally {
     reopened.close();
   }
 
   assert.deepEqual(
-    await host.action({ action: 'speaker.rename', label: '' }),
-    { ok: false, reason: 'label-required', speakerId: 'self' },
+    await host.action({ action: 'speaker.voiceprints.rename', speakerId, label: '' }),
+    { ok: false, reason: 'label-required' },
   );
-  const tooLong = await host.action({ action: 'speaker.rename', label: 'x'.repeat(41) });
+  const tooLong = await host.action({
+    action: 'speaker.voiceprints.rename', speakerId, label: 'x'.repeat(41),
+  });
   assert.equal(tooLong.ok, false);
   assert.equal(tooLong.reason, 'label-too-long');
   assert.equal(tooLong.max, 40);
@@ -540,7 +538,7 @@ test('4) build：库+登记+self 一次成立；rename 只改名称并持久化'
   const events = await readEvents(host.root);
   assert.equal(events.filter((event) => event.type === 'speaker.enroll.confirmed').length, 1);
   assert.equal(events.filter((event) => event.type === 'speaker.candidates.built').length, 1);
-  console.log(`[4] built=${built.library.label} samples=${built.sampleCount} self=${enrollment.selfId} renamed=${renamed.label}`);
+  console.log(`[4] built=${built.voiceprint?.label} samples=${built.sampleCount} self=${enrollment.selfId} renamed=${renamed.label}`);
 });
 
 // ---------------------------------------------------------------------------

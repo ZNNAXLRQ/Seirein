@@ -611,7 +611,7 @@ function fakeWorker(text) {
 // 6. Automatic training: weak match stays in the cache; reliable match trains once
 // ---------------------------------------------------------------------------
 
-test('6) 自动训练：短答/弱匹配只进缓存，可靠样本要等完整语音回合才提交', async (t) => {
+test('6) reliable matched inputs update their own voiceprint; a second pool build coexists', async (t) => {
   const app = await mount(t);
   assert.equal((await app.start()).ok, true);
   const callback = app.callback();
@@ -621,47 +621,73 @@ test('6) 自动训练：短答/弱匹配只进缓存，可靠样本要等完整�
     callback(sampleOf(`auto-seed:${index}`, { durationMs: 1200, embedding: [1, 0, 0] }));
   }
   await until(async () => candidateStatusOf(await app.status())?.count === 3, 'seed candidates');
-  const listed = await app.action({ action: 'speaker.candidates.list' });
-  const ids = (Array.isArray(listed.candidates) ? listed.candidates : []).map((row) => row.id);
-  assert.equal(ids.length, 3);
-  const built = await app.action({ action: 'speaker.candidates.build', ids, label: '本人' });
+  const built = await app.action({ action: 'speaker.candidates.build', label: '声纹一' });
   assert.equal(built.ok, true, built.error ?? built.reason);
-  await app.action({ action: 'speaker.candidates.clear' });
+  const firstId = String(built.speakerId ?? '');
+  assert.notEqual(firstId, '');
   assert.equal(candidateStatusOf(await app.status()).count, 0);
 
   const shortAnswer = sampleOf('auto-short:1', {
-    decision: 'match', speakerId: 'self', score: 0.92, shadowQuality: 'ok',
+    decision: 'match', speakerId: firstId, score: 0.92, shadowQuality: 'ok',
     durationMs: 1000, embedding: [1, 0, 0],
   });
   callback(shortAnswer);
-  await until(async () => candidateStatusOf(await app.status())?.count === 1, 'short answer cached');
-  let events = await app.events();
-  assert.equal(ofType(events, 'speaker.auto.trained').length, 0, 'a 1 s answer never trains');
-  await app.action({ action: 'speaker.candidates.clear' });
+  await until(async () => ofType(await app.events(), 'speaker.auto.trained').length >= 1,
+    'short reliable sample trains');
+  assert.equal(candidateStatusOf(await app.status()).count, 0,
+    'a trained short answer does not enter the candidate cache');
 
-  const weak = sampleOf('auto-weak:1', {
-    decision: 'match', speakerId: 'self', score: 0.5, shadowQuality: 'ok',
+  const secondMatch = sampleOf('auto-good:2', {
+    decision: 'match', speakerId: firstId, score: 0.91, shadowQuality: 'ok',
     durationMs: 5000, embedding: [1, 0, 0],
+  });
+  callback(secondMatch);
+  await until(async () => ofType(await app.events(), 'speaker.auto.trained').length >= 2,
+    'second matched input trains');
+  let events = await app.events();
+  assert.equal(ofType(events, 'speaker.auto.trained').map((event) => event.payload)
+    .filter((row) => row.speakerId === firstId).length, 2);
+  assert.equal(candidateStatusOf(await app.status()).count, 0);
+
+  // A repeated callback for the same utterance is de-duplicated, not a second sample.
+  callback(secondMatch);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  events = await app.events();
+  assert.equal(ofType(events, 'speaker.auto.trained').length, 2, 'utterance de-dupe');
+
+  // A matched clip below the reliability floor is review evidence, not training data.
+  const weak = sampleOf('auto-weak:3', {
+    decision: 'match', speakerId: firstId, score: 0.5, shadowQuality: 'ok',
+    durationMs: 3000, embedding: [1, 0, 0],
   });
   callback(weak);
   await until(async () => candidateStatusOf(await app.status())?.count === 1, 'weak match cached');
-  events = await app.events();
-  assert.equal(ofType(events, 'speaker.auto.trained').length, 0, 'weak match never trains');
+  assert.equal(ofType(await app.events(), 'speaker.auto.trained').length, 2);
   await app.action({ action: 'speaker.candidates.clear' });
 
-  // No complete voice round exists in this harness, so a reliable sample may be queued but must
-  // not commit a version. The old immediate-update path is the regression being guarded here.
-  const reliable = sampleOf('auto-good:1', {
-    decision: 'match', speakerId: 'self', score: 0.92, shadowQuality: 'ok',
-    durationMs: 5000, embedding: [1, 0, 0],
+  // An existing voiceprint never blocks a second pool build.
+  for (let index = 0; index < 3; index += 1) {
+    callback(sampleOf(`auto-seed-b:${index}`, { durationMs: 1200, embedding: [0, 1, 0] }));
+  }
+  await until(async () => candidateStatusOf(await app.status())?.count === 3, 'second seed candidates');
+  const secondBuild = await app.action({ action: 'speaker.candidates.build', label: '声纹二' });
+  assert.equal(secondBuild.ok, true, secondBuild.error ?? secondBuild.reason);
+  assert.notEqual(String(secondBuild.speakerId), firstId);
+  const listed = await app.action({ action: 'speaker.candidates.list' });
+  assert.equal(Array.isArray(listed.voiceprints) ? listed.voiceprints.length : 0, 2);
+
+  // A match for the second row updates only that row.
+  const secondOnly = sampleOf('auto-second-only', {
+    decision: 'match', speakerId: String(secondBuild.speakerId), score: 0.93,
+    shadowQuality: 'ok', durationMs: 3000, embedding: [0, 1, 0],
   });
-  callback(reliable);
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  events = await app.events();
-  assert.equal(ofType(events, 'speaker.auto.trained').length, 0,
-    'without a complete round the sample is not committed');
-  assert.equal(candidateStatusOf(await app.status()).count, 0,
-    'the reliable sample is held, not written to the candidate cache');
-  const template = await app.action({ action: 'speaker.template.status' });
-  assert.equal(template.currentVersion, 1, 'the base checkpoint is unchanged');
+  callback(secondOnly);
+  await until(async () => ofType(await app.events(), 'speaker.auto.trained')
+    .map((event) => event.payload)
+    .some((row) => row.speakerId === String(secondBuild.speakerId)), 'second voiceprint trains');
+  const finalList = await app.action({ action: 'speaker.candidates.list' });
+  const firstRow = finalList.voiceprints.find((row) => row.speakerId === firstId);
+  const secondRow = finalList.voiceprints.find((row) => row.speakerId === String(secondBuild.speakerId));
+  assert.equal(firstRow.sampleCount, 5, 'first row unchanged by the second match');
+  assert.equal(secondRow.sampleCount, 4, 'second row received exactly its own sample');
 });

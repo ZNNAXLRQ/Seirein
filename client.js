@@ -3571,6 +3571,21 @@ window.__ModuleLoader__.load({
       const listCount = speakerEnrollNumber(list?.count);
       const listedGroups = speakerEnrollNumber(list?.groupCount);
       const template = speakerEnrollObject(list?.template);
+      const voiceprints = (Array.isArray(list?.voiceprints) ? list.voiceprints : [])
+        .map((value, index) => {
+          const row = speakerEnrollObject(value);
+          if (row === null) return null;
+          const speakerId = speakerEnrollText(row.speakerId);
+          if (speakerId === '') return null;
+          return {
+            key: `${speakerId}#${index}`,
+            speakerId,
+            label: speakerEnrollText(row.label) || speakerId,
+            sampleCount: Math.max(0, Math.round(speakerEnrollNumber(row.sampleCount) ?? 0)),
+            enabled: row.enabled !== false,
+          };
+        })
+        .filter((row) => row !== null);
       const templateAvailable = template?.ok === true;
       const templateVersions = (Array.isArray(template?.versions) ? template.versions : [])
         .map((value) => {
@@ -3604,6 +3619,7 @@ window.__ModuleLoader__.load({
         groupCount: listedGroups === null || listedGroups < 0 ? groups.length : Math.round(listedGroups),
         candidates,
         groups,
+        voiceprints,
         selfId: speakerEnrollText(list?.selfId),
         libraryPresent: library?.present === true,
         libraryLabel: speakerEnrollText(library?.label),
@@ -3756,10 +3772,10 @@ window.__ModuleLoader__.load({
       const noSelection = selected.length === 0;
       const shadowEnabled = props?.shadowEnabled === true;
       const buildReason = !view.available
-        ? '建立基础声纹已禁用：候选接口不可用。'
+        ? '建立声纹已禁用：候选接口不可用。'
         : (view.count === 0
-            ? '建立基础声纹已禁用：还没有候选；正常说话会自动收集，或点「刷新候选」。'
-            : (noSelection ? '建立基础声纹已禁用：先勾选至少一条候选。' : ''));
+            ? '建立声纹已禁用：还没有候选；正常说话会自动收集，或点「刷新候选」。'
+            : '');
       const strengthenReason = !view.available
         ? '强化当前声纹已禁用：候选接口不可用。'
         : (view.templateCurrentVersion === null
@@ -3856,6 +3872,35 @@ window.__ModuleLoader__.load({
       },
         h('div', { style: styles.groupTitle }, '声纹候选'),
         h('div', { style: styles.hint }, SPEAKER_CANDIDATE_NOTICE),
+        h('div', { 'data-speaker-voiceprints': 'true', style: { marginTop: 6 } },
+          h('div', { style: { ...styles.label, fontWeight: 600 } },
+            `已有声纹${view.voiceprints.length === 0 ? '' : ` 路 ${view.voiceprints.length} 个`}`),
+          view.voiceprints.length === 0
+            ? h('div', { style: styles.hint }, '还没有独立声纹：整理候选后可建立多个声纹。')
+            : view.voiceprints.map((voiceprint) => h('div', {
+                key: voiceprint.key,
+                style: { ...styles.row, alignItems: 'flex-start' },
+              },
+                h('span', { style: { ...styles.value, flex: 1 } },
+                  `${voiceprint.label} 路 样本 ${voiceprint.sampleCount} 条`),
+                h('span', { style: { display: 'flex', gap: 6 } },
+                  h('button', {
+                    style: { ...styles.btn, ...(locked ? styles.off : {}) },
+                    disabled: locked,
+                    onClick: () => {
+                      const next = typeof window !== 'undefined' && typeof window.prompt === 'function'
+                        ? window.prompt('声纹显示名称', voiceprint.label)
+                        : null;
+                      if (typeof next === 'string' && next.trim() !== '') {
+                        props?.onVoiceprintRename?.(voiceprint.speakerId, next.trim());
+                      }
+                    },
+                  }, '重命名'),
+                  h('button', {
+                    style: { ...styles.btnDanger, ...(locked ? styles.off : {}) },
+                    disabled: locked,
+                    onClick: () => props?.onVoiceprintRemove?.(voiceprint.speakerId),
+                  }, '删除'))))),
         h('div', { style: styles.row },
           h('span', { style: styles.label }, '候选数'),
           h('span', { style: styles.value },
@@ -3921,7 +3966,7 @@ window.__ModuleLoader__.load({
             style: styles.input,
             value: label,
             maxLength: SPEAKER_CANDIDATE_LABEL_MAX_CHARS,
-            placeholder: '本人声纹名称（留空使用「本人」）',
+            placeholder: '新声纹名称（留空自动命名）',
             disabled: locked,
             onChange: (event) => props?.onCandidateLabel?.(event?.target?.value ?? ''),
           }),
@@ -3938,11 +3983,11 @@ window.__ModuleLoader__.load({
             onClick: () => props?.onCandidatePreview?.(selected),
           }, '预览一致性'),
           h('button', {
-            style: { ...styles.btnPrimary, ...(locked || !view.available || noSelection ? styles.off : {}) },
-            disabled: locked || !view.available || noSelection,
-            title: '只有你点这里才会写入本人声纹；不会自动确认',
-            onClick: () => props?.onCandidateBuild?.(selected, label === '' ? '本人' : label),
-          }, '建立基础声纹'),
+            style: { ...styles.btnPrimary, ...(locked || !view.available || view.count === 0 ? styles.off : {}) },
+            disabled: locked || !view.available || view.count === 0,
+            title: '把当前整池候选建立为一个新的独立声纹；不会覆盖已有声纹',
+            onClick: () => props?.onCandidateBuild?.(selected, label),
+          }, '从整池新建声纹'),
           h('button', {
             style: {
               ...styles.btn,
@@ -5924,6 +5969,30 @@ window.__ModuleLoader__.load({
           'speaker-rename',
         );
         const outcome = speakerCandidateOutcome('rename', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return;
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
+
+      const renameSpeakerVoiceprint = useCallback(async (speakerId, label) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.voiceprints.rename', speakerId, label },
+          'speaker-voiceprint-rename',
+        );
+        const outcome = speakerCandidateOutcome('rename', result);
+        setSpeakerCandidateNotice(outcome);
+        if (!outcome.ok) return;
+        await loadSpeakerCandidates();
+      }, [loadSpeakerCandidates, runSpeakerCandidateAction]);
+
+      const removeSpeakerVoiceprint = useCallback(async (speakerId) => {
+        const result = await runSpeakerCandidateAction(
+          { action: 'speaker.voiceprints.remove', speakerId },
+          'speaker-voiceprint-remove',
+        );
+        const outcome = result?.ok === true
+          ? { ok: true, message: '已删除声纹及其样本记录；其他声纹保留。' }
+          : speakerCandidateOutcome('remove', result);
         setSpeakerCandidateNotice(outcome);
         if (!outcome.ok) return;
         await loadSpeakerCandidates();
@@ -8524,6 +8593,8 @@ window.__ModuleLoader__.load({
             onTemplateRollbackCancel: () => setSpeakerTemplateRollback(null),
             onTemplateRollback: (version) => void rollbackSpeakerTemplate(version),
             onCandidateRename: (label) => void renameSpeakerLibrary(label),
+            onVoiceprintRename: (speakerId, label) => void renameSpeakerVoiceprint(speakerId, label),
+            onVoiceprintRemove: (speakerId) => void removeSpeakerVoiceprint(speakerId),
             onCandidateLabel: setSpeakerCandidateLabel,
           }),
           settingsGroup(h, 'speaker-shadow', '',

@@ -1808,6 +1808,52 @@ export function play(file, { ffplayPath = null, signal, onStart = null, label = 
   }, signal, { label });
 }
 
+/**
+ * Choose the block list for one prepared line.
+ *
+ * The first-block planner is an ADDITION to the normal safe comma splitter, not a replacement. If
+ * it cannot cut (for example the first safe comma lies after its target window), the caller must
+ * still get the ordinary `splitSpeechChunks` result instead of a single whole-sentence block.
+ * `chunking:false` keeps the explicit one-clip-per-unit behavior.
+ *
+ * @param {string} text
+ * @param {{chunking?: boolean, minChars?: number,
+ *   firstBlockPlan?: {blocks?: string[], chunked?: boolean}|null}} [options]
+ * @returns {{blocks: string[], firstBlockPlan: object|null, usedFirstBlockPlan: boolean,
+ *   fellBackToSafeChunks: boolean}}
+ */
+export function planSpeechBlocks(text, {
+  chunking = true, minChars = DEFAULT_CHUNK_MIN_CHARS, firstBlockPlan = null,
+} = {}) {
+  const source = typeof text === 'string' ? text.trim() : '';
+  if (source.length === 0) {
+    return { blocks: [], firstBlockPlan, usedFirstBlockPlan: false, fellBackToSafeChunks: false };
+  }
+  const planned = firstBlockPlan !== null && firstBlockPlan !== undefined
+    && firstBlockPlan.chunked === true
+    && Array.isArray(firstBlockPlan.blocks)
+    && firstBlockPlan.blocks.length > 1
+    ? firstBlockPlan.blocks
+    : null;
+  if (planned !== null) {
+    return {
+      blocks: planned,
+      firstBlockPlan,
+      usedFirstBlockPlan: true,
+      fellBackToSafeChunks: false,
+    };
+  }
+  const blocks = chunking ? splitSpeechChunks(source, { minChars }) : [source];
+  return {
+    blocks: blocks.length > 0 ? blocks : [source],
+    firstBlockPlan,
+    usedFirstBlockPlan: false,
+    // A first plan existed but did not cut, and the ordinary safe splitter recovered the blocks.
+    fellBackToSafeChunks: firstBlockPlan !== null && firstBlockPlan !== undefined
+      && firstBlockPlan.chunked !== true && chunking && blocks.length > 1,
+  };
+}
+
 /** A bounded producer: scans without copying the whole input into a sentence array. */
 export function* speechSentences(text, { maxTextChars = 4096, maxSentenceChars = 1024 } = {}) {
   if (typeof text !== 'string') throw new TypeError('Speech text must be a string');

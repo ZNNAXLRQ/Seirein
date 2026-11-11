@@ -47,8 +47,19 @@ const pipeline = rows.filter((row) => row.type === 'voice.pipeline.timeline').ma
 const latency = rows.filter((row) => row.type === 'voice.latency').map((row) => row.payload ?? {});
 const pipelineByKey = new Map(pipeline.map((row) => [keyOf({ payload: row }), row]).filter(([key]) => key !== ''));
 const latencyByKey = new Map(latency.map((row) => [keyOf({ payload: row }), row]).filter(([key]) => key !== ''));
-const joinedKeys = [...pipelineByKey.keys()].filter((key) => latencyByKey.has(key)).slice(-windowSize);
+const allPairedKeys = [...pipelineByKey.keys()].filter((key) => latencyByKey.has(key));
+const joinedKeys = allPairedKeys.slice(-windowSize);
 const joined = joinedKeys.map((key) => ({ key, pipeline: pipelineByKey.get(key), latency: latencyByKey.get(key) }));
+// Count missing counterparts across the WHOLE log, then restrict only the statistics window.
+// A pair outside the last N rounds is old data, not an unpaired row.
+const unpairedPipeline = pipeline.filter((row) => {
+  const key = keyOf({ payload: row });
+  return key === '' || !latencyByKey.has(key);
+}).length;
+const unpairedLatency = latency.filter((row) => {
+  const key = keyOf({ payload: row });
+  return key === '' || !pipelineByKey.has(key);
+}).length;
 
 const bodyAfter = joined
   .map(({ pipeline: p }) => (num(p.firstAudioMs) !== null && num(p.bodyReadyMs) !== null
@@ -61,10 +72,12 @@ const synthAfterBody = joined
 
 const reply = {
   pairedSamples: joined.length,
+  pairedSamplesAll: allPairedKeys.length,
+  pairedOutsideWindow: allPairedKeys.length - joined.length,
   pipelineSamples: pipeline.length,
   latencySamples: latency.length,
-  unpairedPipeline: pipeline.length - joined.length,
-  unpairedLatency: latency.length - joined.length,
+  unpairedPipeline,
+  unpairedLatency,
   pipeline: Object.fromEntries([
     'bodyReadyMs', 'firstChunkTranslateMs', 'firstChunkTtsMs', 'firstChunkSynthMs',
     'firstChunkSlotWaitMs', 'firstChunkQueueWaitMs', 'firstAudioMs', 'firstChunkChars',
