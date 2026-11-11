@@ -414,7 +414,9 @@ export function createSpeakerEmbedder({ modelPath, numThreads = 1, extractorFact
           result.lastError = 'stream-not-ready';
           return null;
         }
-        const embedding = extractor.compute(stream);
+        // Electron/native sherpa rejects externally allocated output buffers; `false` asks for a
+        // JS-owned result. Copying the input alone does not fix this output allocation.
+        const embedding = extractor.compute(stream, false);
         if (!(embedding instanceof Float32Array) || embedding.length === 0) {
           result.lastError = 'empty-embedding';
           return null;
