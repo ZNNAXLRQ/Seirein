@@ -976,9 +976,9 @@ export const POSTURE_REACH = 1.5;
  * (the writer's convention is 1 semantic unit = 30°).
  */
 export const BASE_ACTIVITY_DEGREES = Object.freeze({
-  headX: 0.9,
+  headX: 1.35,
   headY: 1.6,
-  headZ: 0.9,
+  headZ: 1.4,
 });
 
 /**
@@ -2894,7 +2894,7 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const base = finite(state.motion.posture.base[axis], 0);
     const salt = hash32(motionSeed, axis);
     const slow = 0.82 + 0.18 * smoothNoise1(salt, tSeconds * 0.07 + 1.7);
-    const micro = 0.09 * smoothNoise1(salt, tSeconds * 0.55 + 3.1);
+    const micro = 0.10 * smoothNoise1(salt, tSeconds * 0.55 + 3.1);
     return base * slow + micro;
   }
 
@@ -6930,9 +6930,9 @@ export function createBehaviorRuntime({ config = {} } = {}) {
     const headXAmp = idleEnabled ? headBaseSemantic('headX') * speakingHead : 0;
     const headYAmp = idleEnabled ? headBaseSemantic('headY') * speakingHead : 0;
     const headZAmp = idleEnabled ? headBaseSemantic('headZ') : 0;
-    const bodyAmp = idleEnabled ? 0.03 * idleChannelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
-    const gazeXAmp = 0.03 * idleChannelSway('gazeX') * gazeDrift;
-    const gazeYAmp = 0.02 * idleChannelSway('gazeY') * gazeDrift;
+    const bodyAmp = idleEnabled ? 0.05 * idleChannelSway('bodyX') * (frame.speaking ? 0.8 : 1) : 0;
+    const gazeXAmp = 0.05 * idleChannelSway('gazeX') * gazeDrift;
+    const gazeYAmp = 0.035 * idleChannelSway('gazeY') * gazeDrift;
     // Eye-open idle micro-motion is opt-in: `idleEye` (the switch that lets the eye channel be
     // written) or an explicit eye channel override. Otherwise the eye base stays exactly 1, so
     // expressions and blink tests keep their exact values.
