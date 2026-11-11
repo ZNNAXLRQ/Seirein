@@ -9,7 +9,10 @@ import { PRESETS } from '../src/host/avatar/presets/index.js';
 
 const builtin = [{
   id: 'custom.head',
+  recipeId: 'custom-head',
   family: 'attention',
+  semantic: 'neutral',
+  styles: ['neutral'],
   states: ['idle'],
   events: ['idle'],
   requires: ['headX'],
@@ -63,4 +66,33 @@ test('invalid or empty user files fall back to built-ins with a visible error', 
   const empty = loadPresetLibrary({ root, builtins: PRESETS });
   assert.equal(empty.source, 'builtin-fallback');
   assert.match(empty.error, /no valid preset/u);
+});
+
+test('selector-required fields and duplicate ids are rejected, not loaded then thrown', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'seirein-presets-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const first = loadPresetLibrary({ root, builtins: builtin });
+  const missing = { ...builtin[0] };
+  delete missing.recipeId;
+  await writeFile(first.file, JSON.stringify({ schemaVersion: 1, presets: [missing] }), 'utf8');
+  const badFields = loadPresetLibrary({ root, builtins: builtin });
+  assert.equal(badFields.source, 'builtin-fallback');
+  assert.match(badFields.error, /required selector fields/u);
+
+  await writeFile(first.file, JSON.stringify({
+    schemaVersion: 1,
+    presets: [builtin[0], { ...builtin[0] }],
+  }), 'utf8');
+  const duplicate = loadPresetLibrary({ root, builtins: builtin });
+  assert.equal(duplicate.source, 'builtin-fallback');
+  assert.match(duplicate.error, /duplicate id/u);
+
+  await writeFile(first.file, JSON.stringify({
+    schemaVersion: 1,
+    presets: [builtin[0]],
+  }), 'utf8');
+  const good = loadPresetLibrary({ root, builtins: PRESETS });
+  assert.equal(good.source, 'user');
+  assert.equal(good.error, '');
+  assert.equal(good.presets.length, 1);
 });

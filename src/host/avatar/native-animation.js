@@ -7,6 +7,19 @@
  * the one place that talks to VTS.
  */
 
+/** VTS hotkey types that really play a model animation. Unknown/missing types fail closed. */
+export const NATIVE_ANIMATION_HOTKEY_TYPES = Object.freeze([
+  'TriggerAnimation',
+  'ChangeIdleAnimation',
+]);
+
+/** Whether one VTS hotkey entry is safe for the native animation scheduler. */
+export function isNativeAnimationHotkey(entry) {
+  return entry !== null && typeof entry === 'object'
+    && typeof entry.name === 'string' && entry.name.trim().length > 0
+    && NATIVE_ANIMATION_HOTKEY_TYPES.includes(entry.type);
+}
+
 /** Hard skip for the immediately previous native animation; older repeats get a soft penalty. */
 export function createNativeAnimationScheduler({
   pool = [],

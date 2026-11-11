@@ -11,6 +11,7 @@ import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { createPresetIndex, createPresetSelector } from '../preset-selector.js';
 
 export const PRESET_LIBRARY_DIR = 'avatar/presets';
 export const PRESET_LIBRARY_FILE = 'presets.json';
@@ -35,7 +36,10 @@ const isObject = (value) => value !== null && typeof value === 'object' && !Arra
 export function validPresetRow(row) {
   return isObject(row)
     && typeof row.id === 'string' && row.id.trim().length > 0
+    && typeof row.recipeId === 'string' && row.recipeId.trim().length > 0
     && typeof row.family === 'string' && row.family.trim().length > 0
+    && typeof row.semantic === 'string' && row.semantic.trim().length > 0
+    && Array.isArray(row.styles) && row.styles.length > 0
     && Array.isArray(row.states)
     && Array.isArray(row.events)
     && Array.isArray(row.requires)
@@ -44,7 +48,28 @@ export function validPresetRow(row) {
 }
 
 function validRows(rows) {
-  return Array.isArray(rows) ? rows.filter(validPresetRow) : [];
+  if (!Array.isArray(rows)) return { rows: [], error: 'presets must be an array' };
+  const valid = rows.filter(validPresetRow);
+  if (valid.length !== rows.length) {
+    return { rows: [], error: 'presets.json contains a row missing required selector fields' };
+  }
+  const ids = new Set();
+  for (const row of valid) {
+    if (ids.has(row.id)) return { rows: [], error: `presets.json contains duplicate id: ${row.id}` };
+    ids.add(row.id);
+  }
+  return { rows: valid, error: '' };
+}
+
+/** Validate exactly what the selector consumes, not only the shallow file shape. */
+function selectorValidation(rows) {
+  try {
+    const index = createPresetIndex(rows);
+    createPresetSelector({ presets: index.presets });
+    return '';
+  } catch (error) {
+    return `preset selector rejected the library: ${error?.message ?? String(error)}`;
+  }
 }
 
 /**
@@ -83,14 +108,27 @@ export function loadPresetLibrary({ root, builtins, now = Date.now }) {
   }
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8'));
-    const rows = validRows(parsed?.presets);
-    if (rows.length === 0) {
+    const checked = validRows(parsed?.presets);
+    if (checked.error.length > 0) {
+      return {
+        directory, file, presets: builtins, source: 'builtin-fallback', created: false,
+        error: checked.error,
+      };
+    }
+    if (checked.rows.length === 0) {
       return {
         directory, file, presets: builtins, source: 'builtin-fallback', created: false,
         error: 'presets.json has no valid preset row; built-in catalog used',
       };
     }
-    return { directory, file, presets: rows, source: 'user', created: false, error: '' };
+    const selectorError = selectorValidation(checked.rows);
+    if (selectorError.length > 0) {
+      return {
+        directory, file, presets: builtins, source: 'builtin-fallback', created: false,
+        error: selectorError,
+      };
+    }
+    return { directory, file, presets: checked.rows, source: 'user', created: false, error: '' };
   } catch (error) {
     return {
       directory, file, presets: builtins, source: 'builtin-fallback', created: false,

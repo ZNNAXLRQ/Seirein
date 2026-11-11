@@ -276,7 +276,7 @@ import {
 // the renderers, and the optional residual drain must not turn that mock into an import failure.
 import * as speechTextModule from './speech/speech-text.js';
 import { VtsClient } from './avatar/vts.js';
-import { createNativeAnimationScheduler } from './avatar/native-animation.js';
+import { createNativeAnimationScheduler, isNativeAnimationHotkey } from './avatar/native-animation.js';
 import { PRESETS } from './avatar/presets/index.js';
 import { loadPresetLibrary } from './avatar/presets/library.js';
 import {
@@ -451,7 +451,6 @@ import {
   VoiceLatencyLog,
   VOICE_LATENCY_OPTIONAL_FIELDS,
 } from './session/delivery/dispatch.js';
-import { createVoiceFollowup } from './session/delivery/followup.js';
 import {
   FastPath,
   UNGROUPED_DOMAIN,
@@ -2417,12 +2416,6 @@ export function apply(ctx, config) {
   });
   /** sessionId -> the live voice round whose agent turn must settle before a continuation. */
   const voiceRounds = new Map();
-  /** sessionId -> the bounded watcher that speaks a delegated task's later result once. */
-  const voiceFollowups = new Map();
-  ctx.effect(() => () => {
-    for (const watcher of voiceFollowups.values()) watcher.cancel?.();
-    voiceFollowups.clear();
-  });
   /** groupId -> the one reply speaker that may currently sound for that group. */
   const replyVoiceByGroup = new Map();
   /** groupId -> every accepted reply speech id of the current answer version. */
@@ -5696,9 +5689,12 @@ export function apply(ctx, config) {
     if (avatarStyleRefreshTimer !== null) clearTimeout(avatarStyleRefreshTimer);
   });
 
+  /** Keep only hotkeys whose VTS type really plays an animation; unknown types fail closed. */
+  const nativeAnimationHotkeys = () => (vts?.hotkeys ?? []).filter(isNativeAnimationHotkey);
+
   /** Keep the light idle pool inside what this model really exposes (hotkey / expression names). */
   const refreshAvatarIdleActions = () => {
-    nativeAnimationSampler.setPool((vts?.hotkeys ?? []).map((entry) => entry.name));
+    nativeAnimationSampler.setPool(nativeAnimationHotkeys().map((entry) => entry.name));
     const names = [
       ...(vts?.hotkeys ?? []).map((entry) => String(entry.name ?? '').toLowerCase()),
       ...(vts?.expressions ?? []).map((entry) => String(entry.name ?? '').toLowerCase()),
@@ -5758,13 +5754,18 @@ export function apply(ctx, config) {
     // A native animation already in flight (user or plugin) is never replaced by a blind second
     // trigger; VTS would otherwise blend two animations into the same pose.
     if (client.animations?.current != null) return;
-    nativeAnimationSampler.setPool((client.hotkeys ?? []).map((entry) => entry.name));
+    const hotkeys = nativeAnimationHotkeys();
+    nativeAnimationSampler.setPool(hotkeys.map((entry) => entry.name));
     const name = nativeAnimationSampler.pick();
     if (name === null) return;
+    const hotkey = hotkeys.find((entry) => entry.name === name);
+    if (hotkey === undefined) return;
     nativeAnimationInFlight = true;
     try {
-      await client.triggerHotkey(name);
-      await log.emit('avatar.native.animation', { name, source: 'scheduler' }).catch(() => {});
+      await client.triggerHotkey(hotkey.hotkeyID ?? hotkey.name);
+      await log.emit('avatar.native.animation', {
+        name, hotkeyID: hotkey.hotkeyID ?? '', type: hotkey.type ?? '', source: 'scheduler',
+      }).catch(() => {});
     } catch (error) {
       await log.emit('avatar.native.animation.failed', {
         name, error: error?.message ?? String(error),
@@ -18094,8 +18095,6 @@ export function apply(ctx, config) {
     // A2: the per-turn sentence speaker. Declared outside `try` so a failed delivery can cancel it.
     let sentenceVoice = null;
     let detachSentenceVoice = null;
-    // The second-speech gate: a task result may arrive while the first answer is still sounding.
-    let releaseFollowupGate = () => {};
     // Join keys for `voice.translate`: the injected message id and the accepted turn. Kept in
     // variables so the speaker's synth seam never reads `request`/`stage` before they are bound.
     let deliveryMessageId = '';
@@ -18204,10 +18203,6 @@ export function apply(ctx, config) {
       // or absent, so voice can never land in whichever browser session happens to be focused.
       const target = voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR });
       const sessionId = target.sessionId;
-      // A newer user turn supersedes a pending second-speech watcher; never speak a stale task
-      // result over the answer the user is asking for now.
-      voiceFollowups.get(sessionId)?.cancel?.();
-      voiceFollowups.delete(sessionId);
       // P-46: the timeline row is joinable by session even when the delivery never got a message id.
       roundSessionId = sessionId;
       // Batch 2: one continuous expression is one response group. A second segment that arrives
@@ -19477,43 +19472,7 @@ export function apply(ctx, config) {
         releaseVoiceTurn(sessionId);
         return;
       }
-      // A subagent/goal/job notification is a later user-message source. The Agent's answer to it
-      // is the completed result; speak that once, after this round's first answer has finished.
-      // The watcher arms only on those sources and never speaks an ordinary follow-up turn.
-      const followupGate = new Promise((resolve) => { releaseFollowupGate = resolve; });
-      const followup = createVoiceFollowup({
-        ctx,
-        sessionId,
-        afterSeq: session.seq,
-        note: (type, payload) => { void log.emit(type, payload).catch(() => {}); },
-        onResult: async ({ text, source, turn }) => {
-          await followupGate;
-          if (shutdown.closing === true) return;
-          const label = String(source?.label ?? '').replace(/\s+/gu, ' ').trim().slice(0, 40);
-          const prefix = source?.kind === 'goal'
-            ? '你之前交代的目标完成了，结果是：'
-            : `你之前交代的「${label || '任务'}」完成了，结果是：`;
-          const line = `${prefix}${text}`;
-          const spoken = await speakLine(line, line, {
-            sessionId,
-            turn: Number.isInteger(turn) ? turn : null,
-            lane: 'say',
-          });
-          await log.emit('voice.followup.spoken', {
-            sessionId,
-            kind: source?.kind ?? '',
-            chars: line.length,
-            audioStartedAt: Number(spoken?.audioStartedAt) || 0,
-          }).catch(() => {});
-        },
-        onError: (error) => {
-          void log.emit('voice.followup.failed', {
-            sessionId, error: error?.message ?? String(error),
-          }).catch(() => {});
-        },
-      });
-      voiceFollowups.set(sessionId, followup);
-      const speechRun = runSpeechProducer('voice-speech', async () => {
+      void runSpeechProducer('voice-speech', async () => {
         // First segment: a quick task is answered exactly like before, with no pending line.
         const early = await Promise.race([
           resultPromise,
@@ -19839,8 +19798,6 @@ export function apply(ctx, config) {
           }
         }
         releaseVoiceTurn(sessionId);
-        // The second spoken pass may have been waiting for the first answer's audio to finish.
-        releaseFollowupGate();
       });
     } catch (error) {
       // Delivery failed (e.g. `followup` threw) before the turn was handed off: release the
@@ -19850,10 +19807,6 @@ export function apply(ctx, config) {
         try { pendingResult?.cancel?.(); } catch { /* listener already released */ }
       }
       sentenceVoice?.cancel('delivery-failed');
-      releaseFollowupGate();
-      const pendingFollowup = voiceFollowups.get(roundSessionId);
-      pendingFollowup?.cancel?.();
-      if (pendingFollowup !== undefined) voiceFollowups.delete(roundSessionId);
       // Batch 2: a failed delivery produced no answer, but it must not erase the group's earlier
       // unvoiced content (a normal failure is not an explicit cancel).
       if (voiceGroup !== null) {

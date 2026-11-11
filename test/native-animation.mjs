@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createNativeAnimationScheduler } from '../src/host/avatar/native-animation.js';
+import {
+  createNativeAnimationScheduler,
+  isNativeAnimationHotkey,
+} from '../src/host/avatar/native-animation.js';
 
 test('native animation picks exclude the immediate previous name', () => {
   const sampler = createNativeAnimationScheduler({
@@ -36,4 +39,13 @@ test('empty pools and duplicate names stay inert', () => {
   assert.deepEqual(deduped.pool(), ['one']);
   deduped.clear();
   assert.equal(deduped.history().length, 0);
+});
+
+test('only explicit animation hotkey types are eligible', () => {
+  assert.equal(isNativeAnimationHotkey({ name: 'anim', type: 'TriggerAnimation' }), true);
+  assert.equal(isNativeAnimationHotkey({ name: 'idle', type: 'ChangeIdleAnimation' }), true);
+  assert.equal(isNativeAnimationHotkey({ name: 'expression', type: 'ToggleExpression' }), false);
+  assert.equal(isNativeAnimationHotkey({ name: 'tracking', type: 'ToggleTracking' }), false);
+  assert.equal(isNativeAnimationHotkey({ name: 'unknown' }), false);
+  assert.equal(isNativeAnimationHotkey(null), false);
 });
