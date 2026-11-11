@@ -382,28 +382,61 @@ export function createSpeakerEmbedder({ modelPath, numThreads = 1, extractorFact
   if (extractor === null || typeof extractor?.createStream !== 'function' || typeof extractor?.compute !== 'function') {
     return SPEAKER_EMBEDDER_MISSING;
   }
-  return {
+  const result = {
     modelPath,
     sampleRate: SPEAKER_SAMPLE_RATE,
     dim: Number(extractor.dim) || 0,
+    /** Last concrete reason `embed()` returned null; diagnostics only, cleared on success. */
+    lastError: '',
     embed(samples) {
+      result.lastError = '';
       // One stream per utterance: an extractor stream is consumed by `compute`, so reusing it
       // would blend two utterances into one embedding.
-      if (!(samples instanceof Float32Array) || samples.length === 0) return null;
+      if (!(samples instanceof Float32Array) || samples.length === 0) {
+        result.lastError = 'invalid-samples';
+        return null;
+      }
+      // Capture normally hands over finite [-1,1] PCM. A driver/decoder edge can still produce a
+      // NaN or an unscaled 16-bit value; sanitize a copy instead of losing the enrollment sample.
+      let input = samples;
+      let needsCopy = false;
+      for (let index = 0; index < samples.length; index += 1) {
+        const value = samples[index];
+        if (!Number.isFinite(value) || value < -1 || value > 1) {
+          needsCopy = true;
+          break;
+        }
+      }
+      if (needsCopy) {
+        input = new Float32Array(samples.length);
+        for (let index = 0; index < samples.length; index += 1) {
+          const value = Number(samples[index]);
+          input[index] = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
+        }
+      }
       try {
         const stream = extractor.createStream();
-        stream.acceptWaveform({ samples, sampleRate: SPEAKER_SAMPLE_RATE });
+        stream.acceptWaveform({ samples: input, sampleRate: SPEAKER_SAMPLE_RATE });
         // The upstream example finalizes the input before asking whether enough audio arrived;
         // a stream that never became ready has no embedding to offer.
         stream.inputFinished?.();
-        if (typeof extractor.isReady === 'function' && !extractor.isReady(stream)) return null;
+        if (typeof extractor.isReady === 'function' && !extractor.isReady(stream)) {
+          result.lastError = 'stream-not-ready';
+          return null;
+        }
         const embedding = extractor.compute(stream);
-        return embedding instanceof Float32Array && embedding.length > 0 ? embedding : null;
-      } catch {
+        if (!(embedding instanceof Float32Array) || embedding.length === 0) {
+          result.lastError = 'empty-embedding';
+          return null;
+        }
+        return embedding;
+      } catch (error) {
+        result.lastError = `compute-failed:${error?.message ?? String(error)}`;
         return null;
       }
     },
   };
+  return result;
 }
 
 /**

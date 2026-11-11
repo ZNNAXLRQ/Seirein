@@ -967,7 +967,7 @@ export function startHearing({
             } else {
               // Do not turn a cold-start observation into a fake candidate: name the missing
               // measurement so the voiceprint card's zero count is diagnosable.
-              noteSpeakerDebug('embedding-null', snapshot.utteranceId);
+              noteSpeakerDebug('embedding-null', `${snapshot.utteranceId}:${embedder.lastError || 'unknown'}`);
             }
           } catch (error) {
             // A failed embed must not suppress the no-speakers evidence row.
@@ -987,6 +987,7 @@ export function startHearing({
       const embedding = embedder.embed(snapshot.speakerSamples);
       if (!(embedding instanceof Float32Array) || embedding.length === 0) {
         const verdict = speakerVerdict(snapshot, {});
+        noteSpeakerDebug('embedding-null', `${snapshot.utteranceId}:${embedder.lastError || 'unknown'}`);
         emitSpeakerShadow({
           decision: 'unsure',
           reason: 'no-embedding',
