@@ -947,6 +947,10 @@ export function startHearing({
             const embedding = embedder.embed(snapshot.speakerSamples);
             if (embedding instanceof Float32Array && embedding.length > 0) {
               noteSpeakerSample(snapshot, baseVerdict, embedding, text);
+            } else {
+              // Do not turn a cold-start observation into a fake candidate: name the missing
+              // measurement so the voiceprint card's zero count is diagnosable.
+              noteSpeakerDebug('embedding-null', snapshot.utteranceId);
             }
           } catch (error) {
             // A failed embed must not suppress the no-speakers evidence row.
