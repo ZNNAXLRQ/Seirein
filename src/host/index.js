@@ -612,7 +612,7 @@ import {
 
 import { createStatusBuilder } from './runtime/http/status.js';
 import { createSettingsRoutes } from './runtime/http/routes.js';
-import { ACTIONS as hearingActions, createHearingSettingsActions, createWordCommandDefinition, projectHearingStatus, resolveSelfSpeakerId } from './hearing/settings-actions.js';
+import { ACTIONS as hearingActions, createHearingSettingsActions, createWordCommandDefinition, projectHearingStatus, resolveSelfSpeakerId, SPEAKER_BASE_ID } from './hearing/settings-actions.js';
 import { ACTIONS as memoryActions, createMemorySettingsActions } from './memory/settings-actions.js';
 import { ACTIONS as speechActions, createSpeechSettingsActions } from './speech/settings-actions.js';
 import {
@@ -19892,7 +19892,9 @@ export function apply(ctx, config) {
   const SPEAKER_STATUS_EVENT_MS = 5_000;
   const speakerShadowEnabled = () => {
     const saved = readSettings().voice?.speakerShadow;
-    return saved !== undefined ? saved === true : config?.voice?.speakerShadow === true;
+    // Collection is part of the voiceprint flow, not a separate optional feature. Existing users
+    // can still opt out explicitly with `speakerShadow:false`.
+    return saved !== undefined ? saved === true : true;
   };
   /**
    * Loopback diagnostic shadow (`voice.speakerShadowLoopback`, **default OFF**). Its own switch:
@@ -20064,6 +20066,47 @@ export function apply(ctx, config) {
     return '';
   };
   /**
+   * Once a confirmed self exists, a high-confidence match is training evidence, not an unlabelled
+   * candidate. Fold that embedding into the same `self` row without touching the candidate cache.
+   * This is deliberately only the library running average: the version chain remains the explicit
+   * build/strengthen history, so an automatic match cannot silently rewrite a user-selected version.
+   */
+  const autoTrainMatchedSpeaker = (sample) => {
+    if (sample?.decision !== 'match' || !(sample.embedding instanceof Float32Array)) return false;
+    let self = null;
+    try {
+      self = speakerEnrollmentStore.getConfirmedSelf();
+    } catch {
+      return false;
+    }
+    if (self === null || self === undefined) return false;
+    const selfId = String(self.speakerId ?? '');
+    if (selfId.length === 0) return false;
+    if (typeof sample.speakerId === 'string' && sample.speakerId.length > 0
+      && sample.speakerId !== selfId) return false;
+    try {
+      const trained = speakerLibrary.register(selfId, sample.embedding, {
+        label: String(self.label ?? '') || '本人',
+        enabled: true,
+      });
+      if (trained?.ok !== true) {
+        void log.emit('speaker.auto.train.failed', {
+          reason: String(trained?.reason ?? 'library-failed'),
+        }).catch(() => {});
+        return false;
+      }
+      void log.emit('speaker.auto.trained', {
+        utteranceId: typeof sample.utteranceId === 'string' ? sample.utteranceId : '',
+        score: Number.isFinite(Number(sample.score)) ? Number(sample.score) : null,
+        durationMs: Math.round(Number(sample.durationMs) || 0),
+        activeCount: Number(trained.activeCount) || 0,
+      }).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  /**
    * One hearing callback: validate, write the short WAV, then admit the metadata row. Failure to
    * write audio records one reason event and stores nothing; every path is best-effort and never
    * reaches delivery.
@@ -20074,6 +20117,11 @@ export function apply(ctx, config) {
       skipSpeakerCandidate(drop);
       return;
     }
+    noteSpeakerCandidateEvent('speaker.candidates.received', {
+      utteranceId: typeof sample?.utteranceId === 'string' ? sample.utteranceId : '',
+      decision: typeof sample?.decision === 'string' ? sample.decision : '',
+      durationMs: Math.round(Number(sample?.durationMs) || 0),
+    });
     if (sample === null || typeof sample !== 'object') {
       skipSpeakerCandidate('invalid-sample');
       return;
@@ -20117,6 +20165,8 @@ export function apply(ctx, config) {
       skipSpeakerCandidate('invalid-samples');
       return;
     }
+    // Matched speech is already labelled self: train it and never put it in the unlabelled cache.
+    if (autoTrainMatchedSpeaker(sample)) return;
     try {
       const duplicate = speakerCandidatesStore.list().find(
         (candidate) => candidate.utteranceId === utteranceId,
@@ -20633,6 +20683,8 @@ export function apply(ctx, config) {
     // A start attempt is a new candidate generation: a callback queued by a predecessor (or by a
     // session that is about to be replaced) must never land in the new session's cache.
     const speakerCandidateEpoch = ++speakerCandidateGeneration;
+    // Enrollment uses the same switch as scoring; the default is on, and an explicit false means
+    // this user opted out of collection/scoring for this capture.
     const speakerShadowAtStart = speakerShadowEnabled();
     // Best-effort: remove files a previous crash/failed add left unreferenced before this session
     // starts writing. Nothing here touches referenced audio.

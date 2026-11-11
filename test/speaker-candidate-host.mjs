@@ -357,13 +357,16 @@ test('1) 空声纹库：hearing 仍算 embedding 并回调候选，no-speakers �
   assert.equal(sample.text, '好');
 
   const [shadow] = ofType(rows, 'speaker.shadow').map((event) => event.payload);
-  assert.deepEqual(shadow, {
+  assert.equal(typeof shadow.utteranceId, 'string');
+  assert.equal(shadow.utteranceId.length > 0, true, 'the no-speakers row is citable');
+  const { utteranceId: _shadowId, ...shadowRest } = shadow;
+  assert.deepEqual(shadowRest, {
     decision: 'no-speakers',
     class: 'unknown-identity',
     quality: 'ok',
     source: 'mic',
     reason: 'no-speakers',
-  }, 'the no-speakers row keeps its exact old shape');
+  }, 'the no-speakers row keeps its old semantic shape');
   assert.deepEqual(updates.filter((event) => typeof event.final === 'string').map((event) => event.final), ['好']);
   console.log(
     `[speaker-candidate-host 1] emptyLibrary embedCalls=${embedCalls.length} candidates=${samples.length} `

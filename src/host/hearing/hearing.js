@@ -900,6 +900,20 @@ export function startHearing({
     // Copy the small vector now: an embedder may reuse its output buffer on the next call.
     const embeddingCopy = embedding.slice();
     const utteranceText = typeof text === 'string' && text.length > 0 ? text : snapshot.onlineText;
+    // One offer row precedes the deferred host callback. It is the only direct evidence that the
+    // capture reached this seam, which separates "no candidate was offered" from "host rejected it".
+    try {
+      onEvent?.('speaker.candidates.offered', {
+        level: 'debug',
+        utteranceId: snapshot.utteranceId,
+        durationMs: Math.round(snapshot.durationMs),
+        quality: verdict.quality,
+        decision: verdict.decision,
+        speakerId: typeof verdict.speakerId === 'string' ? verdict.speakerId : null,
+      });
+    } catch {
+      /* an event sink must never change capture */
+    }
     setImmediate(() => {
       // The capture may have stopped while this call sat in the queue; the host also has its own
       // generation check, but the seam must not hand out a sample after its own stop.
@@ -916,6 +930,8 @@ export function startHearing({
           // above. The host's candidate store admits `ok`; the shadow row keeps the original quality.
           quality: 'ok',
           decision: verdict.decision,
+          speakerId: typeof verdict.speakerId === 'string' ? verdict.speakerId : null,
+          score: Number.isFinite(Number(verdict.score)) ? Number(verdict.score) : null,
           text: utteranceText,
         });
         if (result !== null && typeof result?.then === 'function') {

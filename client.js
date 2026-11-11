@@ -2269,14 +2269,10 @@ window.__ModuleLoader__.load({
       const counts = `匹配 ${shadow.matches ?? 0} · 不确定 ${shadow.unsure ?? 0} · 无声纹 ${shadow.noSpeakers ?? 0} · 错误 ${shadow.errors ?? 0}`;
       return h('div', { style: styles.field },
         h('div', { style: styles.row },
-          h('span', { style: styles.value }, '声纹影子（只记录，不参与投递）'),
-          h('button', {
-            style: { ...(shadow.enabled ? styles.btnActive : styles.btn), ...(busy !== '' ? styles.off : {}) },
-            disabled: busy !== '',
-            onClick: () => act({ action: 'voice.speakerShadow', enabled: shadow.enabled !== true }, 'speaker-shadow'),
-          }, shadow.enabled ? '已开启' : '已关闭')),
+          h('span', { style: styles.value }, '声纹自动收集与匹配'),
+          h('span', { style: styles.value }, shadow.enabled ? '自动收集' : '已关闭')),
         h('div', { style: styles.hint },
-          `${shadow.enabled ? '已开启' : '默认关闭'} · ${model} · ${counts}${last}；判定不拦截、不改写、不入记忆。`),
+          `${shadow.enabled ? '已开启' : '未开启'} · ${model} · ${counts}${last}；未建立声纹时自动收集候选；匹配到本人后只训练，不再进入候选。`),
       );
     }
 
@@ -3260,7 +3256,7 @@ window.__ModuleLoader__.load({
     });
     const SPEAKER_ENROLL_MISSING_RE = /not implemented|unknown action|unsupported|未实现|不支持/iu;
     const SPEAKER_ENROLL_RECORD_HINT =
-      '现在不再需要专门「说三句话」：开启听觉页的「声纹影子」后，正常说话会自动进入下方候选；试听、勾选后点「建立基础声纹」才生效。';
+      '开启声纹收集后，正常说话会进入“声纹候选”；先试听、删除错误的语音，再勾选并点“建立基础声纹”。建立后，匹配到本人的语音会自动用于后续训练，不再进入候选区。';
     const SPEAKER_ENROLL_CONFIRM_NOTICE =
       '已确认：之后只用于词库与新增记忆归属，不用于拒收/打断。';
 
@@ -3519,9 +3515,9 @@ window.__ModuleLoader__.load({
     const SPEAKER_CANDIDATE_READ_TIMEOUT_MS = 4000;
     const SPEAKER_CANDIDATE_LABEL_MAX_CHARS = 40;
     const SPEAKER_CANDIDATE_NOTICE =
-      '只有你确认后才生效：试听后勾选候选，点「建立基础声纹」才会写入本人声纹；不会自动认领。';
+      '只有你确认后才生效：先试听，错误或不像本人的片段直接删除；勾选正确片段后点「建立基础声纹」。建立后匹配到本人的语音自动训练，不再进入候选区。';
     const SPEAKER_TEMPLATE_NOTICE =
-      '版本链最多保留 20 个版本；强化和回滚都只在你点击后发生，不会自动强化，也不会自动确认 self。';
+      '基础声纹建立后，匹配到本人的语音会自动训练当前声纹，不再进入候选区；版本链只记录显式强化/回滚，最多 20 个版本。';
 
     /** 一条候选：字段缺失只降级这一行；embedding / audioPath 根本不会到达客户端。 */
     function speakerCandidateOf(value, index) {
@@ -3888,13 +3884,13 @@ window.__ModuleLoader__.load({
               style: { marginTop: 6 },
             },
               h('div', { style: styles.hint },
-                '还没有声纹候选：先在听觉页开启「声纹影子」，正常说话会自动收集；不需要专门说三句话。'),
+                '还没有声纹候选：正常说话会自动收集；也可以在说完后点「刷新候选」。'),
               h('div', { style: styles.hint },
                 shadowEnabled
-                  ? '当前声纹影子已开启：正常说话就会进入候选；刚切换的话点「刷新候选」，或等当前会话下一次发言。'
-                  : '去「听觉」页开启「声纹影子」：当前监听会立即补挂候选收集，不用等下次重启。'),
+                  ? '当前声纹自动收集已开启：正常说话会进入候选；点「刷新候选」可以看到最新片段。'
+                  : '当前声纹自动收集未开启：到「听觉」页开启后，当前监听会立即补挂候选收集。'),
               h('div', { style: styles.hint },
-                '未收集到候选时也可以随时点上方「刷新候选」；不会自动确认本人，也不会自动建立声纹。'))
+                '未收集到候选时也可随时点上方「刷新候选」；不会自动确认本人，也不会自动建立声纹。'))
           : null,
         view.available
           ? h('div', { style: { marginTop: 6 } },
@@ -4052,7 +4048,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: styles.group, 'data-settings-group': 'speaker-enroll', 'data-seirein-speaker-enroll': 'client' },
         h('div', { style: styles.groupTitle }, '声纹'),
         h('div', { style: styles.hint },
-          '先登记本人声纹，影子只观测：不自动确认、不自动拒绝，判定不参与拒收、打断或投递。'),
+          '声纹流程：自动收集候选 → 试听/删除错误片段 → 勾选建立本人声纹。建立后匹配到本人的语音自动训练，不再进入候选区。'),
         h('div', { style: styles.row },
           h('button', {
             style: { ...styles.btn, ...(locked || view.loading ? styles.off : {}) },
