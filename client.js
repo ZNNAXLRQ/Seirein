@@ -3750,7 +3750,7 @@ window.__ModuleLoader__.load({
       const buildReason = !view.available
         ? '建立基础声纹已禁用：候选接口不可用。'
         : (view.count === 0
-            ? '建立基础声纹已禁用：还没有候选；开启声纹影子并正常说话，或点「刷新候选」。'
+            ? '建立基础声纹已禁用：还没有候选；正常说话会自动收集，或点「刷新候选」。'
             : (noSelection ? '建立基础声纹已禁用：先勾选至少一条候选。' : ''));
       const strengthenReason = !view.available
         ? '强化当前声纹已禁用：候选接口不可用。'
