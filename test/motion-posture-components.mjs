@@ -285,7 +285,10 @@ test('4. 完整手势叠加在组件之上：姿态目标不变，动作结束�
   let gestureStarted = null;
   let peakDifference = 0;
   let endAt = 0;
-  for (let at = 0; at <= 6_000; at += DT) {
+  // Start with the old 6 s search window, then extend to the action's real end + settle window.
+  // A fixed 6 s check races a long action and is not evidence that the pose failed to return.
+  let limit = 6_000;
+  for (let at = 0; at <= limit; at += DT) {
     const controlPose = control.tick(at);
     const actionPose = action.tick(at);
     if (gestureStarted === null && at >= 3_000) {
@@ -296,6 +299,8 @@ test('4. 完整手势叠加在组件之上：姿态目标不变，动作结束�
       gestureStarted = action.startPreset(selection, { at });
       assert.equal(gestureStarted.started, true);
       endAt = at + gestureStarted.durationMs;
+      // Completion is a state, not a guessed wall-clock instant: wait through the settle tail.
+      limit = endAt + 3_000;
     }
     if (gestureStarted !== null) {
       peakDifference = Math.max(peakDifference, Math.abs(actionPose.headX - controlPose.headX));
