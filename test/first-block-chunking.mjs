@@ -79,14 +79,14 @@ test('1b) a bracket/quote pause is never a cut point', (t) => {
 // 2. a short first unit keeps the old one-block path
 // ---------------------------------------------------------------------------
 
-test('2) a short first unit (< 40 characters) is not cut', (t) => {
+test('2) a short first unit (< 32 characters) is not cut', (t) => {
   const plan = splitFirstBlockChunks(SHORT_UNIT);
   assert.ok(chars(SHORT_UNIT) < DEFAULT_FIRST_BLOCK_SHORT_CHARS);
   assert.equal(plan.chunked, false);
   assert.deepEqual(plan.blocks, [SHORT_UNIT], 'one block, exactly the old behavior');
   assert.equal(plan.firstBlockChars, chars(SHORT_UNIT));
-  // The short rule is independent of an explicit target: a 39-character unit is still whole.
-  const nearly = '这句话一共三十九个字但里面有一个逗号，仍然不应该被切成两块听起来才自然。';
+  // The short rule is independent of an explicit target: a still-short unit stays whole.
+  const nearly = '这句话里有逗号，但整体仍然很短，不应该切。';
   assert.ok(chars(nearly) < DEFAULT_FIRST_BLOCK_SHORT_CHARS, `fixture is ${chars(nearly)} characters`);
   const nearPlan = splitFirstBlockChunks(nearly, { targetChars: 12 });
   assert.deepEqual(nearPlan.blocks, [nearly], 'a short unit is whole even with a smaller target');

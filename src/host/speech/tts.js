@@ -70,6 +70,8 @@ let gptSovitsWarmupFailureHook = null;
 let gptSovitsWarmupEventHook = null;
 /** Observation only: a synthesis that had to wait for a slot reports its measured queue wait. */
 let ttsSlotWaitHook = null;
+/** Observation only: the playback seat wait, separate from synthesis. */
+let playbackSlotWaitHook = null;
 /** Observation only: one `voice.tts.request` row per finished synthesis request. */
 let ttsRequestHook = null;
 let edgeSynthesizeOverride = null;
@@ -165,6 +167,8 @@ function createSlots() {
           slotWaitMs: Math.max(0, entry.startedAt - entry.enqueuedAt),
           queueDepth: entry.queueDepth,
           running: entry.runningWhenQueued,
+          label: entry.label,
+          waitingOn: entry.waitingOn,
         });
         checkAbort(entry.controller.signal);
         entry.resolve(result);
@@ -181,7 +185,7 @@ function createSlots() {
     })();
   };
   return {
-    run(run, signal, { priority = 0, preemptWarmup = false } = {}) {
+    run(run, signal, { priority = 0, preemptWarmup = false, label = '' } = {}) {
       try { checkAbort(signal); } catch (error) { return Promise.reject(error); }
       // Warm-up is the only negative-priority producer. A real request that arrives before it
       // starts cancels it from the waiting list; a warm-up that already owns the slot is never
@@ -204,6 +208,8 @@ function createSlots() {
           // is a real duration and never shares a clock with the provider measurement.
           enqueuedAt: monotonicNow(),
           startedAt: 0,
+          label: String(label ?? '').slice(0, 120),
+          waitingOn: active === null ? '' : String(active.label ?? '').slice(0, 120),
           queueDepth: waiting.length + (active === null ? 0 : 1),
           runningWhenQueued: active !== null,
           off: () => signal?.removeEventListener('abort', abort),
@@ -345,6 +351,7 @@ export function configureTts({
   onGptSovitsWarmupEvent,
   warmupRetryDelays: retryDelays,
   onSlotWait,
+  onPlaybackSlotWait,
   onTtsRequest,
   coldStartRequests,
   edgeSynthesize,
@@ -367,6 +374,7 @@ export function configureTts({
       .slice(0, 5))
     : DEFAULT_WARMUP_RETRY_DELAYS;
   ttsSlotWaitHook = typeof onSlotWait === 'function' ? onSlotWait : null;
+  playbackSlotWaitHook = typeof onPlaybackSlotWait === 'function' ? onPlaybackSlotWait : null;
   ttsRequestHook = typeof onTtsRequest === 'function' ? onTtsRequest : null;
   // A fresh provider generation is a fresh service start: cold-start counting begins again.
   ttsColdStartLimit = Number.isInteger(coldStartRequests) && coldStartRequests >= 0
@@ -1409,6 +1417,7 @@ export function synthesize(options) {
   // Observation only: which engines were tried, so the automatic Edge fallback is reported as one
   // retry instead of being folded into a single opaque duration.
   const observation = { attempts: [], retryErrorCode: null };
+  const synthLabel = `${String(request?.purpose ?? 'speech')}:${request?.speechId || request?.sentenceId || ''}:${request?.chunkIndex ?? 0}`;
   return synthesisSlots.run(
     async (signal, slot) => {
       // Round first: a sub-millisecond enqueue->start gap is an immediate slot, not a queue wait.
@@ -1417,6 +1426,8 @@ export function synthesize(options) {
       if (slotWaitMs > 0) {
         void notifyHook(ttsSlotWaitHook, {
           purpose,
+          label: String(slot?.label ?? '').slice(0, 120),
+          waitingOn: String(slot?.waitingOn ?? '').slice(0, 120),
           slotWaitMs: Math.round(slotWaitMs),
           queueDepth: Number(slot?.queueDepth) || 0,
           running: slot?.running === true,
@@ -1437,7 +1448,7 @@ export function synthesize(options) {
       return { ...result, slotWaitMs };
     },
     request.signal,
-    { priority: Number(request.priority) || 0, preemptWarmup: true },
+    { priority: Number(request.priority) || 0, preemptWarmup: true, label: synthLabel },
   );
 }
 
@@ -1614,9 +1625,23 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
     // Always acquire synthesis before playback, like the model-application barrier. The legacy
     // pipe path conservatively retains synthesis ownership until player cleanup; sentence-file
     // prefetch below releases synthesis independently and still overlaps with playback.
+    const streamLabel = `stream:${purpose}:${speechId || sentenceId || ''}:${chunkIndex ?? 0}`;
     void synthesisSlots.run(async (synthSignal, synthSlot) => {
       const slotWaitMs = Math.max(0, Number(synthSlot?.slotWaitMs) || 0);
-      return playbackSlots.run(async (playSignal) => {
+      const playbackLabel = streamLabel;
+      return playbackSlots.run(async (playSignal, playSlot) => {
+        if (Number(playSlot?.slotWaitMs) > 0) {
+          void notifyHook(playbackSlotWaitHook, {
+            label: playbackLabel,
+            slotWaitMs: Math.round(Number(playSlot.slotWaitMs)),
+            queueDepth: Number(playSlot.queueDepth) || 0,
+            waitingOn: String(playSlot.waitingOn ?? ''),
+            purpose,
+            speechId: speechId ?? null,
+            sentenceId: Number.isInteger(sentenceId) ? sentenceId : null,
+            chunkIndex: Number.isInteger(chunkIndex) ? chunkIndex : null,
+          });
+        }
         // The provider round trip is timed from the instant both seats are owned, so the playback
         // seat wait never becomes synthesis time (the request row keeps its clocks separate).
         const requestStartedAt = monotonicNow();
@@ -1744,8 +1769,8 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
           streamSignal.removeEventListener('abort', close);
           close();
         }
-      }, synthSignal);
-    }, signal, { preemptWarmup: true }).catch(reject);
+      }, synthSignal, { label: playbackLabel });
+    }, signal, { preemptWarmup: true, label: streamLabel }).catch(reject);
   });
 }
 
@@ -1758,8 +1783,16 @@ export async function speakStreaming({ text, voice, lang = 'zh', textLang = '', 
  * @param {{ffplayPath?: string|null}} [options]
  * @returns {Promise<void>}
  */
-export function play(file, { ffplayPath = null, signal, onStart = null } = {}) {
-  return playbackSlots.run(async (ownedSignal) => {
+export function play(file, { ffplayPath = null, signal, onStart = null, label = 'file' } = {}) {
+  return playbackSlots.run(async (ownedSignal, ownedSlot) => {
+    if (Number(ownedSlot?.slotWaitMs) > 0) {
+      void notifyHook(playbackSlotWaitHook, {
+        label: String(label ?? 'file').slice(0, 120),
+        slotWaitMs: Math.round(Number(ownedSlot.slotWaitMs)),
+        queueDepth: Number(ownedSlot.queueDepth) || 0,
+        waitingOn: String(ownedSlot.waitingOn ?? ''),
+      });
+    }
     if (ffplayPath) {
       try {
         await startPlayer(ffplayPath, ['-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', file], { signal: ownedSignal, onStart }).done;
@@ -1772,7 +1805,7 @@ export function play(file, { ffplayPath = null, signal, onStart = null } = {}) {
     }
     checkAbort(ownedSignal);
     await wpfPlay(file, { signal: ownedSignal, onStart });
-  }, signal);
+  }, signal, { label });
 }
 
 /** A bounded producer: scans without copying the whole input into a sentence array. */
@@ -1872,7 +1905,7 @@ export const DEFAULT_FIRST_BLOCK_TARGET_MS = 1200;
 export const FIRST_BLOCK_TARGET_CHARS_MIN = 4;
 export const FIRST_BLOCK_TARGET_CHARS_MAX = 120;
 /** A unit at or below this size is synthesized whole (the old, unsplit path). */
-export const DEFAULT_FIRST_BLOCK_SHORT_CHARS = 40;
+export const DEFAULT_FIRST_BLOCK_SHORT_CHARS = 32;
 
 /** Resolve the first-block character budget: explicit chars > measured ms/char > 30 chars. */
 export function resolveFirstBlockTarget({ targetChars, targetMs, msPerChar, measured = false } = {}) {

@@ -2846,6 +2846,7 @@ export function apply(ctx, config) {
     // Observation only: a synthesis that had to wait for a slot reports how long and behind how
     // many earlier jobs. A slot that started immediately is not emitted (the throttle).
     onSlotWait: (payload) => log.emit('tts.slot.wait', payload),
+    onPlaybackSlotWait: (payload) => log.emit('tts.playback.slot.wait', payload),
     resolveProbe: () => resolveFfmpeg(root, config),
   });
 
@@ -6471,7 +6472,7 @@ export function apply(ctx, config) {
    */
   const synthesizeChunked = async (prepared, {
     voice, signal, liveSignal = null, chunking: chunkingOverride = undefined,
-    purpose = 'answer', sentenceId = 0, firstBlock = false,
+    purpose = 'answer', sentenceId = 0, firstBlock = Number(sentenceId) === 0,
     // P-46 stage 2: optional turn attribution, forwarded to every block's synthesis. `speechId`
     // is present only for a lane that already owns a ledger id; a reply body synthesizes before
     // its playback ledger record exists, so it stays null there.
@@ -6486,7 +6487,7 @@ export function apply(ctx, config) {
     // synthesized at once while the rest of the unit follows as one later block. Every later unit
     // (and every block of it) keeps the existing one-block path, and `voice.chunking:false` still
     // means "no splitting at all". The plan is also the event payload (`firstPlan`).
-    const firstPlan = firstBlock && chunking === false && settings.chunking && firstBlockCuts !== null
+    const firstPlan = firstBlock && settings.chunking && firstBlockCuts !== null
       ? firstBlockCuts(prepared.speechText, {
         ...firstBlockTargetSettings(),
         minChars,
@@ -6531,7 +6532,9 @@ export function apply(ctx, config) {
     const firstBlockAt = Date.now();
     const firstBlockMono = performance.now();
     const firstBlockChars = speechCharCount(list[0]);
-    const audio = await synthesizeBlock(list[0], signal);
+    // The opening body block outranks queued ack synthesis (priority 1) and later prefetch. The
+    // slot's own labels identify the occupant; priority only decides who starts when it frees.
+    const audio = await synthesizeBlock(list[0], signal, firstBlock ? 2 : 1);
     // The real provider cost of this first block, from the request's own monotonic `requestMs`
     // (slot acquired -> synthesis end). The host await time is only the fallback when the row is
     // missing; queue wait must never be reported as synthesis speed.
