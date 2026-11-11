@@ -1079,6 +1079,8 @@ const DEFAULT_CONFIG = Object.freeze({
   flushIntervalMs: TIMING.FLUSH_INTERVAL_MS,
   injectTimeoutMs: TIMING.INJECT_TIMEOUT_MS,
   mouthStepMs: TIMING.MOUTH_STEP_MS,
+  // Text envelopes are already shaped low by buildSpeechLevels; explicit audio/lip-sync levels
+  // keep their raw 0..1 value, so this gain stays neutral for callers that supply levels.
   speechGain: 1,
   breathPeriodMs: 3600,
   gazeFollowMs: TIMING.GAZE_FOLLOW_SECONDS * 1000,
@@ -1513,13 +1515,45 @@ export function buildSpeechLevels(text, durationMs, stepMs = TIMING.MOUTH_STEP_M
   const chars = Array.from(String(text ?? '').replace(/\s+/gu, ''));
   const step = Math.max(1, finite(stepMs, TIMING.MOUTH_STEP_MS));
   const count = Math.max(1, Math.ceil(Math.max(0, finite(durationMs, 0)) / step));
+  if (chars.length === 0) return Array.from({ length: count }, () => 0);
+  let previous = 0.12;
   return Array.from({ length: count }, (_, index) => {
-    if (chars.length === 0) return 0;
     const ch = chars[Math.min(chars.length - 1, Math.floor((index * chars.length) / count))];
-    if (/[，。！？、；：,.!?;:]/u.test(ch)) return 0.05;
-    const base = 0.2 + 0.75 * ((ch.codePointAt(0) % 89) / 88);
-    return clamp01(base * (0.85 + 0.15 * Math.sin(index * 1.7)));
+    const raw = mouthOpenness(ch);
+    // A 100 ms slice is short enough that a hard jump reads as a mechanical flap. Ease toward the
+    // new vowel/consonant instead of resetting the visible aperture every slice.
+    previous = raw * 0.68 + previous * 0.32;
+    return clamp01(previous);
   });
+}
+
+/** Kana/Latin/Han openness buckets; no pinyin dependency is generated here. */
+function mouthOpenness(ch) {
+  if (typeof ch !== 'string' || ch.length === 0) return 0;
+  if (/[，。！？、；：,.!?;:…—-]/u.test(ch)) return 0.025;
+  const cp = ch.codePointAt(0) ?? 0;
+  // Japanese kana: use the vowel row as a cheap, deterministic mouth-open cue.
+  const rows = [
+    ['あかさたなはまやらわがざだばぱぁゃ', 0.58],
+    ['いきしちにひみりぎじぢびぴぃ', 0.28],
+    ['うくすつぬふむゆるぐずづぶぷぅゅ', 0.38],
+    ['えけせてねへめれげぜでべぺぇ', 0.44],
+    ['おこそとのほもよろをごぞどぼぽぉょ', 0.52],
+  ];
+  for (const [row, level] of rows) if (row.includes(ch)) return level;
+  // Latin vowels/consonants: only the vowel carries a wide aperture.
+  const lower = ch.toLowerCase();
+  if ('aæɑ'.includes(lower)) return 0.52;
+  if ('eɛ'.includes(lower)) return 0.38;
+  if ('iɪ'.includes(lower)) return 0.25;
+  if ('oɔ'.includes(lower)) return 0.48;
+  if ('uʊ'.includes(lower)) return 0.34;
+  if (/^[a-z]$/u.test(lower)) return 0.18;
+  // Han: without a pinyin/audio dependency there is no true final, so keep the range narrow and
+  // low instead of turning every character into a nearly-full open mouth.
+  if (cp >= 0x3400 && cp <= 0x9fff) return 0.22 + ((cp % 19) / 18) * 0.18;
+  // Emoji/other symbols are not speech; hold a small neutral aperture.
+  return 0.16;
 }
 
 
