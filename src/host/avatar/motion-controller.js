@@ -270,7 +270,7 @@ export const POSTURE_GAZE_COMPONENT_CHANNELS = Object.freeze(['gazeX', 'gazeY'])
 
 /** Independent gaze hold band. A persona may stretch/shrink the draw inside this band only. */
 export const POSTURE_GAZE_COMPONENT_MIN_MS = 6_000;
-export const POSTURE_GAZE_COMPONENT_MAX_MS = 12_000;
+export const POSTURE_GAZE_COMPONENT_MAX_MS = 10_000;
 
 /**
  * Semantic amplitude band of the gaze component, in the SAME 30°-per-unit convention the head
@@ -378,7 +378,7 @@ export const BODY_ARM_BASE_DEGREES = Object.freeze({
 export const BODY_ARM_MAX_STEP = 0.06;
 
 export const BODY_ARM_COMPONENT_MIN_MS = 8_000;
-export const BODY_ARM_COMPONENT_MAX_MS = 16_000;
+export const BODY_ARM_COMPONENT_MAX_MS = 14_000;
 export const BODY_ARM_COMPONENT_MIN_AMPLITUDE = 0.12;
 export const BODY_ARM_COMPONENT_MAX_AMPLITUDE = 0.40;
 
