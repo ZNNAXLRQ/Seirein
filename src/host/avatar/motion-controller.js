@@ -4699,7 +4699,15 @@ export function createBehaviorRuntime({ config = {} } = {}) {
       if (presetSettleOwner(channel, now) !== null) continue;
       // The settle cancels exactly the action's OWN temporary offset (never the spring lag or the
       // live base). A normal exit already reached 0; a cancel/eviction is where it is non-zero.
-      const offset = finite(contribution[channel], 0);
+      // The settle starts from the pose that really reached the output, not only from the action's
+      // internal contribution. A completed stage exits its contribution to ~0, but the spring/base
+      // may still hold a visible offset; using that offset is what makes the return continuous
+      // instead of a snap back to the component baseline.
+      const actionOffset = finite(contribution[channel], 0);
+      const naturalNow = finite(state.idle?.[channel], 0);
+      const actualNow = finite(state.lastPose?.[channel], naturalNow);
+      const visibleOffset = actualNow - naturalNow;
+      const offset = Math.abs(visibleOffset) > 1e-4 ? visibleOffset : actionOffset;
       // A COMPLETED action already ran its stage exit to zero, so the last active frame carries a
       // near-zero offset plus a possibly large exit velocity. Feeding that velocity into the
       // quintic asks it to travel a near-zero distance at high speed, which visibly swings the

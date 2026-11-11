@@ -708,6 +708,9 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     lastFrameAt: null,
     lastSendAt: null,
     lastDurationMs: null,
+    /** Consecutive committed frames with an identical input/value signature (trajectory flatness). */
+    lastSignature: '',
+    repeatedFrames: 0,
     /** Frames whose due time was missed by more than the late tolerance (late tick). */
     late: 0,
     /** Due frames overwritten/dropped while a send was in flight: only the newest survives. */
@@ -1166,10 +1169,19 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
    * Record one frame that really committed. `at` is the frame's own timestamp (for the rate);
    * `startedAt` is the wall/monotonic clock when the transport call started (for sendDuration).
    */
-  function noteSendCommitted(at, startedAt = null) {
+  function noteSendCommitted(at, startedAt = null, entries = null) {
     sendTelemetry.commits += 1;
     sendTelemetry.lastFrameAt = Number.isFinite(at) ? at : sendTelemetry.lastFrameAt;
     sendTelemetry.lastSendAt = clockNow();
+    if (Array.isArray(entries) && entries.length > 0) {
+      const signature = entries
+        .map((entry) => `${String(entry?.input ?? entry?.channel ?? '')}:${Math.round(Number(entry?.value) * 10000) / 10000}`)
+        .join('|');
+      if (signature.length > 0) {
+        if (signature === sendTelemetry.lastSignature) sendTelemetry.repeatedFrames += 1;
+        sendTelemetry.lastSignature = signature;
+      }
+    }
     if (sendTelemetry.lastFrameAt !== null) {
       sendTelemetry.times.push(sendTelemetry.lastFrameAt);
       while (sendTelemetry.times.length > SEND_HISTORY_LIMIT) sendTelemetry.times.shift();
@@ -1201,6 +1213,14 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     const times = sendTelemetry.times;
     const span = times.length > 1 ? times[times.length - 1] - times[0] : 0;
     const actualHz = span > 0 ? ((times.length - 1) * 1000) / span : 0;
+    const expectedMs = 1000 / Math.max(1, host.motionOutputHz);
+    let maxIntervalMs = 0;
+    let longIntervals = 0;
+    for (let index = 1; index < times.length; index += 1) {
+      const gap = times[index] - times[index - 1];
+      if (gap > maxIntervalMs) maxIntervalMs = gap;
+      if (Number.isFinite(expectedMs) && expectedMs > 0 && gap > expectedMs * 1.8) longIntervals += 1;
+    }
     const durations = sendTelemetry.durations;
     const averageMs = durations.length === 0
       ? null : durations.reduce((sum, value) => sum + value, 0) / durations.length;
@@ -1208,6 +1228,10 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
       attempts: sendTelemetry.attempts,
       commits: sendTelemetry.commits,
       actualHz: Math.round(actualHz * 100) / 100,
+      expectedIntervalMs: Math.round(expectedMs * 100) / 100,
+      maxIntervalMs: Math.round(maxIntervalMs * 100) / 100,
+      longIntervals,
+      repeatedFrames: sendTelemetry.repeatedFrames,
       sendDurationMs: sendTelemetry.lastDurationMs,
       sendDurationAvgMs: averageMs === null ? null : Math.round(averageMs * 100) / 100,
       lastFrameAt: sendTelemetry.lastFrameAt,
@@ -1726,7 +1750,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
         noteTransportCommitted(ticket, entries, clockNow());
         motionPump.sent += 1;
         motionPump.writes += entries.length;
-        noteSendCommitted(frame.at, sendStartedAt);
+        noteSendCommitted(frame.at, sendStartedAt, entries);
         countBreathEntries(entries, frame.at);
         motionPump.appliedSeq = send.seq;
         motionPump.lastSentAt = clockNow();
@@ -5465,7 +5489,7 @@ export function createAvatarRuntime({ transport = null, now = null, log = null, 
     sent
       .then(() => {
         // One committed frame, independent of how many rows it carried.
-        noteSendCommitted(at, sendStartedAt);
+        noteSendCommitted(at, sendStartedAt, entries);
       })
       .catch((error) => {
         noteTransportFailed(ticket, error?.evidenceRows ?? entries, error, clockNow());

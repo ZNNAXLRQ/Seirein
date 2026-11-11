@@ -121,9 +121,14 @@ test('1. 正常完成：动作偏移归零、组件回自然站姿、动态基�
   `large component release extends the short window (${componentStart.durationMs} ms)`);
   assert.ok(componentStart.durationMs > 1_000,
     `a large component is not forced into the 0.5–1 s short band (${componentStart.durationMs} ms)`);
-  // A normal exit already brought the temporary offset back to ~0; the tail must not invent one.
+  // A normal stage exit brings the action CONTRIBUTION near zero, but the published spring can
+  // still hold a visible offset. The tail starts from that real offset instead of snapping to the
+  // component baseline.
+  const settleOffsets = Object.values(settleStart.offsets).map((value) => Math.abs(value));
+  assert.ok(settleOffsets.some((value) => value > 0.01),
+    `the tail captures the visible offset (${settleOffsets.join(', ')})`);
   for (const [channel, offset] of Object.entries(settleStart.offsets)) {
-    assert.ok(Math.abs(offset) < 0.05, `${channel} completed offset is near zero (${offset})`);
+    assert.ok(Math.abs(offset) < 2, `${channel} completed offset stays bounded (${offset})`);
   }
 
   const settle = settleView(runtime);

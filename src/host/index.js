@@ -4994,6 +4994,10 @@ export function apply(ctx, config) {
         /** Configured send rate (15 default, <=30) and its MEASURED committed rate. */
         outputHz: snap.motion?.outputHz ?? 0,
         actualHz: snap.motion?.actualHz ?? 0,
+        expectedIntervalMs: snap.motion?.expectedIntervalMs ?? null,
+        maxIntervalMs: snap.motion?.maxIntervalMs ?? 0,
+        longIntervals: snap.motion?.longIntervals ?? 0,
+        repeatedFrames: snap.motion?.repeatedFrames ?? 0,
         sendDurationMs: snap.motion?.sendDurationMs ?? null,
         sendDurationAvgMs: snap.motion?.sendDurationAvgMs ?? null,
         lateFrames: snap.motion?.lateFrames ?? 0,
