@@ -6069,9 +6069,9 @@ export function apply(ctx, config) {
             // A rough vowel aperture cue: high zero-crossing rate is consonant/high-vowel and gets
             // a smaller opening than an open vowel. This is not phoneme recognition, but it keeps
             // every 100 ms window at the same loudness from looking like one frozen mouth.
-            const zcr = Math.min(1, (crossings / step) * 12);
-            const aperture = 0.06 + 0.48 * Math.pow(loud, 0.85) * (1 - 0.3 * zcr);
-            levels.push(Math.min(0.56, Math.max(0, aperture)));
+            const zcr = Math.min(1, (crossings / step) * 8);
+            const aperture = 0.05 + 0.46 * Math.pow(loud, 0.9) * (1 - 0.55 * zcr);
+            levels.push(Math.min(0.52, Math.max(0, aperture)));
           }
           return resolve(levels);
         },
