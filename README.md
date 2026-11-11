@@ -26,7 +26,7 @@
 
 ### 1.1 Seirein 是什么
 
-Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH 启动，把自己注册进宿主进程，向外提供 24 个工具、一套 HTTP 设置接口和一个 Web 设置页。
+Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH 启动，把自己注册进宿主进程，向外提供 27 个工具、一套 HTTP 设置接口和一个 Web 设置页。
 
 它将 DSH 变成了一个多模态助手, 完成了「把一个能听见、能看见、有人设、有记忆、有形象、会说话、能做事的桌面助手装进 DSH」这件事，而不只是再造一个语音聊天前端。DSH 负责模型、会话、工具循环与 Agent 生命周期；Seirein 负责把语音、感知、形象与人设接到这条循环上。
 
@@ -47,13 +47,21 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 听觉 | `hearing/` | 麦克风 / 回环采集、ASR worker、VAD、端点、声纹影子、通话模式、环境音、音频保留 | 「听」：实时转写、连续对话缓冲、打断判定 |
 | 记忆 | `memory/` | 分域情节记忆（SQLite + FTS5）、固定记忆、自动记录、召回 / 纠正 / 归档 / 容量衰退 | 「记得」：相关记忆、固定约束、历史检索 |
 | 视觉 | `vision/` | 截图、故事板、桌面 / OBS 虚拟摄像头、隐私锁、OBS 连接、黑帧检查、视听证据窗口、后台理解与主动回应 | 「看见」：按需截屏、连续观看、场景查看、按证据回看 |
-| 形象动作 | `avatar/` | VTS 连接 / 热键 / 表情 / 口型 / 参数、行为运行时、动作预设库、WPF 透明层、Spout 独立进程 | 「动」：说话口型、语义动作、待机生命感 |
+| 形象动作 | `avatar/` | VTS 连接 / 热键 / 表情 / 口型 / 参数、行为运行时、用户动作预设词库、原生动画独立调度、WPF 透明层、Spout 独立进程 | 「动」：说话口型、语义动作、待机生命感 |
 | 字幕 | `subtitle/` | WPF 叠加层、区域 / 气泡模式、字体枚举、对比色、分页 | 「显示」：语音字幕与原文对照 |
 | 平台 | `platform/` | 全局热键（`koffi`）、硬件探测、模型下载、Windows 窗口矩形 | 系统层适配 |
 | 运行时 | `runtime/` | 组件开关、依赖引用计数、工具执行、HTTP、诊断、关闭编排 | 插件骨架与可观测性 |
 | 会话 | `session/` | 投递与结果绑定、快路 / 轻量模型通道、请求前上下文、连续台词、待回应组、日切、压缩 | 与 DSH Agent 的接缝 |
 | 画像 | `profile/` | 人设与用户画像、画像库分类 / 评分 / 整理、初始问卷 | 长期人设与偏好 |
 | 共享 | `shared/` | 纯文本与时间函数 | 跨域复用，不持有状态 |
+
+几个容易找错的关键文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/host/avatar/presets/library.js` | 读取 `<root>/avatar/presets/presets.json`；首次创建形象运行时把内置 324 条复制过去，之后允许用户增删改。每行必须含 `id` / `recipeId` / `family` / `semantic` / `styles` / `states` / `events` / `requires` / `operations` / `timing`；JSON 无法解析、任一行缺字段、ID 重复或选择器无法接受时整体回退内置并写 `avatar.presets.library` |
+| `src/host/avatar/native-animation.js` | VTS 原生热键动画的独立选择器：独立池、独立历史，避开连续同名；默认间隔 `nativeAnimationIntervalMs = 45000` 毫秒。只接受 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的热键，未知或缺失类型不进入池 |
+| `src/host/runtime/startup-diagnostics.js` | 启动期 `unhandledRejection` / `uncaughtException` 的被动记录器；只写有界摘要，不阻止事件继续传播 |
 
 组件开关（`data/features.json`，不是 `cordis.patch.yml`）共 8 个，默认值如下：
 
@@ -68,14 +76,15 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | `memory` | 记忆 | 开 | 记忆读写与检索 |
 | `fastpath` | 闲聊模式 | **关** | 绕过 agent、直连 LLM 的纯闲聊通道 |
 
-工具面共 **24 个**（`test/smoke.mjs` 会断言数量）：
+工具面共 **27 个**（`test/smoke.mjs` 会断言数量）：
 
 | 分组 | 工具 |
 | --- | --- |
 | 语音 / 听觉 | `assistant_say`、`assistant_listen`、`assistant_ambient`、`assistant_call_mode` |
 | 视觉 | `assistant_see`、`assistant_watch`、`assistant_vision`、`assistant_obs`、`assistant_obs_status` |
 | 形象 | `assistant_live2d`、`assistant_hotkeys` |
-| 记忆 / 画像 | `assistant_remember`、`assistant_recall`、`assistant_memory_brief`、`assistant_memory_correct`、`assistant_archive_search`、`assistant_resource_set/get/list/forget`、`assistant_persona_view/append`、`assistant_prompt_preview` |
+| 记忆 / 画像 / 词库 | `assistant_remember`、`assistant_recall`、`assistant_memory_brief`、`assistant_memory_correct`、`assistant_archive_search`、`assistant_lexicon`、`assistant_resource_set/get/list/forget`、`assistant_persona_view/append`、`assistant_prompt_preview` |
+| 网络 | `assistant_web_search`、`assistant_web_fetch` |
 | 运行时 | `assistant_doctor` |
 
 ### 1.3 实现了什么效果
@@ -88,14 +97,16 @@ Seirein 是 DSH 的一个 **bundle 插件**（不是独立应用）：它随 DSH
 | 可打断 | 默认只允许**通过校验的成句 final** 停播；单个 partial、咳嗽、回声、重复句不会打断。`voice.bargeInPartial` 是可选项，开启后才接受连续响亮 partial | `hearing.bargein`、`hearing.bargein.skipped` |
 | 候音 | 用户消息投递后计时，默认 **3000 ms**（可在 500–15000 ms 调）回答仍未出声，就说一句简短等待语；正文音频就绪时未播放的等待语会被取消 | `voice.ack.*` 事件 |
 | 一次只播一个版本 | 短答原样播；长答最多一次轻量模型改写为口语版；改写失败回落**完整正文**，不截断成摘要 | `voice.spoken.version` |
-| 压缩上下文 | 当天语音会话挂载只含压缩能力的 `seirein-voice` preset；接近窗口 80% 时置 `near-limit` 并写节流事件 | `voice.compaction.*` |
-| 动作预设 | 动作库按状态 / 事件 / 语义 / 已验证通道硬过滤，设置页可禁用、调优先级、恢复默认；不可用项跳过而不是降级成热键 | `motion.presets.*`、`avatar.*` |
+| 压缩上下文 | 当天语音会话挂载 `seirein-voice` preset：动态继承当前 DSH `standard` 的工具与 planning 能力，再加压缩三件套；排除 persona / agent-instructions / 重复 compaction。接近窗口 80% 时置 `near-limit` 并写节流事件 | `voice.compaction.*` |
+| 动作预设 | 运行期从 `<root>/avatar/presets/presets.json` 读取词库：内置 324 条在首次创建形象运行时复制，用户可增删改；JSON 无法解析、任一行缺字段、ID 重复或选择器无法接受时整体回退内置。选择器按状态 / 事件 / 语义 / 已验证通道硬过滤，设置页可禁用、调优先级、恢复默认；不可用项跳过而不是降级成热键 | `motion.presets.*`、`avatar.presets.library`、`avatar.*` |
+| 原生 VTS 动画 | 与 Seirein 预设分开调度：默认每 **45 秒**从 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的池中选一个，独立池 / 独立历史，避开连续同名；热键名是模型专属，不写死 | `avatar.native.animation*`、`status.avatar.nativeAnimation` |
+| 任务完成播报 | 任务结果以父会话的 `agent-message` / `subagent-settled` / `goal` / `tool-jobs` 消息到达；结果回合结束时由既有 typed-reply 结果出口播报一次，与首轮回答共用单播放队列；不是完整后台任务闭环 | `voice.result.*` |
 | 视觉观看 | 桌面用 ffmpeg ddagrab（gdigrab 兜底）；场景模式读 OBS 虚拟摄像头；`assistant_watch` 把 4–8 个变化帧拼成一张故事板；隐私模式下所有 agent 捕获被拒绝 | `assistant_see` / `assistant_watch` / `vision.*` 事件 |
 | 持续视听理解 | 陪伴会话开始后按画面变化在后台取故事板，进入 **30 秒 / 24 MiB** 的有界证据窗口；用户开口即锁住开口前后的画面，终稿后把评论对齐到关联帧；后台图片理解把场景摘要与经证据校验的事件接入下一轮，符合条件时主动说一句（默认开，可在设置页关；每小时最多 3 句、间隔 ≥60 秒） | `assistant:audiovisual` / `assistant:understanding`、`vision.evidence.*`、`vision.comment.*`、`vision.understanding.*`、`vision.proactive.*` |
 | 按证据回看 | 评论证据块直接给出最多 3 个可回看的关联帧 id；`assistant_see` 传 `evidenceFrameIds`（最多 3 个）时，只回看证据窗口里的缓存副本，不重新截屏；隐私、来源与代次门禁和正常截图一致，过期/已淘汰的 id 直接拒绝 | `vision.evidence.added`、`vision.delivery.refused` |
 | 字幕 | 区域模式或气泡模式（跟随统一形象几何）；字幕语言与语音语言独立 | `subtitle.*` 事件 |
 | 记忆 | 相关记忆在 `agent/pre-step` 注入；固定记忆每轮注入（加密项只给索引）；普通记忆按容量衰退并归档 | `memory.recall`、`resource.inject.truncated`、`memory.*` |
-| 设置页 + 热键 | 插件页 / 设置分区里可切换组件、设备、语种、TTS、字幕、VTS、主动回应、热键、记忆、人设；默认热键 `Ctrl+Alt+M`（麦克风）、`Ctrl+Alt+V`（视觉）、`Ctrl+Alt+E`（图层编辑）、`Ctrl+Alt+A`（环境音） | `client.js`、`assistant_hotkeys` |
+| 设置页 + 热键 | 插件页 / 设置分区里可切换组件、设备、语种、TTS、字幕、VTS、主动回应、热键、记忆、人设；默认热键 `Ctrl+Alt+M`（麦克风）、`Ctrl+Alt+V`（视觉）、`Ctrl+Alt+E`（图层编辑）、`Ctrl+Alt+A`（环境音）、`Ctrl+Alt+C`（通话模式） | `client.js`、`assistant_hotkeys` |
 
 ### 1.4 参考对象
 
@@ -266,6 +277,7 @@ Seirein 是 DSH 的**插件**，不是独立软件。装好 DSH Desktop 后，�
 <数据根>\
   bin\        ffmpeg.exe / ffplay.exe（你自己放）
   models\     语音识别、VAD、声纹模型
+  avatar\     动作预设词库（presets\presets.json，用户可改）
   data\       设置、组件开关、事件日志
   memory\     记忆库、人设、画像、声纹库
   cache\      临时音频、截图、字幕缓存（可以删）
@@ -703,18 +715,21 @@ tokens.txt
 
 **没设置会怎样：** 没有 Live2D 形象和口型；声音、字幕、视觉仍然可用。
 
-**注意：** 动作/表情依赖模型自己的参数、热键和表情。名字对不上或没有映射的部位会被跳过，不会硬触发一个不存在的动作。
+**注意：** 动作/表情依赖模型自己的参数、热键和表情。名字对不上或没有映射的部位会被跳过，不会硬触发一个不存在的动作。原生动画由 VTS 热键触发，调度只接受 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的热键；热键名是模型专属，不能假定 `My Animation 3` 之类的固定名字。插件的 hand / arm 通道只有在模型提供可注入输入时才会写；当前使用的 `hiyori` 模型 hand / arm 未映射，所以原生动画留下的手部 / 手臂姿态不会被插件自动复位，只能靠 VTS 自己的动画 / 热键或换模型。
+
+**动作词库：** 动作预设从 `<数据根>\avatar\presets\presets.json` 读取。首次创建形象运行时会把内置 324 条复制过去；之后这个文件归你维护，可以增删改，改完重启 DSH 生效。每行必须含 `id` / `recipeId` / `family` / `semantic` / `styles` / `states` / `events` / `requires` / `operations` / `timing`；JSON 无法解析、任一行缺字段、ID 重复，或选择器无法接受时，会整体回退内置词库并在事件里报告原因。设置页里的启用 / 禁用 / 优先级是另一份覆盖文件（`<数据根>\data\motion-presets.json`），不会改写这个词库。
 
 #### 2.3.8 全局热键（建议检查一次）
 
 **在哪里：** 设置页 → **全局快捷键** 卡片。
 
-**默认四组：**
+**默认五组：**
 
 - `Ctrl+Alt+M`：开 / 关麦克风（静音 / 恢复）。
 - `Ctrl+Alt+V`：开 / 关隐私模式（只由用户操作）。
 - `Ctrl+Alt+E`：形象编辑模式。
 - `Ctrl+Alt+A`：开 / 关环境声音。
+- `Ctrl+Alt+C`：开 / 关通话模式（需要先启用至少一个助手称呼）。
 
 **怎么改：**
 
@@ -776,6 +791,7 @@ tokens.txt
 - 先确认「已连接」且模型已加载。
 - 再看「可注入 / 已验证」：只有 VTS 里真实存在并映射过的参数才会动；名字像但没映射的会被跳过。
 - 表情按钮只列出模型真实有的表情；没有就说明模型没配。
+- 原生动画由 VTS 热键触发，热键名随模型变化；当前 `hiyori` 的 hand / arm 未映射，插件没有可写的 hand 注入通道，原生动画留下的手部 / 手臂姿态不会自动复位。
 
 **透明层失败：** 确认 VTS 没被最小化、背景透明已开；如果 VTS 窗口不可见，PrintWindow 抓不到画面。可以让插件把 VTS 调出来（编辑模式），再完成编辑。
 
@@ -875,6 +891,8 @@ tokens.txt
 - `asrMinRmsDb`：麦克风门限，默认 `-50`；一般用设置页。
 - `virtualCamera`：OBS 虚拟摄像头设备名，默认 `OBS Virtual Camera`。
 - `obsPath`：OBS 可执行文件路径；不填时扫描常见安装位置。
+- `nativeAnimationIntervalMs`：VTS 原生热键动画的间隔，默认 `45000` 毫秒；`<= 0` 关闭。它和 Seirein 预设是两条独立调度。
+- `avatarMotionOutputHz`：待机 / 组件动作的发送频率，默认 `15`，运行时上限 `30`；`avatarIdleWriteHz` 是兼容别名。30 Hz 仍属待验证配置，不保证改善顿挫。
 - `ttsVoice`：Edge 声音名；不填按语种默认。
 - `sessionRolloverHour`：语音会话日切小时，默认 `4`（凌晨 4 点）。
 - `voice.speechMaxChars`：语音预算，默认 1200；`0` 表示不截。
@@ -904,13 +922,13 @@ tokens.txt
    上一条还在处理时，再说一句不会被排队，而是听到「上一条还在处理，等处理完请再说一次。」等它处理完再说即可。这是故意的，避免把上一轮的回答当成这一轮的。
 
 5. **重载/更新会中断语音。**
-   卸载、重装、更新插件会拆掉采集、播放、字幕、形象进程；正在说的话不会跨重载续播。已存在的语音会话如果压缩 preset 没装配，需要重启 DSH，或在没有 live agent 时用 `voice.session.recover`（见 2.6.14）。
+   卸载、重装、更新插件会拆掉采集、播放、字幕、形象进程；正在说的话不会跨重载续播。已存在的语音会话如果 `seirein-voice` preset 没装配，需要重启 DSH，或在没有 live agent 时用 `voice.session.recover`（见 2.6.14）。
 
 6. **上下文有上限。**
-   语音会话挂的是 `seirein-voice` 压缩 preset；接近窗口 **80%** 会提示接近上限。压缩不可用时是「降级」而不是「已压缩」；压缩本身不会自动开新会话。上下文特别长时，回答可能变慢或丢细节，这是模型窗口的限制，不是插件能突破的。
+   语音会话挂的是 `seirein-voice` preset：包含压缩三件套，并从当前 DSH `standard` 动态继承工具与 planning 能力（排除 persona / agent-instructions / 重复 compaction）。接近窗口 **80%** 会提示接近上限。压缩不可用时是「降级」而不是「已压缩」；压缩本身不会自动开新会话。上下文特别长时，回答可能变慢或丢细节，这是模型窗口的限制，不是插件能突破的。
 
 7. **数据目录与备份。**
-   重要文件都在 `<数据根>`：`memory\memory.db`、`memory\persona.md`、`memory\user.md`、`memory\profile.db`、`memory\speaker.db`、`data\settings.json`、`data\features.json`、`data\events.jsonl`、`vts-token.json`。`cache\` 是临时文件，可以删。
+   重要文件都在 `<数据根>`：`memory\memory.db`、`memory\persona.md`、`memory\user.md`、`memory\profile.db`、`memory\speaker.db`、`avatar\presets\presets.json`、`data\settings.json`、`data\features.json`、`data\events.jsonl`、`vts-token.json`。`cache\` 是临时文件，可以删；`avatar\presets\presets.json` 是用户可编辑的动作词库，备份时不要漏掉。
    **备份方法：先退出 DSH，再整个复制 `<数据根>`**。不要在 DSH 运行时复制 SQLite 文件，可能得到不一致的副本。换机器时，把整个数据根复制到新机器，安装插件后把「存放位置」选到同一层父目录，让数据根路径对应上。
 
 8. **单实例与端口。**
@@ -1088,6 +1106,7 @@ tokens.txt
 4. token 失效。
 5. 模型没有对应参数/热键/表情，或没有映射。
 6. VTS 窗口被最小化，透明层抓不到。
+7. 原生动画热键名随模型不同；当前 `hiyori` 的 hand / arm 没有注入映射。
 
 **操作：**
 
@@ -1098,6 +1117,7 @@ tokens.txt
 5. 连上了但不动：看「可注入 / 已验证」；只有 VTS 里真实存在并映射过的参数才会动。没有映射的会被跳过，这是正常行为。
 6. 透明层不显示：确认 VTS 没最小化、背景透明已开；用「编辑模式」把 VTS 调出来再完成编辑。
 7. 端口不是 8001：改 VTS 或插件配置 `vtsPort`，重装/重启。
+8. 原生动画按 VTS 当前模型自己的热键列表触发，不要按固定名字（例如 `My Animation 3`）找；hand / arm 未映射时插件无法自动复位，只能用 VTS 自己的动画 / 热键或换模型。
 
 #### 2.6.8 OBS 找不到 / 虚拟摄像头失败
 
@@ -1167,17 +1187,18 @@ tokens.txt
 **原因：**
 
 1. 语音会话的上下文接近模型窗口上限（约 80% 会提示）。
-2. `seirein-voice` 压缩 preset 没有装配到已存在的会话。
+2. `seirein-voice` preset 没有装配到已存在的会话，或只装配了旧版“只含压缩”的声明（会被标为 `nativeToolsStale`）。
 3. 压缩执行了但没释放多少，仍处于高压力。
 4. 模型窗口本身有限，插件不能突破。
 
 **操作：**
 
-1. 先按 2.6.14 点 **恢复当前语音会话**（会重新装配压缩 preset 并压缩一次；历史不删除）。
+1. 先按 2.6.14 点 **恢复当前语音会话**（会重新装配 `seirein-voice` preset 并压缩一次；历史不删除）。
 2. 如果提示「需重启 DSH 释放 agent」：重启 DSH，再点一次恢复。
-3. 仍提示接近上限：等当天语音会话在凌晨 4 点日切后开新会话，或减少一次性长文。
-4. 不要期待「压缩后和没聊过一样」；压缩只是把旧内容变短，细节会损失。
-5. 若只是普通对话变慢，先确认不是网络/模型服务问题。
+3. 如果状态里写 `nativeToolsStale`：按提示先检查 profile patch / 插件 bundle 里是否有旧的 `seirein-voice` 声明；有则删除或改成含 `seirein-native-tools` 的新定义，再重启 DSH。不要直接改运行中的 `agentPresets.definitions`。
+4. 仍提示接近上限：等当天语音会话在凌晨 4 点日切后开新会话，或减少一次性长文。
+5. 不要期待「压缩后和没聊过一样」；压缩只是把旧内容变短，细节会损失。
+6. 若只是普通对话变慢，先确认不是网络/模型服务问题。
 
 #### 2.6.12 隐私模式开 / 关，以及「agent 不能退出」
 
@@ -1221,9 +1242,9 @@ tokens.txt
 
 **现象：** 聊久了提示上下文接近上限 / 压缩不可用；或设置页提示需要恢复语音会话。
 
-**原因：** 已经存在的语音会话没有装配压缩能力，或原来装配的会话需要手动重建一次。
+**原因：** 已经存在的语音会话没有装配 `seirein-voice` preset，或只装配了旧版“只含压缩”的声明，需要手动重建一次。
 
-**它解决什么：** 给已存在的语音会话重新挂上 `seirein-voice` 压缩能力，避免上下文压力一直升高。
+**它解决什么：** 给已存在的语音会话重新挂上 `seirein-voice`（压缩 + 从当前 DSH `standard` 继承的原生工具组），避免上下文压力一直升高，并恢复标准工具 / planning 能力。
 
 **在哪里：** 设置页靠上的 **「恢复语音会话（诊断）」** 卡片（在诊断/时间线附近）。
 
@@ -1235,7 +1256,7 @@ tokens.txt
 4. 等结果：成功会显示已恢复/已压缩；失败会显示原因。
 5. 成功后继续对话即可；历史不会被删除。
 
-**它实际做什么：** 保留同一个会话 id，重新挂上 `seirein-voice` 压缩 preset，并先压缩一次；不会自动调用、不会轮询、不会新建会话、不会删除历史。
+**它实际做什么：** 保留同一个会话 id，重新挂上 `seirein-voice` preset（压缩 + 从 `standard` 继承的原生工具组），并先压缩一次；不会自动调用、不会轮询、不会新建会话、不会删除历史。
 
 **常见失败：**
 
@@ -1263,8 +1284,10 @@ DSH Host（Node 模式子进程）
    ├─ cordis.patch.yml  → 插入 dsh-assistant 插件行（id / name / config 默认值）
    ├─ FeatureStore      → data/features.json（8 个组件开关，带启停钩子）
    ├─ 服务层            → hearing / speech / memory / vision / avatar / subtitle / session / profile / platform
-   ├─ 工具面            → ctx.tools.register × 24（定义在 index.js，execute 在 runtime/tools.js）
+   ├─ 工具面            → ctx.tools.register × 27（定义在 index.js，execute 在 runtime/tools.js）
    ├─ 事件接缝          → session/event、agent/pre-step、tools/execute；agent/created 由压缩模块订阅
+   ├─ 任务结果          → speech/typed-reply.js（结果回合在既有出口播报一次）
+   ├─ 启动诊断          → runtime/startup-diagnostics.js（被动记录，不吞未处理 rejection / exception）
    ├─ HTTP              → /assistant/status、/assistant/action、/assistant/shot
    ├─ 客户端            → client.js（package.json 的 dsh.client → settings.plugins.tab + settings.section）
    └─ 外部进程 / 服务    → ffmpeg / ffplay、PowerShell + WPF、VTS WebSocket、OBS WebSocket、GPT-SoVITS HTTP、Edge TTS
@@ -1276,7 +1299,7 @@ DSH Host（Node 模式子进程）
 | 工具注册 | `ctx.tools.register` | 名称 / description / parameters / schema / render 在 `index.js`，execute 在 `runtime/tools.js` |
 | 会话事件 | `ctx.on('session/event', …)` | 观察回答、工具、turn、stream，驱动语音、记忆与动作；不修改宿主事件 |
 | 请求前上下文 | `ctx.on('agent/pre-step', …)` | 记忆注入、日切摘要、视觉预取、识别残片提示；只追加，不改宿主的决定 |
-| Agent 生命周期 | `ctx.on('agent/created', …)` | 由 `session/compaction/voice-compaction.js` 订阅：给当天语音会话挂压缩 preset |
+| Agent 生命周期 | `ctx.on('agent/created', …)` | 由 `session/compaction/voice-compaction.js` 订阅：给当天语音会话挂 `seirein-voice`（压缩 + 从 `standard` 继承的原生工具组） |
 | 工具执行 | `ctx.on('tools/execute', …)` | 只给宿主的 `session_search` 加一层超时预算，不改工具语义 |
 | HTTP | `ctx.inject(['webServer'], …)` + `webServer.register({ kind: 'exact' })` | 状态、动作、截图缓存三个端点，路径精确匹配 |
 | 客户端 | `package.json` 的 `dsh.client` + `ctx.slots` | `client.js` 注册 `settings.plugins.tab` 与 `settings.section`，面板通过 HTTP 读写 |
@@ -1296,15 +1319,17 @@ Seirein/
 ├─ locale/                   zh.json / en.json（界面元数据）
 ├─ src/host/
 │  ├─ index.js               唯一入口：装配服务、工具、事件、HTTP、生命周期
-│  ├─ avatar/                形象与动作（presets/、spout-layer/）
+│  ├─ avatar/                形象与动作
+│  │  ├─ presets/library.js  用户动作词库（首启复制 / 校验失败回退）
+│  │  └─ native-animation.js VTS 原生动画独立池 / 历史
 │  ├─ hearing/               听觉（interaction/）
 │  ├─ memory/                记忆与固定记忆
 │  ├─ platform/              Windows / 热键 / 模型下载
 │  ├─ profile/               人设与画像
-│  ├─ runtime/               组件、依赖、HTTP、设置、诊断、关闭、数据根
+│  ├─ runtime/               组件、依赖、HTTP、设置、诊断（startup-diagnostics.js）、关闭、数据根
 │  ├─ session/               compaction / conversation / delivery / events / inference / timeline
 │  ├─ shared/                纯文本与时间函数
-│  ├─ speech/                语音输出
+│  ├─ speech/                语音输出（typed-reply.js 结果出口）
 │  ├─ subtitle/              字幕
 │  └─ vision/                视觉
 ├─ test/                     node:test 回归
@@ -1316,14 +1341,14 @@ Seirein/
 
 | 模块 | 职责 |
 | --- | --- |
-| `avatar/` | VTS WebSocket 客户端（认证、热键、表情、参数）、行为运行时与唯一参数写者、动作预设库与选择器、WPF 透明层、Spout 实验层 |
+| `avatar/` | VTS WebSocket 客户端（认证、热键、表情、参数）、行为运行时与唯一参数写者、用户动作词库（`presets/library.js`）、原生 VTS 动画独立采样器（`native-animation.js`）、WPF 透明层、Spout 实验层 |
 | `hearing/` | 麦克风与环境音采集（ffmpeg dshow → 16 kHz PCM）、ASR worker 与主线程解耦、VAD 与端点、终稿门禁（回声 / 低证据影子）、声纹影子、连续台词缓冲、通话模式、音频保留 |
 | `memory/` | 分域情节记忆（SQLite + FTS5）、固定记忆 vault（DPAPI 加密）、自动记录、召回 / 纠正 / 归档 / 容量衰退、请求前注入与分层预算 |
 | `vision/` | 三种观察状态（桌面 / OBS 场景 / 隐私锁）、截图与故事板、单帧与故事板两种产物、黑帧拒绝、鼠标注意目标、回合内视觉预取 |
 | `subtitle/` | 独立 PowerShell/WPF 叠加层与文件协议、区域 / 气泡几何、Windows 字体枚举、分页 |
-| `speech/` | 统一语音出口：Edge / GPT-SoVITS 合成、串行队列与取消、语音 / 字幕双流翻译、口语版单元流、逐句说话人、候音、播放账本与单播放席位、共享语言库、打字回合播报 |
+| `speech/` | 统一语音出口：Edge / GPT-SoVITS 合成、串行队列与取消、语音 / 字幕双流翻译、口语版单元流、逐句说话人、候音、播放账本与单播放席位、共享语言库、打字回合播报、`typed-reply.js` 的结果回合出口 |
 | `platform/` | 全局热键（`koffi` 轮询 Win32）、硬件探测与 ASR 线程推导、模型下载（URL + 大小 + sha256）、窗口矩形与移动 |
-| `runtime/` | 组件注册表与开关、外部依赖引用计数、工具 execute、HTTP 路由与设置动作、受控诊断、关闭编排、数据根解析与迁移 |
+| `runtime/` | 组件注册表与开关、外部依赖引用计数、工具 execute、HTTP 路由与设置动作、受控诊断、启动期 rejection / exception 被动记录（`startup-diagnostics.js`）、关闭编排、数据根解析与迁移 |
 | `session/` | 投递与结果绑定、闲聊快路 / 轻量模型通道、请求前上下文、连续台词与待回应组、日切摘要、压缩 preset、逐轮时间线 |
 | `profile/` | 人设与用户画像的读写与预算、画像库分类 / 评分 / 整理后台工作流、初始参考人设问卷 |
 | `shared/` | 纯文本与时间函数（句界、注入消息识别、语音预算、日切、时区），不持有状态 |
@@ -1332,6 +1357,7 @@ Seirein/
 几条结构约定：
 
 - 子目录按职责再分：`session/{compaction,conversation,delivery,events,inference,timeline}`、`runtime/{http,settings,diagnostics}`、`avatar/{presets,spout-layer}`、`hearing/interaction`。
+- `avatar/presets/library.js` 只负责“用户词库文件 ↔ 内置回退”的读取与选择器校验，选择器仍只读数组；`avatar/native-animation.js` 只管 VTS 原生动画的独立池 / 历史，不接 Seirein preset 的冷却与重复惩罚。
 - 发布清单以 `package.json.files` 为准：`client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、`Seirein.ico`、`Seirein.png`；新增运行资源必须放进这些路径。
 - 只有纯文本 / 时间函数进 `shared/`，跨域生命周期进 `runtime/`，不要为了方便 import 把业务模块塞进 `runtime/`。
 
@@ -1365,16 +1391,17 @@ Seirein/
 - **压缩**：由语音会话挂载的 preset 在宿主侧触发，不打断正在播放的句子；不可用是可见降级。
 - **环境音**：只进上下文，不触发回复，也不占语音投递的所有权。
 - **打字回合**：GUI 里打字的回合结束后仍走同一个语音出口与同一本账本。
+- **任务结果**：`agent-message` / `subagent-settled` / `goal` / `tool-jobs` 结果进入父会话后，结果回合在 `turn/end` 走既有 typed-reply 出口播报一次；与首轮回答共用单播放队列，不管理后台任务本身。
 
 #### 3.3.2 关键问题与解决方式
 
-**上下文溢出：复用 DSH 原生压缩，不自己滚会话。**
+**上下文溢出：复用 DSH 原生压缩，并继承 standard 的能力。**
 
-语音会话挂一个只含压缩能力的 `seirein-voice` preset（`compaction-basic` / `command-compact` / `tool-result-pruner` 三行，`compaction` 与 `toolResultPruner` 各自 isolate），由插件在挂载时自己注册——新机器不需要手写 profile patch，也不会打开宿主全局压缩。
+语音会话挂 `seirein-voice` preset。注册时读取当前 DSH 的 `standard` 声明，按行 id 与包名排除 persona / agent-instructions / 任何 compaction 提供者，把其余原生行复制进 `seirein-native-tools` 组；因此 standard 里的工具与 planning（含 `/plan` / 计划模式）会随 DSH 版本走，不写死在插件里。插件自己仍保留 `compaction-basic` / `command-compact` / `tool-result-pruner` 三行压缩能力，并按包名排除重复 compaction，避免出现第二个压缩服务；新机器不需要手写 profile patch，也不会打开宿主全局压缩。
 
-同 ID 的 preset 已经存在时先核对内容：只允许压缩行，夹带 `tools` / `persona` / `permissions` 等任何一项都判为 `conflict`，既不覆盖也不挂载。注册失败不是静默的：`status` 给出 `enabled:false` 与原因。压力到窗口的 80% 时置 `near-limit`，并写一条节流过的 `voice.compaction.near-limit`；压缩后仍在 80% 以上、或什么都没释放，只标记 `stillNearLimit` 并给建议。
+同 ID 的旧定义先审计：只允许一个压缩组、最多一个 `seirein-native-tools` 组；任意层夹带 `tools` / `persona` / `permissions` / `systemPrompt` 等额外能力键仍判为 `conflict`，既不覆盖也不挂载。旧版“只含压缩”的声明如果已经由别处注册，在能读到 `standard` 且它确实贡献原生行时会被复用但标记 `nativeToolsStale: true`，并给出“先删 profile patch / bundle 里的旧行再重启”的恢复步骤；读不到 `standard` 时保持 `nativeToolsStale: null`（未知），不会假装“不旧”。插件不覆盖、不删除不归自己的定义。注册失败不是静默的：`status` 给出 `enabled:false` 与原因。压力到窗口的 80% 时置 `near-limit`，并写一条节流过的 `voice.compaction.near-limit`；压缩后仍在 80% 以上、或什么都没释放，只标记 `stillNearLimit` 并给建议。
 
-**边界**：不自动换会话、不自动新建会话、也不反复压缩；已运行的 Agent 需要重启或手动执行 `voice.session.recover`；没有 token meter 时窗口按 128k 估算。
+**边界**：不自动换会话、不自动新建会话、也不反复压缩；已运行的 Agent 需要重启 DSH 或手动执行 `voice.session.recover` 重新装配。注册状态只能证明“声明里带了什么”，不能单独证明原生工具在某个运行中的会话里真的可见——后者要在重启 / 恢复后的实际回合里验证。没有 token meter 时窗口按 128k 估算。
 
 **动态观察注入：按步快照，变化才追加历史。**
 
@@ -1420,17 +1447,23 @@ P-65C 复核确认：GPT-SoVITS 的 `streaming_mode=2/3` 在协议层是真正�
 
 **边界**：静音幻觉默认仍会投递；声纹阈值没按本机校准，不能当「只认主人」用。
 
-**动作生硬：预设库、单写者、起始接替。**
+**动作生硬：用户词库、单写者、原生动画分离。**
 
-动作来自只读预设库：`recipes.js` 写符号编舞与 `requires`，`catalog.js` 展开成稳定 ID 的节奏变体。选择器只做硬过滤（状态、事件、语义、能力、禁用、隐私）和打分，输出候选，不直接写参数。
+动作预设的运行期来源是 `<root>/avatar/presets/presets.json`：`recipes.js` 写符号编舞与 `requires`，`catalog.js` 展开成 324 条稳定 ID 的节奏变体；这是内置 / 回退数据，首次创建运行时复制到用户文件。之后用户可以直接增删改；JSON 无法解析、任一行缺字段、ID 重复或选择器拒绝时，整体回退内置并写 `avatar.presets.library`。选择器只做硬过滤（状态、事件、语义、能力、禁用、隐私）和打分，输出候选，不直接写参数；空闲 recipe 冷却、family / preset 重复惩罚和频率窗口只作用于 Seirein preset。
 
 只有一个参数写者：`avatarRuntime` 拥有连接代次与已验证通道，控制器在同一帧里复核通道占用、旧代次、速度 / 加速度与最终优先级；预设不携带模型参数名。
 
 回答起始接替：回答第一块音频真正开始时，还停着的思考 / 倾听类预设可以在短窗口内被接替（通道集合必须可拆分）；接不了就丢弃这个开场动作（`takeover-unavailable`），而不是拖到 `speechEnd` 再补一个过时的动作。
 
+基础层幅度已提高：headX 基础活动 0.9→1.35、headZ 0.9→1.4（语义单位），身体 / 视线微动也上调；组件频率做了小幅调整——视线组件保持上限 12→10 秒、身体组件 16→14 秒，头部保持原节奏。姿态仍按 30 Hz 计算，传输默认 15 Hz；30 Hz 只是可配置上限，是否真的改善顿挫尚未完成实机验证，不能当成已验证的默认值。
+
+动作结束回中从实际输出接回：settle 优先用上一帧真实输出姿态与自然基线的差值作为起点，而不是只看动作内部贡献值；动作完成态退出到 ~0 后不会 snap 回基线。
+
+原生 VTS 动画是另一条调度：默认每 **45 秒**从 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的热键池挑一个，独立池 / 独立历史，避开连续同名；未知或缺失类型不进入池。触发时用热键自己的 `hotkeyID`（缺失才回落到名字），事件会带 `name` / `hotkeyID` / `type`。它不共享 Seirein preset 的 recipe / preset 冷却和重复惩罚。热键名是模型专属，不能写死 `My Animation 3` 之类的名字。
+
 通道不退化：只用当前模型验证过的语义通道；未映射 / 未验证的通道在状态与设置页明确标注（`unmapped` / `unverified`），不假装可用，也不降级成热键。
 
-**边界**：能力过滤会让可用动作变少；身体与呼吸不归预设执行器写（保留 VTS 自己的动画所有权），需要这两个通道的条目会被直接过滤。
+**边界**：能力过滤会让可用动作变少；身体与呼吸不归预设执行器写（保留 VTS 自己的动画所有权），需要这两个通道的条目会被直接过滤。当前 `hiyori` 的 hand / arm 未映射，插件没有可写的 hand 注入通道，原生动画留下的手部 / 手臂姿态不能自动复位。
 
 **事件日志被刷屏：源侧聚合、读取侧白名单。**
 
@@ -1441,6 +1474,12 @@ P-65C 复核确认：GPT-SoVITS 的 `streaming_mode=2/3` 在协议层是真正�
 保留窗口靠轮转：10 MB × 5 代，够排查最近一段时间，但不是审计日志。
 
 **边界**：诊断默认关闭，需要在 `settings.json` 打开 `diagnostics.enabled`（或 config `diagnosticsEnabled`）；被轮转掉的旧记录找不回来。
+
+**启动期失败可追踪：只记录，不吞事件。**
+
+DSH 的 fail-loud 会在一次未处理 rejection 后拆掉根上下文，随后出现的“inactive context”错误会盖住原始原因。`runtime/startup-diagnostics.js` 在插件挂载时安装两个**被动**监听：`unhandledRejection` / `uncaughtException` 只把有界、去凭据的摘要写进事件日志（`startup.unhandled.rejection` / `startup.uncaught.exception`），从不调用 `preventDefault`、从不退出、也不消费事件；Node 仍会执行其它监听器（包括 DSH 自己的 fail-loud）。监听器随插件卸载通过 `ctx.effect` 精确移除。
+
+**边界**：它只负责让第一个失败可追踪，不改变宿主对未处理异常的处理结果，也不替代崩溃修复；日志本身仍是 10 MB × 5 轮转。
 
 **延迟说不清：单轮时间线加席位归因。**
 
@@ -1486,9 +1525,15 @@ P-65C 复核确认：GPT-SoVITS 的 `streaming_mode=2/3` 在协议层是真正�
 
 **边界**：首次陪伴轮之前没有后台连续采集的历史帧，不能倒查；后台理解依赖图片输入能力；主动回应的关键台词检测尚未接入；证据窗口只保留有界副本，不写记忆。
 
+**任务回来后的第二次播报：复用 typed-reply 结果出口。**
+
+任务结果以父会话的 `agent-message` / `subagent-settled` / `goal` / `tool-jobs` 消息到达；`speech/typed-reply.js` 把它当作结果回合，在 `turn/end` 由既有语音出口播报一次。两个通知属于同一任务时按 `(sessionId, taskId)` 去重，不会重复播；同一发送者的下一个任务仍会正常播。结果回答与首轮回答共用单一语音出口，首轮语音还没播完时会排在它之后。
+
+**边界**：它不创建、恢复或轮询后台任务，不保证每个后台任务都有结果，也不等于完整的任务闭环；任务本身仍由 DSH 的 subagent / goal / job 机制负责。
+
 **会话恢复：重装配再压缩。**
 
-`voice.session.recover` 是唯一能手动重建已存在语音会话的动作：保留同一个 session id，通过 `agentLoop.resume` 在 setup 里重新挂上压缩 preset，再调用一次 preset 自己的 `compactNow()` 后返回。
+`voice.session.recover` 是唯一能手动重建已存在语音会话的动作：保留同一个 session id，通过 `agentLoop.resume` 在 setup 里重新挂上 `seirein-voice` preset，再调用一次 preset 自己的 `compactNow()` 后返回。
 
 它不新开会话、不写用户消息、不删历史、不排程、不轮询；失败原样报告，不重试。
 
@@ -1504,7 +1549,9 @@ P-65C 复核确认：GPT-SoVITS 的 `streaming_mode=2/3` 在协议层是真正�
 | 忙时拒投递 | 上一个回合没结束时拒绝新语音，并说明「上一条还在处理」 | 排队会把旧请求的答案说成新请求的 | 用户需要再说一次 |
 | 上下文观察走快照 | 非语言线索 / 连续台词走 `systemPrompt.context`（内容变化才追加）；环境事实走独立 section；人设 / 画像 / 固定记忆走 section | 观察不会每步改写系统提示；最新快照在上下文中生效 | 旧快照仍留在历史，等自动压缩回收；渲染侧只展示当前有效内容 |
 | 记忆只在 `agent/pre-step` 注入 | 用户原话原样投递，记忆作为额外上下文追加 | 避免「拼在用户消息里」导致原话被改写、重复召回 | 注入时机受宿主 pre-step 预算约束 |
-| 压缩 preset 随插件走 | 插件注册 `seirein-voice`（只含压缩三件套），挂到当天语音会话 | 新机器不需要手写 profile patch；不打开宿主全局压缩 | 冲突 / 未装配时降级；需重启或恢复 |
+| 压缩 preset 随插件走 | 插件注册 `seirein-voice`（压缩三件套 + 从 `standard` 继承的原生工具组），挂到当天语音会话 | 新机器不需要手写 profile patch；不打开宿主全局压缩，工具 / planning 跟随 DSH 版本 | 别处注册的旧压缩-only 声明会标 `nativeToolsStale`；冲突 / 未装配时降级，需重启或恢复 |
+| 原生动画与预设分离 | VTS 热键动画走独立池 / 独立历史，默认每 45 秒一次；只接受 `TriggerAnimation` / `ChangeIdleAnimation` 类型；Seirein preset 仍由 selector 的 recipe / preset 冷却与重复惩罚管理 | 两条来源不互相污染防重复记录 | 热键名随模型变化；没有 hand / arm 注入通道时无法自动复位 |
+| 任务结果复用既有出口 | 结果消息进入父会话后，在 `turn/end` 由 typed-reply 播一次，并按任务去重 | 复用已有出口，避免同一结果被两个出口重复播报 | 只处理 DSH 投递到父会话的结果消息；不是后台任务闭环 |
 | 动作单一写者 | `avatarRuntime` 是唯一参数写者，预设只给候选 | 防止两个循环抢同一参数、抖动、旧代次复活 | 预设要过能力过滤，可用动作变少 |
 | 隐私只锁视觉 | `privacy` 停采集、拒截图、取消在途，不动麦克风、不切 OBS | 用户要的是「别看我」，不是「别听我」；OBS 场景由用户控制 | 语音仍在工作，需要自己静音 |
 | Windows 专属实现 | 麦克风 / DPAPI / WPF / 字体 / 窗口几何都直接依赖 Windows 能力 | 这些能力在 Host 的 Node 子进程里没有 Electron 等价物 | 非 Windows 环境语音、视觉、字幕不可用 |
@@ -1567,7 +1614,9 @@ npm pack --dry-run --json
 - **领域模块不反向 import 入口**：功能模块不得 `import '../index.js'`；依赖通过参数或 getter 注入，避免循环依赖。只有同时被两个以上功能域使用的纯文本 / 时间函数才放 `shared/`。
 - **领域模块尽量纯**：解析、计算、状态机不直接启动设备、进程或模型；有外部副作用的服务由宿主创建并通过参数注入，模块导入本身不产生副作用。
 - **跨域生命周期放 `runtime/`**：依赖引用计数、关闭顺序、HTTP、诊断。不要为「方便 import」把业务模块塞进 `runtime/`。
-- **presets 只读**：`avatar/presets/` 是版本控制的数据与查询模块；用户覆盖写 `data/motion-presets.json`，不写回源码。预设不携带模型参数名，不创建第二套参数写者。
+- **动作词库分两层**：`avatar/presets/` 里的代码是内置词库与回退；运行期读取 `<root>/avatar/presets/presets.json`（首次创建形象运行时复制内置 324 条，用户可增删改）。每行必须含 `id` / `recipeId` / `family` / `semantic` / `styles` / `states` / `events` / `requires` / `operations` / `timing`；任一行缺字段、ID 重复或选择器无法接受时，整体回退内置，不会只跳过坏行。保存后重启 DSH 生效。设置页的启用 / 禁用 / 优先级覆盖仍写 `data/motion-presets.json`，不要写回源码；预设不携带模型参数名，不创建第二套参数写者。
+- **原生动画独立**：`avatar/native-animation.js` 只维护 VTS 热键池与独立历史，并只接受 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的条目；不要把它接到 Seirein preset 的冷却 / 重复记录上，也不要把某个模型的热键名写成默认值。
+- **启动诊断只旁听**：`runtime/startup-diagnostics.js` 不得 `preventDefault`、退出或吞掉未处理 rejection / exception；只把有界摘要交给日志，监听器随卸载移除。
 - **`test/` 必须上传**：测试是提交的一部分；新增行为要有对应 `test/*.mjs`，真机脚本在文件头标 `// @live` 或加入 `scripts/test-batch.mjs` 的 `LIVE_FILES`。
 - **发布清单**：`package.json.files` 是 `client.js`、`src/host/**`、`cordis.patch.yml`、`locale/*.json`、`Seirein.ico`、`Seirein.png`；`exports` 暴露入口、`client`、`locale` 与 `icon`。新增运行资源要放进这些路径，不能只留在仓库根。
 - **客户端入口固定在根 `client.js`**；`CLIENT_VERSION` 与 `package.json.version` / `PLUGIN_VERSION` 一起升。
@@ -1579,7 +1628,7 @@ npm pack --dry-run --json
 
 1. 在 `src/host/index.js` 的工具定义区加 `name` / `description` / `parameters` / `outputSchema` 与 `render`。
 2. 在 `src/host/runtime/tools.js` 加 execute 实现（参数解析、调用服务、返回结构）；工具实现不持有宿主状态。
-3. 更新 `test/smoke.mjs` 的工具数量断言（当前 24）与相关 schema 测试。
+3. 更新 `test/smoke.mjs` 的工具数量断言（当前 27）与相关 schema 测试。
 4. 如果工具有跨域副作用，补一条定向测试（参考 `test/tool-content.mjs`、`test/tool-schema-vision.mjs`）。
 
 #### 加一个模块
@@ -1593,9 +1642,10 @@ npm pack --dry-run --json
 
 1. 在 `avatar/presets/recipes.js` 增加 `recipe`：`operations` 只写符号编舞，`requires` 只写当前运行时验证过的语义通道。
 2. `catalog.js` 会按 recipe × 4 种节奏展开变体；稳定 ID 用 `recipe.variant`，不要依赖显示名。
-3. 只使用已声明通道（头 / 眼 / 眉 / 身体 / 呼吸）；没有验证输入的部位不要假装可用，也不要把动作降级成热键。
-4. 设置页的启用 / 禁用 / 优先级通过 `motion.presets.*` 写入 `data/motion-presets.json`；不要改源码数据。
-5. 跑 `test/motion-preset-library.mjs`、`test/preset-execution.mjs`、`test/motion-presets-native-unmapped.mjs`。
+3. 运行期读的是 `<root>/avatar/presets/presets.json`：内置 324 条只在首次创建时复制，之后不会自动合并新内置条目。新增内置 recipe 要验证时，用新建数据根，或先备份、再手工把新行合并进用户文件；不要假设已有用户的词库会随版本升级自动变。手工改文件时每行必须含 `id` / `recipeId` / `family` / `semantic` / `styles` / `states` / `events` / `requires` / `operations` / `timing`；JSON 无法解析、任一行缺字段、ID 重复或选择器无法接受都会整体回退内置。
+4. 只使用已声明通道（头 / 眼 / 眉 / 身体 / 呼吸）；没有验证输入的部位不要假装可用，也不要把动作降级成热键。
+5. 设置页的启用 / 禁用 / 优先级通过 `motion.presets.*` 写入 `data/motion-presets.json`；不要改源码数据。
+6. 跑 `test/preset-library.mjs`、`test/motion-preset-library.mjs`、`test/preset-execution.mjs`、`test/motion-presets-native-unmapped.mjs`、`test/native-animation.mjs`。
 
 #### 加一个设置页项
 
@@ -1633,7 +1683,12 @@ npm pack --dry-run --json
 | P-65 句内流式 | B 档（逗号切块 + 分块合成 + 预取）已实现、待审查，继续作为当前主方案；C 档（句内流式）可行性调研完成、协议层可行但**生产接入暂缓**（`streaming_mode=2/3` 是真增量；`true/1` 只是片段级返回） | 不宣称 B 是最终性能上限；长句首音仍受整块合成影响；首块收益未实测；C 的单合成槽冲突是现有调度问题，不是流式与预取天然不兼容 |
 | 低证据门禁 | `lowEvidenceVerdict` 已有完整判定，但 `voice.lowEvidenceGate` **默认关**，只写影子 | 静音幻觉仍会投递；开启前需要更多真实设备证据 |
 | 声纹身份 | CAM++ 模型、影子打分，仅麦克风通道，阈值未按本机校准；不参与投递 | 不能用于「只认主人」；误匹配风险未量化 |
-| 上下文容量 | 压缩 preset 失败会降级；窗口默认 128k（无 token meter 时）；80% 只告警 | 长会话可能贴近上限，需重启或手动恢复 |
+| 动作预设词库 | 运行期来源是 `<root>/avatar/presets/presets.json`；内置 324 条在首次创建形象运行时复制，用户可增删改；JSON 无法解析、任一行缺字段、ID 重复或选择器无法接受时整体回退内置 | 修改后重启 DSH 生效；升级不会自动合并新增内置条目 |
+| 原生 VTS 动画 / 手部 | 默认每 45 秒一次，独立池 / 独立历史；只接受 `hotkey.type` 为 `TriggerAnimation` / `ChangeIdleAnimation` 的热键；热键名模型专属；当前 `hiyori` 的 hand / arm 未映射 | 插件没有 hand 注入通道时不能自动复位；不能写死 `My Animation 3` 之类的热键名 |
+| 动作发送频率 | 姿态按 30 Hz 计算，传输默认 15 Hz；30 Hz 是可配置上限 | 30 Hz 是否真的改善顿挫尚未完成实机验证，不能写成已验证 |
+| `seirein-voice` 原生工具 | 动态继承当前 DSH `standard` 的工具与 planning，排除 persona / agent-instructions / 重复 compaction；别处注册的旧压缩-only 声明标 `nativeToolsStale` | 注册不会回填已运行的 Agent；实际工具可见性要重启 / 恢复后在实际回合验证 |
+| 任务完成第二次播报 | `agent-message` / `subagent-settled` / `goal` / `tool-jobs` 结果进入父会话后，由 `speech/typed-reply.js` 在结果回合 `turn/end` 播一次，并按任务去重；与首轮回答共用单播放队列 | 只处理 DSH 投递到父会话的结果消息，不是完整的后台任务闭环 |
+| 上下文容量 | 压缩 preset 失败会降级；别处注册的旧压缩-only 声明会标 `nativeToolsStale`；窗口默认 128k（无 token meter 时）；80% 只告警 | 长会话可能贴近上限，需重启或手动恢复 |
 | P-128 日志噪声 | Spout 状态通道节流已提交、仍待审查 | 事件日志可能被刷到只剩约 50 分钟 |
 | 透明层 | `PrintWindow` + 色键能用；移动 VTS 出屏会破坏透明推流；WGC 需原生帮助程序（P-68，条件触发） | 实验性，不适合作为稳定直播层 |
 | OBS 场景截图 | `GetSourceScreenshot` 对场景返回空 | 场景模式只能走虚拟摄像头，首帧 0.5–1.5 s |
@@ -1648,7 +1703,10 @@ npm pack --dry-run --json
 | `POST /assistant/action` | body `{ "action": "…", … }` | 设置动作统一入口；未知动作返回 `unknown action` |
 | `GET /assistant/shot?path=…` | 预览缓存图 | 只允许 `<root>/cache` 下且登记过的文件；隐私 / 切换中返回 403 |
 | `data/status.json` | 直接读文件 | 启动时写入的状态快照，便于外部工具检查 |
-| `data/events.jsonl` | JSONL，10 MB × 5 轮转 | `{id, ts, type, corr_id, payload}`；语音链路优先看 `voice.*`、`hearing.*`、`memory.recall` |
+| `data/events.jsonl` | JSONL，10 MB × 5 轮转 | `{id, ts, type, corr_id, payload}`；语音链路优先看 `voice.*`、`hearing.*`、`memory.recall`；启动失败看 `startup.unhandled.rejection` / `startup.uncaught.exception` |
+| 动作词库 | 直接读 `<root>/avatar/presets/presets.json`；事件 `avatar.presets.library` | 首次复制 / 校验失败回退；改完重启 DSH 生效，运行中不热替换 |
+| 原生 VTS 动画 | `status.avatar.nativeAnimation`；事件 `avatar.native.animation` / `avatar.native.animation.failed` | 默认 45 秒、独立池 / 历史；只从 `TriggerAnimation` / `ChangeIdleAnimation` 热键池取名字 |
+| 任务结果播报 | `voice.result.accepted` / `voice.result.audio.started` / `voice.result.completed` / `voice.result.failed` / `voice.result.skipped` | 结果回合由 typed-reply 播一次；按 `(sessionId, taskId)` 去重；不是后台任务闭环 |
 | 设置页「诊断（客户端）」 | 打开插件页 → 诊断卡片 | 卡片本身只读一次 `/assistant/status`，可复制诊断报告；不单独加轮询 |
 | `diagnostics.query` | `{"action":"diagnostics.query","probe":"voice.latency","limit":20}` | 受控探针：`voice.latency` / `noise.shadow` / `turn.timeline` / `pipeline.timeline` / `hotkeys` / `memory.stats` / `spout`；默认关闭，需 `settings.json` 的 `diagnostics.enabled` 或 config `diagnosticsEnabled` |
 | 音频保留 | `voice.audioRetention` + `audio.retention.list` | 只保留可疑语句的 16 kHz WAV，存 `<root>/cache/retention/`；默认关，隐私时不写 |
