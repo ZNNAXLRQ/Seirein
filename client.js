@@ -3874,7 +3874,7 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.hint }, SPEAKER_CANDIDATE_NOTICE),
         h('div', { 'data-speaker-voiceprints': 'true', style: { marginTop: 6 } },
           h('div', { style: { ...styles.label, fontWeight: 600 } },
-            `已有声纹${view.voiceprints.length === 0 ? '' : ` 路 ${view.voiceprints.length} 个`}`),
+            `已有声纹${view.voiceprints.length === 0 ? '' : ` · ${view.voiceprints.length} 个`}`),
           view.voiceprints.length === 0
             ? h('div', { style: styles.hint }, '还没有独立声纹：整理候选后可建立多个声纹。')
             : view.voiceprints.map((voiceprint) => h('div', {
@@ -3882,7 +3882,7 @@ window.__ModuleLoader__.load({
                 style: { ...styles.row, alignItems: 'flex-start' },
               },
                 h('span', { style: { ...styles.value, flex: 1 } },
-                  `${voiceprint.label} 路 样本 ${voiceprint.sampleCount} 条`),
+                  `${voiceprint.label} · 样本 ${voiceprint.sampleCount} 条`),
                 h('span', { style: { display: 'flex', gap: 6 } },
                   h('button', {
                     style: { ...styles.btn, ...(locked ? styles.off : {}) },
