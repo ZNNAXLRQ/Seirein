@@ -978,7 +978,13 @@ export function createVoiceCompaction({
    */
   const startRegistration = (presetsArg) => {
     const presets = presetsArg ?? getService('agentPresets');
-    if (presets === undefined || presets === null) return;
+    if (presets === undefined || presets === null) {
+      // A persisted voice session names `seirein-voice` in its history. If the registry service has
+      // not mounted yet, the gateway can reject that session before any `agent/created` listener
+      // runs; report the wait instead of silently leaving registration pending.
+      note('voice.compaction.preset.unavailable', { presetId, reason: 'agent-presets-service-missing' });
+      return;
+    }
     let settled = null;
     try {
       const loader = presets?.owner?.loader;
@@ -1179,6 +1185,21 @@ export function createVoiceCompaction({
     // Register as soon as the plugin mounts; if the registry service is not ready yet, the next
     // voice Agent's ensure() retries (an unavailable state is deliberately not latched).
     startRegistration();
+    // On a fresh Host the preset registry may mount after this plugin. Waiting through the
+    // Cordis service graph is required: the persisted voice session is resumed by the gateway and
+    // references `seirein-voice`, so a missing registration would fail resume before the Agent
+    // (and its `ensure()`) exists. This is a registration timing issue, not a turn failure.
+    if (getService('agentPresets') == null && typeof ctx.inject === 'function') {
+      try {
+        ctx.inject(['agentPresets'], () => {
+          if (!attached) return;
+          const presets = getService('agentPresets');
+          if (presets !== undefined && presets !== null) startRegistration(presets);
+        });
+      } catch {
+        /* a build without inject keeps the existing fail-open behavior */
+      }
+    }
     detach = () => {
       if (!attached) return undefined;
       attached = false;
