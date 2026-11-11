@@ -396,23 +396,13 @@ export function createSpeakerEmbedder({ modelPath, numThreads = 1, extractorFact
         result.lastError = 'invalid-samples';
         return null;
       }
-      // Capture normally hands over finite [-1,1] PCM. A driver/decoder edge can still produce a
-      // NaN or an unscaled 16-bit value; sanitize a copy instead of losing the enrollment sample.
-      let input = samples;
-      let needsCopy = false;
+      // sherpa-onnx-node rejects externally backed views ("External buffers are not allowed").
+      // Always hand it a fresh, ordinary JS ArrayBuffer; sanitize driver/decoder edge values in the
+      // same copy. This is also what makes the candidate sample independent of the capture buffer.
+      const input = new Float32Array(samples.length);
       for (let index = 0; index < samples.length; index += 1) {
-        const value = samples[index];
-        if (!Number.isFinite(value) || value < -1 || value > 1) {
-          needsCopy = true;
-          break;
-        }
-      }
-      if (needsCopy) {
-        input = new Float32Array(samples.length);
-        for (let index = 0; index < samples.length; index += 1) {
-          const value = Number(samples[index]);
-          input[index] = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
-        }
+        const value = Number(samples[index]);
+        input[index] = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
       }
       try {
         const stream = extractor.createStream();
