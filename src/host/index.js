@@ -276,6 +276,7 @@ import {
 // the renderers, and the optional residual drain must not turn that mock into an import failure.
 import * as speechTextModule from './speech/speech-text.js';
 import { VtsClient } from './avatar/vts.js';
+import { createNativeAnimationScheduler } from './avatar/native-animation.js';
 import { PRESETS } from './avatar/presets/index.js';
 import { loadPresetLibrary } from './avatar/presets/library.js';
 import {
@@ -4187,6 +4188,10 @@ export function apply(ctx, config) {
   let avatarIdleSinceFloor = 0;
   let avatarActionTimer = null;
   let avatarActionDraining = false;
+  /** Native VTS hotkey animations: a separate pool and history from Seirein presets. */
+  const nativeAnimationSampler = createNativeAnimationScheduler({ random: Math.random });
+  let nativeAnimationTimer = null;
+  let nativeAnimationInFlight = false;
   /** First successful avatar connect already built the persona style (later reconnects use the tick). */
   let avatarStyleBooted = false;
   /**
@@ -4992,6 +4997,14 @@ export function apply(ctx, config) {
         lastFrameAt: snap.idleParams?.lastFrameAt ?? null,
         suppressedBySpeech: snap.idleParams?.suppressedBySpeech ?? 0,
       },
+      /** Native VTS hotkey pool/history are deliberately separate from the Seirein presets. */
+      nativeAnimation: {
+        enabled: Number(nativeAnimationIntervalMs) > 0,
+        intervalMs: Number.isFinite(nativeAnimationIntervalMs) ? nativeAnimationIntervalMs : 0,
+        inFlight: nativeAnimationInFlight,
+        pool: nativeAnimationSampler.pool(),
+        history: nativeAnimationSampler.history(),
+      },
       /** 'param' = continuous frames; 'hotkey' is only a discrete fallback, never the engine. */
       idleSource: snap.idleSource ?? 'none',
       /**
@@ -5685,6 +5698,7 @@ export function apply(ctx, config) {
 
   /** Keep the light idle pool inside what this model really exposes (hotkey / expression names). */
   const refreshAvatarIdleActions = () => {
+    nativeAnimationSampler.setPool((vts?.hotkeys ?? []).map((entry) => entry.name));
     const names = [
       ...(vts?.hotkeys ?? []).map((entry) => String(entry.name ?? '').toLowerCase()),
       ...(vts?.expressions ?? []).map((entry) => String(entry.name ?? '').toLowerCase()),
@@ -5736,9 +5750,40 @@ export function apply(ctx, config) {
       .finally(() => { avatarActionDraining = false; });
   }, 250);
   avatarActionTimer.unref?.();
+  const nativeAnimationIntervalMs = Number(config?.nativeAnimationIntervalMs ?? 45_000);
+  const nativeAnimationTick = async () => {
+    if (nativeAnimationInFlight || features.enabled('avatar') !== true) return;
+    const client = vtsClient();
+    if (client.ready !== true) return;
+    // A native animation already in flight (user or plugin) is never replaced by a blind second
+    // trigger; VTS would otherwise blend two animations into the same pose.
+    if (client.animations?.current != null) return;
+    nativeAnimationSampler.setPool((client.hotkeys ?? []).map((entry) => entry.name));
+    const name = nativeAnimationSampler.pick();
+    if (name === null) return;
+    nativeAnimationInFlight = true;
+    try {
+      await client.triggerHotkey(name);
+      await log.emit('avatar.native.animation', { name, source: 'scheduler' }).catch(() => {});
+    } catch (error) {
+      await log.emit('avatar.native.animation.failed', {
+        name, error: error?.message ?? String(error),
+      }).catch(() => {});
+    } finally {
+      nativeAnimationInFlight = false;
+    }
+  };
+  if (Number.isFinite(nativeAnimationIntervalMs) && nativeAnimationIntervalMs > 0) {
+    nativeAnimationTimer = setInterval(() => {
+      void nativeAnimationTick().catch(() => {});
+    }, nativeAnimationIntervalMs);
+    nativeAnimationTimer.unref?.();
+  }
   ctx.effect(() => () => {
     if (avatarActionTimer !== null) clearInterval(avatarActionTimer);
     avatarActionTimer = null;
+    if (nativeAnimationTimer !== null) clearInterval(nativeAnimationTimer);
+    nativeAnimationTimer = null;
     disposeAvatarRuntime('plugin-dispose');
   });
 
