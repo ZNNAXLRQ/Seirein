@@ -246,6 +246,8 @@ const DELIVERY_SKIP_SUMMARY_MAX = 100;
  * requires an `ok` quality clip on the mic lane at or above this duration; nothing else changes.
  */
 const SPEAKER_CANDIDATE_MIN_MS = 800;
+/** Real speech required inside a candidate clip; a trailing-silence ratio is not a reason to reject. */
+const SPEAKER_CANDIDATE_MIN_SPEECH_MS = 600;
 
 /**
  * Start streaming recognition.
@@ -872,11 +874,21 @@ export function startHearing({
     if (typeof onSpeakerSample !== 'function' || stopped) return false;
     // Only a real microphone lane: an unnamed input is not promoted to `mic`, and loopback is a
     // different person's audio far more often than not.
-    if (inputSource !== 'mic' || verdict.quality !== 'ok') return false;
+    if (inputSource !== 'mic') return false;
+    if (verdict.quality === 'quiet' || verdict.quality === 'short') return false;
+    if (verdict.quality !== 'ok' && verdict.quality !== 'noisy') return false;
     if (!(Number.isFinite(snapshot.durationMs) && snapshot.durationMs >= SPEAKER_CANDIDATE_MIN_MS)) return false;
+    // `quality` alone turns a 1 s phrase plus 2.5 s trailing silence into `noisy` and loses a perfectly
+    // usable voice sample. A noisy RATIO is admitted only with enough measured SPEECH; an unmeasured
+    // noisy clip and the old `ok` path keep their previous behaviour.
+    if (verdict.quality === 'noisy') {
+      const vadSpeechMs = Number(snapshot.vadSpeechMs);
+      if (!Number.isFinite(vadSpeechMs) || vadSpeechMs < SPEAKER_CANDIDATE_MIN_SPEECH_MS) return false;
+    }
     const samples = snapshot.speakerSamples;
     return samples instanceof Float32Array && samples.length > 0;
   };
+
   const noteSpeakerSample = (snapshot, verdict, embedding, text) => {
     if (!speakerCandidateEligible(snapshot, verdict)) return;
     if (!(embedding instanceof Float32Array) || embedding.length === 0) return;
@@ -900,7 +912,9 @@ export function startHearing({
           sampleRate: 16000,
           durationMs: Math.round(snapshot.durationMs),
           source: 'mic',
-          quality: verdict.quality,
+          // A noisy RATIO with enough measured speech is a usable sample; the admission gate ran
+          // above. The host's candidate store admits `ok`; the shadow row keeps the original quality.
+          quality: 'ok',
           decision: verdict.decision,
           text: utteranceText,
         });
