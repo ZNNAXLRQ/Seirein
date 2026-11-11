@@ -7,10 +7,11 @@
  * the one place that talks to VTS.
  */
 
-/** VTS hotkey types that really play a model animation. Unknown/missing types fail closed. */
+/** VTS hotkey types that really play a one-shot model animation. */
 export const NATIVE_ANIMATION_HOTKEY_TYPES = Object.freeze([
+  // ChangeIdleAnimation is deliberately excluded: it changes the default idle state and has no
+  // generic restore path.
   'TriggerAnimation',
-  'ChangeIdleAnimation',
 ]);
 
 /** Whether one VTS hotkey entry is safe for the native animation scheduler. */

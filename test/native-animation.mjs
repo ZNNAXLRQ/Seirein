@@ -41,9 +41,9 @@ test('empty pools and duplicate names stay inert', () => {
   assert.equal(deduped.history().length, 0);
 });
 
-test('only explicit animation hotkey types are eligible', () => {
+test('only explicit one-shot animation hotkey types are eligible', () => {
   assert.equal(isNativeAnimationHotkey({ name: 'anim', type: 'TriggerAnimation' }), true);
-  assert.equal(isNativeAnimationHotkey({ name: 'idle', type: 'ChangeIdleAnimation' }), true);
+  assert.equal(isNativeAnimationHotkey({ name: 'idle', type: 'ChangeIdleAnimation' }), false);
   assert.equal(isNativeAnimationHotkey({ name: 'expression', type: 'ToggleExpression' }), false);
   assert.equal(isNativeAnimationHotkey({ name: 'tracking', type: 'ToggleTracking' }), false);
   assert.equal(isNativeAnimationHotkey({ name: 'unknown' }), false);

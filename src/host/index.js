@@ -2418,6 +2418,8 @@ export function apply(ctx, config) {
   });
   /** sessionId -> the live voice round whose agent turn must settle before a continuation. */
   const voiceRounds = new Map();
+  /** The session whose complete voice round may commit one accumulated auto-training sample. */
+  let activeSpeakerTrainingSession = '';
   /** groupId -> the one reply speaker that may currently sound for that group. */
   const replyVoiceByGroup = new Map();
   /** groupId -> every accepted reply speech id of the current answer version. */
@@ -18183,6 +18185,10 @@ export function apply(ctx, config) {
       if (turnReleased) return;
       turnReleased = true;
       clearSpokenTimer?.();
+      // A voice round is complete only here (its answer has finished). Commit at most one queued
+      // matched sample for that round, then clear the accumulator so the next round starts clean.
+      flushSpeakerTraining(id);
+      if (id === '' || activeSpeakerTrainingSession === id) activeSpeakerTrainingSession = '';
       if (playback === null) {
         avatarStatusIf(['thinking', 'speaking'], 'waiting', 'voice.release');
         // P-139: the turn released its voice owner and nothing is sounding: back to silence.
@@ -18207,6 +18213,7 @@ export function apply(ctx, config) {
       const sessionId = target.sessionId;
       // P-46: the timeline row is joinable by session even when the delivery never got a message id.
       roundSessionId = sessionId;
+      activeSpeakerTrainingSession = sessionId;
       // Batch 2: one continuous expression is one response group. A second segment that arrives
       // while the previous answer is still generating/ready/playing continues that group instead
       // of replacing it; a terminal group starts a new one. The group is bookkeeping only: the
@@ -19426,6 +19433,7 @@ export function apply(ctx, config) {
           group: voiceGroup, version: voiceGroupVersion, status: 'delivery-refused', error: 'busy',
         });
         if (voiceRounds.get(sessionId) === voiceGroupRound) voiceRounds.delete(sessionId);
+        speakerTrainingQueue.delete(sessionId);
         releaseVoiceTurn(sessionId);
         return;
       }
@@ -19471,6 +19479,7 @@ export function apply(ctx, config) {
       if (!features.enabled('voice')) {
         // P-46: the utterance was delivered but this round speaks nothing; the row still exists.
         await timelineEmit('no-audio', 'voice-disabled');
+        speakerTrainingQueue.delete(sessionId);
         releaseVoiceTurn(sessionId);
         return;
       }
@@ -19823,7 +19832,8 @@ export function apply(ctx, config) {
           voiceRounds.delete(voiceGroupRound.group.sessionId);
         }
       }
-      // The failed delivery never bound a session id: `idle` keeps whatever identity is current.
+      // The failed delivery never bound a session id; `idle` keeps whatever identity is current.
+      speakerTrainingQueue.delete(activeSpeakerTrainingSession || roundSessionId);
       releaseVoiceTurn();
       await log.emit('voice.inject.failed', { error: error?.message ?? String(error) });
       // P-46: a round that never delivered records why; the message itself never enters the row.
@@ -20218,11 +20228,55 @@ export function apply(ctx, config) {
     return true;
   };
   /**
+   * Matched samples are held until the complete voice round ends. One round commits at most one
+   * best sample; utterance ids are de-duplicated, so a repeated callback can never add twice.
+   */
+  const speakerTrainingQueue = new Map();
+  const autoTrainCandidateReady = (sample) => (
+    sample?.decision === 'match'
+    && sample.shadowQuality === 'ok'
+    && Number.isFinite(Number(sample.score))
+    && Number(sample.score) >= SPEAKER_AUTO_TRAIN_MIN_SCORE
+    && Number.isFinite(Number(sample.durationMs))
+    && Number(sample.durationMs) >= SPEAKER_AUTO_TRAIN_MIN_DURATION_MS
+    && Number(sample.durationMs) <= 15000
+  );
+  const queueSpeakerTraining = (sample, generation) => {
+    if (!autoTrainCandidateReady(sample)) return false;
+    const sessionId = activeSpeakerTrainingSession
+      || voiceSessionTarget({ root, rolloverHour: ROLLOVER_HOUR }).sessionId;
+    const id = typeof sample.utteranceId === 'string' ? sample.utteranceId : '';
+    if (id.length === 0) return false;
+    let bucket = speakerTrainingQueue.get(sessionId);
+    if (bucket === undefined) {
+      bucket = new Map();
+      speakerTrainingQueue.set(sessionId, bucket);
+    }
+    if (!bucket.has(id)) bucket.set(id, { sample, generation });
+    return true;
+  };
+  const flushSpeakerTraining = (sessionId = '') => {
+    const id = sessionId || activeSpeakerTrainingSession;
+    if (id === '') return false;
+    const bucket = speakerTrainingQueue.get(id);
+    speakerTrainingQueue.delete(id);
+    if (bucket === undefined || bucket.size === 0) return false;
+    const best = [...bucket.values()].sort((left, right) => (
+      (Number(right.sample.score) || 0) - (Number(left.sample.score) || 0)
+      || (Number(right.sample.durationMs) || 0) - (Number(left.sample.durationMs) || 0)
+    ))[0];
+    if (autoTrainMatchedSpeaker(best.sample)) return true;
+    // The complete round exists but this sample did not qualify (or persistence failed): keep it
+    // in the explicit cache instead of silently discarding the evidence.
+    handleSpeakerCandidate(best.sample, best.generation, { cacheOnly: true });
+    return false;
+  };
+  /**
    * One hearing callback: validate, write the short WAV, then admit the metadata row. Failure to
    * write audio records one reason event and stores nothing; every path is best-effort and never
    * reaches delivery.
    */
-  const handleSpeakerCandidate = (sample, generation) => {
+  const handleSpeakerCandidate = (sample, generation, { cacheOnly = false } = {}) => {
     const drop = speakerCandidateDropReason(generation);
     if (drop !== '') {
       skipSpeakerCandidate(drop);
@@ -20276,8 +20330,9 @@ export function apply(ctx, config) {
       skipSpeakerCandidate('invalid-samples');
       return;
     }
-    // Matched speech is already labelled self: train it and never put it in the unlabelled cache.
-    if (autoTrainMatchedSpeaker(sample)) return;
+    // Matched speech is queued for the complete round; weak/short samples fall through to the
+    // explicit candidate cache. `cacheOnly` is used when a queued round sample failed training.
+    if (!cacheOnly && queueSpeakerTraining(sample, generation)) return;
     try {
       const duplicate = speakerCandidatesStore.list().find(
         (candidate) => candidate.utteranceId === utteranceId,

@@ -611,7 +611,7 @@ function fakeWorker(text) {
 // 6. Automatic training: weak match stays in the cache; reliable match trains once
 // ---------------------------------------------------------------------------
 
-test('6) 自动训练：弱匹配不训练并保留候选，可靠匹配训练一次后不进候选', async (t) => {
+test('6) 自动训练：短答/弱匹配只进缓存，可靠样本要等完整语音回合才提交', async (t) => {
   const app = await mount(t);
   assert.equal((await app.start()).ok, true);
   const callback = app.callback();
@@ -629,26 +629,39 @@ test('6) 自动训练：弱匹配不训练并保留候选，可靠匹配训练�
   await app.action({ action: 'speaker.candidates.clear' });
   assert.equal(candidateStatusOf(await app.status()).count, 0);
 
+  const shortAnswer = sampleOf('auto-short:1', {
+    decision: 'match', speakerId: 'self', score: 0.92, shadowQuality: 'ok',
+    durationMs: 1000, embedding: [1, 0, 0],
+  });
+  callback(shortAnswer);
+  await until(async () => candidateStatusOf(await app.status())?.count === 1, 'short answer cached');
+  let events = await app.events();
+  assert.equal(ofType(events, 'speaker.auto.trained').length, 0, 'a 1 s answer never trains');
+  await app.action({ action: 'speaker.candidates.clear' });
+
   const weak = sampleOf('auto-weak:1', {
     decision: 'match', speakerId: 'self', score: 0.5, shadowQuality: 'ok',
     durationMs: 5000, embedding: [1, 0, 0],
   });
   callback(weak);
   await until(async () => candidateStatusOf(await app.status())?.count === 1, 'weak match cached');
-  const weakSkip = await app.waitForEvent('speaker.auto.skipped');
-  assert.equal(weakSkip.payload?.reason, 'score', 'weak match is explicitly skipped as low score');
-  let events = await app.events();
+  events = await app.events();
   assert.equal(ofType(events, 'speaker.auto.trained').length, 0, 'weak match never trains');
   await app.action({ action: 'speaker.candidates.clear' });
 
+  // No complete voice round exists in this harness, so a reliable sample may be queued but must
+  // not commit a version. The old immediate-update path is the regression being guarded here.
   const reliable = sampleOf('auto-good:1', {
     decision: 'match', speakerId: 'self', score: 0.92, shadowQuality: 'ok',
     durationMs: 5000, embedding: [1, 0, 0],
   });
   callback(reliable);
-  const trained = await app.waitForEvent('speaker.auto.trained');
-  assert.equal(trained.payload.version, 2, 'the reliable match appends one version');
-  assert.equal(candidateStatusOf(await app.status()).count, 0, 'trained speech never enters the cache');
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  events = await app.events();
+  assert.equal(ofType(events, 'speaker.auto.trained').length, 0,
+    'without a complete round the sample is not committed');
+  assert.equal(candidateStatusOf(await app.status()).count, 0,
+    'the reliable sample is held, not written to the candidate cache');
   const template = await app.action({ action: 'speaker.template.status' });
-  assert.equal(template.currentVersion, 2, 'the template checkpoint is visible and rollbackable');
+  assert.equal(template.currentVersion, 1, 'the base checkpoint is unchanged');
 });
